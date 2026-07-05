@@ -1,0 +1,468 @@
+"""Kaggle backend unit tests — no network, no real kaggle package.
+
+A fake KaggleApi is injected through the module's lazy loader hook;
+omnirun.repo.create_bundle is monkeypatched (module owned by another layer).
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import re
+import sys
+import tarfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+import omnirun.backends.kaggle as kaggle_mod
+from omnirun.backends.base import BackendError
+from omnirun.backends.kaggle import KaggleBackend
+from omnirun.config import BackendConfig
+from omnirun.models import (
+    JobHandle,
+    JobRecord,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+    StatusReport,
+)
+from omnirun.store import JobStore
+
+JOB_ID = "train-abc123"
+SHA = "a" * 40
+
+
+def make_spec(**res) -> JobSpec:
+    return JobSpec(
+        job_id=JOB_ID,
+        name="train",
+        command="python train.py",
+        resources=ResourceSpec(**res),
+        repo=RepoRef(
+            remote_url="git@github.com:me/proj.git",
+            sha=SHA,
+            branch="main",
+            slug="proj",
+        ),
+    )
+
+
+def make_handle(**extra) -> JobHandle:
+    data = {
+        "kernel_ref": f"testuser/omnirun-{JOB_ID}",
+        "dataset_ref": f"testuser/omnirun-{JOB_ID}",
+        "machine_shape": "NvidiaTeslaP100",
+    }
+    data.update(extra)
+    return JobHandle(backend="kaggle", job_id=JOB_ID, data=data)
+
+
+def make_result_tar(exit_code: int, outputs: dict[str, bytes] | None = None) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+
+        def add(name: str, data: bytes) -> None:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        add(
+            "result.json",
+            json.dumps(
+                {
+                    "exit_code": exit_code,
+                    "started_at": "2026-07-04T10:00:00Z",
+                    "finished_at": "2026-07-04T10:30:00Z",
+                    "hostname": "kaggle-worker",
+                }
+            ).encode(),
+        )
+        for name, data in (outputs or {}).items():
+            add(f"outputs/{name}", data)
+    return buf.getvalue()
+
+
+class FakeKaggleApi:
+    def __init__(self) -> None:
+        self.authenticated = False
+        self.auth_error: Exception | None = None
+        self.username = "testuser"
+        self.status_value = "queued"
+        self.failure_message = ""
+        self.output_files: dict[str, bytes] = {}
+        self.dataset_folders: list[dict] = []
+        self.kernel_folders: list[dict] = []
+
+    def authenticate(self) -> None:
+        if self.auth_error:
+            raise self.auth_error
+        self.authenticated = True
+
+    def get_config_value(self, key: str):
+        return self.username if key == "username" else None
+
+    def dataset_create_new(self, folder, public=False, quiet=True, **kw) -> None:
+        folder = Path(folder)
+        self.dataset_folders.append(
+            {
+                "files": sorted(p.name for p in folder.iterdir()),
+                "metadata": json.loads((folder / "dataset-metadata.json").read_text()),
+                "public": public,
+                "bundle": (folder / "bundle.git").read_bytes()
+                if (folder / "bundle.git").exists()
+                else None,
+            }
+        )
+
+    def kernels_push(self, folder):
+        folder = Path(folder)
+        self.kernel_folders.append(
+            {
+                "metadata": json.loads((folder / "kernel-metadata.json").read_text()),
+                "run_py": (folder / "run.py").read_text(),
+            }
+        )
+        return {}
+
+    def kernels_status(self, kernel):
+        return {"status": self.status_value, "failureMessage": self.failure_message}
+
+    def kernels_output(self, kernel, path, **kw) -> None:
+        for name, data in self.output_files.items():
+            (Path(path) / name).write_bytes(data)
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIRUN_STATE_DIR", str(tmp_path / "state"))
+
+
+@pytest.fixture(autouse=True)
+def fake_bundle(monkeypatch):
+    def create(root: Path, sha: str, dest: Path) -> Path:
+        dest = Path(dest)
+        dest.write_bytes(b"FAKE-BUNDLE " + sha.encode())
+        return dest
+
+    monkeypatch.setattr(kaggle_mod, "_create_bundle", create)
+
+
+@pytest.fixture
+def fake_api(monkeypatch) -> FakeKaggleApi:
+    api = FakeKaggleApi()
+    monkeypatch.setattr(kaggle_mod, "_load_kaggle_api_class", lambda: lambda: api)
+    return api
+
+
+@pytest.fixture
+def backend(fake_api) -> KaggleBackend:
+    return KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+
+
+# ---- probe -----------------------------------------------------------------
+
+
+def test_probe_never_raises_without_kaggle_package(monkeypatch):
+    # simulate ImportError even if a real `kaggle` package is around
+    monkeypatch.setitem(sys.modules, "kaggle", None)
+    backend = KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+    offers = backend.probe(ResourceSpec(gpus=1))
+    assert len(offers) == 1
+    assert not offers[0].fits
+    assert "omnirun[kaggle]" in offers[0].unfit_reasons[0]
+
+
+def test_probe_never_raises_without_creds(fake_api, backend):
+    fake_api.auth_error = OSError("could not find kaggle.json")
+    offers = backend.probe(ResourceSpec(gpus=1))
+    assert len(offers) == 1
+    assert not offers[0].fits
+    assert "authentication failed" in offers[0].unfit_reasons[0]
+
+
+def test_probe_t4_maps_to_paired_t4_shape(backend):
+    offers = backend.probe(ResourceSpec(gpu_type="T4"))
+    assert [o.gpu_type for o in offers] == ["2xT4"]
+    assert offers[0].gpus == 2
+    assert offers[0].details["machine_shape"] == "NvidiaTeslaT4"
+    assert offers[0].fits
+    assert offers[0].cost_per_hour is None
+    assert offers[0].wait_note == "kernel queue, usually minutes"
+
+
+@pytest.mark.parametrize(
+    ("gpu_type", "shape"),
+    [
+        ("P100", "NvidiaTeslaP100"),
+        ("L4", "NvidiaL4"),
+        ("A100", "NvidiaTeslaA100"),
+        ("H100", "NvidiaH100"),
+    ],
+)
+def test_probe_machine_shape_mapping(backend, gpu_type, shape):
+    offers = backend.probe(ResourceSpec(gpu_type=gpu_type))
+    assert len(offers) == 1
+    assert offers[0].details["machine_shape"] == shape
+
+
+def test_probe_vram_selects_premium_tiers_with_note(backend):
+    offers = backend.probe(ResourceSpec(gpus=1, min_vram_gb=40))
+    assert {o.gpu_type for o in offers} == {"A100", "H100"}
+    for o in offers:
+        assert "Colab-Pro" in o.notes
+        assert "push may be rejected" in o.notes
+
+
+def test_probe_two_gpus_only_2xt4(backend):
+    offers = backend.probe(ResourceSpec(gpus=2))
+    assert [o.gpu_type for o in offers] == ["2xT4"]
+
+
+def test_probe_free_tiers_marked_free(backend):
+    offers = backend.probe(ResourceSpec(gpus=1))
+    by_type = {o.gpu_type: o for o in offers}
+    assert set(by_type) == {"P100", "2xT4", "L4", "A100", "H100"}
+    assert by_type["P100"].notes == "free"
+    assert by_type["2xT4"].notes == "free"
+    assert "Colab-Pro" in by_type["H100"].notes
+
+
+@pytest.mark.parametrize(
+    ("res", "needle"),
+    [
+        (dict(time=timedelta(hours=12)), "12h session cap"),
+        (dict(gpus=3), "at most 2 GPUs"),
+        (dict(mem_gb=64), "RAM"),
+        (dict(disk_gb=100), "disk"),
+    ],
+)
+def test_probe_unfit_limits(backend, res, needle):
+    offers = backend.probe(ResourceSpec(**res))
+    assert len(offers) == 1
+    assert not offers[0].fits
+    assert any(needle in r for r in offers[0].unfit_reasons)
+
+
+def test_probe_cpu_offer_when_no_gpu(backend):
+    offers = backend.probe(ResourceSpec())
+    assert len(offers) == 1
+    assert offers[0].fits
+    assert offers[0].gpus == 0
+    assert offers[0].details["machine_shape"] is None
+
+
+def _store_gpu_job(hours: float) -> None:
+    now = datetime.now(timezone.utc)
+    rec = JobRecord(
+        spec=make_spec(gpus=1),
+        handle=make_handle(),
+        submitted_at=now - timedelta(hours=hours),
+        last_status=StatusReport(
+            status=JobStatus.SUCCEEDED,
+            exit_code=0,
+            started_at=now - timedelta(hours=hours),
+            finished_at=now,
+        ),
+    )
+    JobStore().save(rec)
+
+
+def test_probe_quota_exhausted_makes_gpu_offers_unfit(backend):
+    _store_gpu_job(hours=31)  # 31 GPU-hours this week > default 30h budget
+    offers = backend.probe(ResourceSpec(gpus=1))
+    assert offers
+    for o in offers:
+        assert not o.fits
+        assert any("weekly quota likely exhausted" in r for r in o.unfit_reasons)
+
+
+def test_probe_quota_within_budget_fits(backend):
+    _store_gpu_job(hours=2)
+    offers = backend.probe(ResourceSpec(gpus=1))
+    assert all(o.fits for o in offers)
+
+
+def test_probe_quota_respects_config_override(fake_api):
+    backend = KaggleBackend(
+        "kaggle",
+        BackendConfig.model_validate({"type": "kaggle", "weekly_gpu_hours": 1}),
+    )
+    _store_gpu_job(hours=2)
+    offers = backend.probe(ResourceSpec(gpus=1))
+    assert all(not o.fits for o in offers)
+
+
+# ---- submit ----------------------------------------------------------------
+
+
+def test_submit_dataset_and_kernel(fake_api, backend):
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    handle = backend.submit(spec, offer)
+
+    # per-job private dataset carries the bundle
+    assert len(fake_api.dataset_folders) == 1
+    ds = fake_api.dataset_folders[0]
+    assert ds["public"] is False
+    assert "bundle.git" in ds["files"]
+    assert ds["metadata"]["id"] == f"testuser/omnirun-{JOB_ID}"
+    assert ds["metadata"]["licenses"] == [{"name": "CC0-1.0"}]
+    assert ds["bundle"] == b"FAKE-BUNDLE " + SHA.encode()
+
+    # kernel metadata
+    assert len(fake_api.kernel_folders) == 1
+    meta = fake_api.kernel_folders[0]["metadata"]
+    assert meta["id"] == f"testuser/omnirun-{JOB_ID}"
+    assert meta["title"] == f"omnirun-{JOB_ID}"  # title must slugify to id slug
+    assert meta["kernel_type"] == "script"
+    assert meta["code_file"] == "run.py"
+    assert meta["language"] == "python"
+    assert meta["is_private"] == "true"
+    assert meta["enable_internet"] == "true"
+    assert meta["enable_gpu"] == "true"
+    assert meta["machine_shape"] == "NvidiaTeslaP100"
+    assert meta["dataset_sources"] == [f"testuser/omnirun-{JOB_ID}"]
+
+    assert handle.backend == "kaggle"
+    assert handle.job_id == JOB_ID
+    assert handle.data == {
+        "kernel_ref": f"testuser/omnirun-{JOB_ID}",
+        "dataset_ref": f"testuser/omnirun-{JOB_ID}",
+        "machine_shape": "NvidiaTeslaP100",
+    }
+
+
+def test_submit_harness_contents(fake_api, backend):
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    # job root lives in /kaggle/tmp (venvs are huge; /kaggle/working stays clean)
+    assert '"/kaggle/tmp/omnirun"' in run_py
+    # bundle is copied from the attached dataset input
+    assert f"/kaggle/input/omnirun-{JOB_ID}/bundle.git" in run_py
+    # bootstrap is embedded via base64 to dodge quoting
+    m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
+    assert m, "base64-embedded bootstrap missing"
+    bootstrap = base64.b64decode(m.group(1)).decode()
+    assert bootstrap.startswith("#!/usr/bin/env bash")
+    assert SHA in bootstrap
+    assert "/kaggle/tmp/omnirun" in bootstrap
+    assert f"/kaggle/tmp/omnirun/jobs/{JOB_ID}/bundle.git" in bootstrap
+    # results are tarred into /kaggle/working as the LAST step
+    assert "tarfile.open" in run_py
+    assert "/omnirun-job.tar.gz" in run_py
+    assert '"/kaggle/working"' in run_py
+    for name in ("logs", "outputs", "result.json", "phase"):
+        assert f'"{name}"' in run_py
+
+
+def test_submit_push_rejection_raises(fake_api, backend):
+    def rejecting_push(folder):
+        return {"error": "accelerator not available for this account"}
+
+    fake_api.kernels_push = rejecting_push
+    spec = make_spec(gpu_type="H100")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(BackendError, match="push rejected"):
+        backend.submit(spec, offer)
+
+
+# ---- status ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("queued", JobStatus.QUEUED),
+        ("running", JobStatus.RUNNING),
+        ("error", JobStatus.FAILED),
+        ("cancelAcknowledged", JobStatus.CANCELLED),
+    ],
+)
+def test_status_mapping(fake_api, raw, expected):
+    backend = KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+    fake_api.status_value = raw
+    report = backend.status(make_handle())
+    assert report.status == expected
+
+
+def test_status_error_carries_failure_message(fake_api, backend):
+    fake_api.status_value = "error"
+    fake_api.failure_message = "CUDA out of memory"
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.FAILED
+    assert "CUDA out of memory" in report.detail
+
+
+def test_status_complete_parses_result_success(fake_api, backend):
+    fake_api.status_value = "complete"
+    fake_api.output_files = {"omnirun-job.tar.gz": make_result_tar(0)}
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.SUCCEEDED
+    assert report.exit_code == 0
+    assert report.started_at is not None
+    assert report.finished_at is not None
+
+
+def test_status_complete_parses_result_failure(fake_api, backend):
+    fake_api.status_value = "complete"
+    fake_api.output_files = {"omnirun-job.tar.gz": make_result_tar(3)}
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.FAILED
+    assert report.exit_code == 3
+
+
+def test_status_complete_without_result_tar_is_failed(fake_api, backend):
+    fake_api.status_value = "complete"
+    fake_api.output_files = {}
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.FAILED
+    assert "omnirun-job.tar.gz" in report.detail
+
+
+def test_status_terminal_results_are_cached(fake_api, backend):
+    fake_api.status_value = "complete"
+    fake_api.output_files = {"omnirun-job.tar.gz": make_result_tar(0)}
+    handle = make_handle()
+    assert backend.status(handle).status == JobStatus.SUCCEEDED
+    # even if the API starts erroring afterwards, the cached verdict stands
+    fake_api.status_value = "error"
+    fake_api.output_files = {}
+    assert backend.status(handle).status == JobStatus.SUCCEEDED
+
+
+# ---- outputs / cancel ----------------------------------------------------------
+
+
+def test_pull_outputs(fake_api, backend, tmp_path):
+    fake_api.output_files = {
+        "omnirun-job.tar.gz": make_result_tar(0, outputs={"model.txt": b"weights"})
+    }
+    dest = tmp_path / "results"
+    files = backend.pull_outputs(make_handle(), dest)
+    assert (dest / "model.txt").read_bytes() == b"weights"
+    assert files == [dest / "model.txt"]
+
+
+def test_cancel_without_api_support_points_at_website(fake_api, backend):
+    with pytest.raises(BackendError, match="kaggle.com"):
+        backend.cancel(make_handle())
+
+
+def test_cancel_uses_api_when_available(fake_api, backend):
+    cancelled: list[str] = []
+    fake_api.kernels_cancel = cancelled.append
+    handle = make_handle()
+    backend.cancel(handle)
+    assert cancelled == [f"testuser/omnirun-{JOB_ID}"]
+    assert backend.status(handle).status == JobStatus.CANCELLED
+
+
+def test_check_reports_username(fake_api, backend):
+    assert "testuser" in backend.check()

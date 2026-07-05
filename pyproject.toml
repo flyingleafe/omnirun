@@ -1,7 +1,47 @@
 [project]
 name = "omnirun"
 version = "0.1.0"
-description = "Add your description here"
+description = "Run jobs from your repo anywhere: Slurm over SSH, any SSH box, Kaggle, Colab, or marketplace GPUs"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+kaggle = ["kaggle>=2.2"]
+colab = ["google-colab-cli>=0.6"]
+all = ["omnirun[kaggle,colab]"]
+
+[project.scripts]
+omnirun = "omnirun.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-mock>=3.14",
+    "respx>=0.21",
+    "kaggle>=2.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omnirun"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs docker or network (deselect with '-m \"not integration\"')",
+    "live: needs real backend credentials",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+include = ["src", "tests"]

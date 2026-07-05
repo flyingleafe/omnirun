@@ -1,0 +1,97 @@
+"""Execution transport: run commands and move files on a target machine.
+
+The SSH family of backends (ssh, slurm, marketplaces after provisioning) is
+written against this protocol; LocalExec makes the whole pipeline testable
+without a network.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class ExecResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+class ExecError(RuntimeError):
+    def __init__(self, message: str, result: ExecResult | None = None) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class Exec(ABC):
+    """A place where shell commands can run. Stateless between calls."""
+
+    @abstractmethod
+    def run(
+        self,
+        command: str,
+        *,
+        stdin: str | None = None,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> ExecResult:
+        """Run `command` through bash. check=True raises ExecError on rc != 0."""
+        ...
+
+    @abstractmethod
+    def put(self, local: Path, remote: str) -> None:
+        """Copy a local file/dir to the target (parents created)."""
+        ...
+
+    @abstractmethod
+    def get(self, remote: str, local: Path) -> None:
+        """Copy a remote file/dir to the local path (parents created)."""
+        ...
+
+    @abstractmethod
+    def describe(self) -> str:
+        """Short human label, e.g. 'ssh:hpc-login' or 'local'."""
+        ...
+
+    @abstractmethod
+    def git_url(self, remote_path: str) -> str:
+        """URL under which the client-side `git push` reaches remote_path on
+        this target (file://... for local, ssh://host/... for ssh)."""
+        ...
+
+    def git_env(self) -> dict[str, str]:
+        """Extra env for client-side git against git_url() (GIT_SSH_COMMAND
+        pointing at the multiplexed connection, for ssh transports)."""
+        return {}
+
+    # --- conveniences shared by all transports ---
+
+    def read_file(self, remote: str, max_bytes: int | None = None) -> str | None:
+        """Return file contents, or None if it doesn't exist."""
+        head = f"head -c {max_bytes} " if max_bytes else "cat "
+        r = self.run(f"{head}{shell_quote(remote)} 2>/dev/null")
+        if r.returncode != 0:
+            return None
+        return r.stdout
+
+    def file_exists(self, remote: str) -> bool:
+        return self.run(f"test -e {shell_quote(remote)}").ok
+
+    def write_file(self, remote: str, content: str, mode: str | None = None) -> None:
+        q = shell_quote(remote)
+        cmd = f"mkdir -p $(dirname {q}) && cat > {q}"
+        if mode:
+            cmd += f" && chmod {mode} {q}"
+        self.run(cmd, stdin=content, check=True)
+
+
+def shell_quote(s: str) -> str:
+    import shlex
+
+    return shlex.quote(s)

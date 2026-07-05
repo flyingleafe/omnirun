@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from omnirun.repo import (
+    RepoError,
+    capture_repo_state,
+    create_bundle,
+    find_repo_root,
+    repo_slug,
+)
+from tests.conftest import git
+
+# --- find_repo_root ---------------------------------------------------------
+
+
+def test_find_repo_root_from_subdir(sample_repo: Path) -> None:
+    sub = sample_repo / "a" / "b"
+    sub.mkdir(parents=True)
+    assert find_repo_root(sub) == sample_repo
+
+
+def test_find_repo_root_outside_repo(tmp_path: Path) -> None:
+    lonely = tmp_path / "no-repo"
+    lonely.mkdir()
+    with pytest.raises(RepoError, match="not inside a git repo"):
+        find_repo_root(lonely)
+
+
+# --- slug --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@github.com:me/omnirun.git", "omnirun"),
+        ("https://github.com/me/my-repo", "my-repo"),
+        ("https://github.com/me/my-repo.git/", "my-repo"),
+        ("ssh://git@host:2222/team/w e i r d!.git", "w-e-i-r-d"),
+    ],
+)
+def test_slug_from_remote(url: str, expected: str, tmp_path: Path) -> None:
+    assert repo_slug(url, tmp_path) == expected
+
+
+def test_slug_from_dir_name(tmp_path: Path) -> None:
+    root = tmp_path / "My Project"
+    root.mkdir()
+    assert repo_slug(None, root) == "My-Project"
+    assert repo_slug("", root) == "My-Project"
+
+
+# --- clean / dirty ------------------------------------------------------------
+
+
+def test_capture_clean(sample_repo: Path) -> None:
+    ref = capture_repo_state(sample_repo)
+    assert ref.sha == git(sample_repo, "rev-parse", "HEAD")
+    assert ref.branch == "main"
+    assert ref.slug == "sample"
+    assert ref.remote_url == ""
+    assert ref.dirty is False
+
+
+def test_capture_dirty_tracked(sample_repo: Path) -> None:
+    (sample_repo / "job.py").write_text("changed\n")
+    with pytest.raises(RepoError, match=r"modified/staged.*commit"):
+        capture_repo_state(sample_repo)
+
+
+def test_capture_dirty_untracked(sample_repo: Path) -> None:
+    (sample_repo / "scratch.txt").write_text("wip\n")
+    with pytest.raises(RepoError, match="untracked"):
+        capture_repo_state(sample_repo)
+
+
+def test_capture_allow_dirty(sample_repo: Path) -> None:
+    (sample_repo / "job.py").write_text("changed\n")
+    ref = capture_repo_state(sample_repo, allow_dirty=True)
+    assert ref.dirty is True
+    assert ref.sha == git(sample_repo, "rev-parse", "HEAD")
+
+
+# --- pushed check ---------------------------------------------------------------
+
+
+@pytest.fixture
+def origin(sample_repo: Path, tmp_path: Path) -> Path:
+    """A bare 'origin' remote with the current main branch pushed."""
+    bare = tmp_path / "origin.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    git(sample_repo, "remote", "add", "origin", str(bare))
+    git(sample_repo, "push", "-q", "origin", "main")
+    return bare
+
+
+def _commit(repo: Path, name: str) -> str:
+    (repo / name).write_text(name)
+    git(repo, "add", name)
+    git(repo, "commit", "-q", "-m", name)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def test_pushed_head_passes(sample_repo: Path, origin: Path) -> None:
+    ref = capture_repo_state(sample_repo)
+    assert ref.remote_url == str(origin)
+    assert ref.slug == "origin"  # slug follows the remote url basename
+
+
+def test_unpushed_head_raises(sample_repo: Path, origin: Path) -> None:
+    _commit(sample_repo, "new.txt")
+    with pytest.raises(RepoError, match="push"):
+        capture_repo_state(sample_repo)
+
+
+def test_auto_push(sample_repo: Path, origin: Path) -> None:
+    sha = _commit(sample_repo, "new.txt")
+    ref = capture_repo_state(sample_repo, auto_push=True)
+    assert ref.sha == sha
+    # the sha actually arrived on the remote
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "cat-file", "-e", f"{sha}^{{commit}}"],
+        check=True,
+    )
+
+
+def test_auto_push_failure_surfaces_stderr(sample_repo: Path, origin: Path) -> None:
+    _commit(sample_repo, "new.txt")
+    git(sample_repo, "remote", "set-url", "origin", str(origin) + "-missing")
+    with pytest.raises(RepoError, match="git push origin main"):
+        capture_repo_state(sample_repo, auto_push=True)
+
+
+def test_no_origin_skips_pushed_check(sample_repo: Path) -> None:
+    _commit(sample_repo, "new.txt")
+    ref = capture_repo_state(sample_repo)  # must not raise
+    assert ref.remote_url == ""
+
+
+def test_detached_head_skips_pushed_check(sample_repo: Path, origin: Path) -> None:
+    git(sample_repo, "checkout", "-q", "--detach")
+    _commit(sample_repo, "detached.txt")  # unpushed, but detached -> no check
+    ref = capture_repo_state(sample_repo)
+    assert ref.branch == "detached"
+
+
+# --- bundles ----------------------------------------------------------------------
+
+
+def test_create_bundle_clonable(sample_repo: Path, tmp_path: Path) -> None:
+    sha = git(sample_repo, "rev-parse", "HEAD")
+    dest = tmp_path / "deep" / "job.bundle"
+    assert create_bundle(sample_repo, sha, dest) == dest
+    assert dest.is_file()
+    # the temp ref did not leak into the source repo
+    assert "refs/omnirun" not in git(sample_repo, "for-each-ref")
+
+    # bare-clone from the bundle (what bootstrap does) and find the sha
+    clone = tmp_path / "clone.git"
+    git(tmp_path, "clone", "-q", "--bare", str(dest), str(clone))
+    git(clone, "cat-file", "-e", f"{sha}^{{commit}}")
+
+    # fetch path (pre-existing bare repo) works too
+    bare2 = tmp_path / "existing.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare2))
+    git(bare2, "fetch", "-q", str(dest), "+refs/*:refs/*")
+    git(bare2, "cat-file", "-e", f"{sha}^{{commit}}")
+
+
+def test_create_bundle_bad_sha(sample_repo: Path, tmp_path: Path) -> None:
+    with pytest.raises(RepoError):
+        create_bundle(sample_repo, "0" * 40, tmp_path / "x.bundle")
