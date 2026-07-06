@@ -32,12 +32,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from omnirun.backends import jobdir
 from omnirun.backends.base import Backend, BackendError, register
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
     CodeSource,
     generate_bootstrap,
+    notebook_env_spec,
 )
 from omnirun.models import (
     JobHandle,
@@ -92,6 +94,13 @@ def _local_root(spec: JobSpec) -> Path:
     from omnirun import repo
 
     return repo.local_root_of(spec.repo)
+
+
+def _env_file(spec: JobSpec):
+    """Local uncommitted .env to ship, or None (lazy import, monkeypatched)."""
+    from omnirun import repo
+
+    return repo.env_file(_local_root(spec))
 
 
 def _ts(s: str | None) -> datetime | None:
@@ -277,6 +286,11 @@ class ColabBackend(Backend):
         if want is None and floor is None:
             default = normalize_gpu_type(str(self.config.extra("default_gpu", "T4")))
             tiers.sort(key=lambda t: t != default)  # stable: default tier first
+            # An unspecified GPU request means "any / cheapest" — offer ONLY the
+            # default tier, never the whole ladder. Otherwise the cross-backend
+            # ranker can pick a premium tier (e.g. A100) the account isn't
+            # entitled to, and the session fails at `colab new --gpu A100`.
+            tiers = tiers[:1]
         if not tiers:
             return [
                 Offer(
@@ -325,11 +339,23 @@ class ColabBackend(Backend):
 
         try:
             script = generate_bootstrap(
-                spec,
+                notebook_env_spec(spec),
                 BootstrapParams(
                     omnirun_root=COLAB_ROOT,
+                    project_root=jobdir.project_root_of(
+                        COLAB_ROOT, spec.repo.slug, self.config.project_root
+                    ),
                     code=CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git"),
                 ),
+            )
+            # `colab upload` (jupyter contents API) 500s if the target dir does
+            # not exist yet — create it in the kernel before uploading into it.
+            self._colab(
+                "exec",
+                "-s",
+                session,
+                stdin=f"import os; os.makedirs({job_dir!r}, exist_ok=True); print('MKDIR_OK')",
+                timeout=EXEC_TIMEOUT_S,
             )
             with tempfile.TemporaryDirectory(prefix="omnirun-colab-") as td:
                 local = Path(td)
@@ -351,6 +377,16 @@ class ColabBackend(Backend):
                     f"{job_dir}/bundle.git",
                     timeout=UPLOAD_TIMEOUT_S,
                 )
+                envf = _env_file(spec)
+                if envf is not None:
+                    self._colab(
+                        "upload",
+                        "-s",
+                        session,
+                        str(envf),
+                        f"{job_dir}/.env",
+                        timeout=UPLOAD_TIMEOUT_S,
+                    )
 
             out = self._colab(
                 "exec",

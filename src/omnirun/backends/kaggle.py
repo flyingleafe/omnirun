@@ -1,21 +1,23 @@
 """Kaggle backend — fully automated batch jobs via the `kaggle` API client.
 
-Per job we create:
-  * a private dataset ``<user>/omnirun-<job_id>`` carrying the git bundle
-    (credential-free code delivery — no git tokens ever leave the laptop);
-  * a private script kernel ``<user>/omnirun-<job_id>`` whose ``run.py`` harness
-    unpacks the embedded bootstrap script, runs it under ``/kaggle/tmp/omnirun``
-    (venvs are huge; ``/kaggle/working`` must stay small), and as a last step
-    tars ``logs/ outputs/ result.json phase`` into
-    ``/kaggle/working/omnirun-job.tar.gz`` so it persists with the version.
+Per job we create a single private script kernel ``<user>/omnirun-<job_id>``
+whose ``run.py`` harness carries BOTH the bootstrap script and the git bundle
+inline (base64) — credential-free code delivery with no git tokens leaving the
+laptop, and no separate dataset. (An earlier design shipped the bundle as a
+dataset; that raced the kernel push — Kaggle 409s a kernel referencing a
+still-processing dataset — and needed a create/delete lifecycle. Embedding
+removes both problems; the only limit is Kaggle's kernel source size, so this
+suits code-sized repos — data is never shipped, jobs fetch their own.) The
+harness runs the bootstrap under ``/kaggle/tmp/omnirun`` (venvs are huge;
+``/kaggle/working`` must stay small) and, last, tars
+``logs/ outputs/ result.json phase`` into ``/kaggle/working/omnirun-job.tar.gz``
+so it persists with the kernel version.
 
 Notes:
   * The ``kaggle`` package is an optional dependency; it is imported lazily so
     unrelated commands never break (``pip install omnirun[kaggle]``).
   * There is no quota API: the ~30 GPU-h/week budget is tracked best-effort
     from the local JobStore (config: ``weekly_gpu_hours``).
-  * gc() deletes the per-job dataset only if the installed client exposes a
-    dataset-delete endpoint; otherwise datasets must be removed on kaggle.com.
 """
 
 from __future__ import annotations
@@ -32,7 +34,13 @@ from pathlib import Path
 from typing import Any
 
 from omnirun.backends.base import Backend, BackendError, register
-from omnirun.bootstrap import BootstrapParams, CodeSource, generate_bootstrap
+from omnirun.backends import jobdir
+from omnirun.bootstrap import (
+    BootstrapParams,
+    CodeSource,
+    generate_bootstrap,
+    notebook_env_spec,
+)
 from omnirun.models import (
     JobHandle,
     JobSpec,
@@ -67,6 +75,10 @@ MAX_MEM_GB = 30
 MAX_DISK_GB = 55
 KAGGLE_ROOT = "/kaggle/tmp/omnirun"  # venv + tree scratch; /kaggle/working stays small
 RESULT_TAR = "omnirun-job.tar.gz"
+# Cap on the base64 git bundle embedded in the kernel source. Kaggle rejects
+# oversized kernel pushes; fail early with a clear message instead. Generous —
+# a code-only repo bundle is normally well under a megabyte.
+MAX_EMBED_B64 = 40 * 1024 * 1024
 LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
 
 
@@ -104,23 +116,26 @@ def _ts(s: str | None) -> datetime | None:
         return None
 
 
-def _render_harness(job_id: str, bootstrap_b64: str) -> str:
-    """The script-kernel payload: decode + run bootstrap.sh under /kaggle/tmp,
+def _render_harness(job_id: str, bootstrap_b64: str, bundle_b64: str) -> str:
+    """The script-kernel payload: decode the embedded bootstrap.sh + git bundle
+    (both carried inline — no dataset needed), run bootstrap under /kaggle/tmp,
     stream its log to kernel stdout, then persist results to /kaggle/working."""
     return f'''\
 """omnirun harness for job {job_id} — generated, do not edit."""
-import base64, os, shutil, subprocess, sys, tarfile, time
+import base64, os, subprocess, sys, tarfile, time
 
 ROOT = "{KAGGLE_ROOT}"
 JOB_DIR = ROOT + "/jobs/{job_id}"
 WORK = "/kaggle/working"
 BOOTSTRAP_B64 = "{bootstrap_b64}"
+BUNDLE_B64 = "{bundle_b64}"
 
 os.makedirs(JOB_DIR, exist_ok=True)
 os.environ["OMNIRUN_ROOT"] = ROOT
 with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
     f.write(base64.b64decode(BOOTSTRAP_B64))
-shutil.copy("/kaggle/input/omnirun-{job_id}/bundle.git", JOB_DIR + "/bundle.git")
+with open(JOB_DIR + "/bundle.git", "wb") as f:
+    f.write(base64.b64decode(BUNDLE_B64))
 
 proc = subprocess.Popen(["bash", JOB_DIR + "/bootstrap.sh"])
 
@@ -302,6 +317,12 @@ class KaggleBackend(Backend):
                     wait_note="kernel queue, usually minutes",
                 )
             )
+        if want is None and floor is None and offers:
+            # unspecified GPU = "any / cheapest": offer only the cheapest free
+            # tier, never premium shapes (A100/H100 need a Pro-linked account and
+            # would fail the kernel push).
+            free = [o for o in offers if o.details.get("free")]
+            offers = (free or offers)[:1]
         if not offers:
             return [
                 Offer(
@@ -324,48 +345,43 @@ class KaggleBackend(Backend):
         job_id = spec.job_id
         slug = f"omnirun-{job_id}"
         kernel_ref = f"{user}/{slug}"
-        dataset_ref = f"{user}/{slug}"
         shape = offer.details.get("machine_shape")
 
         with tempfile.TemporaryDirectory(prefix="omnirun-kaggle-") as td:
             stage = Path(td)
-
-            # 1. private per-job dataset carrying the git bundle
-            ds_dir = stage / "dataset"
-            ds_dir.mkdir()
-            _create_bundle(_local_root(spec), spec.repo.sha, ds_dir / "bundle.git")
-            (ds_dir / "dataset-metadata.json").write_text(
-                json.dumps(
-                    {
-                        "title": slug,
-                        "id": dataset_ref,
-                        "licenses": [{"name": "CC0-1.0"}],
-                    },
-                    indent=2,
-                )
-            )
-            try:
-                api.dataset_create_new(folder=str(ds_dir), public=False, quiet=True)
-            except Exception as e:
+            # The git bundle is embedded in the kernel itself (base64 in run.py),
+            # NOT shipped as a dataset. A dataset would 409 the kernel push until
+            # it finished processing, and needs create/delete lifecycle; embedding
+            # sidesteps all of it. Cost: the kernel source carries the bundle, so
+            # only code-sized repos fit (data isn't shipped — jobs fetch their own).
+            bundle_path = stage / "bundle.git"
+            _create_bundle(_local_root(spec), spec.repo.sha, bundle_path)
+            bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
+            if len(bundle_b64) > MAX_EMBED_B64:
                 raise BackendError(
-                    f"creating kaggle dataset {dataset_ref} failed: {e}"
-                ) from e
+                    f"repo bundle is too large to embed in a kaggle kernel "
+                    f"(~{len(bundle_b64) // (1024 * 1024)}MB base64) — slim the git "
+                    "history (shallow/squash) or run this job on another backend"
+                )
 
-            # 2. script kernel wrapping the bootstrap payload
-            k_dir = stage / "kernel"
-            k_dir.mkdir()
             script = generate_bootstrap(
-                spec,
+                notebook_env_spec(spec),
                 BootstrapParams(
                     omnirun_root=KAGGLE_ROOT,
+                    project_root=jobdir.project_root_of(
+                        KAGGLE_ROOT, spec.repo.slug, self.config.project_root
+                    ),
                     code=CodeSource(
                         kind="bundle",
                         bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
                     ),
                 ),
             )
-            b64 = base64.b64encode(script.encode()).decode()
-            (k_dir / "run.py").write_text(_render_harness(job_id, b64))
+            boot_b64 = base64.b64encode(script.encode()).decode()
+
+            k_dir = stage / "kernel"
+            k_dir.mkdir()
+            (k_dir / "run.py").write_text(_render_harness(job_id, boot_b64, bundle_b64))
             meta: dict[str, Any] = {
                 "id": kernel_ref,
                 "title": slug,  # title must slugify to the id slug
@@ -375,7 +391,7 @@ class KaggleBackend(Backend):
                 "is_private": "true",
                 "enable_gpu": "true" if shape else "false",
                 "enable_internet": "true",  # uv standalone installer needs it
-                "dataset_sources": [dataset_ref],
+                "dataset_sources": [],
                 "competition_sources": [],
                 "kernel_sources": [],
                 "model_sources": [],
@@ -387,13 +403,11 @@ class KaggleBackend(Backend):
             try:
                 resp = api.kernels_push(str(k_dir))
             except Exception as e:
-                self._try_delete_dataset(api, dataset_ref)
                 raise BackendError(f"kernels_push failed for {kernel_ref}: {e}") from e
             err = getattr(resp, "error", None)
             if err is None and isinstance(resp, dict):
                 err = resp.get("error")
             if err:
-                self._try_delete_dataset(api, dataset_ref)
                 hint = (
                     f" ({PREMIUM_NOTE})"
                     if shape and not offer.details.get("free", True)
@@ -404,11 +418,7 @@ class KaggleBackend(Backend):
         return JobHandle(
             backend=self.name,
             job_id=job_id,
-            data={
-                "kernel_ref": kernel_ref,
-                "dataset_ref": dataset_ref,
-                "machine_shape": shape,
-            },
+            data={"kernel_ref": kernel_ref, "machine_shape": shape},
         )
 
     # ---- status ----------------------------------------------------------------
@@ -584,31 +594,10 @@ class KaggleBackend(Backend):
         )
 
     def gc(self, handle: JobHandle) -> None:
-        """Delete the per-job dataset if the client supports it (no-op otherwise;
-        stale omnirun-* datasets can be removed on kaggle.com)."""
-        ds = handle.data.get("dataset_ref")
-        if not ds:
-            return
-        try:
-            api = self._api()
-        except BackendError:
-            return
-        self._try_delete_dataset(api, ds)
-
-    @staticmethod
-    def _try_delete_dataset(api: Any, dataset_ref: str) -> None:
-        for name in ("dataset_delete", "datasets_delete"):
-            fn = getattr(api, name, None)
-            if callable(fn):
-                try:
-                    owner, slug = dataset_ref.split("/", 1)
-                    try:
-                        fn(owner, slug)
-                    except TypeError:
-                        fn(dataset_ref)
-                except Exception:
-                    pass
-                return
+        """Nothing worker-side to reap: the code bundle rode inside the kernel
+        (no dataset), and the kernel version itself is lightweight and private.
+        Stale omnirun-* kernels can be removed on kaggle.com if desired."""
+        return
 
     def check(self) -> str:
         api = self._api()

@@ -15,9 +15,12 @@ from tests.conftest import git
 
 
 def stage(sample_repo: Path, spec: JobSpec, root: Path) -> Path:
-    """Simulate submit-time staging: push the sha into the worker bare repo
-    over file:// and write bootstrap.sh."""
-    bare = root / "repos" / f"{spec.repo.slug}.git"
+    """Simulate submit-time staging: push the sha into the worker object store
+    over file:// and write bootstrap.sh. The object store lives under the shared
+    project root ($OMNIRUN_ROOT/projects/<slug>/repo.git); bootstrap creates the
+    per-revision worktree off it itself."""
+    project_root = root / "projects" / spec.repo.slug
+    bare = project_root / "repo.git"
     bare.parent.mkdir(parents=True, exist_ok=True)
     git(sample_repo, "init", "-q", "--bare", str(bare))
     git(
@@ -56,8 +59,8 @@ def test_full_bootstrap_run(
     bootstrap_log = (job_dir / "logs" / "bootstrap.log").read_text()
     assert proc.returncode == 0, bootstrap_log
 
-    # worktree checked out at the exact sha
-    tree = job_dir / "tree"
+    # worktree checked out at the exact sha, shared per-revision under the project
+    tree = root / "projects" / job_spec.repo.slug / ".trees" / job_spec.repo.sha[:12]
     assert (tree / "job.py").is_file()
     assert git(tree, "rev-parse", "HEAD") == job_spec.repo.sha
 

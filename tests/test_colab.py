@@ -139,17 +139,18 @@ def test_probe_exact_gpu_type(cli, backend):
     assert [o.details["gpu_flag"] for o in offers] == ["G4"]
 
 
-def test_probe_unconstrained_puts_default_gpu_first(cli):
+def test_probe_unconstrained_offers_only_default_gpu(cli):
+    # an unspecified GPU request means "any / cheapest" -> offer ONLY the default
+    # tier, never the whole ladder (else the ranker can pick an unentitled A100).
     backend = ColabBackend("colab", BackendConfig(type="colab"))
     offers = backend.probe(ResourceSpec(gpus=1))
-    assert offers[0].gpu_type == "T4"
-    assert len(offers) == 5
+    assert [o.gpu_type for o in offers] == ["T4"]
 
     custom = ColabBackend(
         "colab", BackendConfig.model_validate({"type": "colab", "default_gpu": "A100"})
     )
     offers = custom.probe(ResourceSpec(gpus=1))
-    assert offers[0].gpu_type == "A100"
+    assert [o.gpu_type for o in offers] == ["A100"]
 
 
 def test_probe_no_matching_tier_is_unfit(cli, backend):
@@ -187,10 +188,13 @@ def test_submit_sequence(cli, backend):
 
     handle = backend.submit(spec, offer)
 
-    assert cli.subcommands() == ["new", "upload", "upload", "exec"]
-    new, up1, up2, ex = cli.calls
+    # mkdir exec must precede the uploads (colab upload 500s on a missing dir)
+    assert cli.subcommands() == ["new", "exec", "upload", "upload", "exec"]
+    new, mkdir, up1, up2, ex = cli.calls
 
     assert new["argv"] == ["colab", "new", "-s", SESSION, "--gpu", "T4"]
+    assert mkdir["argv"] == ["colab", "exec", "-s", SESSION]
+    assert f"makedirs({JOB_DIR!r}" in mkdir["stdin"]
     assert up1["argv"][:4] == ["colab", "upload", "-s", SESSION]
     assert up1["argv"][-1] == f"{JOB_DIR}/bootstrap.sh"
     assert up2["argv"][-1] == f"{JOB_DIR}/bundle.git"

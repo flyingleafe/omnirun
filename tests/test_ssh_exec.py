@@ -79,6 +79,16 @@ def test_run_builds_batchmode_multiplexed_command(ex, recorder, cm_dir):
     assert argv[i + 1 :] == ["user@box", "bash", "-c", shlex.quote("echo hi")]
 
 
+def test_run_login_shell_uses_dash_lc(recorder, cm_dir):
+    """login_shell=True runs `bash -lc` so /etc/profile + module load put
+    sbatch/sinfo on PATH (HPC login nodes)."""
+    ex = SSHExec("user@box", control_dir=cm_dir, login_shell=True)
+    ex.run("sinfo")
+    argv = recorder.last
+    i = argv.index("--")
+    assert argv[i + 1 :] == ["user@box", "bash", "-lc", shlex.quote("sinfo")]
+
+
 def test_run_creates_control_dir_0700(ex, recorder, cm_dir):
     ex.run("true")
     assert cm_dir.is_dir()

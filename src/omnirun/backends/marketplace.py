@@ -285,8 +285,13 @@ class MarketplaceBackend(Backend, ABC):
             ex = self._make_exec(target, inst.ssh_port)
             self._wait_ssh(ex)
             root = jobdir.remote_root(ex, self.config.root)
+            project_root = jobdir.resolve_project_root(
+                ex, root, spec.repo.slug, self.config.project_root
+            )
             params = BootstrapParams(
-                omnirun_root=root, setup_lines=list(self.config.env_setup)
+                omnirun_root=root,
+                project_root=project_root,
+                setup_lines=list(self.config.env_setup),
             )
             job_dir = jobdir.stage_job(ex, spec, local_root_of(spec.repo), params, root)
             self._launch_detached(ex, job_dir)

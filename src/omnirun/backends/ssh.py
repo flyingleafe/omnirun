@@ -50,6 +50,9 @@ class SshBackend(Backend):
                 self.config.host,
                 port=self.config.extra("port"),
                 identity=self.config.extra("identity"),
+                # opt-in: a personal box may need `module`/conda from the login
+                # profile — [backends.x] login_shell = true
+                login_shell=self.config.extra("login_shell", False),
             )
         return self._exec
 
@@ -213,8 +216,13 @@ class SshBackend(Backend):
     def submit(self, spec: JobSpec, offer: Offer | None = None) -> JobHandle:
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
+        project_root = jobdir.resolve_project_root(
+            ex, root, spec.repo.slug, self.config.project_root
+        )
         params = BootstrapParams(
-            omnirun_root=root, setup_lines=list(self.config.env_setup)
+            omnirun_root=root,
+            project_root=project_root,
+            setup_lines=list(self.config.env_setup),
         )
         job_dir = jobdir.stage_job(ex, spec, local_root_of(spec.repo), params, root)
         pid_file = shell_quote(f"{job_dir}/pid")

@@ -224,6 +224,7 @@ def no_push(monkeypatch):
 def test_submit_pipes_script_and_parses_id(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"git init --bare", stdout=f"{ROOT}/projects/proj/repo.git\n")
     fake.add(r"sbatch --parsable", stdout="12345;cluster\n")
     b = make_backend(fake, partition="gpu")
     handle = b.submit(make_spec(gpus=1, gpu_type="A100"), offer=None)
@@ -247,6 +248,7 @@ def test_submit_pipes_script_and_parses_id(no_push):
 def test_submit_plain_job_id(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"git init --bare", stdout=f"{ROOT}/projects/proj/repo.git\n")
     fake.add(r"sbatch --parsable", stdout="777\n")
     handle = make_backend(fake).submit(make_spec(), offer=None)
     assert handle.data["slurm_job_id"] == "777"
@@ -255,6 +257,7 @@ def test_submit_plain_job_id(no_push):
 def test_submit_sbatch_failure_raises(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"git init --bare", stdout=f"{ROOT}/projects/proj/repo.git\n")
     fake.add(
         r"sbatch --parsable", returncode=1, stderr="sbatch: error: invalid partition"
     )
@@ -265,6 +268,7 @@ def test_submit_sbatch_failure_raises(no_push):
 def test_submit_garbage_output_raises(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"git init --bare", stdout=f"{ROOT}/projects/proj/repo.git\n")
     fake.add(r"sbatch --parsable", stdout="Submitted batch job banana\n")
     with pytest.raises(BackendError, match="parse"):
         make_backend(fake).submit(make_spec(), offer=None)

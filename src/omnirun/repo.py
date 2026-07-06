@@ -125,6 +125,17 @@ def local_root_of(ref: RepoRef) -> Path:
     return find_repo_root()
 
 
+def env_file(root: Path) -> Path | None:
+    """<root>/.env if it exists and is NOT tracked by git — the uncommitted
+    secrets file we ship out-of-band. A committed .env is already in the sha, so
+    we leave it alone (returning None) rather than double-shipping it."""
+    p = root / ".env"
+    if not p.is_file():
+        return None
+    tracked = _git(root, "ls-files", "--error-unmatch", ".env")
+    return None if tracked.returncode == 0 else p
+
+
 def create_bundle(root: Path, sha: str, dest: Path) -> Path:
     """`git bundle` carrying `sha` (and its history), for backends where the
     client cannot push directly (Kaggle datasets, Colab uploads).

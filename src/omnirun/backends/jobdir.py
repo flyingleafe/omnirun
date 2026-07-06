@@ -38,21 +38,49 @@ def job_dir_of(root: str, job_id: str) -> str:
     return f"{root}/jobs/{job_id}"
 
 
-def push_repo(
-    exec_: Exec, local_repo_root: Path, sha: str, slug: str, root: str
-) -> None:
-    """Push the exact sha from the client repo into the worker-side bare repo
-    over our own transport — the worker never needs git credentials."""
-    bare = f"{root}/repos/{slug}.git"
-    exec_.run(
-        f"mkdir -p {shell_quote(bare)} && git init --bare -q {shell_quote(bare)} 2>/dev/null || true",
-        check=True,
+def project_root_of(root: str, slug: str, configured: str | None) -> str:
+    """The project's shared checkout+venv dir. Configured value wins (verbatim,
+    for callers that don't need it expanded); otherwise "$root/projects/<slug>"."""
+    return configured or f"{root}/projects/{slug}"
+
+
+def resolve_project_root(
+    exec_: Exec, root: str, slug: str, configured: str | None
+) -> str:
+    """Absolute project root on the worker. A configured value may reference
+    remote env vars ("$HOME/proj", "$SCRATCH/..") so it's expanded remotely;
+    the default "$root/projects/<slug>" is already absolute (root came from
+    remote_root)."""
+    if configured:
+        return remote_root(exec_, configured)
+    return f"{root}/projects/{slug}"
+
+
+def remote_git_dir(exec_: Exec, project_root: str) -> str:
+    """Resolve (and create if needed) the object store to push into: an existing
+    checkout's .git if project_root already holds one, else a managed bare repo."""
+    pr = shell_quote(project_root)
+    r = exec_.run(
+        f"if [ -d {pr}/.git ]; then echo {pr}/.git; "
+        f"else mkdir -p {pr} && git init --bare -q {pr}/repo.git 2>/dev/null; echo {pr}/repo.git; fi"
     )
+    line = r.stdout.strip().splitlines()[-1] if r.ok and r.stdout.strip() else ""
+    if not line.startswith("/"):
+        raise BackendError(
+            f"cannot resolve object store under {project_root!r} on {exec_.describe()}"
+        )
+    return line
+
+
+def push_repo(exec_: Exec, local_repo_root: Path, sha: str, git_dir: str) -> None:
+    """Push the exact sha from the client repo into the worker-side object store
+    over our own transport — the worker never needs git credentials. The refspec
+    targets a non-branch ref, so pushing into an existing checkout is safe."""
     env = {**os.environ, **exec_.git_env()}
     # An explicit ref per push keeps the sha alive against gc; worktrees detach from it.
     refspec = f"{sha}:refs/omnirun/{sha[:12]}"
     proc = subprocess.run(
-        ["git", "push", "--quiet", exec_.git_url(bare), refspec],
+        ["git", "push", "--quiet", exec_.git_url(git_dir), refspec],
         cwd=local_repo_root,
         env=env,
         capture_output=True,
@@ -72,12 +100,28 @@ def stage_job(
     params: BootstrapParams,
     root: str,
 ) -> str:
-    """Push code + write bootstrap.sh; returns the absolute worker job dir."""
-    push_repo(exec_, local_repo_root, spec.repo.sha, spec.repo.slug, root)
+    """Push code + stage any .env + write bootstrap.sh; returns the worker job dir.
+
+    params.project_root must be the resolved (absolute) shared project dir; the
+    object store is created under it and the exact sha pushed there."""
+    project_root = params.project_root or project_root_of(root, spec.repo.slug, None)
+    git_dir = remote_git_dir(exec_, project_root)
+    push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
     job_dir = job_dir_of(root, spec.job_id)
+    stage_env_file(exec_, local_repo_root, job_dir)
     script = generate_bootstrap(spec, params)
     exec_.write_file(f"{job_dir}/bootstrap.sh", script, mode="755")
     return job_dir
+
+
+def stage_env_file(exec_: Exec, local_repo_root: Path, job_dir: str) -> None:
+    """Ship an uncommitted, gitignored <root>/.env out-of-band (not via git, not
+    baked into bootstrap.sh) so secrets reach the worker without being committed."""
+    from omnirun.repo import env_file
+
+    envf = env_file(local_repo_root)
+    if envf is not None:
+        exec_.write_file(f"{job_dir}/.env", envf.read_text(), mode="600")
 
 
 def derive_status(
@@ -175,10 +219,7 @@ def pull_outputs(exec_: Exec, job_dir: str, dest: Path) -> list[Path]:
 
 
 def gc_job(exec_: Exec, job_dir: str, slug: str, root: str) -> None:
-    """Remove the job's worktree + dir (bare repo and caches stay for reuse)."""
-    bare = f"{root}/repos/{slug}.git"
-    exec_.run(
-        f"git --git-dir={shell_quote(bare)} worktree remove --force {shell_quote(job_dir + '/tree')} 2>/dev/null; "
-        f"rm -rf {shell_quote(job_dir)}; "
-        f"git --git-dir={shell_quote(bare)} worktree prune 2>/dev/null || true"
-    )
+    """Remove the job dir only. The shared project (worktrees at $PROJECT_ROOT/
+    .trees/<sha> and the .venv) persists as reusable cache — a job never owns
+    them, so tearing them down here would break sibling jobs at the same sha."""
+    exec_.run(f"rm -rf {shell_quote(job_dir)}")

@@ -60,11 +60,16 @@ class SSHExec(Exec):
         identity: str | None = None,
         extra_opts: list[str] | None = None,
         control_dir: Path | None = None,
+        login_shell: bool = False,
     ) -> None:
         self.target = target
         self.port = port
         self.identity = identity
         self.extra_opts = list(extra_opts or [])
+        # Run remote commands through a login shell (`bash -lc`) so /etc/profile
+        # and the module system set PATH — required on HPC login nodes where
+        # sbatch/sinfo live behind `module load`, not in the default env.
+        self.login_shell = login_shell
         self.control_dir = (
             Path(control_dir) if control_dir else Path.home() / ".ssh" / "omnirun-cm"
         )
@@ -140,7 +145,7 @@ class SSHExec(Exec):
             "--",
             self.target,
             "bash",
-            "-c",
+            "-lc" if self.login_shell else "-c",
             shell_quote(command),
         ]
         try:

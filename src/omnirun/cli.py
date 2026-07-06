@@ -16,6 +16,7 @@ from rich.table import Table
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
+from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.config import (
     Config,
     ConfigError,
@@ -33,6 +34,7 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
+from omnirun.queue import QueueState
 from omnirun.store import JobStore
 
 app = typer.Typer(
@@ -280,6 +282,63 @@ def _truncate(s: str, n: int = 40) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _build_job_spec(
+    command: list[str],
+    *,
+    name: str | None,
+    gpus: int | None,
+    gpu_type: str | None,
+    vram: float | None,
+    time: str | None,
+    cpus: int | None,
+    mem: float | None,
+    disk: float | None,
+    outputs: list[str] | None,
+    env: list[str] | None,
+    push: bool,
+    dirty: bool,
+) -> JobSpec:
+    """Repo capture + defaults merge shared by `submit` and `enqueue`."""
+    from omnirun import repo as repo_mod
+
+    root = repo_mod.find_repo_root()
+    repo_ref = repo_mod.capture_repo_state(root, allow_dirty=dirty, auto_push=push)
+    if repo_ref.dirty:
+        console.print(
+            "[yellow]warning:[/yellow] working tree is dirty — running a wip "
+            f"commit ({repo_ref.sha[:12]}), not your last pushed revision"
+        )
+
+    job_defaults = load_repo_defaults(root).get("job", {}) or {}
+    res = _build_resources(
+        job_defaults.get("resources", {}) or {},
+        gpus=gpus,
+        gpu_type=gpu_type,
+        vram=vram,
+        time=time,
+        cpus=cpus,
+        mem=mem,
+        disk=disk,
+    )
+    env_vars = dict(job_defaults.get("env_vars", {}) or {})
+    env_vars.update(_parse_env(env or []))
+    job_name = name or job_defaults.get("name") or command[0]
+    command_str = command[0] if len(command) == 1 else shlex.join(command)
+
+    return JobSpec(
+        job_id=JobSpec.make_job_id(job_name),
+        name=job_name,
+        command=command_str,
+        resources=res,
+        env=EnvSpec.model_validate(job_defaults.get("env", {}) or {}),
+        outputs=list(outputs)
+        if outputs
+        else list(job_defaults.get("outputs", []) or []),
+        repo=repo_ref,
+        env_vars=env_vars,
+    )
+
+
 # --------------------------------------------------------------------------- submit
 
 
@@ -332,19 +391,9 @@ def submit(
         help="Print the rendered payload for the chosen backend; do not submit.",
     ),
 ) -> None:
-    from omnirun import repo as repo_mod
-
-    root = repo_mod.find_repo_root()
-    repo_ref = repo_mod.capture_repo_state(root, allow_dirty=dirty, auto_push=push)
-    if repo_ref.dirty:
-        console.print(
-            "[yellow]warning:[/yellow] working tree is dirty — running a wip "
-            f"commit ({repo_ref.sha[:12]}), not your last pushed revision"
-        )
-
-    job_defaults = load_repo_defaults(root).get("job", {}) or {}
-    res = _build_resources(
-        job_defaults.get("resources", {}) or {},
+    spec = _build_job_spec(
+        command,
+        name=name,
         gpus=gpus,
         gpu_type=gpu_type,
         vram=vram,
@@ -352,24 +401,12 @@ def submit(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        outputs=outputs,
+        env=env,
+        push=push,
+        dirty=dirty,
     )
-    env_vars = dict(job_defaults.get("env_vars", {}) or {})
-    env_vars.update(_parse_env(env or []))
-    job_name = name or job_defaults.get("name") or command[0]
-    command_str = command[0] if len(command) == 1 else shlex.join(command)
-
-    spec = JobSpec(
-        job_id=JobSpec.make_job_id(job_name),
-        name=job_name,
-        command=command_str,
-        resources=res,
-        env=EnvSpec.model_validate(job_defaults.get("env", {}) or {}),
-        outputs=list(outputs)
-        if outputs
-        else list(job_defaults.get("outputs", []) or []),
-        repo=repo_ref,
-        env_vars=env_vars,
-    )
+    res = spec.resources
 
     cfg = _load_cfg()
 
@@ -459,6 +496,172 @@ def offers(
     cfg = _load_cfg()
     _, ranked, unfit = _probe(cfg, res, backend)
     console.print(chooser.render_offer_table(ranked, unfit, res))
+
+
+# --------------------------------------------------------------------------- queue
+
+_QUEUE_STYLE = {
+    QueueState.RUNNING: "cyan",
+    QueueState.SUCCEEDED: "green",
+    QueueState.FAILED: "red",
+    QueueState.CANCELLED: "yellow",
+    QueueState.PLACING: "blue",
+}
+
+
+@app.command(
+    help="Run the scheduler daemon in the foreground (background it yourself)."
+)
+@friendly_errors
+def serve(
+    host: str | None = typer.Option(None, "--host", help="Bind host override."),
+    port: int | None = typer.Option(None, "--port", help="Bind port override."),
+) -> None:
+    cfg = _load_cfg()
+    if host is not None:
+        cfg.daemon.host = host
+    if port is not None:
+        cfg.daemon.port = port
+    console.print(f"listening on {cfg.daemon.host}:{cfg.daemon.port}")
+    Daemon(cfg).serve()
+
+
+@app.command(
+    help="Enqueue a job on the daemon: omnirun enqueue [OPTIONS] -- COMMAND..."
+)
+@friendly_errors
+def enqueue(
+    command: list[str] = typer.Argument(
+        ..., metavar="[--] COMMAND...", help="Command to run in the repo root."
+    ),
+    name: str | None = typer.Option(None, "--name", help="Job name."),
+    gpus: int | None = typer.Option(None, "--gpus", help="Number of GPUs."),
+    gpu_type: str | None = typer.Option(
+        None, "--gpu-type", help="Normalized GPU name, e.g. H100, A100-80."
+    ),
+    vram: float | None = typer.Option(None, "--vram", help="Min per-GPU VRAM in GB."),
+    time: str | None = typer.Option(None, "--time", help="Estimated duration."),
+    cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
+    mem: float | None = typer.Option(None, "--mem", help="RAM in GB."),
+    disk: float | None = typer.Option(None, "--disk", help="Disk in GB."),
+    outputs: list[str] | None = typer.Option(
+        None, "--outputs", help="Output glob relative to repo root (repeatable)."
+    ),
+    env: list[str] | None = typer.Option(
+        None, "--env", help="KEY=VALUE forwarded to the job (repeatable)."
+    ),
+    backend: str | None = typer.Option(
+        None, "--backend", help="Restrict placement to one configured backend."
+    ),
+    push: bool = typer.Option(
+        False, "--push", help="Auto-push an unpushed HEAD to the remote."
+    ),
+    dirty: bool = typer.Option(
+        False, "--dirty", help="Allow a dirty working tree (runs a wip commit)."
+    ),
+    count: int = typer.Option(1, "--count", help="Enqueue N copies of the job."),
+) -> None:
+    spec = _build_job_spec(
+        command,
+        name=name,
+        gpus=gpus,
+        gpu_type=gpu_type,
+        vram=vram,
+        time=time,
+        cpus=cpus,
+        mem=mem,
+        disk=disk,
+        outputs=outputs,
+        env=env,
+        push=push,
+        dirty=dirty,
+    )
+    host, port = _require_daemon()
+    resp = send_request(
+        host,
+        port,
+        {
+            "cmd": "enqueue",
+            "spec": spec.model_dump(mode="json"),
+            "count": count,
+            "backend": backend,
+        },
+    )
+    if not resp.get("ok"):
+        _die(str(resp.get("error", "enqueue failed")))
+    qids = resp.get("qids", [])
+    console.print(f"[green]enqueued[/green] {len(qids)} job(s): {', '.join(qids)}")
+
+
+@app.command(help="Show the daemon's job queue (or --wait / --cancel it).")
+@friendly_errors
+def queue(
+    wait: bool = typer.Option(
+        False, "--wait", help="Poll until every entry is terminal, then summarize."
+    ),
+    cancel: str | None = typer.Option(
+        None, "--cancel", help="Cancel a qid (or 'all')."
+    ),
+) -> None:
+    host, port = _require_daemon()
+    if cancel is not None:
+        resp = send_request(host, port, {"cmd": "cancel", "qid": cancel})
+        if not resp.get("ok"):
+            _die(str(resp.get("error", "cancel failed")))
+        console.print(f"cancelled {resp.get('cancelled', 0)} entr(y|ies)")
+        return
+    if wait:
+        _queue_wait(host, port)
+        return
+    resp = send_request(host, port, {"cmd": "list"})
+    console.print(_queue_table(resp.get("entries", [])))
+
+
+def _require_daemon() -> tuple[str, int]:
+    addr = daemon_address()
+    if addr is None:
+        _die("no omnirun daemon running — start one with `omnirun serve`")
+    assert addr is not None
+    return addr
+
+
+def _queue_table(entries: list[dict[str, Any]]) -> Table:
+    table = Table()
+    for col in ("qid", "state", "backend", "job", "name", "command"):
+        table.add_column(col)
+    for e in entries:
+        state = QueueState(e["state"])
+        style = _QUEUE_STYLE.get(state)
+        state_txt = f"[{style}]{state.value}[/{style}]" if style else state.value
+        table.add_row(
+            e["qid"],
+            state_txt,
+            e.get("backend") or "-",
+            e.get("job_id") or "-",
+            e["spec"]["name"],
+            _truncate(e["spec"]["command"]),
+        )
+    return table
+
+
+def _queue_wait(host: str, port: int) -> None:
+    import time as _time
+
+    entries: list[dict[str, Any]] = []
+    while True:
+        resp = send_request(host, port, {"cmd": "list"})
+        entries = resp.get("entries", [])
+        if not entries or all(QueueState(e["state"]).terminal for e in entries):
+            break
+        _time.sleep(3.0)
+    console.print(_queue_table(entries))
+    counts: dict[str, int] = {}
+    for e in entries:
+        counts[e["state"]] = counts.get(e["state"], 0) + 1
+    summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items()))
+    console.print(f"queue drained: {summary or 'empty'}")
+    if counts.get(QueueState.FAILED.value):
+        raise typer.Exit(1)
 
 
 # --------------------------------------------------------------------------- ps & co

@@ -105,6 +105,9 @@ class FakeKaggleApi:
     def get_config_value(self, key: str):
         return self.username if key == "username" else None
 
+    def dataset_status(self, owner, slug=None):
+        return "ready"  # created datasets are immediately ready in the fake
+
     def dataset_create_new(self, folder, public=False, quiet=True, **kw) -> None:
         folder = Path(folder)
         self.dataset_folders.append(
@@ -223,12 +226,17 @@ def test_probe_two_gpus_only_2xt4(backend):
 
 
 def test_probe_free_tiers_marked_free(backend):
+    # unspecified GPU -> only the cheapest free tier (never a premium shape that
+    # needs a Pro-linked account and would fail the kernel push)
     offers = backend.probe(ResourceSpec(gpus=1))
-    by_type = {o.gpu_type: o for o in offers}
-    assert set(by_type) == {"P100", "2xT4", "L4", "A100", "H100"}
-    assert by_type["P100"].notes == "free"
-    assert by_type["2xT4"].notes == "free"
-    assert "Colab-Pro" in by_type["H100"].notes
+    assert len(offers) == 1
+    assert offers[0].gpu_type == "P100"
+    assert offers[0].notes == "free"
+    assert offers[0].details.get("free") is True
+    # an explicitly requested premium tier is still offered, marked non-free
+    h100 = backend.probe(ResourceSpec(gpu_type="H100"))
+    assert h100[0].gpu_type == "H100"
+    assert h100[0].details.get("free") is False
 
 
 @pytest.mark.parametrize(
@@ -299,19 +307,14 @@ def test_probe_quota_respects_config_override(fake_api):
 # ---- submit ----------------------------------------------------------------
 
 
-def test_submit_dataset_and_kernel(fake_api, backend):
+def test_submit_kernel_embeds_bundle(fake_api, backend):
     spec = make_spec(gpu_type="P100")
     offer = backend.probe(spec.resources)[0]
     handle = backend.submit(spec, offer)
 
-    # per-job private dataset carries the bundle
-    assert len(fake_api.dataset_folders) == 1
-    ds = fake_api.dataset_folders[0]
-    assert ds["public"] is False
-    assert "bundle.git" in ds["files"]
-    assert ds["metadata"]["id"] == f"testuser/omnirun-{JOB_ID}"
-    assert ds["metadata"]["licenses"] == [{"name": "CC0-1.0"}]
-    assert ds["bundle"] == b"FAKE-BUNDLE " + SHA.encode()
+    # NO dataset is created — the bundle rides inside the kernel source itself,
+    # so there is no dataset-vs-kernel processing race (the old 409 cause).
+    assert fake_api.dataset_folders == []
 
     # kernel metadata
     assert len(fake_api.kernel_folders) == 1
@@ -325,13 +328,12 @@ def test_submit_dataset_and_kernel(fake_api, backend):
     assert meta["enable_internet"] == "true"
     assert meta["enable_gpu"] == "true"
     assert meta["machine_shape"] == "NvidiaTeslaP100"
-    assert meta["dataset_sources"] == [f"testuser/omnirun-{JOB_ID}"]
+    assert meta["dataset_sources"] == []  # nothing attached
 
     assert handle.backend == "kaggle"
     assert handle.job_id == JOB_ID
     assert handle.data == {
         "kernel_ref": f"testuser/omnirun-{JOB_ID}",
-        "dataset_ref": f"testuser/omnirun-{JOB_ID}",
         "machine_shape": "NvidiaTeslaP100",
     }
 
@@ -344,8 +346,12 @@ def test_submit_harness_contents(fake_api, backend):
 
     # job root lives in /kaggle/tmp (venvs are huge; /kaggle/working stays clean)
     assert '"/kaggle/tmp/omnirun"' in run_py
-    # bundle is copied from the attached dataset input
-    assert f"/kaggle/input/omnirun-{JOB_ID}/bundle.git" in run_py
+    # no dataset mount — the bundle is embedded, not read from /kaggle/input
+    assert "/kaggle/input/" not in run_py
+    # the git bundle is embedded via base64 alongside the bootstrap
+    mb = re.search(r'BUNDLE_B64 = "([A-Za-z0-9+/=]*)"', run_py)
+    assert mb, "base64-embedded bundle missing"
+    assert base64.b64decode(mb.group(1)) == b"FAKE-BUNDLE " + SHA.encode()
     # bootstrap is embedded via base64 to dodge quoting
     m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
     assert m, "base64-embedded bootstrap missing"

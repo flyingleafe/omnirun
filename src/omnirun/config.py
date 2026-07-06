@@ -46,6 +46,10 @@ class BackendConfig(BaseModel, extra="allow"):
     host: str | None = None  # ssh alias or host; ~/.ssh/config is honored
     root: str = "$HOME/.omnirun"  # OMNIRUN_ROOT on the worker (clusters: $SCRATCH/..)
     env_setup: list[str] = Field(default_factory=list)  # module loads, exports
+    # Where a project's shared checkout + .venv live on the worker. Default
+    # "$OMNIRUN_ROOT/projects/<slug>"; point at an existing clone to reuse it
+    # (its .git becomes the object store, its .venv the shared env).
+    project_root: str | None = None
 
     # static capability declaration (ssh backend; probe checks live via nvidia-smi)
     gpus: list[GpuDecl] = Field(default_factory=list)
@@ -63,12 +67,23 @@ class BackendConfig(BaseModel, extra="allow"):
     max_hourly: float | None = None
     api_key_env: str | None = None  # override the provider's default env var name
 
+    # queue: max concurrent non-terminal jobs the scheduler places here. Per-
+    # partition Slurm limits = one backend section per partition, each capped.
+    max_parallel: int = 1
+
     def extra(self, key: str, default: Any = None) -> Any:
         return (self.model_extra or {}).get(key, default)
 
 
+class DaemonConfig(BaseModel):
+    host: str = "127.0.0.1"  # localhost socket; bind 0.0.0.0 + auth to go remote
+    port: int = 8787
+    poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
+
+
 class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
 

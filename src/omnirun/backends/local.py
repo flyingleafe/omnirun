@@ -112,7 +112,14 @@ class LocalBackend(Backend):
 
     def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
         root = jobdir.remote_root(self.exec, self.config.root)
-        params = BootstrapParams(omnirun_root=root, setup_lines=self.config.env_setup)
+        project_root = jobdir.resolve_project_root(
+            self.exec, root, spec.repo.slug, self.config.project_root
+        )
+        params = BootstrapParams(
+            omnirun_root=root,
+            project_root=project_root,
+            setup_lines=self.config.env_setup,
+        )
         job_dir = jobdir.stage_job(
             self.exec, spec, local_root_of(spec.repo), params, root
         )

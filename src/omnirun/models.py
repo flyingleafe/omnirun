@@ -79,6 +79,7 @@ class EnvKind(str, enum.Enum):
     UV = "uv"  # uv sync (uv.lock / pyproject.toml)
     PIP = "pip"  # uv venv + uv pip install -r requirements.txt
     CONDA = "conda"  # micromamba create -f environment.yml
+    SYSTEM = "system"  # install deps into the ambient interpreter (notebooks: keep their torch)
     NONE = "none"  # run bare; user's setup lines do everything
 
 

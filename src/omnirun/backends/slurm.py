@@ -143,6 +143,9 @@ class SlurmBackend(Backend):
                 self.config.host,
                 port=self.config.extra("port"),
                 identity=self.config.extra("identity"),
+                # login shell so `module`/sbatch are on PATH; override if a site's
+                # login profile is noisy or slow: [backends.x] login_shell = false
+                login_shell=self.config.extra("login_shell", True),
             )
         return self._exec
 
@@ -254,10 +257,17 @@ class SlurmBackend(Backend):
         used verbatim as a placeholder for the remotely-expanded job dir."""
         root = self.config.root
         job_dir = jobdir.job_dir_of(root, spec.job_id)
+        project_root = jobdir.project_root_of(
+            root, spec.repo.slug, self.config.project_root
+        )
         sbatch = render_sbatch(spec, self.config, job_dir, root)
         bootstrap = generate_bootstrap(
             spec,
-            BootstrapParams(omnirun_root=root, setup_lines=list(self.config.env_setup)),
+            BootstrapParams(
+                omnirun_root=root,
+                project_root=project_root,
+                setup_lines=list(self.config.env_setup),
+            ),
         )
         sep = (
             f"# {'-' * 74}\n"
@@ -270,8 +280,13 @@ class SlurmBackend(Backend):
     def submit(self, spec: JobSpec, offer: Offer | None = None) -> JobHandle:
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
+        project_root = jobdir.resolve_project_root(
+            ex, root, spec.repo.slug, self.config.project_root
+        )
         params = BootstrapParams(
-            omnirun_root=root, setup_lines=list(self.config.env_setup)
+            omnirun_root=root,
+            project_root=project_root,
+            setup_lines=list(self.config.env_setup),
         )
         job_dir = jobdir.stage_job(ex, spec, local_root_of(spec.repo), params, root)
         script = render_sbatch(spec, self.config, job_dir, root)

@@ -252,6 +252,7 @@ def no_push(monkeypatch):
 def test_submit_stages_and_detaches(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout="/home/u/.omnirun\n")
+    fake.add(r"git init --bare", stdout="/home/u/.omnirun/projects/proj/repo.git\n")
     fake.add(r"setsid nohup", stdout="4242\n")
     b = make_backend(fake)
     spec = make_spec()
@@ -275,6 +276,7 @@ def test_submit_stages_and_detaches(no_push):
 def test_submit_bad_pid_raises(no_push):
     fake = FakeExec()
     fake.add(r"eval echo", stdout="/home/u/.omnirun\n")
+    fake.add(r"git init --bare", stdout="/home/u/.omnirun/projects/proj/repo.git\n")
     fake.add(r"setsid nohup", stdout="not-a-pid\n")
     with pytest.raises(BackendError, match="launch"):
         make_backend(fake).submit(make_spec(), offer=None)
@@ -379,11 +381,14 @@ def test_pull_outputs_uses_trailing_slash(tmp_path):
     assert fake.gets and fake.gets[0][0].endswith("/outputs/")
 
 
-def test_gc_removes_worktree_and_dir():
+def test_gc_removes_job_dir():
+    # Shared worktrees + venv are reusable project cache, never per-job owned:
+    # gc removes only the job dir, and must NOT tear down the worktree.
     fake = FakeExec()
     make_backend(fake).gc(HANDLE)
     cmd = fake.commands[-1]
-    assert "worktree remove" in cmd and "rm -rf" in cmd
+    assert "rm -rf" in cmd and "/h/.omnirun/jobs/train-abc123" in cmd
+    assert "worktree remove" not in cmd
 
 
 def test_check_interactive_and_hostname():
