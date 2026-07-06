@@ -36,43 +36,89 @@ your working tree is clean and HEAD is pushed (it offers `--push` / `--dirty`
 escape hatches), then every backend executes the same generated `bootstrap.sh`
 on the worker:
 
-1. maintain a bare mirror repo per project (`$OMNIRUN_ROOT/repos/<slug>.git`) —
-   the client pushes the exact sha over its own SSH connection (or ships a
-   `git bundle` for Kaggle/Colab), so **git credentials never leave your laptop**;
-2. check out a worktree per job (`jobs/<job_id>/tree`) at that sha;
+1. keep the repo's object store under a per-project `project_root` (default
+   `$OMNIRUN_ROOT/projects/<slug>`; you can point it at an existing checkout to
+   reuse its `.git` and `.venv`) — a bare `repo.git` mirror, or that checkout's
+   own `.git`. The client pushes the exact sha to a non-branch ref
+   `refs/omnirun/<sha12>` over its own SSH connection (or ships a `git bundle`
+   for Kaggle/Colab), so **git credentials never leave your laptop** and pushing
+   into an existing checkout is safe;
+2. check out a worktree **shared per git revision** at `.trees/<sha12>` (guarded
+   by a `.locks/` flock) — jobs at the same sha reuse the checkout instead of
+   each getting their own;
 3. build the env from what the repo declares: `uv.lock` / `pyproject.toml` →
    `uv sync`, `requirements.txt` → `uv venv + uv pip install`,
    `environment.yml` → micromamba (uv/micromamba are installed user-space as
-   static binaries if missing);
+   static binaries if missing) — into one `.venv` **shared across all worktrees
+   of the project** (`UV_PROJECT_ENVIRONMENT`);
 4. run the command, tee logs, touch a heartbeat every 30 s, write `result.json`
    on exit;
-5. collect your `outputs` globs into `jobs/<job_id>/outputs/` for `omnirun pull`.
+5. collect your `outputs` globs into the per-job dir (`jobs/<job_id>/`, which
+   holds only logs, outputs, and `result.json`) for `omnirun pull`.
 
-There is **no daemon and no control plane**. Client state is plain JSON under
-`~/.local/share/omnirun/jobs/<id>/meta.json`; job status is derived by polling
-the worker's job dir (result.json presence, heartbeat freshness) merged with
-runtime-native signals (Slurm state, PID liveness, kernel status). Your laptop
-can be off while jobs run; `omnirun ps` re-syncs.
+The direct `omnirun submit` path is **daemonless and has no control plane**.
+Client state is plain JSON under `~/.local/share/omnirun/jobs/<id>/meta.json`;
+job status is derived by polling the worker's job dir (result.json presence,
+heartbeat freshness) merged with runtime-native signals (Slurm state, PID
+liveness, kernel status) — pull, not callbacks. Your laptop can be off while
+jobs run; `omnirun ps` re-syncs.
+
+When you want to queue *many* jobs and have them spread automatically, there is
+an **optional** scheduler daemon you run yourself (`omnirun serve`) — see
+[Queueing many jobs](#queueing-many-jobs-optional). It's an add-on, not a
+requirement: single submits never touch it.
+
+## Queueing many jobs (optional)
+
+`omnirun serve` runs an always-on scheduler daemon in the foreground (background
+it yourself — it's meant to live on a small VPS under `mosh`/`tmux`). It listens
+on a localhost TCP socket (default `127.0.0.1:8787`) and owns a durable queue
+persisted as plain JSON, so a restart resumes where it left off.
+
+```bash
+omnirun serve &                              # start the daemon (localhost only)
+omnirun enqueue --count 20 -- python sweep.py --config $CONFIG
+omnirun queue                                # show the queue
+omnirun queue --wait                         # block until every entry is terminal
+omnirun queue --cancel all                   # cancel everything queued/running
+```
+
+The scheduler spreads queued jobs across all configured backends, respecting a
+per-backend `max_parallel` cap: it reserves a slot before submitting (so ticks
+never double-book a backend), backfills as running jobs finish, and retries a
+failed placement (up to 3 attempts) on another backend before giving up.
+Minimizing provisioning cost by reusing warm workers is a planned next phase,
+not yet implemented — every placement is still a plain one-shot `submit`.
 
 ## Install
 
-Not on PyPI yet — install from this repo:
+On [PyPI](https://pypi.org/project/omnirun/):
+
+```bash
+uv tool install omnirun         # or: pip install omnirun
+```
+
+Or from this repo:
 
 ```bash
 uv tool install ".[all]"        # or: pip install -e ".[all]"
 ```
 
 Extras: `kaggle` (the `kaggle` API client), `colab` (the official
-`google-colab-cli`), `all` = both. The core (local / ssh / slurm / marketplaces)
-has no optional deps. Requires Python ≥ 3.12, plus `git`, and the OpenSSH
-client + `rsync` for the ssh-family backends.
+`google-colab-cli`), `all` = both — e.g. `uv tool install "omnirun[all]"`. The
+core (local / ssh / slurm / marketplaces) has no optional deps. Requires
+Python ≥ 3.12, plus `git`, and the OpenSSH client + `rsync` for the ssh-family
+backends.
 
 ## Configuration
 
 Global config: `~/.config/omnirun/config.toml` (override with `--config` or
 `$OMNIRUN_CONFIG`). Every `[backends.<name>]` section needs a `type`; the
 section name is yours (you can have several of the same type). All backends
-accept `enabled = false` to keep the config without probing it.
+accept `enabled = false` to keep the config without probing it. Every backend
+also accepts `project_root` (point it at an existing checkout to reuse its
+`.git`/`.venv`) and `max_parallel` (queue-daemon cap on concurrent jobs, default
+`1`).
 
 ```toml
 [policy]
@@ -80,10 +126,18 @@ auto_wait_threshold = "15m"  # a free offer starting sooner than this is auto-pi
 max_hourly_default = 5.0     # also used as the $ value of an hour of your waiting
 probe_timeout_s = 10.0       # per-backend probe budget
 
+# ---- optional queue daemon (only used by `omnirun serve`) ----
+[daemon]
+host = "127.0.0.1"           # localhost socket; bind 0.0.0.0 + auth to go remote
+port = 8787
+poll_interval_s = 10.0       # scheduler tick: refresh running + place pending
+
 # ---- run on this machine (mostly for testing the pipeline) ----
 [backends.local]
 type = "local"
-# root = "$HOME/.omnirun"    # OMNIRUN_ROOT: where repos/worktrees/jobs live
+# root = "$HOME/.omnirun"    # OMNIRUN_ROOT: where jobs live
+# project_root = "$HOME/proj"  # reuse an existing checkout's .git and .venv
+# max_parallel = 2           # queue daemon: run up to 2 jobs here at once
 
 # ---- any machine you can ssh into ----
 [backends.rig]
@@ -165,7 +219,9 @@ mem_gb = 32
 disk_gb = 60
 
 [job.env]
-kind = "auto"          # auto | uv | pip | conda | none
+kind = "auto"          # auto | uv | pip | conda | system | none
+                       # system = install into the ambient interpreter (Kaggle/
+                       # Colab notebooks use this to keep their CUDA-matched torch)
 setup = []             # shell lines before env creation (after backend env_setup)
 pre_run = []           # shell lines inside the activated env, before the command
 
@@ -200,6 +256,20 @@ unique id prefix.
 
 **`omnirun offers [resource flags] [--backend NAME]`** — probe and print the
 offer table without submitting (same resource flags as `submit`).
+
+**`omnirun serve [--host H] [--port P]`** — run the optional scheduler daemon in
+the foreground (background it yourself). Listens on a localhost TCP socket
+(default `127.0.0.1:8787`, overridable in config or with these flags).
+
+**`omnirun enqueue [OPTIONS] --count N -- COMMAND...`** — hand a job to the
+running daemon's queue. Takes all of `submit`'s resource flags (`--gpus`,
+`--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`, `--outputs`,
+`--env`, `--push`, `--dirty`) plus `--count N` (enqueue N copies) and
+`--backend NAME` (restrict placement to one backend).
+
+**`omnirun queue [--wait] [--cancel QID|all]`** — show the daemon's queue;
+`--wait` polls until every entry is terminal then summarizes; `--cancel` cancels
+one qid (or `all`, which also stops running jobs).
 
 **`omnirun ps`** — all known jobs with refreshed statuses.
 
@@ -246,8 +316,12 @@ omnirun shells out to the real OpenSSH binary. Declare the machine's GPUs in
 config; probe verifies them live via `nvidia-smi` and reports busy GPUs.
 
 **kaggle** — genuinely free compute: ~30 GPU-hours/week on P100 or 2×T4, hard
-12 h cap per batch session. Jobs run as private script kernels; code arrives as
-a git bundle inside a private per-job dataset (no tokens leave your machine).
+12 h cap per batch session. Jobs run as private script kernels; the git bundle
+is embedded (base64) directly inside the kernel's `run.py` — no separate dataset
+(no tokens leave your machine). This sidesteps a Kaggle 409 race a dataset used
+to cause and its create/delete lifecycle; the one constraint is that the
+embedded bundle has a size cap, so only code-sized repos fit (data is never
+shipped — jobs fetch their own).
 Kaggle has no quota API, so omnirun tracks your weekly GPU-hour spend locally
 (`weekly_gpu_hours`) and marks offers unfit when the budget looks exhausted —
 it is an estimate, not the truth. L4/A100/H100 shapes exist but are gated
@@ -282,11 +356,16 @@ whole flow, and your configs, without touching a network.
 ## Limitations / non-goals (v0)
 
 - **No data syncing** — jobs own their data (download it in your command, or
-  keep it on the cluster). Only code (git) goes in; only `outputs` globs come out.
+  keep it on the cluster). Only code (git) goes in; only `outputs` globs come
+  out. The one out-of-band exception is secrets: a gitignored `<repo>/.env` is
+  shipped separately (never written into the shared tree) and exported into the
+  job's environment, so API keys reach the worker without being committed.
 - **Dirty trees are not shipped**: submit requires a clean, pushed HEAD.
   `--dirty` only skips the check and runs HEAD — your uncommitted edits stay home.
 - No DAGs/pipelines, no multi-node jobs, no spot-preemption recovery, no image
   building, no artifact versioning, no web UI.
-- One job = one machine = one command. Queueing beyond what the backend gives
-  you (Slurm) is not omnirun's job.
+- One job = one machine = one command. Cross-backend queueing now exists via the
+  optional `omnirun serve` daemon, but warm-worker reuse (keeping a provisioned
+  instance hot for the next queued job) is not built yet — every placement is a
+  fresh one-shot submit.
 - Wait estimates (especially Slurm queues) are informed guesses, not promises.
