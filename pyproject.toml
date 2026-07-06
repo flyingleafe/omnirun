@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Run jobs from your repo anywhere: Slurm over SSH, any SSH box, Kaggle, Colab, or marketplace GPUs"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Dmitrii Mukhutdinov", email = "flyingleafe@gmail.com" }]
 dependencies = [
     "typer>=0.12",
     "rich>=13.7",
