@@ -127,11 +127,16 @@ Steps:
 1. `mkdir -p` the per-job dirs and `$PROJECT_ROOT/{.trees,.locks}`. `PROJECT_ROOT`
    comes from `BackendConfig.project_root` (default `$OMNIRUN_ROOT/projects/<slug>`) and
    may point at an existing checkout to reuse its `.git` and `.venv`.
-2. **Code**: the exact sha is already in the object store (pushed at submit time to the
-   non-branch ref `refs/omnirun/<sha12>`; notebooks fetch it from an embedded bundle,
-   see §6). Under a per-sha flock, `git worktree add --detach .trees/<sha12> <sha>` — but
-   only if that tree doesn't already exist, so all jobs at a revision share one checkout.
-   Private repos: see §6.
+2. **Code**: the exact sha is made available in the object store via one of three
+   `CodeSource` kinds baked into the script (`bootstrap.py`): `bare` — the sha was pushed
+   at submit time to the non-branch ref `refs/omnirun/<sha12>` (ssh family); `remote` —
+   the worker itself runs `git clone --bare "$CLONE_URL"` (or `git fetch` on a warm
+   project) from an anonymous `https://` URL, used for public repos on the notebook
+   backends; `bundle` — the sha rides as a `git bundle` and is fetched from that file
+   (private/unpushed repos on notebooks). See §6 for how a notebook backend chooses
+   between `remote` and `bundle`. Under a per-sha flock,
+   `git worktree add --detach .trees/<sha12> <sha>` — but only if that tree doesn't
+   already exist, so all jobs at a revision share one checkout. Private repos: see §6.
 3. **Env** (in the shared `.trees/<sha12>`, targeting the shared `.venv` via
    `UV_PROJECT_ENVIRONMENT`, serialized on a per-project flock): kinds are
    `auto | uv | pip | conda | system | none`. `auto` detects — `uv.lock`/`pyproject.toml →
@@ -255,19 +260,46 @@ Worker access to private repos — **no git credentials ever leave the laptop**:
   branches; the sha stays alive against gc and the worktree detaches from it. Nothing
   on the worker can or needs to reach the origin remote. (Documented alternatives:
   agent-forwarded `git fetch origin` for huge repos; per-repo deploy keys.)
-- **kaggle/colab**: the revision travels as a **`git bundle`**. Colab `colab upload`s it
-  next to the bootstrap. Kaggle **embeds the bundle base64 inside the kernel's `run.py`**
-  (next to the base64 bootstrap) — *not* a dataset. The old dataset approach 409'd every
-  kernel that referenced a still-processing dataset (a systematic race) and needed a
-  create/delete lifecycle; embedding removes both. A size guard (`MAX_EMBED_B64`) rejects
-  oversized repos, so this suits code-sized repos (data is never shipped — jobs fetch
-  their own). The bootstrap clones/fetches from the bundle into the object store.
+- **kaggle/colab**: the client picks one of two code-delivery modes at submit time
+  (`repo.remote_clone_plan(ref, root) -> str | None`):
+  - **public repo → direct clone (default when it applies).** The worker clones the repo
+    itself over its own internet connection from an anonymous `https://` URL — no bundle
+    is shipped, no credentials are needed (`CodeSource(kind="remote")`, §3). A plan URL is
+    returned only when *all* hold, else `None` (→ bundle): (a) there is a real origin
+    remote and the sha is a normal pushed **branch** commit (not `--dirty`, not detached
+    HEAD); (b) the origin is anonymously **public** — `remote_is_public()` checks via
+    `gh repo view --json visibility` for GitHub when `gh` is present, else an
+    unauthenticated `curl` smart-http probe of `<url>/info/refs?service=git-upload-pack`
+    (200 == public), host-agnostic; (c) the sha is provably **reachable** from the current
+    remote branch tip — `git ls-remote <url> <branch>` gives the tip and
+    `git merge-base --is-ancestor <sha> <tip>` confirms locally, so the credential-less
+    worker clone can't succeed-then-fail-to-find-the-commit.
+    `worker_clone_url(remote_url)` normalizes any origin form (scp-style
+    `git@host:o/r.git`, `ssh://`, `git://`, https) to an anonymous `https://<host>/<path>`
+    (`None` for local-only remotes).
+  - **private / unpushed sha → bundle (fallback, unchanged).** The revision travels as a
+    **`git bundle`**. Colab `colab upload`s it next to the bootstrap. Kaggle **embeds the
+    bundle base64 inside the kernel's `run.py`** (next to the base64 bootstrap) — *not* a
+    dataset. The old dataset approach 409'd every kernel that referenced a still-processing
+    dataset (a systematic race) and needed a create/delete lifecycle; embedding removes
+    both. A size guard (`MAX_EMBED_B64`, 40 MiB, covering bundle + env together) rejects
+    oversized repos, so this suits code-sized repos (data is never shipped — jobs fetch
+    their own). The bootstrap clones/fetches from the bundle into the object store. In the
+    public-repo case no bundle is embedded, so the ceiling is a non-issue.
+
+  This keeps the invariant intact: a public clone needs no credentials, and private repos
+  still never touch origin from the worker. What changed is that public-repo workers now
+  *do* reach the (anonymous) origin directly, by design.
 
 **Uncommitted secrets** (`.env`): if `<repo-root>/.env` exists *and is gitignored*, it is
-shipped out-of-band to the worker's job dir (`jobdir.stage_env_file`, or `colab upload` on
-Colab) and sourced/exported into the job environment before the command runs — never
-written into the shared tree, never committed into the sha. A tracked `.env` is already in
-the revision and is left alone. (`repo.env_file` / `jobdir.stage_env_file`.)
+shipped out-of-band to the worker's job dir and sourced/exported into the job environment
+before the command runs — never written into the shared tree, never committed into the
+sha. The `.env` always rides as its own blob, independent of the code-delivery mode (even
+when the repo itself is cloned directly). Transport per family: `jobdir.stage_env_file`
+(ssh/slurm/marketplace), `colab upload` (Colab), and — new — base64-embedded in the kernel
+`run.py` as `ENV_B64`, decoded to `$JOB_DIR/.env` mode 0600 (Kaggle). So **both** notebook
+backends now fully support `.env` injection (Kaggle previously did not). A tracked `.env`
+is already in the revision and is left alone. (`repo.env_file` / `jobdir.stage_env_file`.)
 
 ## 7. Notebook backends
 
@@ -276,8 +308,12 @@ the revision and is left alone. (`repo.env_file` / `jobdir.stage_env_file`.)
   (`title == slug == omnirun-<job_id>`, `enable_internet`, `machine_shape` mapped
   from ResourceSpec: free set = P100 / 2×T4; L4/A100/H100 exist but are
   Colab-Pro-gated → surfaced as conditional non-free offers, and never auto-offered
-  unless explicitly requested). The kernel's `run.py` harness carries BOTH the
-  bootstrap and the git bundle inline (base64) — no dataset (see §6). It writes them
+  unless explicitly requested). The kernel's `run.py` harness carries the bootstrap
+  inline (base64), plus — for a private/unpushed repo — the git bundle inline (base64),
+  never a dataset (see §6); for a public repo it ships no bundle and the worker clones the
+  repo directly over its own internet connection. A gitignored `<root>/.env` (if present)
+  also rides base64 in `run.py` (`ENV_B64`), decoded to `$JOB_DIR/.env` mode 0600 and
+  sourced by bootstrap — Kaggle now supports `.env` injection too. It writes them
   out, runs the bootstrap under `/kaggle/tmp/omnirun` (venvs are large; `/kaggle/working`
   must stay small), tails `bootstrap.log` to kernel stdout, then tars
   `logs/ outputs/ result.json phase` into `/kaggle/working/omnirun-job.tar.gz` so results
@@ -288,7 +324,9 @@ the revision and is left alone. (`repo.env_file` / `jobdir.stage_env_file`.)
   worker-side: the bundle rode inside the kernel).
 - **Colab**: fully automated via the official `google-colab-cli` (v0.6+, June 2026;
   one-time OAuth). Submit = `colab new --gpu <T4|L4|G4|A100|H100>` → `colab upload`
-  bundle+bootstrap → `colab exec` a launcher cell that starts `bootstrap.sh`
+  the bootstrap (plus the git bundle for a private/unpushed repo; a public repo ships no
+  bundle and the worker clones it directly, see §6) and, if present, the gitignored
+  `.env` → `colab exec` a launcher cell that starts `bootstrap.sh`
   detached under the kernel and returns → CLI keep-alive daemon holds the VM.
   Status = short `colab exec` beacon reads (or heartbeat-file check); logs via
   incremental file reads; `colab download` outputs; `colab stop` to release. Env handling
@@ -386,7 +424,8 @@ omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemo
                    # Offer, JobStatus, JobHandle
     config.py      # TOML load, backend registry (project_root, gpu_map, max_parallel),
                    # PolicyConfig, DaemonConfig
-    repo.py        # git state, clean/pushed checks, RepoRef, env_file, bundle creation
+    repo.py        # git state, clean/pushed checks, RepoRef, env_file, bundle creation,
+                   # remote_clone_plan/worker_clone_url/remote_is_public (public-repo direct clone)
     bootstrap.py   # bootstrap.sh generation (shared payload), notebook_env_spec
     store.py       # $OMNIRUN_STATE_DIR/jobs/<id>/meta.json
     queue.py       # durable QueueStore/QueueEntry backing the scheduler

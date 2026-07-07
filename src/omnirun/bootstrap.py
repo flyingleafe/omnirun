@@ -63,10 +63,13 @@ class CodeSource:
                    connection, or the worker can reach the remote).
     kind="bundle": a `git bundle` file is present at bundle_path (uploaded by
                    the backend); bootstrap fetches from it into the object store.
+    kind="remote": the repo is public — bootstrap clones/fetches clone_url (an
+                   anonymous https url) directly on the worker, no bundle shipped.
     """
 
-    kind: str = "bare"  # "bare" | "bundle"
+    kind: str = "bare"  # "bare" | "bundle" | "remote"
     bundle_path: str = "$JOB_DIR/bundle.git"
+    clone_url: str = ""  # anonymous https url, for kind="remote"
 
 
 @dataclass
@@ -223,6 +226,15 @@ if [ ! -d "$GIT_DIR" ]; then
   git clone --bare "$BUNDLE" "$GIT_DIR" >/dev/null 2>&1 || fail "bundle clone failed"
 else
   git --git-dir="$GIT_DIR" fetch "$BUNDLE" '+refs/*:refs/*' >/dev/null 2>&1 || fail "bundle fetch failed"
+fi
+"""
+    elif params.code.kind == "remote":
+        code_block = f"""\
+CLONE_URL={shlex.quote(params.code.clone_url)}
+if [ ! -d "$GIT_DIR" ]; then
+  git clone --bare "$CLONE_URL" "$GIT_DIR" >/dev/null 2>&1 || fail "clone of $CLONE_URL failed"
+else
+  git --git-dir="$GIT_DIR" fetch "$CLONE_URL" '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || fail "fetch from $CLONE_URL failed"
 fi
 """
     else:

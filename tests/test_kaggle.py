@@ -152,6 +152,10 @@ def fake_bundle(monkeypatch):
         return dest
 
     monkeypatch.setattr(kaggle_mod, "_create_bundle", create)
+    # default: private repo (ship a bundle), no .env — keeps submit hermetic
+    # (no gh/curl/ls-remote to the network). Tests override these per-case.
+    monkeypatch.setattr(kaggle_mod, "_remote_clone_plan", lambda ref, root: None)
+    monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: None)
 
 
 @pytest.fixture
@@ -366,6 +370,42 @@ def test_submit_harness_contents(fake_api, backend):
     assert '"/kaggle/working"' in run_py
     for name in ("logs", "outputs", "result.json", "phase"):
         assert f'"{name}"' in run_py
+
+
+def test_submit_public_repo_clones_directly(fake_api, backend, monkeypatch):
+    # public repo → no bundle embedded; bootstrap clones the anon https url
+    monkeypatch.setattr(
+        kaggle_mod,
+        "_remote_clone_plan",
+        lambda ref, root: "https://github.com/me/proj.git",
+    )
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    mb = re.search(r'BUNDLE_B64 = "([A-Za-z0-9+/=]*)"', run_py)
+    assert mb and mb.group(1) == ""  # nothing embedded
+    m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
+    assert m
+    bootstrap = base64.b64decode(m.group(1)).decode()
+    assert "git clone --bare" in bootstrap
+    assert "https://github.com/me/proj.git" in bootstrap
+    assert "bundle.git" not in bootstrap  # no bundle path referenced
+
+
+def test_submit_embeds_env_file(fake_api, backend, monkeypatch, tmp_path):
+    envf = tmp_path / ".env"
+    envf.write_text("SECRET=hunter2\n")
+    monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: envf)
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    me = re.search(r'ENV_B64 = "([A-Za-z0-9+/=]*)"', run_py)
+    assert me and base64.b64decode(me.group(1)) == b"SECRET=hunter2\n"
+    assert "/.env" in run_py and "0o600" in run_py  # written mode-restricted
 
 
 def test_submit_push_rejection_raises(fake_api, backend):

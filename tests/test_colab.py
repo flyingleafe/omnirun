@@ -104,6 +104,9 @@ def fake_bundle(monkeypatch):
         return dest
 
     monkeypatch.setattr(colab_mod, "_create_bundle", create)
+    # default: private repo (upload a bundle) — keeps submit hermetic (no
+    # gh/curl/ls-remote to the network). The public-repo test overrides this.
+    monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
 
 
 # ---- probe -----------------------------------------------------------------
@@ -212,6 +215,33 @@ def test_submit_sequence(cli, backend):
         "root": "/content/omnirun",
         "pid": 4242,
     }
+
+
+def test_submit_public_repo_skips_bundle(cli, backend, monkeypatch):
+    # public repo → no bundle upload; bootstrap clones the anon https url
+    monkeypatch.setattr(
+        colab_mod, "_remote_clone_plan", lambda spec: "https://github.com/me/proj.git"
+    )
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    uploaded: dict[str, str] = {}
+
+    def capture(argv, stdin):  # read staging file before its tempdir is cleaned
+        uploaded[argv[-1]] = Path(argv[4]).read_text()
+        return (0, "", "")
+
+    cli.handlers["upload"] = capture
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    cli.calls.clear()
+
+    backend.submit(spec, offer)
+
+    # only bootstrap.sh is uploaded — no second (bundle) upload
+    assert cli.subcommands() == ["new", "exec", "upload", "exec"]
+    script = uploaded[f"{JOB_DIR}/bootstrap.sh"]
+    assert "git clone --bare" in script
+    assert "https://github.com/me/proj.git" in script
+    assert "bundle.git" not in script
 
 
 def test_submit_failure_stops_session(cli, backend):

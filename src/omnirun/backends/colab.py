@@ -103,6 +103,14 @@ def _env_file(spec: JobSpec):
     return repo.env_file(_local_root(spec))
 
 
+def _remote_clone_plan(spec: JobSpec) -> str | None:
+    """Anonymous https url a public repo's sha can be cloned from, else None
+    (lazy import, monkeypatched in tests)."""
+    from omnirun import repo
+
+    return repo.remote_clone_plan(spec.repo, _local_root(spec))
+
+
 def _ts(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -337,6 +345,15 @@ class ColabBackend(Backend):
             new_args += ["--gpu", gpu_flag]
         self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
 
+        # a public repo is cloned by the worker directly (bootstrap does the git
+        # clone over the VM's internet); only a private/unpushed sha is uploaded
+        # as a bundle.
+        clone_url = _remote_clone_plan(spec)
+        code = (
+            CodeSource(kind="remote", clone_url=clone_url)
+            if clone_url is not None
+            else CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git")
+        )
         try:
             script = generate_bootstrap(
                 notebook_env_spec(spec),
@@ -345,7 +362,7 @@ class ColabBackend(Backend):
                     project_root=jobdir.project_root_of(
                         COLAB_ROOT, spec.repo.slug, self.config.project_root
                     ),
-                    code=CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git"),
+                    code=code,
                 ),
             )
             # `colab upload` (jupyter contents API) 500s if the target dir does
@@ -360,7 +377,6 @@ class ColabBackend(Backend):
             with tempfile.TemporaryDirectory(prefix="omnirun-colab-") as td:
                 local = Path(td)
                 (local / "bootstrap.sh").write_text(script)
-                _create_bundle(_local_root(spec), spec.repo.sha, local / "bundle.git")
                 self._colab(
                     "upload",
                     "-s",
@@ -369,14 +385,18 @@ class ColabBackend(Backend):
                     f"{job_dir}/bootstrap.sh",
                     timeout=UPLOAD_TIMEOUT_S,
                 )
-                self._colab(
-                    "upload",
-                    "-s",
-                    session,
-                    str(local / "bundle.git"),
-                    f"{job_dir}/bundle.git",
-                    timeout=UPLOAD_TIMEOUT_S,
-                )
+                if clone_url is None:  # private repo → upload the bundle
+                    _create_bundle(
+                        _local_root(spec), spec.repo.sha, local / "bundle.git"
+                    )
+                    self._colab(
+                        "upload",
+                        "-s",
+                        session,
+                        str(local / "bundle.git"),
+                        f"{job_dir}/bundle.git",
+                        timeout=UPLOAD_TIMEOUT_S,
+                    )
                 envf = _env_file(spec)
                 if envf is not None:
                     self._colab(

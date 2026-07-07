@@ -46,6 +46,7 @@ from omnirun.models import (
     JobSpec,
     JobStatus,
     Offer,
+    RepoRef,
     ResourceSpec,
     StatusReport,
 )
@@ -97,6 +98,21 @@ def _local_root(spec: JobSpec) -> Path:
     return repo.local_root_of(spec.repo)
 
 
+def _remote_clone_plan(ref: RepoRef, root: Path) -> str | None:
+    """Anonymous https url a public repo's sha can be cloned from, else None
+    (lazy import, monkeypatched in tests)."""
+    from omnirun import repo
+
+    return repo.remote_clone_plan(ref, root)
+
+
+def _env_file(spec: JobSpec):
+    """Local uncommitted .env to ship as a blob, or None (lazy, monkeypatched)."""
+    from omnirun import repo
+
+    return repo.env_file(_local_root(spec))
+
+
 def _load_kaggle_api_class() -> Any:
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
@@ -116,10 +132,13 @@ def _ts(s: str | None) -> datetime | None:
         return None
 
 
-def _render_harness(job_id: str, bootstrap_b64: str, bundle_b64: str) -> str:
-    """The script-kernel payload: decode the embedded bootstrap.sh + git bundle
-    (both carried inline — no dataset needed), run bootstrap under /kaggle/tmp,
-    stream its log to kernel stdout, then persist results to /kaggle/working."""
+def _render_harness(
+    job_id: str, bootstrap_b64: str, bundle_b64: str, env_b64: str
+) -> str:
+    """The script-kernel payload: decode the embedded bootstrap.sh (+ the git
+    bundle, unless the repo is public and bootstrap clones it directly, + any
+    out-of-band .env), run bootstrap under /kaggle/tmp, stream its log to kernel
+    stdout, then persist results to /kaggle/working."""
     return f'''\
 """omnirun harness for job {job_id} — generated, do not edit."""
 import base64, os, subprocess, sys, tarfile, time
@@ -129,13 +148,20 @@ JOB_DIR = ROOT + "/jobs/{job_id}"
 WORK = "/kaggle/working"
 BOOTSTRAP_B64 = "{bootstrap_b64}"
 BUNDLE_B64 = "{bundle_b64}"
+ENV_B64 = "{env_b64}"
 
 os.makedirs(JOB_DIR, exist_ok=True)
 os.environ["OMNIRUN_ROOT"] = ROOT
 with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
     f.write(base64.b64decode(BOOTSTRAP_B64))
-with open(JOB_DIR + "/bundle.git", "wb") as f:
-    f.write(base64.b64decode(BUNDLE_B64))
+if BUNDLE_B64:  # empty when the repo is public (bootstrap clones it directly)
+    with open(JOB_DIR + "/bundle.git", "wb") as f:
+        f.write(base64.b64decode(BUNDLE_B64))
+if ENV_B64:  # uncommitted secrets, shipped as a blob; bootstrap sources it
+    env_path = JOB_DIR + "/.env"
+    with open(env_path, "wb") as f:
+        f.write(base64.b64decode(ENV_B64))
+    os.chmod(env_path, 0o600)
 
 proc = subprocess.Popen(["bash", JOB_DIR + "/bootstrap.sh"])
 
@@ -349,19 +375,38 @@ class KaggleBackend(Backend):
 
         with tempfile.TemporaryDirectory(prefix="omnirun-kaggle-") as td:
             stage = Path(td)
-            # The git bundle is embedded in the kernel itself (base64 in run.py),
-            # NOT shipped as a dataset. A dataset would 409 the kernel push until
-            # it finished processing, and needs create/delete lifecycle; embedding
-            # sidesteps all of it. Cost: the kernel source carries the bundle, so
-            # only code-sized repos fit (data isn't shipped — jobs fetch their own).
-            bundle_path = stage / "bundle.git"
-            _create_bundle(_local_root(spec), spec.repo.sha, bundle_path)
-            bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
-            if len(bundle_b64) > MAX_EMBED_B64:
+            local_root = _local_root(spec)
+            # A public repo is cloned by the worker directly (bootstrap does the
+            # git clone over the kernel's own internet); only a private/unpushed
+            # sha rides along as a bundle. The bundle, when needed, is embedded in
+            # the kernel itself (base64 in run.py), NOT shipped as a dataset: a
+            # dataset would 409 the kernel push until it finished processing and
+            # needs a create/delete lifecycle. Cost of embedding: the kernel
+            # source carries the bundle, so only code-sized repos fit.
+            clone_url = _remote_clone_plan(spec.repo, local_root)
+            if clone_url is not None:
+                bundle_b64 = ""
+                code = CodeSource(kind="remote", clone_url=clone_url)
+            else:
+                bundle_path = stage / "bundle.git"
+                _create_bundle(local_root, spec.repo.sha, bundle_path)
+                bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
+                code = CodeSource(
+                    kind="bundle",
+                    bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
+                )
+
+            # uncommitted, gitignored .env ships as its own blob (never via git)
+            envf = _env_file(spec)
+            env_b64 = (
+                base64.b64encode(envf.read_text().encode()).decode() if envf else ""
+            )
+            if len(bundle_b64) + len(env_b64) > MAX_EMBED_B64:
                 raise BackendError(
-                    f"repo bundle is too large to embed in a kaggle kernel "
-                    f"(~{len(bundle_b64) // (1024 * 1024)}MB base64) — slim the git "
-                    "history (shallow/squash) or run this job on another backend"
+                    f"embedded payload is too large for a kaggle kernel "
+                    f"(~{(len(bundle_b64) + len(env_b64)) // (1024 * 1024)}MB base64) "
+                    "— slim the git history (shallow/squash), push a public repo, or "
+                    "run this job on another backend"
                 )
 
             script = generate_bootstrap(
@@ -371,17 +416,16 @@ class KaggleBackend(Backend):
                     project_root=jobdir.project_root_of(
                         KAGGLE_ROOT, spec.repo.slug, self.config.project_root
                     ),
-                    code=CodeSource(
-                        kind="bundle",
-                        bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
-                    ),
+                    code=code,
                 ),
             )
             boot_b64 = base64.b64encode(script.encode()).decode()
 
             k_dir = stage / "kernel"
             k_dir.mkdir()
-            (k_dir / "run.py").write_text(_render_harness(job_id, boot_b64, bundle_b64))
+            (k_dir / "run.py").write_text(
+                _render_harness(job_id, boot_b64, bundle_b64, env_b64)
+            )
             meta: dict[str, Any] = {
                 "id": kernel_ref,
                 "title": slug,  # title must slugify to the id slug

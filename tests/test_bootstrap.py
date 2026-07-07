@@ -9,7 +9,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from omnirun.bootstrap import BootstrapParams, generate_bootstrap
+from omnirun.bootstrap import BootstrapParams, CodeSource, generate_bootstrap
 from omnirun.models import JobSpec
 from tests.conftest import git
 
@@ -47,6 +47,40 @@ def test_script_passes_bash_syntax_check(job_spec: JobSpec, tmp_path: Path) -> N
     script.write_text(generate_bootstrap(job_spec))
     proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_remote_code_source_clones_directly(
+    sample_repo: Path, job_spec: JobSpec, tmp_path: Path
+) -> None:
+    # kind="remote": no bundle, no pre-push — bootstrap clones clone_url itself.
+    root = tmp_path / "omnirun_root"
+    root.mkdir()
+    public = tmp_path / "public.git"
+    git(sample_repo, "init", "-q", "--bare", str(public))
+    git(
+        sample_repo,
+        "push",
+        "-q",
+        f"file://{public}",
+        f"{job_spec.repo.sha}:refs/heads/main",
+    )
+    script = generate_bootstrap(
+        job_spec,
+        BootstrapParams(
+            omnirun_root=str(root),
+            code=CodeSource(kind="remote", clone_url=f"file://{public}"),
+        ),
+    )
+    assert 'git clone --bare "$CLONE_URL"' in script
+    assert f"file://{public}" in script
+    path = root / "bootstrap.sh"
+    path.write_text(script)
+    proc = run_bootstrap(path)
+    job_dir = root / "jobs" / job_spec.job_id
+    log = (job_dir / "logs" / "bootstrap.log").read_text()
+    assert proc.returncode == 0, log
+    # the worker materialized the sha with no bundle present anywhere
+    assert (root / "projects" / job_spec.repo.slug / "repo.git").is_dir()
 
 
 def test_full_bootstrap_run(

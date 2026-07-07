@@ -5,12 +5,15 @@ from pathlib import Path
 
 import pytest
 
+from omnirun import repo as repo_mod
 from omnirun.repo import (
     RepoError,
     capture_repo_state,
     create_bundle,
     find_repo_root,
+    remote_clone_plan,
     repo_slug,
+    worker_clone_url,
 )
 from tests.conftest import git
 
@@ -173,3 +176,63 @@ def test_create_bundle_clonable(sample_repo: Path, tmp_path: Path) -> None:
 def test_create_bundle_bad_sha(sample_repo: Path, tmp_path: Path) -> None:
     with pytest.raises(RepoError):
         create_bundle(sample_repo, "0" * 40, tmp_path / "x.bundle")
+
+
+# --- public-repo direct clone -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("git@github.com:me/proj.git", "https://github.com/me/proj.git"),
+        ("ssh://git@github.com/me/proj.git", "https://github.com/me/proj.git"),
+        ("https://github.com/me/proj.git", "https://github.com/me/proj.git"),
+        ("git://example.com/x/y.git", "https://example.com/x/y.git"),
+        ("/local/path/repo", None),  # local remote -> ship a bundle
+        ("", None),
+    ],
+)
+def test_worker_clone_url(url: str, expected: str | None) -> None:
+    assert worker_clone_url(url) == expected
+
+
+def test_remote_clone_plan_public_reachable(
+    sample_repo: Path, origin: Path, monkeypatch
+) -> None:
+    # stub the network side (public detection + url mapping); the reachability /
+    # ancestry logic runs for real against the local bare `origin`.
+    monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: True)
+    monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
+    ref = capture_repo_state(sample_repo)  # HEAD is pushed to origin/main
+    assert remote_clone_plan(ref, sample_repo) == str(origin)
+
+
+def test_remote_clone_plan_private_ships_bundle(
+    sample_repo: Path, origin: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: False)
+    monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
+    ref = capture_repo_state(sample_repo)
+    assert remote_clone_plan(ref, sample_repo) is None
+
+
+def test_remote_clone_plan_dirty_ships_bundle(
+    sample_repo: Path, origin: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: True)
+    monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
+    ref = capture_repo_state(sample_repo).model_copy(update={"dirty": True})
+    assert remote_clone_plan(ref, sample_repo) is None
+
+
+def test_remote_clone_plan_unreachable_sha_ships_bundle(
+    sample_repo: Path, origin: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: True)
+    monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
+    ref = capture_repo_state(sample_repo)
+    # a local commit that never reached origin: descendant of the tip, so not an
+    # ancestor of it -> a direct clone could not find it -> bundle.
+    unpushed = _commit(sample_repo, "unpushed.txt")
+    ref = ref.model_copy(update={"sha": unpushed})
+    assert remote_clone_plan(ref, sample_repo) is None

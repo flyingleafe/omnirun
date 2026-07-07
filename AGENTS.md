@@ -40,10 +40,15 @@ GPU — picking the cheapest/fastest option that fits.
    in a single backend.
 3. **Git credentials never leave the laptop.** SSH-family: the client
    `git push`es the exact sha to a non-branch ref `refs/omnirun/<sha12>` in the
-   worker-side repo. Notebooks: the sha travels as a `git bundle` embedded
-   (base64) inside the kernel/cell payload — Kaggle does **not** use a dataset
-   (a dataset raced the kernel push with a 409). Nothing on the worker reaches
-   the origin remote.
+   worker-side repo. Notebooks: a **public** repo is cloned by the worker
+   directly from the anonymous https origin (no creds needed) — the decision is
+   made client-side by `repo.remote_clone_plan` (public via `gh`/`curl`, sha
+   provably reachable, not `--dirty`/detached). Only a **private**/unpushed sha
+   travels as a `git bundle` embedded (base64) inside the kernel/cell payload —
+   Kaggle does **not** use a dataset (a dataset raced the kernel push with a
+   409). A gitignored `.env` always rides as its own out-of-band blob (Colab
+   upload; Kaggle base64), never through git. Nothing requiring credentials on
+   the worker ever reaches the origin remote.
 4. **Shared per-project worker layout.** Under a configurable `project_root`:
    worktrees are shared per git revision (`.trees/<sha12>`, deduped — never one
    per job), and there is exactly **one** `.venv` per project via

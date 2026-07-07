@@ -40,8 +40,10 @@ on the worker:
    `$OMNIRUN_ROOT/projects/<slug>`; you can point it at an existing checkout to
    reuse its `.git` and `.venv`) — a bare `repo.git` mirror, or that checkout's
    own `.git`. The client pushes the exact sha to a non-branch ref
-   `refs/omnirun/<sha12>` over its own SSH connection (or ships a `git bundle`
-   for Kaggle/Colab), so **git credentials never leave your laptop** and pushing
+   `refs/omnirun/<sha12>` over its own SSH connection; for Kaggle/Colab a
+   **public** repo is cloned directly by the worker over its own connection
+   (no credentials needed) and a **private** repo instead rides as a `git
+   bundle`, so **git credentials never leave your laptop** and pushing
    into an existing checkout is safe;
 2. check out a worktree **shared per git revision** at `.trees/<sha12>` (guarded
    by a `.locks/` flock) — jobs at the same sha reuse the checkout instead of
@@ -316,12 +318,16 @@ omnirun shells out to the real OpenSSH binary. Declare the machine's GPUs in
 config; probe verifies them live via `nvidia-smi` and reports busy GPUs.
 
 **kaggle** — genuinely free compute: ~30 GPU-hours/week on P100 or 2×T4, hard
-12 h cap per batch session. Jobs run as private script kernels; the git bundle
-is embedded (base64) directly inside the kernel's `run.py` — no separate dataset
-(no tokens leave your machine). This sidesteps a Kaggle 409 race a dataset used
-to cause and its create/delete lifecycle; the one constraint is that the
-embedded bundle has a size cap, so only code-sized repos fit (data is never
-shipped — jobs fetch their own).
+12 h cap per batch session. Jobs run as private script kernels. Code delivery is
+decided per submit: a **public** repo is cloned by the kernel directly over its
+own internet connection (nothing shipped); a **private** (or unpushed) repo has
+its git bundle embedded (base64) inside the kernel's `run.py` — no separate
+dataset, no tokens leave your machine. Embedding sidesteps a Kaggle 409 race a
+dataset used to cause and its create/delete lifecycle; the one constraint (bundle
+case only) is a size cap on the embed, so only code-sized repos fit (data is
+never shipped — jobs fetch their own). A gitignored `<repo>/.env` is injected too
+(embedded base64, decoded to a 0600 file and sourced) — Kaggle now supports `.env`
+the same as Colab.
 Kaggle has no quota API, so omnirun tracks your weekly GPU-hour spend locally
 (`weekly_gpu_hours`) and marks offers unfit when the budget looks exhausted —
 it is an estimate, not the truth. L4/A100/H100 shapes exist but are gated

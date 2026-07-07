@@ -110,14 +110,21 @@ as the template for any other cluster.
 ### Kaggle — LIVE-VERIFIED
 
 Verified this session: a real **P100** kernel job ran end-to-end and its output
-artifact was pulled back. **Delivery change:** the git bundle is now **embedded
-(base64) directly in the kernel's `run.py`** alongside the bootstrap script —
-there is **no per-job dataset** anymore. This replaced a dataset-based design
-that hit a systematic **409** (Kaggle rejects a kernel referencing a
-still-processing dataset). Consequence: kaggle no longer creates or deletes any
-datasets; nothing worker-side to reap. Only caveat is bundle size — a code-only
-repo bundle is well under the embed cap; a repo with large committed blobs will
-be rejected client-side before push.
+artifact was pulled back. **Delivery change:** for a private/unpushed repo the git
+bundle is now **embedded (base64) directly in the kernel's `run.py`** alongside the
+bootstrap script — there is **no per-job dataset** anymore. This replaced a
+dataset-based design that hit a systematic **409** (Kaggle rejects a kernel
+referencing a still-processing dataset). Consequence: kaggle no longer creates or
+deletes any datasets; nothing worker-side to reap. Only caveat is bundle size — a
+code-only repo bundle is well under the embed cap; a repo with large committed
+blobs will be rejected client-side before push.
+
+**Newly added (unit-tested, NOT yet live-verified):** for a **public** repo the
+kernel now clones the repo directly over its own internet connection and no bundle
+is embedded (`repo.remote_clone_plan` gates on public + reachable). Kaggle also now
+injects a gitignored `<repo>/.env` (base64-embedded as `ENV_B64`, decoded to a 0600
+file and sourced) — parity with Colab. Both paths pass unit tests; a live Kaggle
+(and Colab) job against a public repo has not been re-run yet.
 
 - Provide: API token at `~/.config/kaggle/kaggle.json` (kaggle.com → Settings →
   Create New Token) or `KAGGLE_USERNAME`/`KAGGLE_KEY` env vars. The account
@@ -194,7 +201,9 @@ first contact. When one is wrong, the fix is usually a few lines in the named
 module.
 
 **Kaggle** (`src/omnirun/backends/kaggle.py`) — CONFIRMED LIVE (P100 job ran; output pulled)
-- [x] Bundle delivery: **embedded base64 in `run.py`**, no dataset — sidesteps the 409 the old dataset design hit. `dataset_create_new`/`dataset_delete` are no longer used.
+- [x] Bundle delivery (private/unpushed repo): **embedded base64 in `run.py`**, no dataset — sidesteps the 409 the old dataset design hit. `dataset_create_new`/`dataset_delete` are no longer used.
+- [ ] Public-repo **direct clone** (worker `git clone` over its own connection, no bundle) — unit-tested via `repo.remote_clone_plan`; not yet run live on Kaggle.
+- [ ] `.env` injection (`ENV_B64` embedded → 0600 file → sourced) — unit-tested; not yet run live on Kaggle.
 - [x] `kernels_status` response shape + status strings (`queued/running/complete/error/cancelAcknowledged`).
 - [x] `kernels_output` kwarg + downloaded log format (`<slug>.log`).
 - [x] `enable_gpu` + `machine_shape` combo selects the shape on push (P100 confirmed).
@@ -208,6 +217,7 @@ module.
 - [x] `colab exec` stdout relay fidelity — status beacon marker lines survive verbatim.
 - [x] A `Popen(start_new_session=True)` detached bootstrap survives subsequent execs; keep-alive daemon starts from a non-interactive `colab new`.
 - [ ] Nonzero exit code from exec/download when the session is dead (we map that to LOST) — not yet observed on a real dead session.
+- [ ] Public-repo **direct clone** (worker clones over its own connection, no bundle uploaded) — unit-tested via `repo.remote_clone_plan`; not yet run live on Colab (bundle path is the one that ran live).
 
 **RunPod** (`src/omnirun/backends/runpod.py`)
 - [ ] `portMappings` key shape — we read `mappings.get("22")` (string key) with an int fallback.

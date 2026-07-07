@@ -7,11 +7,16 @@ gitpython.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 from omnirun.models import RepoRef
+
+# scp-style ssh remote, e.g. git@github.com:owner/repo.git (no scheme, host:path)
+_SCP_URL = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
 
 
 class RepoError(RuntimeError):
@@ -134,6 +139,93 @@ def env_file(root: Path) -> Path | None:
         return None
     tracked = _git(root, "ls-files", "--error-unmatch", ".env")
     return None if tracked.returncode == 0 else p
+
+
+def worker_clone_url(remote_url: str) -> str | None:
+    """Anonymous https URL a credential-less worker can clone `remote_url` from.
+
+    The configured origin may be scp-style ssh (`git@host:o/r.git`), `ssh://`,
+    `git://`, or already http(s) — normalize all to `https://<host>/<path>` so a
+    worker with no ssh key or stored credentials can still fetch a *public* repo.
+    Returns None for local-only / undecipherable remotes (caller ships a bundle).
+    """
+    u = remote_url.strip()
+    if not u:
+        return None
+    if u.startswith(("https://", "http://")):
+        return u
+    for scheme in ("ssh://", "git://"):
+        if u.startswith(scheme):
+            rest = u[len(scheme) :].split("@", 1)[-1]  # drop any user@
+            host, _, path = rest.partition("/")
+            return f"https://{host}/{path}" if host and path else None
+    if m := _SCP_URL.match(u):
+        return f"https://{m['host']}/{m['path']}"
+    return None
+
+
+def remote_is_public(remote_url: str) -> bool:
+    """Whether `remote_url` is anonymously cloneable (i.e. public).
+
+    Tries `gh` for GitHub (fast, definitive), else an unauthenticated smart-http
+    advertisement probe with `curl` (host-agnostic: a public repo answers 200,
+    a private one 401/404). Any failure or uncertainty → False, so the caller
+    falls back to shipping a bundle."""
+    https = worker_clone_url(remote_url)
+    if https is None:
+        return False
+    parts = https.split("/", 3)
+    if len(parts) < 4:
+        return False
+    host, path = parts[2], parts[3].removesuffix(".git")
+    if host.endswith("github.com") and shutil.which("gh"):
+        r = subprocess.run(
+            ["gh", "repo", "view", path, "--json", "visibility", "-q", ".visibility"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if r.returncode == 0:  # a gh failure (unauthed/not-found) falls through
+            return r.stdout.strip().upper() == "PUBLIC"
+    if shutil.which("curl"):
+        probe = f"{https}/info/refs?service=git-upload-pack"
+        r = subprocess.run(
+            ["curl", "-fsSL", "--no-netrc", "-o", os.devnull, probe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return r.returncode == 0
+    return False
+
+
+def remote_clone_plan(ref: RepoRef, root: Path) -> str | None:
+    """The anonymous https url a worker should clone to materialize `ref.sha`,
+    or None when the code must instead ride along as a bundle.
+
+    Returns a url only when all three hold, so a credential-less worker clone
+    cannot then fail to find the commit: (1) there's a real origin and the sha
+    is a normal pushed branch commit (not a `--dirty` wip or detached HEAD);
+    (2) that origin is anonymously public; (3) `ref.sha` is provably reachable
+    from the current remote branch tip (asked over the wire, ancestry checked
+    against our local objects). Otherwise None → bundle."""
+    if not ref.remote_url or ref.dirty or ref.branch == "detached":
+        return None
+    url = worker_clone_url(ref.remote_url)
+    if url is None or not remote_is_public(ref.remote_url):
+        return None
+    ls = subprocess.run(
+        ["git", "-C", str(root), "ls-remote", url, ref.branch],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if ls.returncode != 0 or not ls.stdout.strip():
+        return None
+    tip = ls.stdout.split()[0]
+    anc = _git(root, "merge-base", "--is-ancestor", ref.sha, tip)
+    return url if anc.returncode == 0 else None
 
 
 def create_bundle(root: Path, sha: str, dest: Path) -> Path:
