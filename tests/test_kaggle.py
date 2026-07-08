@@ -496,6 +496,49 @@ def test_pull_outputs(fake_api, backend, tmp_path):
     assert files == [dest / "model.txt"]
 
 
+def test_pull_outputs_tolerates_absolute_symlink(fake_api, backend, tmp_path):
+    """Regression (#1): every W&B run leaves a symlink to an absolute path under
+    wandb/*/logs/. Python's data filter rejects it; pull must skip that one entry
+    and still recover the real outputs rather than aborting the whole archive."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"metric,value\n1,2\n"
+        good = tarfile.TarInfo("outputs/results.csv")
+        good.size = len(data)
+        tf.addfile(good, io.BytesIO(data))
+        link = tarfile.TarInfo("outputs/wandb/run-x/logs/debug-core.log")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/kaggle/tmp/omnirun/abs/debug-core.log"  # absolute target
+        tf.addfile(link)
+    fake_api.output_files = {"omnirun-job.tar.gz": buf.getvalue()}
+    dest = tmp_path / "results"
+    files = backend.pull_outputs(make_handle(), dest)
+    assert (dest / "results.csv").read_bytes() == data
+    assert [p.name for p in files] == ["results.csv"]  # link skipped, csv kept
+
+
+def test_submit_guards_oversized_source(fake_api, monkeypatch):
+    """Regression (#2): an oversized kernel source must fail early with a
+    size-naming message, not sail past the guard and fail opaquely on Kaggle."""
+    monkeypatch.setattr(
+        kaggle_mod, "_create_bundle", lambda root, sha, dest: _big_bundle(dest)
+    )
+    backend = KaggleBackend(
+        "kaggle",
+        BackendConfig.model_validate({"type": "kaggle", "max_source_bytes": 4096}),
+    )
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(BackendError, match=r"kaggle kernel source is .* over the"):
+        backend.submit(spec, offer)
+
+
+def _big_bundle(dest: Path) -> Path:
+    dest = Path(dest)
+    dest.write_bytes(b"x" * 8192)  # base64 ~11k, over the 4k test limit
+    return dest
+
+
 def test_cancel_without_api_support_points_at_website(fake_api, backend):
     with pytest.raises(BackendError, match="kaggle.com"):
         backend.cancel(make_handle())

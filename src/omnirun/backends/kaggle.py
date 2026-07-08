@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from omnirun.backends.base import Backend, BackendError, register
-from omnirun.backends import jobdir
+from omnirun.backends import jobdir, tarsafe
 from omnirun.bootstrap import (
     BootstrapParams,
     CodeSource,
@@ -76,10 +76,15 @@ MAX_MEM_GB = 30
 MAX_DISK_GB = 55
 KAGGLE_ROOT = "/kaggle/tmp/omnirun"  # venv + tree scratch; /kaggle/working stays small
 RESULT_TAR = "omnirun-job.tar.gz"
-# Cap on the base64 git bundle embedded in the kernel source. Kaggle rejects
-# oversized kernel pushes; fail early with a clear message instead. Generous —
-# a code-only repo bundle is normally well under a megabyte.
-MAX_EMBED_B64 = 40 * 1024 * 1024
+# Cap on the kernel source (run.py) omnirun pushes: the embedded bootstrap +
+# any git bundle (private/unpushed repos) + any out-of-band .env all count
+# against it. Kaggle rejects an oversized push with an opaque HTTP 400, so we
+# guard at the real threshold and fail early naming size as the cause. Measured
+# live against the kernels API: <=1 MiB accepted, >=1.1 MiB rejected — i.e. the
+# limit is 1 MiB. A private/unpushed repo therefore only fits when its bundle is
+# small; a *public* repo is cloned by the worker directly (no bundle shipped) and
+# is unaffected by this cap. Override per backend with `max_source_bytes`.
+KAGGLE_MAX_SOURCE_BYTES = 1024 * 1024
 LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
 
 
@@ -365,6 +370,29 @@ class KaggleBackend(Backend):
 
     # ---- submit ---------------------------------------------------------------
 
+    def _guard_source_size(self, harness: str, *, shipped_bundle: bool) -> None:
+        """Fail early, with a size-naming message, when the kernel source is over
+        Kaggle's real push limit — instead of letting the push fail opaquely."""
+        limit = int(self.config.extra("max_source_bytes", KAGGLE_MAX_SOURCE_BYTES))
+        size = len(harness.encode())
+        if size <= limit:
+            return
+        # the git bundle (full history + tree at the sha) usually dominates when
+        # a private/unpushed repo forces one; a public repo ships no bundle.
+        remedy = (
+            "push the repo to a public remote so the worker clones it directly "
+            "(no bundle shipped), slim the git history (shallow/squash) or exclude "
+            "heavy dirs from the tree, "
+            if shipped_bundle
+            else "slim the tree or "
+        )
+        raise BackendError(
+            f"kaggle kernel source is {size / (1024 * 1024):.1f} MB, over the "
+            f"~{limit / (1024 * 1024):.1f} MB Kaggle push limit (the push would "
+            f"fail opaquely) — {remedy}run this job on another backend, or raise "
+            "the backend's `max_source_bytes` if Kaggle accepts more"
+        )
+
     def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
         api = self._api()
         user = self._username(api)
@@ -401,13 +429,6 @@ class KaggleBackend(Backend):
             env_b64 = (
                 base64.b64encode(envf.read_text().encode()).decode() if envf else ""
             )
-            if len(bundle_b64) + len(env_b64) > MAX_EMBED_B64:
-                raise BackendError(
-                    f"embedded payload is too large for a kaggle kernel "
-                    f"(~{(len(bundle_b64) + len(env_b64)) // (1024 * 1024)}MB base64) "
-                    "— slim the git history (shallow/squash), push a public repo, or "
-                    "run this job on another backend"
-                )
 
             script = generate_bootstrap(
                 notebook_env_spec(spec),
@@ -421,11 +442,12 @@ class KaggleBackend(Backend):
             )
             boot_b64 = base64.b64encode(script.encode()).decode()
 
+            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64)
+            self._guard_source_size(harness, shipped_bundle=bool(bundle_b64))
+
             k_dir = stage / "kernel"
             k_dir.mkdir()
-            (k_dir / "run.py").write_text(
-                _render_harness(job_id, boot_b64, bundle_b64, env_b64)
-            )
+            (k_dir / "run.py").write_text(harness)
             meta: dict[str, Any] = {
                 "id": kernel_ref,
                 "title": slug,  # title must slugify to the id slug
@@ -610,7 +632,7 @@ class KaggleBackend(Backend):
             extract = Path(td) / "extract"
             extract.mkdir()
             with tarfile.open(tar) as tf:
-                tf.extractall(extract, filter="data")
+                tarsafe.extract_all(tf, extract)
             outputs = extract / "outputs"
             if outputs.is_dir():
                 shutil.copytree(outputs, dest, dirs_exist_ok=True)

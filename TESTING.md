@@ -116,15 +116,27 @@ bootstrap script — there is **no per-job dataset** anymore. This replaced a
 dataset-based design that hit a systematic **409** (Kaggle rejects a kernel
 referencing a still-processing dataset). Consequence: kaggle no longer creates or
 deletes any datasets; nothing worker-side to reap. Only caveat is bundle size — a
-code-only repo bundle is well under the embed cap; a repo with large committed
-blobs will be rejected client-side before push.
+code-only repo bundle is well under the source cap; a repo with large committed
+blobs is rejected client-side before push (see the measured cap below).
 
-**Newly added (unit-tested, NOT yet live-verified):** for a **public** repo the
-kernel now clones the repo directly over its own internet connection and no bundle
-is embedded (`repo.remote_clone_plan` gates on public + reachable). Kaggle also now
-injects a gitignored `<repo>/.env` (base64-embedded as `ENV_B64`, decoded to a 0600
-file and sourced) — parity with Colab. Both paths pass unit tests; a live Kaggle
-(and Colab) job against a public repo has not been re-run yet.
+**Public-repo direct clone — LIVE-VERIFIED (this session).** A CPU kernel was
+submitted against `github.com/flyingleafe/omnirun` (public) at the pushed master
+tip with `env=none`: the worker ran `git clone --bare` over its own connection,
+checked out the exact sha (`Preparing worktree (detached HEAD 6fcedf0)` →
+`CLONE OK cwd=…/.trees/6fcedf04a860`, `has_pyproject=True`), no bundle embedded,
+and `proof.txt` was pulled back. So a **public repo of any size** runs on Kaggle,
+unconstrained by the source cap. Kaggle also injects a gitignored `<repo>/.env`
+(base64 `ENV_B64` → 0600 file → sourced) — unit-tested, parity with Colab.
+
+**Kernel-source cap — MEASURED (this session).** Pushing `run.py` payloads of
+increasing size to the kernels API: `<=1 MiB` (1,048,570 B) **accepted**,
+`>=1.1 MiB` **rejected with HTTP 400** — so Kaggle's limit is **1 MiB**. The
+pre-submit guard (`KAGGLE_MAX_SOURCE_BYTES = 1 MiB`, override via
+`max_source_bytes`) now measures the full `run.py` (bootstrap + any bundle + any
+`.env`) against this and fails early naming size, instead of the old 40 MiB
+`MAX_EMBED_B64` guard that let 1–40 MiB pushes fail opaquely on Kaggle's side.
+(Aside: the current kaggle client exposes `kernels_delete(ref, no_confirm=True)`,
+used here to clean up the probe kernels — a future `gc`/`cancel` could use it.)
 
 - Provide: API token at `~/.config/kaggle/kaggle.json` (kaggle.com → Settings →
   Create New Token) or `KAGGLE_USERNAME`/`KAGGLE_KEY` env vars. The account
@@ -202,7 +214,8 @@ module.
 
 **Kaggle** (`src/omnirun/backends/kaggle.py`) — CONFIRMED LIVE (P100 job ran; output pulled)
 - [x] Bundle delivery (private/unpushed repo): **embedded base64 in `run.py`**, no dataset — sidesteps the 409 the old dataset design hit. `dataset_create_new`/`dataset_delete` are no longer used.
-- [ ] Public-repo **direct clone** (worker `git clone` over its own connection, no bundle) — unit-tested via `repo.remote_clone_plan`; not yet run live on Kaggle.
+- [x] Public-repo **direct clone** (worker `git clone` over its own connection, no bundle) — **LIVE-VERIFIED**: CPU job cloned `flyingleafe/omnirun` at master tip, ran in the worktree, `proof.txt` pulled.
+- [x] Kernel-source push cap — **MEASURED**: 1 MiB (≤1 MiB accepted, ≥1.1 MiB → HTTP 400); `KAGGLE_MAX_SOURCE_BYTES` guard set to match, overridable via `max_source_bytes`.
 - [ ] `.env` injection (`ENV_B64` embedded → 0600 file → sourced) — unit-tested; not yet run live on Kaggle.
 - [x] `kernels_status` response shape + status strings (`queued/running/complete/error/cancelAcknowledged`).
 - [x] `kernels_output` kwarg + downloaded log format (`<slug>.log`).

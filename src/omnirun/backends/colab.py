@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from omnirun.backends import jobdir
+from omnirun.backends import jobdir, tarsafe
 from omnirun.backends.base import Backend, BackendError, register
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
@@ -583,7 +583,7 @@ class ColabBackend(Backend):
             if not local_tar.exists():
                 raise BackendError("colab download produced no local file")
             with tarfile.open(local_tar) as tf:
-                tf.extractall(td, filter="data")
+                tarsafe.extract_all(tf, Path(td))
             outputs = Path(td) / "outputs"
             if outputs.is_dir():
                 shutil.copytree(outputs, dest, dirs_exist_ok=True)

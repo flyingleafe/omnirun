@@ -188,6 +188,33 @@ def _indent(block: str, n: int) -> str:
     return "".join(pad + line + "\n" for line in block.splitlines())
 
 
+def _heredoc_delim(body: str) -> str:
+    """A heredoc terminator that provably does not occur as a line in `body`,
+    so embedding an arbitrary command in a heredoc can never terminate early."""
+    lines = body.splitlines()
+    base = "OMNIRUN_CMD_EOF"
+    delim = base
+    i = 0
+    while delim in lines:
+        i += 1
+        delim = f"{base}_{i}"
+    return delim
+
+
+def _command_block(command: str) -> str:
+    """Body of run_cmd(): the user command carried byte-exact via a single-quoted
+    heredoc and run with `eval`.
+
+    A single-quoted heredoc disables every expansion and preserves the body
+    literally — newlines, embedded heredocs, quotes, backslashes all survive — so
+    multi-line scripts reach the worker unmangled. `eval` runs it in the current
+    shell, so env activation, forwarded exports and pre-run lines all still apply.
+    Crucially the command is NOT indented: indenting would shift the user's own
+    heredoc terminators off column 0 and break them."""
+    delim = _heredoc_delim(command)
+    return f"eval \"$(cat <<'{delim}'\n{command}\n{delim}\n)\"\n"
+
+
 def _default_project_root(slug: str) -> str:
     return f"$OMNIRUN_ROOT/projects/{slug}"
 
@@ -307,8 +334,7 @@ status running
 STARTED_AT=$(now)
 set +e
 run_cmd() {{
-{_indent(spec.command, 2)}\
-}}
+{_command_block(spec.command)}}}
 # run in a subshell: a bare `exit N` in the user command must not kill
 # bootstrap.sh itself (result.json would never be written -> job shows LOST)
 ( run_cmd ) > >(tee "$JOB_DIR/logs/stdout.log") 2> >(tee "$JOB_DIR/logs/stderr.log" >&2)

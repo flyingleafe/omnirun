@@ -282,10 +282,13 @@ Worker access to private repos — **no git credentials ever leave the laptop**:
     bundle base64 inside the kernel's `run.py`** (next to the base64 bootstrap) — *not* a
     dataset. The old dataset approach 409'd every kernel that referenced a still-processing
     dataset (a systematic race) and needed a create/delete lifecycle; embedding removes
-    both. A size guard (`MAX_EMBED_B64`, 40 MiB, covering bundle + env together) rejects
-    oversized repos, so this suits code-sized repos (data is never shipped — jobs fetch
-    their own). The bootstrap clones/fetches from the bundle into the object store. In the
-    public-repo case no bundle is embedded, so the ceiling is a non-issue.
+    both. A size guard (`KAGGLE_MAX_SOURCE_BYTES`, ~1 MiB, measuring the whole `run.py`
+    kernel source — embedded bootstrap + bundle + env — against Kaggle's real push limit,
+    overridable per backend via `max_source_bytes`) rejects oversized pushes early with a
+    size-naming error instead of an opaque Kaggle-side failure, so this suits code-sized
+    repos (data is never shipped — jobs fetch their own). The bootstrap clones/fetches from
+    the bundle into the object store. In the public-repo case no bundle is embedded, so the
+    ceiling is a non-issue.
 
   This keeps the invariant intact: a public clone needs no credentials, and private repos
   still never touch origin from the worker. What changed is that public-repo workers now

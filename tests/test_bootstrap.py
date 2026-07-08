@@ -133,6 +133,38 @@ def test_failing_command_propagates_exit_code(
     assert "about to fail" in (job_dir / "logs" / "stdout.log").read_text()
 
 
+def test_multiline_heredoc_command_runs_byte_exact(
+    sample_repo: Path, job_spec: JobSpec, tmp_path: Path
+) -> None:
+    """Regression (#3): a multi-line command with a heredoc must reach the worker
+    byte-identical. The old indent-per-line embedding shifted the heredoc
+    terminator off column 0 (breaking it) and prefixed every body line — this
+    proves the body is written verbatim, indentation and all."""
+    command = (
+        'cat <<EOF > "$OMNIRUN_OUTPUT/cfg.yaml"\n'
+        "key: value\n"
+        "  two-space-indent: kept\n"
+        "EOF\n"
+        'echo "MULTILINE OK"'
+    )
+    spec = job_spec.model_copy(
+        update={
+            "job_id": JobSpec.make_job_id("heredoc"),
+            "command": command,
+            "outputs": [],
+        }
+    )
+    root = tmp_path / "omnirun_root"
+    script = stage(sample_repo, spec, root)
+    proc = run_bootstrap(script)
+
+    job_dir = root / "jobs" / spec.job_id
+    assert proc.returncode == 0, (job_dir / "logs" / "bootstrap.log").read_text()
+    cfg = job_dir / "outputs" / "cfg.yaml"
+    assert cfg.read_text() == "key: value\n  two-space-indent: kept\n"
+    assert "MULTILINE OK" in (job_dir / "logs" / "stdout.log").read_text()
+
+
 def test_bare_exit_in_command_still_writes_result(
     sample_repo: Path, job_spec: JobSpec, tmp_path: Path
 ) -> None:
