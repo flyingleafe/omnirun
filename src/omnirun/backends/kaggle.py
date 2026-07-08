@@ -435,7 +435,9 @@ class KaggleBackend(Backend):
                 BootstrapParams(
                     omnirun_root=KAGGLE_ROOT,
                     project_root=jobdir.project_root_of(
-                        KAGGLE_ROOT, spec.repo.slug, self.config.project_root
+                        KAGGLE_ROOT,
+                        spec.repo.slug,
+                        self.config.project_root_for(spec.repo.slug),
                     ),
                     code=code,
                 ),

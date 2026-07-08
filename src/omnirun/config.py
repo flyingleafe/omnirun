@@ -48,8 +48,10 @@ class BackendConfig(BaseModel, extra="allow"):
     env_setup: list[str] = Field(default_factory=list)  # module loads, exports
     # Where a project's shared checkout + .venv live on the worker. Default
     # "$OMNIRUN_ROOT/projects/<slug>"; point at an existing clone to reuse it
-    # (its .git becomes the object store, its .venv the shared env).
-    project_root: str | None = None
+    # (its .git becomes the object store, its .venv the shared env). A str
+    # applies to every repo; a dict maps repo slug -> path (with an optional
+    # "default" key as fallback) so one backend can serve several repos.
+    project_root: str | dict[str, str] | None = None
 
     # static capability declaration (ssh backend; probe checks live via nvidia-smi)
     gpus: list[GpuDecl] = Field(default_factory=list)
@@ -73,6 +75,15 @@ class BackendConfig(BaseModel, extra="allow"):
 
     def extra(self, key: str, default: Any = None) -> Any:
         return (self.model_extra or {}).get(key, default)
+
+    def project_root_for(self, slug: str) -> str | None:
+        """Configured project root for a repo. A str applies to every repo; a
+        dict is keyed by slug, falling back to a "default" key, then to None
+        (the built-in "$OMNIRUN_ROOT/projects/<slug>" path)."""
+        pr = self.project_root
+        if isinstance(pr, dict):
+            return pr.get(slug) or pr.get("default")
+        return pr
 
 
 class DaemonConfig(BaseModel):

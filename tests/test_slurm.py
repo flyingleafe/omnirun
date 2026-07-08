@@ -295,6 +295,22 @@ def test_render_payload_sbatch_then_bootstrap():
     assert fake.files == {}
 
 
+def test_render_payload_project_root_dict_matches_slug():
+    # spec slug is "proj": a per-repo dict resolves to that repo's checkout...
+    fake = FakeExec()
+    b = make_backend(fake, root=ROOT, project_root={"proj": "/data/existing/proj"})
+    payload = b.render_payload(make_spec(), offer=None)
+    assert 'PROJECT_ROOT="/data/existing/proj"' in payload
+
+
+def test_render_payload_project_root_dict_no_match_uses_default():
+    # ...and an unrelated slug falls through to the built-in "$root/projects/<slug>".
+    fake = FakeExec()
+    b = make_backend(fake, root=ROOT, project_root={"other": "/data/existing/other"})
+    payload = b.render_payload(make_spec(), offer=None)
+    assert f'PROJECT_ROOT="{ROOT}/projects/proj"' in payload
+
+
 # --- status mapping -------------------------------------------------------------------
 
 

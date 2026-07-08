@@ -120,7 +120,9 @@ section name is yours (you can have several of the same type). All backends
 accept `enabled = false` to keep the config without probing it. Every backend
 also accepts `project_root` (point it at an existing checkout to reuse its
 `.git`/`.venv`) and `max_parallel` (queue-daemon cap on concurrent jobs, default
-`1`).
+`1`). `project_root` may be a single path (applied to every repo) or a table
+mapping repo slug -> path, with an optional `default` key as fallback, so one
+backend can serve several repos (each getting the right checkout).
 
 ```toml
 [policy]
@@ -139,6 +141,7 @@ poll_interval_s = 10.0       # scheduler tick: refresh running + place pending
 type = "local"
 # root = "$HOME/.omnirun"    # OMNIRUN_ROOT: where jobs live
 # project_root = "$HOME/proj"  # reuse an existing checkout's .git and .venv
+# project_root = { my-repo = "$HOME/proj" }  # or per-repo (by slug), else default path
 # max_parallel = 2           # queue daemon: run up to 2 jobs here at once
 
 # ---- any machine you can ssh into ----

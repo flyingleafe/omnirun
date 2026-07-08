@@ -360,7 +360,9 @@ class ColabBackend(Backend):
                 BootstrapParams(
                     omnirun_root=COLAB_ROOT,
                     project_root=jobdir.project_root_of(
-                        COLAB_ROOT, spec.repo.slug, self.config.project_root
+                        COLAB_ROOT,
+                        spec.repo.slug,
+                        self.config.project_root_for(spec.repo.slug),
                     ),
                     code=code,
                 ),

@@ -217,7 +217,7 @@ class SshBackend(Backend):
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
         project_root = jobdir.resolve_project_root(
-            ex, root, spec.repo.slug, self.config.project_root
+            ex, root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
         )
         params = BootstrapParams(
             omnirun_root=root,

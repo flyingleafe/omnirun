@@ -260,7 +260,7 @@ class SlurmBackend(Backend):
         root = self.config.root
         job_dir = jobdir.job_dir_of(root, spec.job_id)
         project_root = jobdir.project_root_of(
-            root, spec.repo.slug, self.config.project_root
+            root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
         )
         sbatch = render_sbatch(spec, self.config, job_dir, root)
         bootstrap = generate_bootstrap(
@@ -283,7 +283,7 @@ class SlurmBackend(Backend):
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
         project_root = jobdir.resolve_project_root(
-            ex, root, spec.repo.slug, self.config.project_root
+            ex, root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
         )
         params = BootstrapParams(
             omnirun_root=root,
