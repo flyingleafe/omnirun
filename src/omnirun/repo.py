@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from omnirun.models import RepoRef
@@ -30,6 +31,60 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=600,
     )
+
+
+# Identity stamped on wip commits so `git commit-tree` never fails on a repo
+# without a configured user.name/email; the commit is ephemeral anyway.
+_WIP_IDENTITY = {
+    "GIT_AUTHOR_NAME": "omnirun",
+    "GIT_AUTHOR_EMAIL": "wip@omnirun.invalid",
+    "GIT_COMMITTER_NAME": "omnirun",
+    "GIT_COMMITTER_EMAIL": "wip@omnirun.invalid",
+}
+
+
+def _wip_commit(root: Path, parent_sha: str) -> str:
+    """Create a dangling commit capturing the working tree so a `--dirty` submit
+    runs exactly what's on disk: tracked modifications, staged changes,
+    deletions, and untracked non-ignored files. The user's index, HEAD, and
+    working tree are left untouched — a scratch index is used — and gitignored
+    files (e.g. `.env`) stay out, matching a normal commit. Its parent is
+    `parent_sha` (HEAD); returns the new commit's sha."""
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, **_WIP_IDENTITY, "GIT_INDEX_FILE": str(Path(td) / "index")}
+
+        def run(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600,
+            )
+
+        # Seed the scratch index from HEAD, then stage every working-tree change.
+        for step in (("read-tree", parent_sha), ("add", "-A")):
+            r = run(*step)
+            if r.returncode != 0:
+                raise RepoError(
+                    f"capturing --dirty working tree failed at `git {step[0]}`:\n"
+                    f"{r.stderr.strip()}"
+                )
+        tree = run("write-tree")
+        if tree.returncode != 0:
+            raise RepoError(
+                "capturing --dirty working tree failed at `git write-tree`:\n"
+                f"{tree.stderr.strip()}"
+            )
+        commit = run(
+            "commit-tree", tree.stdout.strip(), "-p", parent_sha, "-m", "omnirun wip"
+        )
+        if commit.returncode != 0:
+            raise RepoError(
+                "capturing --dirty working tree failed at `git commit-tree`:\n"
+                f"{commit.stderr.strip()}"
+            )
+        return commit.stdout.strip()
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -110,6 +165,13 @@ def capture_repo_state(
                     f"HEAD ({sha[:12]}) is not on any remote branch of origin — "
                     f"run `git push origin {branch}` first or pass --push"
                 )
+
+    # A --dirty submit must run the working tree, not plain HEAD: snapshot it
+    # into a wip commit and ship that sha (pushed to refs/omnirun/<sha12> for the
+    # SSH family, bundled for notebooks). `dirty` is only true here when
+    # allow_dirty was set, else we raised above.
+    if dirty:
+        sha = _wip_commit(root, sha)
 
     return RepoRef(
         remote_url=remote_url,
