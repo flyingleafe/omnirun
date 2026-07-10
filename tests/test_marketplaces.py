@@ -310,6 +310,119 @@ def test_runpod_submit_happy_path(spec, fake_ssh, fake_stage):
 
 
 @respx.mock
+def test_submit_emits_provisioning_stub_before_wait(spec, fake_ssh, fake_stage):
+    """on_provisioning fires with the instance id the instant it's rented —
+    before provisioning finishes — so an interrupted submit stays reclaimable."""
+    respx.post(f"{REST_BASE}/pods").mock(
+        return_value=httpx.Response(200, json={"id": "pod123"})
+    )
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "desiredStatus": "RUNNING",
+                "publicIp": "1.2.3.4",
+                "portMappings": {"22": 40022},
+            },
+        )
+    )
+    stubs: list[JobHandle] = []
+    handle = runpod_backend().submit(spec, h100_offer(), on_provisioning=stubs.append)
+
+    # Exactly one stub, carrying the instance id and flagged as provisioning,
+    # with none of the not-yet-known connection details.
+    (stub,) = stubs
+    assert stub.backend == "runpod"
+    assert stub.job_id == spec.job_id
+    assert stub.data == {"instance_id": "pod123", "provisioning": True}
+    # The final handle is the full one (superset).
+    assert handle.data["instance_id"] == "pod123"
+    assert handle.data["job_dir"].endswith(spec.job_id)
+
+
+@respx.mock
+def test_submit_stub_persists_when_interrupted(spec, fake_ssh, monkeypatch):
+    """If the submit dies after renting (here: staging raises), the stub was
+    already handed to the client, so the orphaned instance is recorded."""
+    respx.post(f"{REST_BASE}/pods").mock(
+        return_value=httpx.Response(200, json={"id": "pod123"})
+    )
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "desiredStatus": "RUNNING",
+                "publicIp": "1.2.3.4",
+                "portMappings": {"22": 40022},
+            },
+        )
+    )
+    respx.delete(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("git push exploded")
+
+    monkeypatch.setattr(jobdir, "stage_job", boom)
+    stubs: list[JobHandle] = []
+    with pytest.raises(BackendError, match="git push exploded"):
+        runpod_backend().submit(spec, h100_offer(), on_provisioning=stubs.append)
+    assert stubs and stubs[0].data["instance_id"] == "pod123"
+
+
+@respx.mock
+def test_status_on_provisioning_stub_flags_billing_instance(fake_ssh):
+    """status() of a stub whose instance is still up reports PROVISIONING and
+    tells the user it is billing (so ps surfaces the orphan)."""
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "RUNNING"})
+    )
+    stub = JobHandle(
+        backend="runpod",
+        job_id="train-abc123",
+        data={"instance_id": "pod123", "provisioning": True},
+    )
+    report = runpod_backend().status(stub)
+    assert report.status is JobStatus.PROVISIONING
+    assert "still billing" in report.detail
+    assert "pod123" in report.detail
+
+
+@respx.mock
+def test_status_on_provisioning_stub_lost_when_instance_gone(fake_ssh):
+    """A stub whose instance no longer exists is LOST, not a crash."""
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(404, json={"error": "not found"})
+    )
+    stub = JobHandle(
+        backend="runpod",
+        job_id="train-abc123",
+        data={"instance_id": "pod123", "provisioning": True},
+    )
+    report = runpod_backend().status(stub)
+    assert report.status is JobStatus.LOST
+
+
+@respx.mock
+def test_gc_reclaims_provisioning_stub(fake_ssh):
+    """gc terminates the instance recorded in an interrupted-submit stub."""
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "RUNNING"})
+    )
+    delete = respx.delete(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    stub = JobHandle(
+        backend="runpod",
+        job_id="train-abc123",
+        data={"instance_id": "pod123", "provisioning": True},
+    )
+    runpod_backend().gc(stub)
+    assert delete.called
+
+
+@respx.mock
 def test_runpod_submit_provision_timeout_terminates(spec, fake_ssh, fake_stage):
     respx.post(f"{REST_BASE}/pods").mock(
         return_value=httpx.Response(

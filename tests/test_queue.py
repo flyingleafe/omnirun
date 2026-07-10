@@ -7,7 +7,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from omnirun.backends.base import Backend
+from omnirun.backends.base import Backend, ProvisioningSink
 from omnirun.config import BackendConfig, Config, DaemonConfig
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.models import (
@@ -68,7 +68,12 @@ class FakeBackend(Backend):
             )
         ]
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         if self.fail_submit:
             raise RuntimeError("submit boom")
         self.submitted.append(spec.job_id)

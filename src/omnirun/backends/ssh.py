@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError, register
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
@@ -213,7 +213,12 @@ class SshBackend(Backend):
 
     # --- submit / lifecycle ---------------------------------------------------
 
-    def submit(self, spec: JobSpec, offer: Offer | None = None) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer | None = None,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
         project_root = jobdir.resolve_project_root(

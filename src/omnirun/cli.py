@@ -27,6 +27,7 @@ from omnirun.config import (
 )
 from omnirun.models import (
     EnvSpec,
+    JobHandle,
     JobRecord,
     JobSpec,
     JobStatus,
@@ -451,15 +452,24 @@ def submit(
         _render_payload(backend_obj, spec, picked.offer)
         return
 
-    handle = backend_obj.submit(spec, picked.offer)
-    JobStore().save(
-        JobRecord(
-            spec=spec,
-            handle=handle,
-            offer=picked.offer,
-            submitted_at=datetime.now(timezone.utc),
+    store = JobStore()
+    picked_offer = picked.offer
+
+    def _persist(h: JobHandle) -> None:
+        # Called once with a provisioning stub (if the backend rents something
+        # before the handle is ready) and again with the final handle, so an
+        # interrupted submit still leaves a reclaimable record (#7).
+        store.save(
+            JobRecord(
+                spec=spec,
+                handle=h,
+                offer=picked_offer,
+                submitted_at=datetime.now(timezone.utc),
+            )
         )
-    )
+
+    handle = backend_obj.submit(spec, picked_offer, on_provisioning=_persist)
+    _persist(handle)
     console.print(f"[green]submitted[/green] {spec.job_id} -> {picked.offer.label}")
     console.print(f"follow logs with: omnirun logs -f {spec.job_id}")
 

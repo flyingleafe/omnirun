@@ -26,6 +26,7 @@ from omnirun import chooser
 from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
 from omnirun.models import (
+    JobHandle,
     JobRecord,
     JobSpec,
     JobStatus,
@@ -433,19 +434,25 @@ class Daemon:
         if be is None:
             self._fail_submit(qid, f"backend {backend_name!r} unavailable")
             return
+
+        def _persist(h: JobHandle) -> None:
+            # Persist a stub the instant a billable resource is created, then
+            # the final handle — an interrupted submit stays reclaimable (#7).
+            self._jobstore.save(
+                JobRecord(
+                    spec=spec,
+                    handle=h,
+                    offer=offer,
+                    submitted_at=datetime.now(timezone.utc),
+                )
+            )
+
         try:
-            handle = be.submit(spec, offer)
+            handle = be.submit(spec, offer, on_provisioning=_persist)
         except Exception as e:
             self._retry_or_fail(qid, str(e))
             return
-        self._jobstore.save(
-            JobRecord(
-                spec=spec,
-                handle=handle,
-                offer=offer,
-                submitted_at=datetime.now(timezone.utc),
-            )
-        )
+        _persist(handle)
         with self._lock:
             entry = self._store.get(qid)
             if entry is None:

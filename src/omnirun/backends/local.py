@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, register
+from omnirun.backends.base import Backend, ProvisioningSink, register
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import shell_quote
 from omnirun.execlayer.local import LocalExec
@@ -110,7 +110,12 @@ class LocalBackend(Backend):
 
     # --- lifecycle ---------------------------------------------------------
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         root = jobdir.remote_root(self.exec, self.config.root)
         project_root = jobdir.resolve_project_root(
             self.exec,

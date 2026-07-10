@@ -7,6 +7,13 @@ the job (client-side git push + bootstrap.sh) -> detached launch (setsid+nohup,
 pidfile), exactly like the plain ssh backend.
 
 Termination policy (billable resources must not leak):
+- **Provisioning stub** (issue #7): the instant ``submit`` rents an instance —
+  before the minutes-long provisioning wait — it calls the ``on_provisioning``
+  hook with a partial handle carrying the instance id, so the client persists a
+  recovery record *first*. A submit killed mid-wait then stays visible to
+  ``ps``/``status`` (reported as PROVISIONING with a billing warning) and
+  reclaimable by ``omnirun gc --all``, instead of orphaning a running instance
+  with no local trace. The final handle overwrites the stub on success.
 - **Client-side auto-terminate** (``auto_terminate``, default true): the instance
   is destroyed in ``pull_outputs`` (after a successful pull), in ``cancel``, and
   in ``gc``. ``status`` never terminates — when the job is terminal it appends a
@@ -52,7 +59,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.repo import local_root_of
@@ -270,9 +277,26 @@ class MarketplaceBackend(Backend, ABC):
             unfit_reasons=[reason],
         )
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         inst = self._create_instance(spec, offer)
         instance_id = inst.instance_id
+        # The instance is now billing but the handle isn't ready yet. Hand the
+        # client a stub carrying the instance id *before* the provisioning wait,
+        # so an interrupted submit (a kill mid-wait) stays visible to ps/gc
+        # instead of orphaning a running instance with no local record (#7).
+        if on_provisioning is not None:
+            on_provisioning(
+                JobHandle(
+                    backend=self.name,
+                    job_id=spec.job_id,
+                    data={"instance_id": instance_id, "provisioning": True},
+                )
+            )
         try:
             inst = self._wait_provisioned(instance_id)
             assert inst.ssh_target is not None
@@ -379,6 +403,31 @@ class MarketplaceBackend(Backend, ABC):
 
     def status(self, handle: JobHandle) -> StatusReport:
         instance_id = handle.data["instance_id"]
+        if not handle.data.get("job_dir"):
+            # A provisioning stub: submit was interrupted before it staged the
+            # job, so only the instance id was persisted. Report whether the
+            # rented instance is still billing so the user knows to reclaim it.
+            try:
+                inst = self._get_instance(instance_id)
+            except BackendError as e:
+                return StatusReport(
+                    status=JobStatus.PROVISIONING,
+                    detail=f"submit was interrupted while provisioning instance "
+                    f"{instance_id}; could not reach the {self.name} API to check "
+                    f"it ({e}) — verify in the provider console, run `omnirun gc`",
+                )
+            if inst is None:
+                return StatusReport(
+                    status=JobStatus.LOST,
+                    detail=f"instance {instance_id} never finished provisioning and "
+                    "no longer exists",
+                )
+            return StatusReport(
+                status=JobStatus.PROVISIONING,
+                detail=f"submit was interrupted after renting instance {instance_id} "
+                f"(now {inst.status or 'unknown'}) — it is still billing; run "
+                f"`omnirun gc --all` (or cancel {handle.job_id}) to destroy it",
+            )
         inst: Instance | None = None
         api_error: str | None = None
         try:
@@ -436,16 +485,17 @@ class MarketplaceBackend(Backend, ABC):
         return paths
 
     def cancel(self, handle: JobHandle) -> None:
-        try:  # best-effort remote kill; instance dies right after anyway
-            ex = self._exec_from_handle(handle)
-            q = shell_quote(handle.data["job_dir"])
-            ex.run(
-                f"if [ -f {q}/pid ]; then p=$(cat {q}/pid); "
-                f'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; fi; true',
-                timeout=30,
-            )
-        except Exception:
-            pass
+        if handle.data.get("job_dir"):  # a provisioning stub has nothing to kill
+            try:  # best-effort remote kill; instance dies right after anyway
+                ex = self._exec_from_handle(handle)
+                q = shell_quote(handle.data["job_dir"])
+                ex.run(
+                    f"if [ -f {q}/pid ]; then p=$(cat {q}/pid); "
+                    f'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; fi; true',
+                    timeout=30,
+                )
+            except Exception:
+                pass
         instance_id = handle.data["instance_id"]
         if self._get_instance(instance_id) is not None:
             self._terminate(instance_id)
