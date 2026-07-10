@@ -515,6 +515,16 @@ def test_probe_warns_when_type_requested_but_no_map():
     assert "gpu_map" in offer.notes
 
 
+def test_probe_unfit_for_gpu_job_when_cpu_only():
+    fake = FakeExec()
+    (offer,) = make_backend(fake, has_gpus=False).probe(ResourceSpec(gpus=1))
+    assert not offer.fits
+    assert "CPU-only" in offer.unfit_reasons[0]
+    # CPU jobs still fit
+    (offer,) = make_backend(fake, has_gpus=False).probe(ResourceSpec())
+    assert offer.fits
+
+
 def test_probe_wait_tier1_idle_nodes():
     fake = FakeExec()
     fake.add(r"sinfo -p gpu -t idle", stdout="node01 gpu:a100:4\nnode02 (null)\n")

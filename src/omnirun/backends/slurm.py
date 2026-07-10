@@ -181,6 +181,8 @@ class SlurmBackend(Backend):
 
         reasons: list[str] = []
         notes: list[str] = []
+        if res.wants_gpu() and self.config.extra("has_gpus", True) is False:
+            reasons.append(f"backend {self.name} is CPU-only (has_gpus = false)")
         if res.wants_gpu() and res.gpu_type and self.config.gpu_map:
             if _gpu_map_lookup(self.config.gpu_map, res.gpu_type) is None:
                 reasons.append(

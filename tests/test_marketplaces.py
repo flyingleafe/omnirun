@@ -474,7 +474,7 @@ def test_vast_probe_filter_and_parsing():
 
     body = json.loads(route.calls[0].request.content)
     assert body["type"] == "ondemand"
-    assert body["gpu_name"] == {"in": ["H100_SXM", "H100_PCIE", "H100_NVL"]}
+    assert body["gpu_name"] == {"in": ["H100 SXM", "H100 PCIE", "H100 NVL"]}
     assert body["num_gpus"] == {"eq": 1}
     assert body["rentable"] == {"eq": True}
     assert body["verified"] == {"eq": True}
