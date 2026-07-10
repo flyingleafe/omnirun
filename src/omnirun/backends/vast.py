@@ -37,23 +37,25 @@ OFFER_LIMIT = 5
 MIN_RELIABILITY = 0.95
 
 # normalized name -> vast gpu_name values (their catalog naming)
+# The REST /bundles/ endpoint matches gpu_name with spaces ("A100 SXM4");
+# underscore forms match nothing (the vast CLI translates them, the API doesn't).
 VAST_GPU_NAMES: dict[str, list[str]] = {
     "H200": ["H200"],
-    "H100": ["H100_SXM", "H100_PCIE", "H100_NVL"],
-    "A100": ["A100_SXM4", "A100_PCIE", "A100X"],
-    "A100-80": ["A100_SXM4", "A100_PCIE"],
-    "A6000": ["RTX_A6000"],
+    "H100": ["H100 SXM", "H100 PCIE", "H100 NVL"],
+    "A100": ["A100 SXM4", "A100 PCIE", "A100X"],
+    "A100-80": ["A100 SXM4", "A100 PCIE"],
+    "A6000": ["RTX A6000"],
     "L40": ["L40", "L40S"],
     "L4": ["L4"],
-    "V100": ["Tesla_V100"],
-    "4090": ["RTX_4090"],
-    "3090": ["RTX_3090"],
-    "5090": ["RTX_5090"],
+    "V100": ["Tesla V100"],
+    "4090": ["RTX 4090"],
+    "3090": ["RTX 3090"],
+    "5090": ["RTX 5090"],
 }
 
 
 def vast_gpu_names(gpu_type: str) -> list[str]:
-    return VAST_GPU_NAMES.get(gpu_type, [gpu_type.replace(" ", "_").replace("-", "_")])
+    return VAST_GPU_NAMES.get(gpu_type, [gpu_type.replace("_", " ").replace("-", " ")])
 
 
 def normalize_vast_gpu(name: str, gpu_ram_mb: float | None = None) -> str:
@@ -84,6 +86,10 @@ class VastBackend(MarketplaceBackend):
         }
         if res.gpu_type is not None:
             filt["gpu_name"] = {"in": vast_gpu_names(res.gpu_type)}
+            if res.gpu_type == "A100-80":
+                # cheapest-first + OFFER_LIMIT would otherwise fill the page
+                # with 40GB A100s that normalization then discards
+                filt["gpu_ram"] = {"gte": 70_000}
         elif res.min_vram_gb is not None:
             # vast reports gpu_ram in MB (verify live)
             filt["gpu_ram"] = {"gte": res.min_vram_gb * 1024}
