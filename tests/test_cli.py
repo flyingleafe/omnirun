@@ -11,7 +11,12 @@ from typing import ClassVar
 import pytest
 from typer.testing import CliRunner
 
-from omnirun.backends.base import Backend, BackendError, register  # noqa: E402
+from omnirun.backends.base import (  # noqa: E402
+    Backend,
+    BackendError,
+    ProvisioningSink,
+    register,
+)
 from omnirun.cli import app  # noqa: E402
 from omnirun.models import (  # noqa: E402
     JobHandle,
@@ -47,7 +52,12 @@ class StubBackend(Backend):
             )
         ]
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         type(self).submitted[spec.job_id] = (spec, offer)
         return JobHandle(
             backend=self.name, job_id=spec.job_id, data={"token": f"t-{spec.job_id}"}
@@ -96,11 +106,57 @@ class UnreachableBackend(Backend):
             )
         ]
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:  # pragma: no cover
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:  # pragma: no cover
         raise AssertionError("dry-run must never submit")
 
     def status(self, handle: JobHandle) -> StatusReport:  # pragma: no cover
         raise BackendError("offline")
+
+    def logs(
+        self, handle: JobHandle, follow: bool = False
+    ) -> Iterator[str]:  # pragma: no cover
+        yield ""
+
+    def cancel(self, handle: JobHandle) -> None:  # pragma: no cover
+        pass
+
+    def pull_outputs(
+        self, handle: JobHandle, dest: Path
+    ) -> list[Path]:  # pragma: no cover
+        return []
+
+
+@register("provfail")
+class ProvisionThenFailBackend(Backend):
+    """Rents a resource (emits a provisioning stub) then dies before returning a
+    handle — models an interrupted marketplace submit (issue #7)."""
+
+    def probe(self, res: ResourceSpec) -> list[Offer]:
+        return [Offer(backend=self.name, label=f"{self.name}: ok", fits=True)]
+
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
+        if on_provisioning is not None:
+            on_provisioning(
+                JobHandle(
+                    backend=self.name,
+                    job_id=spec.job_id,
+                    data={"instance_id": "inst-42", "provisioning": True},
+                )
+            )
+        raise BackendError("killed mid-provision")
+
+    def status(self, handle: JobHandle) -> StatusReport:  # pragma: no cover
+        raise BackendError("n/a")
 
     def logs(
         self, handle: JobHandle, follow: bool = False
@@ -126,6 +182,9 @@ type = "stub"
 
 [backends.offline]
 type = "unreachable"
+
+[backends.provfail]
+type = "provfail"
 """
 
 
@@ -170,6 +229,21 @@ def submit_one(*extra: str) -> str:
 
 
 # ------------------------------------------------------------------ submit
+
+
+def test_submit_interrupted_after_provision_leaves_reclaimable_stub(env):
+    """A submit that dies after renting still persists a stub record carrying the
+    instance id, so `ps`/`gc` can see and reclaim the orphan (issue #7)."""
+    result = runner.invoke(
+        app, ["submit", "--yes", "--backend", "provfail", "--", "python", "train.py"]
+    )
+    assert result.exit_code != 0  # the submit failed...
+
+    ids = JobStore().list_ids()
+    assert len(ids) == 1  # ...but a record survived
+    rec = JobStore().load(ids[0])
+    assert rec is not None and rec.handle is not None
+    assert rec.handle.data == {"instance_id": "inst-42", "provisioning": True}
 
 
 def test_submit_yes_happy_path(env):

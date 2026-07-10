@@ -22,6 +22,14 @@ class BackendError(RuntimeError):
     """Raised for backend-level failures with a user-actionable message."""
 
 
+#: Optional hook submit() calls the instant it creates a *billable* resource,
+#: before the (possibly minutes-long) wait for it to become usable. It hands the
+#: client a partial JobHandle so a recovery stub can be persisted immediately —
+#: an interrupted submit then stays visible to `ps`/`gc` instead of orphaning a
+#: running instance with no local record.
+ProvisioningSink = Callable[[JobHandle], None]
+
+
 class Backend(ABC):
     """One configured execution target (a cluster, a machine, a provider account).
 
@@ -46,7 +54,16 @@ class Backend(ABC):
     def probe(self, res: ResourceSpec) -> list[Offer]: ...
 
     @abstractmethod
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle: ...
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
+        """Run the job and return a handle. If a billable resource is created
+        before the handle is ready, call on_provisioning with a partial handle
+        first so the client can persist a recovery stub (see ProvisioningSink)."""
+        ...
 
     @abstractmethod
     def status(self, handle: JobHandle) -> StatusReport: ...

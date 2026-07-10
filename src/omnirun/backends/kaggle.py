@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from omnirun.backends.base import Backend, BackendError, register
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
 from omnirun.backends import jobdir, tarsafe
 from omnirun.bootstrap import (
     BootstrapParams,
@@ -393,7 +393,12 @@ class KaggleBackend(Backend):
             "the backend's `max_source_bytes` if Kaggle accepts more"
         )
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         api = self._api()
         user = self._username(api)
         job_id = spec.job_id

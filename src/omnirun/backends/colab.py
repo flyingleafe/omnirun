@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from omnirun.backends import jobdir, tarsafe
-from omnirun.backends.base import Backend, BackendError, register
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
@@ -329,7 +329,12 @@ class ColabBackend(Backend):
 
     # ---- submit -----------------------------------------------------------------
 
-    def submit(self, spec: JobSpec, offer: Offer) -> JobHandle:
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
         session = self._session(spec.job_id)
         job_dir = f"{COLAB_ROOT}/jobs/{spec.job_id}"
 
