@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Refuse to push a release tag whose commit does not declare a matching version.
+#
+# Installed as .git/hooks/pre-push by the devShell (see flake.nix). It inspects
+# the *pushed commit's* content (via `git show <sha>:path`), so it catches a
+# stale worktree too. CI (publish.yml) enforces the same rule server-side.
+set -euo pipefail
+
+version_at() { git show "$1:$2" | grep -m1 -E "$3" | sed -E 's/.*"([^"]+)".*/\1/'; }
+
+status=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/tags/v[0-9]*) ;;
+    *) continue ;;
+  esac
+  # Deleting a tag pushes the zero sha; nothing to check.
+  case "$local_sha" in
+    0000000000000000000000000000000000000000) continue ;;
+  esac
+
+  tag="${remote_ref#refs/tags/}"
+  pyproject="$(version_at "$local_sha" pyproject.toml '^version *= *"')"
+  init="$(version_at "$local_sha" src/omnirun/__init__.py '^__version__ *= *"')"
+
+  if [ "$tag" != "v$pyproject" ]; then
+    echo "pre-push: tag $tag != pyproject version $pyproject (commit ${local_sha:0:12})" >&2
+    status=1
+  fi
+  if [ "$pyproject" != "$init" ]; then
+    echo "pre-push: pyproject $pyproject != __init__ $init (commit ${local_sha:0:12})" >&2
+    status=1
+  fi
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "pre-push: bump the version before tagging (see scripts/check-version.sh)" >&2
+fi
+exit "$status"

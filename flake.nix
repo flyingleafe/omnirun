@@ -71,6 +71,9 @@
 
           shellHook = ''
             ${pre-commit-check.shellHook}
+            # Guard against tagging a release without bumping the version.
+            # pre-commit owns only the pre-commit hook, so pre-push is ours.
+            ln -sf "$PWD/scripts/pre-push" "$(git rev-parse --git-path hooks)/pre-push"
             export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib ]}:$LD_LIBRARY_PATH
             export UV_PYTHON=${python}/bin/python
             uv sync --quiet
