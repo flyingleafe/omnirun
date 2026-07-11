@@ -37,7 +37,7 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.providers.base import Provider
+from omnirun.providers.base import CancelMode, Provider
 from omnirun.scheduler import SchedPolicy, tick
 from omnirun.state.store import Store
 
@@ -107,6 +107,50 @@ class Control:
         )
         self._store.save_job(rec)
         return spec.job_id
+
+    # ------------------------------------------------------------------
+    # Cancellation (spec §11 invariant 5). Phase-3 minimal: best-effort
+    # reap the live placement, then mark the job CANCELLED. Phase 4
+    # deepens this to graceful→force→reap with confirmation.
+    # ------------------------------------------------------------------
+
+    def cancel(self, job_id: str, now: datetime) -> None:
+        """Cancel *job_id* — reap any live placement, then mark it CANCELLED.
+
+        Idempotent and best-effort: an unknown or already-terminal job is a
+        no-op. If the job has a live placement (a real ``handle``), its provider
+        is asked to ``cancel`` it (FORCE) so no backend instance/session is left
+        running; a provider that raises is swallowed (crash isolation — the job
+        is still marked cancelled). Because the tick only ever considers
+        QUEUED/HELD jobs and reconcile only folds PLACING/RUNNING ones, a job in
+        CANCELLED is never re-placed or resurrected by a later tick — the "even
+        racing a placement" half of the cancellation-completeness invariant.
+        """
+        rec = self._store.load_job(job_id)
+        if rec is None or rec.state.terminal:
+            return
+        # Reap any live placement best-effort, so no instance/session leaks.
+        if rec.placement is not None and rec.placement.handle:
+            provider = self._providers.get(rec.placement.provider_name)
+            if provider is not None:
+                try:
+                    provider.cancel(rec.placement, CancelMode.FORCE)
+                except Exception:
+                    # Best-effort; still mark cancelled (crash isolation).
+                    _log.warning(
+                        "cancel raised for job %s on %s; marking cancelled anyway",
+                        job_id,
+                        rec.placement.provider_name,
+                        exc_info=True,
+                    )
+        placement = rec.placement
+        if placement is not None:
+            placement = placement.model_copy(
+                update={"ended_at": now, "state": JobStatus.CANCELLED}
+            )
+        self._store.save_job(
+            rec.model_copy(update={"state": JobState.CANCELLED, "placement": placement})
+        )
 
     # ------------------------------------------------------------------
     # The tick loop (spec §7)
