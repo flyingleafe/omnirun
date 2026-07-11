@@ -92,7 +92,14 @@ class Control:
 
         Submission is pure bookkeeping — no provider is touched. The job is
         picked up (matched + placed) on the next ``run_tick``.
+
+        Raises ``ValueError`` if a job with this ``job_id`` already exists.
+        ``save_job`` is an upsert, so re-submitting a live ``job_id`` would
+        silently reset a RUNNING record back to QUEUED (losing its placement and
+        risking a double launch); refuse it instead of clobbering.
         """
+        if self._store.load_job(spec.job_id) is not None:
+            raise ValueError(f"duplicate job_id {spec.job_id!r}: already submitted")
         rec = JobRecord(
             spec=spec,
             state=JobState.QUEUED,
@@ -111,6 +118,15 @@ class Control:
         Returns the decisions produced by ``tick`` (already enacted). Reconcile
         runs *first* so any capacity freed by a job that just finished/was lost
         is visible when the tick matches this round's pending jobs.
+
+        The place/persist seam is **at-least-once**, not exactly-once: if the
+        process dies between a successful ``provider.place`` and the RUNNING
+        ``save_job`` in ``_enact_place``, the launched handle is lost. The
+        job's row is still a stub-handle PLACING, so the next reconcile reverts
+        it to QUEUED and a later tick relaunches — leaving the first launch as an
+        orphan. Closing this to exactly-once requires ``on_provisioning``
+        orphan-recovery (re-adopt a live handle before relaunching), deferred to
+        Phase 4/5.
         """
         self._reconcile(now)
         slots = self._gather_slots()
@@ -145,6 +161,15 @@ class Control:
                 continue
             # Crash isolation: reserve wrote a stub placement (empty handle) but
             # place never completed. Release the reservation back to QUEUED.
+            #
+            # This revert ASSUMES a single live tick source (direct submit, or one
+            # daemon event loop). With two overlapping ticks on one Store, tick B's
+            # reconcile could revert a stub that tick A is mid-``place`` on — the
+            # empty handle is indistinguishable from a real crash — and double-
+            # launch the job. Making concurrent ticks safe needs a lease /
+            # ``reserved_at`` min-age gate so a fresh reservation is not reverted
+            # out from under an in-flight place (Phase 5), which is out of scope
+            # here.
             if rec.state is JobState.PLACING and not placement.handle:
                 self._store.save_job(
                     rec.model_copy(
@@ -188,11 +213,11 @@ class Control:
                 placement.provider_name,
                 exc_info=True,
             )
-            self._requeue(rec)
+            self._requeue(rec, now)
             return
 
         if status.state is JobStatus.LOST:
-            self._requeue(rec)
+            self._requeue(rec, now)
             return
 
         new_state = _STATUS_TO_STATE[status.state]
@@ -220,8 +245,23 @@ class Control:
             rec.model_copy(update={"state": JobState.RUNNING, "placement": updated})
         )
 
-    def _requeue(self, rec: JobRecord) -> None:
-        """Return a lost/failed-to-poll job to QUEUED (``attempts+1``, no placement)."""
+    def _requeue(self, rec: JobRecord, now: datetime) -> None:
+        """Return a lost/failed-to-poll job to QUEUED (``attempts+1``, no placement).
+
+        If the lost placement was PAID (a ``committed`` ledger row was written for
+        it at place time — ``cost_actual is not None``), void that commitment
+        BEFORE clearing the placement: realize it to ``$0`` so the window total
+        drops by the estimate. A lost attempt is not charged — this matches the
+        scheduler's bias (a job may run late, but the ledger must never over-count
+        or refuse). Without this, the next tick re-places and writes a SECOND
+        ``committed`` row; ``ledger_realize`` on terminal only converts the
+        earliest, so the abandoned first row would linger as spend forever
+        (double-counting a job that ran once). The place()-raise ``_release`` path
+        does not need this: there ``ledger_add`` had not run yet, so its reloaded
+        placement carries ``cost_actual is None`` and the same guard skips it.
+        """
+        if rec.placement is not None and rec.placement.cost_actual is not None:
+            self._store.ledger_realize(self._budget_window, rec.spec.job_id, 0.0, now)
         self._store.save_job(
             rec.model_copy(
                 update={
@@ -306,11 +346,15 @@ class Control:
         if slot is None:
             return
         rec = self._store.load_job(decision.job_id)
-        if rec is None or rec.state is not JobState.QUEUED:
+        # A ``place`` decision is emitted for a QUEUED job OR a HELD one that has
+        # become satisfiable this round (the pure tick re-derives HELD each tick).
+        # Both are placeable now; requiring QUEUED would wedge the held job (it
+        # would get a ``place`` decision every tick yet never reserve/transition).
+        if rec is None or rec.state not in (JobState.QUEUED, JobState.HELD):
             return
-        # Atomic reserve (#12): flips the row to PLACING + stub placement. A lost
-        # race / gone capacity returns False; the job stays QUEUED, retries next
-        # tick.
+        # Atomic reserve (#12): flips the row (QUEUED/HELD) to PLACING + stub
+        # placement. A lost race / gone capacity returns False; the job keeps its
+        # current state, retries next tick.
         if not self._store.reserve(slot, rec):
             return
         provider = self._providers.get(slot.provider_name)

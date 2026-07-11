@@ -67,6 +67,12 @@ STATE_SCHEMA_VERSION = 3
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
 _ACTIVE_JOB_STATES = (_JobState.PLACING.value, _JobState.RUNNING.value)
 
+# Scheduler states from which a job may still be reserved onto a slot. A ``place``
+# decision from the pure tick is the authority that a job is placeable now, and
+# the tick emits ``place`` for either a QUEUED job or a HELD one that has become
+# satisfiable this round — so both must flip to PLACING under the reserve guard.
+_RESERVABLE_JOB_STATES = frozenset({_JobState.QUEUED, _JobState.HELD})
+
 
 class StoreError(RuntimeError):
     """Raised for state-store failures that are not plain lookups."""
@@ -336,18 +342,26 @@ class Store:
         The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly
         (including the Postgres per-provider advisory lock). Inside ONE
         ``transaction()`` we re-read the job row ``with_for_update()``, and — only
-        if the persisted record is still ``QUEUED`` and
+        if the persisted record is still placeable (``QUEUED`` or ``HELD``) and
         ``_count_active_jobs(slot.provider_name) < slot.capacity`` — flip it to
         ``PLACING`` with a fresh ``Placement`` on *slot*'s provider, UPDATEing the
         row (state/backend/data) directly on the same connection. Because the
         count and the update share the one transaction, no concurrent tick or
         machine can slip a second reservation past the cap.
 
-        *rec* must already be saved as ``QUEUED`` before ``reserve`` is called.
+        A ``HELD`` job is admissible because the pure ``tick`` re-derives HELD
+        every round from the currently-offered slots: once a fitting slot appears
+        it emits a ``place`` decision for the held job, and that decision is the
+        authority that the job is placeable *now*. Requiring QUEUED here would
+        wedge such a job forever (it stays HELD, so no reservation ever lands).
 
-        Returns ``True`` if reserved, ``False`` otherwise (missing, not
-        ``QUEUED``, or the provider's capacity is already full). Does NOT mutate
-        the caller-held *rec*; reload via ``load_job`` for the post-reserve object.
+        *rec* must already be saved as ``QUEUED``/``HELD`` before ``reserve`` is
+        called.
+
+        Returns ``True`` if reserved, ``False`` otherwise (missing, neither
+        ``QUEUED`` nor ``HELD``, or the provider's capacity is already full). Does
+        NOT mutate the caller-held *rec*; reload via ``load_job`` for the
+        post-reserve object.
         """
         job_id = rec.spec.job_id
         provider = slot.provider_name
@@ -373,7 +387,7 @@ class Store:
             if row is None:
                 return False
             current = JobRecord.model_validate(row[0])
-            if current.state is not _JobState.QUEUED:
+            if current.state not in _RESERVABLE_JOB_STATES:
                 return False
             if self._count_active_jobs(conn, provider) >= slot.capacity:
                 return False
