@@ -277,12 +277,15 @@ def test_place_submits_and_returns_placement(store: Store) -> None:
     submitted_spec, submitted_offer = backend.submitted[0]
     assert submitted_spec is rec.spec
     assert submitted_offer == backend.offer
-    # Placement carries the handle data, provider name, and the polled state.
+    # Placement carries the handle data, provider name, and the optimistic initial
+    # state (STARTING).  place() must NOT call status() — the true state is
+    # resolved by the next reconcile poll.
     assert placement.provider_name == "stub"
     assert placement.job_id == "train-abc123"
     assert placement.handle == backend.handle.data
-    assert placement.state is JobStatus.RUNNING  # from StatusReport
+    assert placement.state is JobStatus.STARTING  # optimistic; not a polled result
     assert placement.placed_at is not None
+    assert backend.status_calls == []  # place() must not call status()
 
 
 def test_place_lifts_url_handle_keys_into_links(store: Store) -> None:

@@ -34,6 +34,7 @@ from omnirun.models import (
     Cost,
     JobHandle,
     JobRecord,
+    JobStatus,
     Link,
     Offer,
     Placement,
@@ -106,12 +107,16 @@ class BackendProvider:
         """Submit *rec* onto *slot* and return the resulting ``Placement``.
 
         Reconstructs the winning ``Offer`` from ``slot.provider_ref`` (stashed in
-        ``offer``), submits it, polls once for an accurate initial state, and
-        lifts any display URLs off the handle into ``Link``s.
+        ``offer``), submits it, and lifts any display URLs off the handle into
+        ``Link``s.  The initial state is set optimistically to ``STARTING``:
+        submit() succeeded so the job is launching, and querying status immediately
+        after submit is unreliable (Slurm jobs aren't in squeue yet; marketplace
+        instances are still provisioning) — a premature LOST/absent result would
+        trigger a spurious requeue.  The true state is resolved by the next
+        reconcile poll.  STARTING never triggers a requeue.
         """
         offer = Offer.model_validate(slot.provider_ref["offer"])
         handle = self._backend.submit(rec.spec, offer)
-        report = self._backend.status(handle)
         links: list[Link] = []
         for key, value in handle.data.items():
             if isinstance(value, str) and any(
@@ -123,7 +128,7 @@ class BackendProvider:
             job_id=rec.spec.job_id,
             handle=handle.data,
             links=links,
-            state=report.status,
+            state=JobStatus.STARTING,
             placed_at=datetime.now(timezone.utc),
         )
 
