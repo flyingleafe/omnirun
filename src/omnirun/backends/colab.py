@@ -546,11 +546,11 @@ class ColabBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
-        files = [
-            f"{job_dir}/logs/bootstrap.log",
-            f"{job_dir}/logs/stdout.log",
-            f"{job_dir}/logs/stderr.log",
-        ]
+        # Read only bootstrap.log — the canonical merged log (diagnostics + the
+        # command's stdout+stderr, which the run step tees back through fd 1/2).
+        # Also reading stdout/stderr.log would double every command line; they
+        # stay on disk for `pull`. Matches jobdir.tail_logs and the Kaggle harness.
+        files = [f"{job_dir}/logs/bootstrap.log"]
         offsets = self._log_offsets.setdefault(handle.job_id, dict.fromkeys(files, 0))
         while True:
             try:

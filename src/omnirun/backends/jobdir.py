@@ -205,11 +205,13 @@ def tail_logs(
 ) -> Iterator[str]:
     """Yield merged bootstrap+stdout+stderr lines; poll-based incremental tail
     when follow=True (is_terminal: callable deciding when to stop)."""
-    files = [
-        f"{job_dir}/logs/bootstrap.log",
-        f"{job_dir}/logs/stdout.log",
-        f"{job_dir}/logs/stderr.log",
-    ]
+    # bootstrap.log is the canonical merged log: the bootstrap's diagnostics PLUS
+    # the command's stdout+stderr (the run step tees both streams back through
+    # fd 1/2, which the top-level `exec >> bootstrap.log` captures in real order).
+    # Read only it — also reading stdout/stderr.log would double every command
+    # line. Those per-stream files stay on disk for `pull`, and the Kaggle harness
+    # tails this same single file, so every backend's `logs` view is consistent.
+    files = [f"{job_dir}/logs/bootstrap.log"]
     offsets = dict.fromkeys(files, 0)
     while True:
         for f in files:

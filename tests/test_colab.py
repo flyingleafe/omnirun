@@ -325,20 +325,19 @@ def test_status_missing_job_dir_is_lost(cli, backend):
 
 
 def test_logs_incremental_offsets(cli, backend):
-    first = {
-        f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n",
-        f"{JOB_DIR}/logs/stdout.log": "out1\n",
-        f"{JOB_DIR}/logs/stderr.log": "",
-    }
+    # logs reads only bootstrap.log — the canonical merged log; the run step tees
+    # the command's stdout/stderr into it, so reading the per-stream files too
+    # would double every line.
+    first = {f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n"}
     cli.handlers["exec"] = lambda argv, stdin: (
         0,
         "OMNIRUN_LOGS " + json.dumps(first) + "\n",
         "",
     )
     handle = make_handle()
-    assert list(backend.logs(handle)) == ["line1", "line2", "out1"]
+    assert list(backend.logs(handle)) == ["line1", "line2"]
 
-    # second read sends the advanced offsets and yields nothing new
+    # second read sends the advanced offset and yields nothing new
     empty = dict.fromkeys(first, "")
     cli.handlers["exec"] = lambda argv, stdin: (
         0,
@@ -350,8 +349,6 @@ def test_logs_incremental_offsets(cli, backend):
     inner = cli.calls[-1]["stdin"].split("json.loads(", 1)[1].split(")\n", 1)[0]
     sent_offsets = json.loads(ast.literal_eval(inner))
     assert sent_offsets[f"{JOB_DIR}/logs/bootstrap.log"] == len("line1\nline2\n")
-    assert sent_offsets[f"{JOB_DIR}/logs/stdout.log"] == len("out1\n")
-    assert sent_offsets[f"{JOB_DIR}/logs/stderr.log"] == 0
 
 
 # ---- outputs / cancel / gc / check ---------------------------------------------

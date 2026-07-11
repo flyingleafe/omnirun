@@ -590,7 +590,7 @@ def test_probe_cpu_job_counts_any_idle_node():
 def test_logs_include_slurm_stderr_file():
     fake = FakeExec()
     fake.add(r"slurm-4242\.err", stdout="sbatch: error: something site-specific\n")
-    fake.add(r"tail -c \+1 .*stdout\.log", stdout="epoch 1\n")
+    fake.add(r"tail -c \+1 .*bootstrap\.log", stdout="epoch 1\n")
     lines = list(make_backend(fake).logs(HANDLE, follow=False))
     assert "sbatch: error: something site-specific" in lines
     assert "epoch 1" in lines
