@@ -73,6 +73,12 @@ COLAB_ROOT = "/content/omnirun"
 COST_NOTE = "consumes Colab compute units on paid tiers; free tier = T4 lottery"
 LOST_DETAIL = "session terminated (12h cap or idle reclaim)"
 
+# A bundle upload rides the Jupyter contents API (base64), which chokes on large
+# blobs. Fail fast above this guard instead of an opaque content-API error; a
+# code-only bundle is well under it, and a public repo clones on the worker (no
+# upload at all). Override with `max_upload_bytes`.
+COLAB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
 # Canned RUNNING status beacon: used in tests to seed a successful status read.
 # Heartbeat is ISO-format (parsed by _ts via datetime.fromisoformat), far-future
 # so it is never considered stale; exists=true, no result means RUNNING.
@@ -401,14 +407,25 @@ class ColabBackend(Backend):
                     timeout=UPLOAD_TIMEOUT_S,
                 )
                 if clone_url is None:  # private repo → upload the bundle
-                    _create_bundle(
+                    bundle = _create_bundle(
                         _local_root(spec), spec.repo.sha, local / "bundle.git"
                     )
+                    limit = int(
+                        self.config.extra("max_upload_bytes", COLAB_MAX_UPLOAD_BYTES)
+                    )
+                    size = bundle.stat().st_size
+                    if size > limit:
+                        raise BackendError(
+                            f"repo bundle is {size / 1e6:.1f} MB, over the "
+                            f"{limit / 1e6:.0f} MB Colab upload guard — push HEAD to a "
+                            "public remote so the worker clones it (no upload), or "
+                            "raise `max_upload_bytes`"
+                        )
                     self._colab(
                         "upload",
                         "-s",
                         session,
-                        str(local / "bundle.git"),
+                        str(bundle),
                         f"{job_dir}/bundle.git",
                         timeout=UPLOAD_TIMEOUT_S,
                     )

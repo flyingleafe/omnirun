@@ -217,6 +217,23 @@ def test_submit_sequence(cli, backend):
     }
 
 
+def test_submit_bundle_over_upload_guard_fails_fast(cli):
+    # bundle path (private repo, per the fake_bundle fixture) + a tiny
+    # max_upload_bytes: the guard must reject before uploading the oversized
+    # bundle, and the session must be stopped (no compute-unit leak).
+    backend = ColabBackend(
+        "colab", BackendConfig.model_validate({"type": "colab", "max_upload_bytes": 4})
+    )
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(BackendError, match="upload guard"):
+        backend.submit(spec, offer)
+    uploaded = [c["argv"][-1] for c in cli.calls if c["argv"][1:2] == ["upload"]]
+    assert f"{JOB_DIR}/bundle.git" not in uploaded
+    assert "stop" in cli.subcommands()
+
+
 def test_submit_public_repo_skips_bundle(cli, backend, monkeypatch):
     # public repo → no bundle upload; bootstrap clones the anon https url
     monkeypatch.setattr(
