@@ -194,3 +194,4 @@ class JobRecord(BaseModel):
     submitted_at: datetime | None = None
     last_status: StatusReport | None = None
     outputs_pulled_to: str | None = None
+    schema_version: int = 0  # 0 = written before state versioning; JobStore.save stamps the current version
