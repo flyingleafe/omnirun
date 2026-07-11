@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from omnirun.backends import jobdir
@@ -24,10 +24,13 @@ from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.models import (
+    Capabilities,
+    Health,
     JobHandle,
     JobSpec,
     JobStatus,
     Offer,
+    ProviderFacts,
     ResourceSpec,
     StatusReport,
     normalize_gpu_type,
@@ -47,6 +50,56 @@ QUEUED_STATES = {
 LIVE_STATES = {"RUNNING", "COMPLETING", "STAGE_OUT"}
 
 WAIT_UNKNOWN_NOTE = "queue busy — estimate unknown (backfill estimates are unreliable)"
+
+
+# --- partition / QOS parsing helpers -----------------------------------------
+
+
+def _parse_slurm_duration(s: str) -> timedelta | None:
+    """Parse a Slurm duration string (D-HH:MM:SS, HH:MM:SS, MM:SS) to timedelta.
+
+    Returns None for UNLIMITED / INFINITE / NONE / NOT_SET.
+    """
+    s = s.strip()
+    if not s or s.upper() in {"UNLIMITED", "INFINITE", "NONE", "NOT_SET"}:
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    nums = [int(x) for x in s.split(":")]
+    while len(nums) < 3:
+        nums.insert(0, 0)
+    h, m, sec = nums[-3], nums[-2], nums[-1]
+    return timedelta(days=days, hours=h, minutes=m, seconds=sec)
+
+
+def _scontrol_field(line: str, key: str) -> str | None:
+    """Extract value for *key* from a scontrol one-line output."""
+    for tok in line.split():
+        if tok.startswith(key + "="):
+            return tok[len(key) + 1 :]
+    return None
+
+
+def _parse_sinfo_gres(text: str) -> list[str]:
+    """Parse sinfo GRES output into a deduplicated list of normalised GPU types.
+
+    Each line may contain comma-separated fields like 'gpu:a100:4(S:0-1)'.
+    The string '(null)' means no GRES — returns [].
+    """
+    types: list[str] = []
+    for line in text.strip().splitlines():
+        for field in line.split(","):
+            field = field.strip()
+            if not field.startswith("gpu:"):
+                continue
+            segs = field.split(":")
+            if len(segs) >= 3:  # gpu:<type>:<count>[(S:...)]
+                t = normalize_gpu_type(segs[1])
+                if t not in types:
+                    types.append(t)
+    return types
 
 
 # --- sbatch rendering (pure, unit-testable) -----------------------------------
@@ -157,6 +210,53 @@ class SlurmBackend(Backend):
         ensure = getattr(self.exec_, "ensure_master", None)
         if ensure is not None:
             ensure(interactive=interactive)
+
+    def discover(self) -> ProviderFacts:
+        """Query the cluster for partition walltime, GRES GPU types, and QOS parallelism.
+
+        Never raises — returns UNREACHABLE facts if the host is unreachable.
+        Unknown facts stay None (never fabricated).
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            self._connect(interactive=False)
+        except Exception as e:  # discover never raises
+            return ProviderFacts(
+                backend=self.name,
+                discovered_at=now,
+                health=Health.UNREACHABLE,
+                health_detail=str(e),
+            )
+        caps = Capabilities()
+        part = self.config.partition
+        if part:
+            r = self.exec_.run(
+                f"scontrol show partition {shell_quote(part)} -o", timeout=15
+            )
+            if r.ok:
+                mt = _scontrol_field(r.stdout, "MaxTime")
+                if mt is not None:
+                    caps.max_walltime = _parse_slurm_duration(mt)
+            g = self.exec_.run(f"sinfo -p {shell_quote(part)} -h -o '%G'", timeout=15)
+            if g.ok:
+                caps.gpu_types = _parse_sinfo_gres(g.stdout)
+        qos = self.config.qos
+        if qos:
+            q = self.exec_.run(
+                f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxSubmitJobsPerUser",
+                timeout=15,
+            )
+            if q.ok:
+                field = q.stdout.strip().split("|")[0].strip()
+                if field.isdigit():
+                    caps.max_parallel_jobs = int(field)
+        return ProviderFacts(
+            backend=self.name,
+            discovered_at=now,
+            capabilities=caps,
+            health=Health.OK,
+            health_detail="ok",
+        )
 
     def _wait_key(self, gpu_type: str | None) -> str:
         return f"{self.config.partition or 'default'}:{gpu_type or 'cpu'}"
