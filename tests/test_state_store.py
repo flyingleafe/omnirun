@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect, text
 
-from omnirun.models import JobRecord, JobSpec, JobStatus, RepoRef, StatusReport
+from omnirun.models import (
+    Capabilities,
+    Health,
+    JobRecord,
+    JobSpec,
+    JobStatus,
+    ProviderFacts,
+    RepoRef,
+    StatusReport,
+)
 from omnirun.state import STATE_SCHEMA_VERSION, open_store
 from omnirun.state.store import Store
 
@@ -134,8 +144,6 @@ def test_list_job_ids(store: Store) -> None:
 
 def test_list_jobs_ordering(store: Store) -> None:
     """list_jobs returns records sorted by submitted_at, None last."""
-    from datetime import datetime, timezone
-
     rec_none = make_record("no-date")
     rec_old = make_record("old-job")
     rec_old.submitted_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -184,3 +192,55 @@ def test_wait_history_isolation(store: Store) -> None:
     assert store.median_wait_s("uni", "k1") == 100.0
     assert store.median_wait_s("rig", "k1") == 200.0
     assert store.median_wait_s("uni", "k2") == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Facts CRUD
+# ---------------------------------------------------------------------------
+
+
+def _facts(backend: str) -> ProviderFacts:
+    return ProviderFacts(
+        backend=backend,
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        capabilities=Capabilities(gpu_types=["A100-80"], max_vram_gb=80),
+        health=Health.OK,
+    )
+
+
+def test_facts_save_load_roundtrip(store: Store) -> None:
+    store.save_facts(_facts("uni"))
+    got = store.load_facts("uni")
+    assert got is not None
+    assert got.backend == "uni"
+    assert got.capabilities.gpu_types == ["A100-80"]
+    assert got.health is Health.OK
+
+
+def test_facts_load_missing_returns_none(store: Store) -> None:
+    assert store.load_facts("nope") is None
+
+
+def test_facts_list_facts_sorted_by_backend(store: Store) -> None:
+    store.save_facts(_facts("uni"))
+    store.save_facts(_facts("kaggle"))
+    names = [f.backend for f in store.list_facts()]
+    assert names == ["kaggle", "uni"]
+
+
+def test_facts_upsert_overwrites(store: Store) -> None:
+    """save_facts is idempotent — a second save with different data overwrites."""
+    store.save_facts(_facts("uni"))
+    updated = ProviderFacts(
+        backend="uni",
+        discovered_at=datetime(2026, 7, 11, 12, tzinfo=timezone.utc),
+        capabilities=Capabilities(gpu_types=["H100-80"], max_vram_gb=80),
+        health=Health.DEGRADED,
+    )
+    store.save_facts(updated)
+    got = store.load_facts("uni")
+    assert got is not None
+    assert got.health is Health.DEGRADED
+    assert got.capabilities.gpu_types == ["H100-80"]
+    # list_facts still returns exactly one entry for this backend
+    assert len(store.list_facts()) == 1

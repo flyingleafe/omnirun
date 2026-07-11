@@ -33,8 +33,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from omnirun.models import JobRecord, StatusReport
-from omnirun.state.schema import ALL_TABLES, jobs, meta, metadata, wait_samples
+from omnirun.models import JobRecord, ProviderFacts, StatusReport
+from omnirun.state.schema import ALL_TABLES, facts, jobs, meta, metadata, wait_samples
 
 # SQL era. The DB carries its own meta(schema_version) row.
 STATE_SCHEMA_VERSION = 2
@@ -295,6 +295,42 @@ class Store:
         waits = sorted(row[0] for row in rows)
         # Mirror legacy: waits[len(waits) // 2] (lower-median for even count)
         return waits[len(waits) // 2]
+
+    # ------------------------------------------------------------------
+    # Facts CRUD (mirrors FactStore)
+    # ------------------------------------------------------------------
+
+    def save_facts(self, pf: ProviderFacts) -> None:
+        """Upsert *pf* into the ``facts`` table (keyed on ``pf.backend``)."""
+        discovered_at = pf.discovered_at.isoformat()
+        health = pf.health.value
+        values: dict[str, Any] = {
+            "backend": pf.backend,
+            "discovered_at": discovered_at,
+            "ttl_s": pf.ttl_s,
+            "health": health,
+            "data": pf.model_dump(mode="json"),
+        }
+        with self.transaction() as conn:
+            self._upsert(conn, facts, ["backend"], values)
+
+    def load_facts(self, backend: str) -> ProviderFacts | None:
+        """Return ``ProviderFacts`` for *backend*, or ``None`` if not found."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(facts.c.data).where(facts.c.backend == backend)
+            ).fetchone()
+        if row is None:
+            return None
+        return ProviderFacts.model_validate(row[0])
+
+    def list_facts(self) -> list[ProviderFacts]:
+        """Return all ``ProviderFacts`` sorted by backend name."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(facts.c.data).order_by(facts.c.backend)
+            ).fetchall()
+        return [ProviderFacts.model_validate(row[0]) for row in rows]
 
 
 def open_store(url: str | None = None) -> Store:
