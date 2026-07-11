@@ -184,7 +184,6 @@ class RepoRef(BaseModel):
     sha: str
     branch: str
     slug: str  # filesystem-safe repo name, e.g. "omnirun"
-    dirty: bool = False  # true only when submitted with --dirty (sha is a wip commit)
     # Client-side only: absolute path of the local repo root at capture time, so
     # submit paths don't have to assume Path.cwd() is the repo root. Meaningless
     # on workers (the worker materializes its own tree from the sha).

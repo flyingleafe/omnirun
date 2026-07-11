@@ -300,7 +300,7 @@ remains is the three paid marketplaces (steps 6-8).
 | No RunPod proxy-ssh fallback | `runpod.py` | pods without public IP can't be reached — choose public-IP offers |
 | No retry-next-offer on create failure | `marketplace.py` | Vast "offer taken" / RunPod "no instances" = error out; re-run submit |
 | Kaggle cancel may need the website | `kaggle.py` | cancel/gc best-effort probes several client method names (no dataset lifecycle anymore — bundle is embedded in the kernel) |
-| `--dirty` runs HEAD, not your dirty tree | `repo.py` | uncommitted edits never ship; auto-wip-commit is a v1 item |
+| Dirty trees are refused, not shipped | `repo.py` | a job only runs a committed, pushed revision; commit or stash first — shipping the working tree (thin bundle) is deliberately out of scope, tracked as a separate issue |
 | Wait estimates are rough | `slurm.py`, `chooser.py` | idle-nodes / own-history / unknown; no backfill-estimate parsing |
 | Local weekly Kaggle quota tracking only | `kaggle.py` | drift vs reality if you also use Kaggle outside omnirun |
 | Colab keep-alive daemon lives on the client | `colab.py` | sleeping laptop can lose an idle session between jobs |

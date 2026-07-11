@@ -322,18 +322,12 @@ def _build_job_spec(
     outputs: list[str] | None,
     env: list[str] | None,
     push: bool,
-    dirty: bool,
 ) -> JobSpec:
     """Repo capture + defaults merge shared by `submit` and `enqueue`."""
     from omnirun import repo as repo_mod
 
     root = repo_mod.find_repo_root()
-    repo_ref = repo_mod.capture_repo_state(root, allow_dirty=dirty, auto_push=push)
-    if repo_ref.dirty:
-        console.print(
-            "[yellow]warning:[/yellow] working tree is dirty — running a wip "
-            f"commit ({repo_ref.sha[:12]}), not your last pushed revision"
-        )
+    repo_ref = repo_mod.capture_repo_state(root, auto_push=push)
 
     job_defaults = load_repo_defaults(root).get("job", {}) or {}
     res = _build_resources(
@@ -412,9 +406,6 @@ def submit(
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
-    dirty: bool = typer.Option(
-        False, "--dirty", help="Allow a dirty working tree (runs a wip commit)."
-    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -435,7 +426,6 @@ def submit(
         outputs=outputs,
         env=env,
         push=push,
-        dirty=dirty,
     )
     res = spec.resources
 
@@ -600,9 +590,6 @@ def enqueue(
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
-    dirty: bool = typer.Option(
-        False, "--dirty", help="Allow a dirty working tree (runs a wip commit)."
-    ),
     count: int = typer.Option(1, "--count", help="Enqueue N copies of the job."),
 ) -> None:
     spec = _build_job_spec(
@@ -618,7 +605,6 @@ def enqueue(
         outputs=outputs,
         env=env,
         push=push,
-        dirty=dirty,
     )
     host, port = _require_daemon()
     resp = send_request(

@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 from omnirun.models import RepoRef
@@ -31,60 +30,6 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=600,
     )
-
-
-# Identity stamped on wip commits so `git commit-tree` never fails on a repo
-# without a configured user.name/email; the commit is ephemeral anyway.
-_WIP_IDENTITY = {
-    "GIT_AUTHOR_NAME": "omnirun",
-    "GIT_AUTHOR_EMAIL": "wip@omnirun.invalid",
-    "GIT_COMMITTER_NAME": "omnirun",
-    "GIT_COMMITTER_EMAIL": "wip@omnirun.invalid",
-}
-
-
-def _wip_commit(root: Path, parent_sha: str) -> str:
-    """Create a dangling commit capturing the working tree so a `--dirty` submit
-    runs exactly what's on disk: tracked modifications, staged changes,
-    deletions, and untracked non-ignored files. The user's index, HEAD, and
-    working tree are left untouched — a scratch index is used — and gitignored
-    files (e.g. `.env`) stay out, matching a normal commit. Its parent is
-    `parent_sha` (HEAD); returns the new commit's sha."""
-    with tempfile.TemporaryDirectory() as td:
-        env = {**os.environ, **_WIP_IDENTITY, "GIT_INDEX_FILE": str(Path(td) / "index")}
-
-        def run(*args: str) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                ["git", "-C", str(root), *args],
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=600,
-            )
-
-        # Seed the scratch index from HEAD, then stage every working-tree change.
-        for step in (("read-tree", parent_sha), ("add", "-A")):
-            r = run(*step)
-            if r.returncode != 0:
-                raise RepoError(
-                    f"capturing --dirty working tree failed at `git {step[0]}`:\n"
-                    f"{r.stderr.strip()}"
-                )
-        tree = run("write-tree")
-        if tree.returncode != 0:
-            raise RepoError(
-                "capturing --dirty working tree failed at `git write-tree`:\n"
-                f"{tree.stderr.strip()}"
-            )
-        commit = run(
-            "commit-tree", tree.stdout.strip(), "-p", parent_sha, "-m", "omnirun wip"
-        )
-        if commit.returncode != 0:
-            raise RepoError(
-                "capturing --dirty working tree failed at `git commit-tree`:\n"
-                f"{commit.stderr.strip()}"
-            )
-        return commit.stdout.strip()
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -110,29 +55,26 @@ def repo_slug(remote_url: str | None, root: Path) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-.") or "repo"
 
 
-def capture_repo_state(
-    root: Path, *, allow_dirty: bool = False, auto_push: bool = False
-) -> RepoRef:
+def capture_repo_state(root: Path, *, auto_push: bool = False) -> RepoRef:
     """Snapshot the repo state a job will run against, enforcing the submit-time
-    invariants: clean working tree (unless allow_dirty) and, when an origin
-    remote exists, HEAD pushed (unless auto_push does it for us)."""
+    invariants: a clean working tree and, when an origin remote exists, HEAD
+    pushed (unless auto_push does it for us). A dirty tree is always refused —
+    a job must run a real, reproducible revision, not an on-disk snapshot."""
     st = _git(root, "status", "--porcelain")
     if st.returncode != 0:
         raise RepoError(f"not a git repository: {root} ({st.stderr.strip()})")
     lines = [ln for ln in st.stdout.splitlines() if ln.strip()]
-    untracked = [ln for ln in lines if ln.startswith("??")]
-    tracked = [ln for ln in lines if not ln.startswith("??")]
-    dirty = bool(lines)
-    if dirty and not allow_dirty:
+    if lines:
+        untracked = [ln for ln in lines if ln.startswith("??")]
+        tracked = [ln for ln in lines if not ln.startswith("??")]
         parts = []
         if tracked:
             parts.append(f"{len(tracked)} modified/staged file(s)")
         if untracked:
             parts.append(f"{len(untracked)} untracked file(s)")
         raise RepoError(
-            f"working tree at {root} is dirty ({', '.join(parts)}) — commit your "
-            "changes so the job runs a real revision, or pass --dirty to run "
-            "HEAD as-is"
+            f"working tree at {root} is dirty ({', '.join(parts)}) — commit (or "
+            "stash) your changes so the job runs a real, reproducible revision"
         )
 
     head = _git(root, "rev-parse", "HEAD")
@@ -166,19 +108,11 @@ def capture_repo_state(
                     f"run `git push origin {branch}` first or pass --push"
                 )
 
-    # A --dirty submit must run the working tree, not plain HEAD: snapshot it
-    # into a wip commit and ship that sha (pushed to refs/omnirun/<sha12> for the
-    # SSH family, bundled for notebooks). `dirty` is only true here when
-    # allow_dirty was set, else we raised above.
-    if dirty:
-        sha = _wip_commit(root, sha)
-
     return RepoRef(
         remote_url=remote_url,
         sha=sha,
         branch=branch,
         slug=repo_slug(remote_url or None, root),
-        dirty=dirty,
         local_root=str(root),
     )
 
@@ -267,11 +201,11 @@ def remote_clone_plan(ref: RepoRef, root: Path) -> str | None:
 
     Returns a url only when all three hold, so a credential-less worker clone
     cannot then fail to find the commit: (1) there's a real origin and the sha
-    is a normal pushed branch commit (not a `--dirty` wip or detached HEAD);
-    (2) that origin is anonymously public; (3) `ref.sha` is provably reachable
-    from the current remote branch tip (asked over the wire, ancestry checked
-    against our local objects). Otherwise None → bundle."""
-    if not ref.remote_url or ref.dirty or ref.branch == "detached":
+    is a normal pushed branch commit (not a detached HEAD); (2) that origin is
+    anonymously public; (3) `ref.sha` is provably reachable from the current
+    remote branch tip (asked over the wire, ancestry checked against our local
+    objects). Otherwise None → bundle."""
+    if not ref.remote_url or ref.branch == "detached":
         return None
     url = worker_clone_url(ref.remote_url)
     if url is None or not remote_is_public(ref.remote_url):

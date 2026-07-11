@@ -214,7 +214,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("omnirun.repo.find_repo_root", lambda start=None: repo_root)
     monkeypatch.setattr(
         "omnirun.repo.capture_repo_state",
-        lambda root, *, allow_dirty=False, auto_push=False: ref,
+        lambda root, *, auto_push=False: ref,
     )
     StubBackend.submitted.clear()
     StubBackend.cancelled.clear()
@@ -293,8 +293,8 @@ def test_submit_rejects_malformed_env(env):
 
 
 def test_submit_dirty_repo_error(env, monkeypatch):
-    def raise_dirty(root, *, allow_dirty=False, auto_push=False):
-        raise RepoError("working tree has uncommitted changes (use --dirty)")
+    def raise_dirty(root, *, auto_push=False):
+        raise RepoError("working tree has uncommitted changes — commit them first")
 
     monkeypatch.setattr("omnirun.repo.capture_repo_state", raise_dirty)
     result = runner.invoke(app, ["submit", "--yes", "--", "python", "train.py"])
@@ -304,21 +304,13 @@ def test_submit_dirty_repo_error(env, monkeypatch):
     assert JobStore().list_ids() == []
 
 
-def test_submit_dirty_flag_forwarded_and_warns(env, monkeypatch):
-    seen = {}
-
-    def capture(root, *, allow_dirty=False, auto_push=False):
-        seen["allow_dirty"] = allow_dirty
-        seen["auto_push"] = auto_push
-        return env.ref.model_copy(update={"dirty": True, "sha": "b" * 40})
-
-    monkeypatch.setattr("omnirun.repo.capture_repo_state", capture)
+def test_submit_rejects_dirty_flag(env):
+    # --dirty was removed: dirty trees are always refused, with no escape hatch
     result = runner.invoke(
-        app, ["submit", "--yes", "--dirty", "--push", "--", "python", "train.py"]
+        app, ["submit", "--yes", "--dirty", "--", "python", "train.py"]
     )
-    assert result.exit_code == 0, result.output
-    assert seen == {"allow_dirty": True, "auto_push": True}
-    assert "warning" in result.output and "dirty" in result.output
+    assert result.exit_code != 0
+    assert not StubBackend.submitted
 
 
 def test_submit_dry_run_prints_payload_without_submitting(env):

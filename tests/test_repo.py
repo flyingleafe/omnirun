@@ -65,10 +65,10 @@ def test_capture_clean(sample_repo: Path) -> None:
     assert ref.branch == "main"
     assert ref.slug == "sample"
     assert ref.remote_url == ""
-    assert ref.dirty is False
 
 
 def test_capture_dirty_tracked(sample_repo: Path) -> None:
+    # a dirty tree is always refused — a job must run a real, pushed revision
     (sample_repo / "job.py").write_text("changed\n")
     with pytest.raises(RepoError, match=r"modified/staged.*commit"):
         capture_repo_state(sample_repo)
@@ -78,64 +78,6 @@ def test_capture_dirty_untracked(sample_repo: Path) -> None:
     (sample_repo / "scratch.txt").write_text("wip\n")
     with pytest.raises(RepoError, match="untracked"):
         capture_repo_state(sample_repo)
-
-
-def test_capture_allow_dirty_snapshots_working_tree(sample_repo: Path) -> None:
-    """--dirty ships a wip commit whose tree is the working tree, not plain HEAD,
-    and leaves the user's HEAD/index/working tree untouched (issue #6)."""
-    head = git(sample_repo, "rev-parse", "HEAD")
-    (sample_repo / "job.py").write_text("changed\n")
-    (sample_repo / "scratch.txt").write_text("wip\n")  # untracked, non-ignored
-
-    ref = capture_repo_state(sample_repo, allow_dirty=True)
-
-    assert ref.dirty is True
-    # A real, distinct commit parented on HEAD — not HEAD itself.
-    assert ref.sha != head
-    assert git(sample_repo, "rev-parse", f"{ref.sha}^") == head
-    # The wip tree carries the uncommitted edits and the untracked file.
-    assert git(sample_repo, "show", f"{ref.sha}:job.py") == "changed"
-    assert git(sample_repo, "show", f"{ref.sha}:scratch.txt") == "wip"
-    # The user's repo is not mutated: HEAD unchanged, tree still dirty on disk.
-    assert git(sample_repo, "rev-parse", "HEAD") == head
-    assert (sample_repo / "job.py").read_text() == "changed\n"
-    assert git(sample_repo, "status", "--porcelain") != ""
-
-
-def test_capture_allow_dirty_excludes_gitignored(sample_repo: Path) -> None:
-    """A gitignored file (e.g. .env) rides out-of-band, never in the wip tree."""
-    (sample_repo / ".gitignore").write_text(".env\n")
-    git(sample_repo, "add", ".gitignore")
-    git(sample_repo, "commit", "-q", "-m", "add gitignore")
-    (sample_repo / ".env").write_text("SECRET=1\n")
-    (sample_repo / "job.py").write_text("changed\n")
-
-    ref = capture_repo_state(sample_repo, allow_dirty=True)
-
-    assert git(sample_repo, "show", f"{ref.sha}:job.py") == "changed"
-    missing = subprocess.run(
-        ["git", "-C", str(sample_repo), "cat-file", "-e", f"{ref.sha}:.env"],
-        capture_output=True,
-    )
-    assert missing.returncode != 0  # .env is absent from the wip tree
-
-
-def test_capture_allow_dirty_captures_deletion(sample_repo: Path) -> None:
-    """A deleted tracked file is absent from the wip tree."""
-    (sample_repo / "job.py").unlink()
-    ref = capture_repo_state(sample_repo, allow_dirty=True)
-    gone = subprocess.run(
-        ["git", "-C", str(sample_repo), "cat-file", "-e", f"{ref.sha}:job.py"],
-        capture_output=True,
-    )
-    assert gone.returncode != 0
-
-
-def test_capture_allow_dirty_clean_tree_is_head(sample_repo: Path) -> None:
-    """--dirty on a clean tree is a no-op: sha stays HEAD, no wip commit."""
-    ref = capture_repo_state(sample_repo, allow_dirty=True)
-    assert ref.dirty is False
-    assert ref.sha == git(sample_repo, "rev-parse", "HEAD")
 
 
 # --- pushed check ---------------------------------------------------------------
@@ -264,15 +206,6 @@ def test_remote_clone_plan_private_ships_bundle(
     monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: False)
     monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
     ref = capture_repo_state(sample_repo)
-    assert remote_clone_plan(ref, sample_repo) is None
-
-
-def test_remote_clone_plan_dirty_ships_bundle(
-    sample_repo: Path, origin: Path, monkeypatch
-) -> None:
-    monkeypatch.setattr(repo_mod, "remote_is_public", lambda _u: True)
-    monkeypatch.setattr(repo_mod, "worker_clone_url", lambda _u: str(origin))
-    ref = capture_repo_state(sample_repo).model_copy(update={"dirty": True})
     assert remote_clone_plan(ref, sample_repo) is None
 
 

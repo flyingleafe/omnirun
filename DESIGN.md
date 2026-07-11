@@ -248,8 +248,9 @@ type = "thunder"                 # TNR_API_TOKEN env
 
 ## 6. Repos & credentials
 
-Submit-time invariant: working tree clean (or `--dirty` to auto-stash-commit onto a
-`omnirun/<job_id>` ref — v1), HEAD pushed to remote (offer to push).
+Submit-time invariant: working tree clean (always enforced — a dirty tree is
+refused, with no escape hatch, so a job only ever runs a real, reproducible
+revision), HEAD pushed to remote (offer to push).
 
 Worker access to private repos — **no git credentials ever leave the laptop**:
 - **ssh/slurm/marketplace**: at submit time the client `git push`es the exact sha
@@ -266,7 +267,7 @@ Worker access to private repos — **no git credentials ever leave the laptop**:
     itself over its own internet connection from an anonymous `https://` URL — no bundle
     is shipped, no credentials are needed (`CodeSource(kind="remote")`, §3). A plan URL is
     returned only when *all* hold, else `None` (→ bundle): (a) there is a real origin
-    remote and the sha is a normal pushed **branch** commit (not `--dirty`, not detached
+    remote and the sha is a normal pushed **branch** commit (not a detached
     HEAD); (b) the origin is anonymously **public** — `remote_is_public()` checks via
     `gh repo view --json visibility` for GitHub when `gh` is present, else an
     unauthenticated `curl` smart-http probe of `<url>/info/refs?service=git-upload-pack`
@@ -385,7 +386,7 @@ decides *when* and *where*, then calls the same `Backend.submit`.
 
 ```
 omnirun submit [--name N] [--gpus 1] [--gpu-type H100 | --vram 40] [--time 15h]
-               [--backend uni] [--yes] [--max-cost 30] [--dirty] -- python train.py ...
+               [--backend uni] [--yes] [--max-cost 30] [--push] -- python train.py ...
 omnirun offers [same resource flags]      # probe & table, no submit
 omnirun ps                                # all known jobs, refreshed statuses
 omnirun status <job> | logs [-f] <job> | cancel <job> | pull <job> [dest]
