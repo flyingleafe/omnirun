@@ -16,8 +16,8 @@ so it persists with the kernel version.
 Notes:
   * The ``kaggle`` package is an optional dependency; it is imported lazily so
     unrelated commands never break (``pip install omnirun[kaggle]``).
-  * There is no quota API: the ~30 GPU-h/week budget is tracked best-effort
-    from the local JobStore (config: ``weekly_gpu_hours``).
+  * Remaining weekly GPU/TPU hours ARE queryable via KaggleApi.quota_view();
+    discover() uses it. Local job accounting is only a fallback.
 """
 
 from __future__ import annotations
@@ -42,10 +42,13 @@ from omnirun.bootstrap import (
     notebook_env_spec,
 )
 from omnirun.models import (
+    Capabilities,
+    Health,
     JobHandle,
     JobSpec,
     JobStatus,
     Offer,
+    ProviderFacts,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -235,6 +238,44 @@ class KaggleBackend(Backend):
         if not user:
             raise BackendError("could not determine kaggle username from credentials")
         return str(user)
+
+    # ---- discover ------------------------------------------------------------
+
+    def discover(self) -> ProviderFacts:
+        now = datetime.now(timezone.utc)
+        try:
+            q = self._api().quota_view()
+            remaining_h: float | None = None
+            gpu = getattr(q, "gpu_quota", None)
+            if gpu is not None:
+                remaining = gpu.total_time_allowed - gpu.time_used
+                remaining_h = max(0.0, remaining.total_seconds() / 3600.0)
+            refresh = getattr(q, "quota_refresh_time", None)
+            budget = {
+                "gpu_hours_remaining": remaining_h,
+                "refresh": refresh.isoformat() if refresh else None,
+            }
+            exhausted = remaining_h is not None and remaining_h <= 0.0
+            caps = Capabilities(
+                gpu_types=["P100", "T4"],
+                max_vram_gb=16,
+                max_walltime=timedelta(hours=11.5),
+            )
+            return ProviderFacts(
+                backend=self.name,
+                discovered_at=now,
+                capabilities=caps,
+                health=Health.DEGRADED if exhausted else Health.OK,
+                health_detail="weekly GPU quota exhausted" if exhausted else "quota ok",
+                budget_state=budget,
+            )
+        except Exception as e:  # discover never raises
+            return ProviderFacts(
+                backend=self.name,
+                discovered_at=now,
+                health=Health.UNREACHABLE,
+                health_detail=str(e),
+            )
 
     # ---- probe ---------------------------------------------------------------
 
