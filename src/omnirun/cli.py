@@ -50,6 +50,9 @@ app = typer.Typer(
 backends_app = typer.Typer(no_args_is_help=True, help="Backend management.")
 app.add_typer(backends_app, name="backends")
 
+state_app = typer.Typer(no_args_is_help=True, help="State store management.")
+app.add_typer(state_app, name="state")
+
 console = Console(highlight=False)
 
 _state: dict[str, Any] = {"config_path": None}
@@ -959,6 +962,55 @@ def config_path() -> None:
     p = _state["config_path"] or default_config_path()
     note = "exists" if Path(p).exists() else "missing — create it to configure backends"
     typer.echo(f"{p} ({note})")
+
+
+# --------------------------------------------------------------------------- state
+
+
+@state_app.command("path", help="Print the default SQLite DB URL.")
+def state_path() -> None:
+    from omnirun.state import default_db_url
+
+    typer.echo(default_db_url())
+
+
+@state_app.command("migrate", help="Import legacy JSON state into the SQL store.")
+@friendly_errors
+def state_migrate(
+    from_dir: Path = typer.Option(
+        None,
+        "--from",
+        help="Legacy JSON state directory (default: $OMNIRUN_STATE_DIR or XDG default).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Parse and count records but write nothing to the DB.",
+    ),
+) -> None:
+    from omnirun.state import default_db_url, default_store_dir, open_store
+    from omnirun.state.migrate import import_json_tree
+
+    src = from_dir if from_dir is not None else default_store_dir()
+    db_url = default_db_url()
+    # Ensure the state directory exists before SQLAlchemy tries to open the DB file.
+    default_store_dir().mkdir(parents=True, exist_ok=True)
+    store = open_store(db_url)
+    try:
+        report = import_json_tree(src, store, dry_run=dry_run)
+    finally:
+        store.close()
+
+    if dry_run:
+        console.print("[bold yellow]DRY RUN — nothing written[/bold yellow]")
+    console.print(
+        f"jobs={report.jobs}  facts={report.facts}  "
+        f"queue={report.queue}  waits={report.waits}"
+    )
+    if report.skipped:
+        console.print(f"[yellow]skipped {len(report.skipped)} file(s):[/yellow]")
+        for item in report.skipped:
+            console.print(f"  {item}")
 
 
 if __name__ == "__main__":
