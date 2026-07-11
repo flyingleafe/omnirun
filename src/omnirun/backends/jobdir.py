@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from omnirun.backends.base import BackendError
 from omnirun.bootstrap import (
@@ -22,7 +23,20 @@ from omnirun.bootstrap import (
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.models import JobSpec, JobStatus, StatusReport
 
+if TYPE_CHECKING:
+    from omnirun.config import BackendConfig
+
 POLL_INTERVAL_S = 10.0
+
+
+def _ssh_command(config: "BackendConfig") -> list[str]:
+    """The ssh program to invoke. Accepts a string ("my-ssh") or a list
+    (["my-ssh", "-F", "alt_config"]); defaults to plain ssh so a PATH wrapper
+    named `ssh` is honored."""
+    raw = config.extra("ssh_command", "ssh")
+    if isinstance(raw, str):
+        return raw.split()
+    return [str(x) for x in raw]
 
 
 def remote_root(exec_: Exec, root: str) -> str:

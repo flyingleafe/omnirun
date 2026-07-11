@@ -18,6 +18,7 @@ from pathlib import Path
 
 from omnirun.backends import jobdir
 from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
@@ -146,6 +147,9 @@ class SlurmBackend(Backend):
                 # login shell so `module`/sbatch are on PATH; override if a site's
                 # login profile is noisy or slow: [backends.x] login_shell = false
                 login_shell=self.config.extra("login_shell", True),
+                ssh_command=_ssh_command(self.config),
+                control_master=self.config.extra("control_master", True),
+                batch_mode=self.config.extra("batch_mode", True),
             )
         return self._exec
 

@@ -17,6 +17,7 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from omnirun.execlayer.base import Exec, ExecError, ExecResult, shell_quote
@@ -61,6 +62,9 @@ class SSHExec(Exec):
         extra_opts: list[str] | None = None,
         control_dir: Path | None = None,
         login_shell: bool = False,
+        ssh_command: Sequence[str] = ("ssh",),
+        control_master: bool = True,
+        batch_mode: bool = True,
     ) -> None:
         self.target = target
         self.port = port
@@ -73,6 +77,9 @@ class SSHExec(Exec):
         self.control_dir = (
             Path(control_dir) if control_dir else Path.home() / ".ssh" / "omnirun-cm"
         )
+        self.ssh_command = list(ssh_command)
+        self.control_master = control_master
+        self.batch_mode = batch_mode
 
     # --- option assembly ------------------------------------------------
 
@@ -81,6 +88,8 @@ class SSHExec(Exec):
         self.control_dir.chmod(0o700)
 
     def _control_opts(self) -> list[str]:
+        if not self.control_master:
+            return []
         return [
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={self.control_dir}/%C",
@@ -100,7 +109,8 @@ class SSHExec(Exec):
         return opts
 
     def _batch_ssh_argv(self) -> list[str]:
-        return ["ssh", "-o", "BatchMode=yes", *self._ssh_opts()]
+        batch = ["-o", "BatchMode=yes"] if self.batch_mode else []
+        return [*self.ssh_command, *batch, *self._ssh_opts()]
 
     # --- master session management ----------------------------------------
 
@@ -112,7 +122,7 @@ class SSHExec(Exec):
         """
         self._ensure_control_dir()
         check = subprocess.run(
-            ["ssh", *self._ssh_opts(), "-O", "check", self.target],
+            [*self.ssh_command, *self._ssh_opts(), "-O", "check", self.target],
             capture_output=True,
             text=True,
         )
@@ -122,7 +132,9 @@ class SSHExec(Exec):
             raise ExecError(f"ssh session to {self.target} expired — {RECONNECT_HINT}")
         # Establish the master inheriting the user's terminal so keyboard-
         # interactive auth (Duo, TOTP, passwords) works. No BatchMode here.
-        proc = subprocess.run(["ssh", *self._ssh_opts(), "-tt", self.target, "true"])
+        proc = subprocess.run(
+            [*self.ssh_command, *self._ssh_opts(), "-tt", self.target, "true"]
+        )
         if proc.returncode != 0:
             raise ExecError(
                 f"could not establish ssh connection to {self.target} "
@@ -227,7 +239,8 @@ class SSHExec(Exec):
         self._transfer(argv, f"download {self.target}:{remote} -> {local}")
 
     def _scp_opts(self) -> list[str]:
-        opts = ["-o", "BatchMode=yes", *self._control_opts()]
+        batch = ["-o", "BatchMode=yes"] if self.batch_mode else []
+        opts = [*batch, *self._control_opts()]
         if self.port is not None:
             opts += ["-P", str(self.port)]  # scp spells the port flag -P
         if self.identity:
