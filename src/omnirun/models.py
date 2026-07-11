@@ -6,7 +6,7 @@ import enum
 import re
 import secrets
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -279,3 +279,115 @@ class JobRecord(BaseModel):
     last_status: StatusReport | None = None
     outputs_pulled_to: str | None = None
     schema_version: int = 0  # 0 = written before state versioning; Store.save_job stamps the current version
+
+
+# ---------------------------------------------------------------------------
+# Phase-3 scheduler domain types
+# ---------------------------------------------------------------------------
+
+
+class Cost(BaseModel):
+    """Pricing for a slot.  ``per_hour is None`` means free (returns 0.0 from total)."""
+
+    setup: float | None = None
+    per_hour: float | None = None
+
+    def total(self, dur: timedelta | None) -> float | None:
+        """Estimated total USD for ``dur``.
+
+        * Free (``per_hour is None``) → 0.0.
+        * ``dur`` is None but slot is paid → None (unknowable).
+        * Otherwise ``(setup or 0) + per_hour * hours``.
+        """
+        if self.per_hour is None:
+            return 0.0
+        if dur is None:
+            return None
+        hours = dur.total_seconds() / 3600
+        return (self.setup or 0.0) + self.per_hour * hours
+
+
+class Availability(BaseModel):
+    """When a slot can start a job."""
+
+    kind: Literal["ready_now", "queued", "provision"] = "ready_now"
+    wait_s: float | None = None  # queued/provision wait estimate in seconds
+    note: str = ""
+
+
+class Link(BaseModel):
+    """Human-facing URL for a running job (dashboard, notebook, kernel, etc.).
+
+    DISPLAY ONLY — never used by the pure scheduler tick for decisions.
+    """
+
+    label: str
+    url: str
+
+
+class Slot(BaseModel):
+    """One concrete way to run a job, offered by a Provider.
+
+    ``provider_name`` and any ``Link`` attached to a ``Placement`` are
+    DISPLAY ONLY — ``tick`` never reads them for routing decisions.
+    Fit is determined solely by ``capabilities.satisfies(req)``.
+    """
+
+    provider_name: str  # DISPLAY ONLY
+    capabilities: Capabilities
+    cost: Cost = Field(default_factory=Cost)
+    availability: Availability = Field(default_factory=Availability)
+    capacity: int = 1  # remaining concurrent jobs this slot can accept
+    provider_ref: dict[str, Any] = Field(
+        default_factory=dict
+    )  # opaque; echoed to provider.place
+
+    def fits(self, req: ResourceSpec) -> bool:
+        """True when ``capabilities`` satisfy all requirements in ``req``."""
+        return not self.capabilities.satisfies(req)
+
+
+class JobState(str, enum.Enum):
+    """Scheduler-level lifecycle state of a job (distinct from backend ``JobStatus``)."""
+
+    QUEUED = "queued"
+    HELD = "held"  # admitted but no suitable slot found; retried each tick
+    PLACING = "placing"  # tick emitted a ``place`` Decision; provider.place in flight
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def terminal(self) -> bool:
+        return self in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED)
+
+
+class Status(BaseModel):
+    """Uniform provider → scheduler signal; wraps the backend ``JobStatus`` enum."""
+
+    state: JobStatus
+    exit_code: int | None = None
+    detail: str = ""
+
+
+class Placement(BaseModel):
+    """Record of a job placed on a specific provider slot."""
+
+    provider_name: str  # DISPLAY ONLY
+    job_id: str
+    handle: dict[str, Any] = Field(default_factory=dict)
+    links: list[Link] = Field(default_factory=list)
+    cost_actual: float | None = None
+    state: JobStatus = JobStatus.QUEUED
+    placed_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class Decision(BaseModel):
+    """Output of one ``tick`` call for a single job."""
+
+    kind: Literal["place", "hold", "requeue", "noop"]
+    job_id: str
+    slot: Slot | None = None
+    reason: str = ""
