@@ -28,7 +28,9 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    make_url,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -441,8 +443,23 @@ class Store:
 
         Returns ``True`` if the entry was reserved, ``False`` otherwise (missing,
         not ``PENDING``, or the cap is already full).
+
+        Does NOT mutate a caller-held ``QueueEntry`` (it updates the row
+        directly); reload via ``get_entry`` if you need the post-reserve object.
         """
         with self.transaction() as conn:
+            if conn.dialect.name == "postgresql":
+                # Postgres runs READ COMMITTED and the FOR UPDATE below locks only
+                # the target row, leaving the cap count (which reads OTHER rows)
+                # unlocked — so two txns reserving DIFFERENT entries on the same
+                # backend could both pass the check and over-book. Serialize
+                # reservers per-backend with a transaction-scoped advisory lock
+                # (auto-released at commit). SQLite needs none: its BEGIN IMMEDIATE
+                # already serializes the whole transaction.
+                conn.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:b))"),
+                    {"b": backend},
+                )
             # Re-read under the lock: FOR UPDATE on Postgres, a no-op clause on
             # SQLite where BEGIN IMMEDIATE already serializes the whole txn.
             row = conn.execute(
@@ -473,8 +490,22 @@ class Store:
             return True
 
 
+def _ensure_sqlite_parent(url: str) -> None:
+    """Create the parent directory for a SQLite *file* URL so ``create_engine``
+    can create the database file. No-op for ``:memory:`` and non-sqlite URLs."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return
+    db = parsed.database
+    if not db or db == ":memory:":
+        return
+    Path(db).parent.mkdir(parents=True, exist_ok=True)
+
+
 def open_store(url: str | None = None) -> Store:
-    engine = create_engine(url or default_db_url(), future=True)
+    url = url or default_db_url()
+    _ensure_sqlite_parent(url)
+    engine = create_engine(url, future=True)
     store = Store(engine)
     store.create_all()
     return store
