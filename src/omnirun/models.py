@@ -5,10 +5,13 @@ from __future__ import annotations
 import enum
 import re
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
+
+# Expected timezone for all datetime fields (e.g., ProviderFacts.discovered_at).
+_UTC = timezone.utc
 
 # Normalized GPU type names used across all backends. Backend configs map these
 # to site-/provider-specific identifiers (gres strings, RunPod gpuTypeIds, ...).
@@ -47,6 +50,9 @@ class ResourceSpec(BaseModel):
     gpus: int = 0
     gpu_type: str | None = None  # normalized name, see KNOWN_GPU_VRAM_GB
     min_vram_gb: float | None = None  # alternative to gpu_type
+    min_cuda: str | None = (
+        None  # minimum CUDA version the job's wheels need, e.g. "12.4"
+    )
     cpus: int | None = None
     mem_gb: float | None = None
     time: timedelta | None = None  # estimated duration; drives cost math + --time
@@ -72,6 +78,90 @@ class ResourceSpec(BaseModel):
         if self.gpu_type is not None:
             return KNOWN_GPU_VRAM_GB.get(self.gpu_type)
         return None
+
+
+def _cuda_tuple(v: str | float) -> tuple[int, ...]:
+    out: list[int] = []
+    for part in str(v).strip().split("."):
+        if part.isdigit():
+            out.append(int(part))
+        else:
+            break
+    return tuple(out) or (0,)
+
+
+def cuda_at_least(have: str | float | None, need: str | float | None) -> bool:
+    """True if CUDA ``have`` >= ``need``. Unknown/unparseable side -> True (don't block)."""
+    if have is None or need is None:
+        return True
+    return _cuda_tuple(have) >= _cuda_tuple(need)
+
+
+class Health(str, enum.Enum):
+    OK = "ok"
+    DEGRADED = "degraded"  # reachable but constrained (quota low, partition busy)
+    UNREACHABLE = "unreachable"
+
+
+class Capabilities(BaseModel):
+    """What a backend can offer, discovered or declared. A None/empty field is
+    'unknown' and never used to reject a job."""
+
+    gpu_types: list[str] = Field(default_factory=list)  # normalized names available
+    max_vram_gb: float | None = None
+    max_gpus_per_job: int | None = None
+    cuda_version: str | None = None  # max CUDA the host driver supports
+    max_walltime: timedelta | None = None
+    max_parallel_jobs: int | None = None
+
+    def satisfies(self, res: ResourceSpec) -> list[str]:
+        """Unfit reasons for a job with requirements ``res``; empty list = fits."""
+        reasons: list[str] = []
+        if res.gpu_type and self.gpu_types and res.gpu_type not in self.gpu_types:
+            have = ", ".join(self.gpu_types) or "none"
+            reasons.append(f"GPU {res.gpu_type} not available (offers: {have})")
+        floor = res.vram_floor_gb()
+        if (
+            floor is not None
+            and self.max_vram_gb is not None
+            and floor > self.max_vram_gb
+        ):
+            reasons.append(
+                f"needs >={floor:g}GB VRAM, max here is {self.max_vram_gb:g}GB"
+            )
+        if (
+            res.time is not None
+            and self.max_walltime is not None
+            and res.time > self.max_walltime
+        ):
+            reasons.append(f"time {res.time} exceeds max walltime {self.max_walltime}")
+        if not cuda_at_least(self.cuda_version, res.min_cuda):
+            reasons.append(f"CUDA {self.cuda_version} < required {res.min_cuda}")
+        want_gpus = res.effective_gpus()
+        if (
+            want_gpus
+            and self.max_gpus_per_job is not None
+            and want_gpus > self.max_gpus_per_job
+        ):
+            reasons.append(
+                f"wants {want_gpus} GPUs, max {self.max_gpus_per_job} per job"
+            )
+        return reasons
+
+
+class ProviderFacts(BaseModel):
+    """Discovered metadata about a backend, cached with a TTL."""
+
+    backend: str
+    discovered_at: datetime
+    ttl_s: float = 3600.0
+    capabilities: Capabilities = Field(default_factory=Capabilities)
+    health: Health = Health.OK
+    health_detail: str = ""
+    budget_state: dict[str, Any] = Field(default_factory=dict)
+
+    def is_fresh(self, now: datetime) -> bool:
+        return (now - self.discovered_at).total_seconds() < self.ttl_s
 
 
 class EnvKind(str, enum.Enum):
