@@ -103,6 +103,11 @@ as the template for any other cluster.
 - 2FA note: `omnirun backends check uni` establishes the SSH ControlMaster
   **interactively** (Duo/TOTP prompt appears there, once); all polling then
   rides that socket and fails fast with a reconnect hint when it expires.
+- ssh-wrapper note (2026-07-11): omnirun emits `-o` options in attached form
+  (`-oKEY=VALUE`) so a PATH ssh-wrapper that scans argv for the host (e.g. sshpass
+  keyed on a `#PasswordFile` in `~/.ssh/config`) still finds it — fixes the
+  `backends check` password prompt on such setups. LIVE-VERIFIED passwordless on
+  Apocrita.
 - First test: `backends check` → `omnirun submit --backend uni --time 10m --yes -- nvidia-smi`
   (or a CPU-only `hostname` job first). Also try `--dry-run` to eyeball the
   sbatch script before the real one.
@@ -216,7 +221,7 @@ module.
 - [x] Bundle delivery (private/unpushed repo): **embedded base64 in `run.py`**, no dataset — sidesteps the 409 the old dataset design hit. `dataset_create_new`/`dataset_delete` are no longer used.
 - [x] Public-repo **direct clone** (worker `git clone` over its own connection, no bundle) — **LIVE-VERIFIED**: CPU job cloned `flyingleafe/omnirun` at master tip, ran in the worktree, `proof.txt` pulled.
 - [x] Kernel-source push cap — **MEASURED**: 1 MiB (≤1 MiB accepted, ≥1.1 MiB → HTTP 400); `KAGGLE_MAX_SOURCE_BYTES` guard set to match, overridable via `max_source_bytes`.
-- [ ] `.env` injection (`ENV_B64` embedded → 0600 file → sourced) — unit-tested; not yet run live on Kaggle.
+- [x] `.env` injection (`ENV_B64` embedded → 0600 file → sourced) — **LIVE-VERIFIED (2026-07-11)**: the gitignored `.env` secret round-tripped into pulled `proof.txt` on a CPU clone-path job. Kaggle `logs` are final-dump only (`kernels_output` exposes the log once the kernel completes — no mid-run tail).
 - [x] `kernels_status` response shape + status strings (`queued/running/complete/error/cancelAcknowledged`).
 - [x] `kernels_output` kwarg + downloaded log format (`<slug>.log`).
 - [x] `enable_gpu` + `machine_shape` combo selects the shape on push (P100 confirmed).
@@ -230,7 +235,7 @@ module.
 - [x] `colab exec` stdout relay fidelity — status beacon marker lines survive verbatim.
 - [x] A `Popen(start_new_session=True)` detached bootstrap survives subsequent execs; keep-alive daemon starts from a non-interactive `colab new`.
 - [ ] Nonzero exit code from exec/download when the session is dead (we map that to LOST) — not yet observed on a real dead session.
-- [ ] Public-repo **direct clone** (worker clones over its own connection, no bundle uploaded) — unit-tested via `repo.remote_clone_plan`; not yet run live on Colab (bundle path is the one that ran live).
+- [x] Public-repo **direct clone** — **LIVE-VERIFIED (2026-07-11)**: a CPU job cloned `flyingleafe/omnirun`@a376541 on the VM, ran in the worktree, `.env` rode out-of-band (the content API carried only `bootstrap.sh` + `.env`, no bundle), `proof.txt` pulled. `logs -f` live-tails (15s poll). A pre-upload size guard (`max_upload_bytes`, default 25 MiB) now fails an oversized bundle fast instead of choking the content API.
 
 **RunPod** (`src/omnirun/backends/runpod.py`)
 - [ ] `portMappings` key shape — we read `mappings.get("22")` (string key) with an int fallback.
