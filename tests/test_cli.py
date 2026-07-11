@@ -597,3 +597,35 @@ def test_config_path_reports_existence(env):
     )
     assert result.exit_code == 0, result.output
     assert "missing" in result.output
+
+
+# ------------------------------------------------------------------ backends discover
+
+
+def test_backends_discover_populates_cache(env):
+    from omnirun.factstore import FactStore
+
+    result = runner.invoke(app, ["backends", "discover"])
+    assert result.exit_code == 0, result.output
+    facts = FactStore().load("stub")
+    assert facts is not None
+    assert facts.health.value in {"ok", "degraded", "unreachable"}
+    assert "stub" in result.output
+
+
+def test_backends_discover_named_backend(env):
+    from omnirun.factstore import FactStore
+
+    result = runner.invoke(app, ["backends", "discover", "stub"])
+    assert result.exit_code == 0, result.output
+    facts = FactStore().load("stub")
+    assert facts is not None
+    assert "stub" in result.output
+    # The other configured backends are not discovered when a name is given
+    assert FactStore().load("offline") is None
+
+
+def test_backends_discover_unknown_backend_errors(env):
+    result = runner.invoke(app, ["backends", "discover", "no-such-backend"])
+    assert result.exit_code == 1
+    assert "not configured" in result.output

@@ -25,8 +25,10 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
+from omnirun.factstore import FactStore
 from omnirun.models import (
     EnvSpec,
+    Health,
     JobHandle,
     JobRecord,
     JobSpec,
@@ -888,6 +890,48 @@ def backends_check(
     console.print(table)
     if any_failed:
         raise typer.Exit(1)
+
+
+def _health_markup(h: Health) -> str:
+    return {
+        Health.OK: "[green]ok[/green]",
+        Health.DEGRADED: "[yellow]degraded[/yellow]",
+        Health.UNREACHABLE: "[red]unreachable[/red]",
+    }[h]
+
+
+@backends_app.command(
+    "discover", help="Probe each backend's live capabilities/limits and cache them."
+)
+@friendly_errors
+def backends_discover(
+    name: str | None = typer.Argument(None, help="Discover only this backend."),
+) -> None:
+    cfg = _load_cfg()
+    sections = cfg.backends
+    if name is not None:
+        if name not in sections:
+            known = ", ".join(sorted(sections)) or "none configured"
+            raise BackendError(f"backend {name!r} is not configured (known: {known})")
+        sections = {name: sections[name]}
+    store = FactStore()
+    table = Table("backend", "health", "GPUs", "max walltime", "max parallel", "notes")
+    for nm, bcfg in sections.items():
+        if not bcfg.enabled:
+            table.add_row(nm, "disabled", "-", "-", "-", "", style="dim")
+            continue
+        facts = make_backend(nm, bcfg).discover()
+        store.save(facts)
+        c = facts.capabilities
+        table.add_row(
+            nm,
+            _health_markup(facts.health),
+            ", ".join(c.gpu_types) or "-",
+            str(c.max_walltime) if c.max_walltime is not None else "-",
+            str(c.max_parallel_jobs) if c.max_parallel_jobs is not None else "-",
+            facts.health_detail,
+        )
+    console.print(table)
 
 
 @app.command(
