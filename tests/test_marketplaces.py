@@ -297,7 +297,7 @@ def test_runpod_submit_happy_path(spec, fake_ssh, fake_stage):
 
     (ex,) = fake_ssh.instances
     assert ex.target == "root@1.2.3.4" and ex.port == 40022
-    assert "StrictHostKeyChecking=accept-new" in ex.extra_opts
+    assert "-oStrictHostKeyChecking=accept-new" in ex.extra_opts  # attached form
     assert ex.commands[0] == "true"  # ssh liveness check before staging
     assert len(fake_stage) == 1
     assert fake_stage[0]["root"] == "/root/.omnirun"

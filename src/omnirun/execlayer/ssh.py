@@ -90,13 +90,20 @@ class SSHExec(Exec):
     def _control_opts(self) -> list[str]:
         if not self.control_master:
             return []
+        # Attached `-oKEY=VALUE` (one token), never `-o KEY=VALUE` (two tokens).
+        # A user's `ssh` may be a PATH wrapper that scans argv for the target host
+        # to auto-supply auth (e.g. sshpass from a per-host ~/.ssh/config entry).
+        # Such wrappers commonly don't treat `-o` as argument-taking, so a split
+        # `-o X` makes them mistake X for the host, skip their auth path, and fall
+        # back to a bare login (→ surprise password prompt). The attached form is
+        # skipped whole by that scan and parses identically for stock OpenSSH.
         return [
-            "-o", "ControlMaster=auto",
-            "-o", f"ControlPath={self.control_dir}/%C",
-            "-o", "ControlPersist=10m",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=4",
-        ]  # fmt: skip
+            "-oControlMaster=auto",
+            f"-oControlPath={self.control_dir}/%C",
+            "-oControlPersist=10m",
+            "-oServerAliveInterval=30",
+            "-oServerAliveCountMax=4",
+        ]
 
     def _ssh_opts(self) -> list[str]:
         """All ssh options except BatchMode (interactive vs batch differ)."""
@@ -109,7 +116,8 @@ class SSHExec(Exec):
         return opts
 
     def _batch_ssh_argv(self) -> list[str]:
-        batch = ["-o", "BatchMode=yes"] if self.batch_mode else []
+        # Attached form — see _control_opts for why `-o` is never a lone token.
+        batch = ["-oBatchMode=yes"] if self.batch_mode else []
         return [*self.ssh_command, *batch, *self._ssh_opts()]
 
     # --- master session management ----------------------------------------
@@ -239,7 +247,7 @@ class SSHExec(Exec):
         self._transfer(argv, f"download {self.target}:{remote} -> {local}")
 
     def _scp_opts(self) -> list[str]:
-        batch = ["-o", "BatchMode=yes"] if self.batch_mode else []
+        batch = ["-oBatchMode=yes"] if self.batch_mode else []
         opts = [*batch, *self._control_opts()]
         if self.port is not None:
             opts += ["-P", str(self.port)]  # scp spells the port flag -P
