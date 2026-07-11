@@ -11,15 +11,15 @@ from typing import ClassVar
 import pytest
 from typer.testing import CliRunner
 
-from omnirun.backends.base import (  # noqa: E402
+from omnirun.backends.base import (
     Backend,
     BackendError,
     ProvisioningSink,
     register,
 )
-from omnirun.cli import app  # noqa: E402
-from omnirun.factstore import FactStore as _FactStore  # noqa: E402
-from omnirun.models import (  # noqa: E402
+from omnirun.cli import app
+from omnirun.factstore import FactStore as _FactStore
+from omnirun.models import (
     Capabilities as _Capabilities,
     Health as _Health,
     JobHandle,
@@ -31,8 +31,8 @@ from omnirun.models import (  # noqa: E402
     ResourceSpec,
     StatusReport,
 )
-from omnirun.repo import RepoError  # noqa: E402
-from omnirun.store import JobStore  # noqa: E402
+from omnirun.repo import RepoError
+from omnirun.store import JobStore
 
 runner = CliRunner()
 

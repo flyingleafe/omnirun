@@ -5,13 +5,10 @@ from __future__ import annotations
 import enum
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-
-# Expected timezone for all datetime fields (e.g., ProviderFacts.discovered_at).
-_UTC = timezone.utc
 
 # Normalized GPU type names used across all backends. Backend configs map these
 # to site-/provider-specific identifiers (gres strings, RunPod gpuTypeIds, ...).
@@ -50,9 +47,7 @@ class ResourceSpec(BaseModel):
     gpus: int = 0
     gpu_type: str | None = None  # normalized name, see KNOWN_GPU_VRAM_GB
     min_vram_gb: float | None = None  # alternative to gpu_type
-    min_cuda: str | None = (
-        None  # minimum CUDA version the job's wheels need, e.g. "12.4"
-    )
+    min_cuda: str | None = None  # min CUDA version, e.g. "12.4"
     cpus: int | None = None
     mem_gb: float | None = None
     time: timedelta | None = None  # estimated duration; drives cost math + --time

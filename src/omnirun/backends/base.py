@@ -110,11 +110,12 @@ class Backend(ABC):
         Default: capabilities from statically declared config GPUs, health from
         check(). Backends with queryable limits/quota override this. Must NOT raise.
         """
-        caps = Capabilities(gpu_types=[g.normalized() for g in self.config.gpus])
         try:
+            caps = Capabilities(gpu_types=[g.normalized() for g in self.config.gpus])
             detail = self.check()
             health, health_detail = Health.OK, detail
         except Exception as e:  # discover never raises
+            caps = Capabilities()
             health, health_detail = Health.UNREACHABLE, str(e)
         return ProviderFacts(
             backend=self.name,
