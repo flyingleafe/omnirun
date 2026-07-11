@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from omnirun.models import (
     RepoRef,
     StatusReport,
 )
+from omnirun.queue import QueueEntry, QueueState
 from omnirun.state import STATE_SCHEMA_VERSION, open_store
 from omnirun.state.store import Store
 
@@ -244,3 +247,172 @@ def test_facts_upsert_overwrites(store: Store) -> None:
     assert got.capabilities.gpu_types == ["H100-80"]
     # list_facts still returns exactly one entry for this backend
     assert len(store.list_facts()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Queue CRUD (mirrors the old QueueStore tests against Store)
+# ---------------------------------------------------------------------------
+
+
+def make_spec(name: str = "train") -> JobSpec:
+    return JobSpec(
+        job_id=JobSpec.make_job_id(name),
+        name=name,
+        command="python3 train.py",
+        repo=RepoRef(remote_url="", sha="a" * 40, branch="main", slug="proj"),
+    )
+
+
+def test_queue_save_get_roundtrip(store: Store) -> None:
+    entry = QueueEntry.new(make_spec("a"))
+    store.save_entry(entry)
+
+    loaded = store.get_entry(entry.qid)
+    assert loaded is not None
+    assert loaded.qid == entry.qid
+    assert loaded.spec.name == "a"
+    assert loaded.state is QueueState.PENDING
+
+    assert store.get_entry("q-missing") is None
+    assert [e.qid for e in store.load_entries()] == [entry.qid]
+
+    store.delete_entry(entry.qid)
+    assert store.get_entry(entry.qid) is None
+    assert store.load_entries() == []
+
+
+def test_queue_load_entries_sorted_by_created_at(store: Store) -> None:
+    first = QueueEntry.new(make_spec("first"))
+    time.sleep(0.002)
+    second = QueueEntry.new(make_spec("second"))
+    store.save_entry(second)
+    store.save_entry(first)
+    assert [e.spec.name for e in store.load_entries()] == ["first", "second"]
+
+
+def test_queue_save_touches_updated_at(store: Store) -> None:
+    """save_entry stamps updated_at (the touch moved off QueueStore.save)."""
+    entry = QueueEntry.new(make_spec("a"))
+    before = entry.updated_at
+    time.sleep(0.002)
+    store.save_entry(entry)
+    # save_entry mutates the passed-in entry in place...
+    assert entry.updated_at > before
+    # ...and the persisted copy carries the newer timestamp too.
+    loaded = store.get_entry(entry.qid)
+    assert loaded is not None
+    assert loaded.updated_at > before
+
+
+def test_queue_state_terminal() -> None:
+    assert QueueState.SUCCEEDED.terminal
+    assert QueueState.FAILED.terminal
+    assert QueueState.CANCELLED.terminal
+    assert not QueueState.PENDING.terminal
+    assert not QueueState.RUNNING.terminal
+    assert not QueueState.PLACING.terminal
+
+
+# ---------------------------------------------------------------------------
+# Task 4: count_active + the atomic reserve primitive (#12 double-book guard)
+# ---------------------------------------------------------------------------
+
+
+def test_count_active_ignores_terminal(store: Store) -> None:
+    for state in (QueueState.PENDING, QueueState.PLACING, QueueState.RUNNING):
+        e = QueueEntry.new(make_spec())
+        e.state = state
+        e.backend = "x"
+        store.save_entry(e)
+    for state in (QueueState.SUCCEEDED, QueueState.FAILED, QueueState.CANCELLED):
+        e = QueueEntry.new(make_spec())
+        e.state = state
+        e.backend = "x"
+        store.save_entry(e)
+    # A non-terminal entry on a different backend must not count for "x".
+    other = QueueEntry.new(make_spec())
+    other.backend = "y"
+    store.save_entry(other)
+
+    assert store.count_active("x") == 3
+    assert store.count_active("y") == 1
+    assert store.count_active("z") == 0
+
+
+def test_reserve_entry_respects_cap(store: Store) -> None:
+    entries = [QueueEntry.new(make_spec()) for _ in range(3)]
+    for e in entries:
+        store.save_entry(e)
+
+    # cap=2 -> first two reservations win, the third is refused while two active.
+    assert store.reserve_entry(entries[0].qid, "x", 2) is True
+    assert store.reserve_entry(entries[1].qid, "x", 2) is True
+    assert store.reserve_entry(entries[2].qid, "x", 2) is False
+
+    # The winners flipped to PLACING with backend set; the loser stays PENDING.
+    e0 = store.get_entry(entries[0].qid)
+    e1 = store.get_entry(entries[1].qid)
+    e2 = store.get_entry(entries[2].qid)
+    assert e0 is not None and e0.state is QueueState.PLACING and e0.backend == "x"
+    assert e1 is not None and e1.state is QueueState.PLACING and e1.backend == "x"
+    assert e2 is not None and e2.state is QueueState.PENDING and e2.backend is None
+
+    # Reserving a non-PENDING entry returns False even with headroom.
+    assert store.reserve_entry(entries[0].qid, "x", 10) is False
+
+    # Missing qid -> False (never raises).
+    assert store.reserve_entry("q-nope", "x", 10) is False
+
+
+def test_reserve_entry_race_single_winner(tmp_path: Path) -> None:
+    """Two threads contend for the LAST free slot; exactly one wins.
+
+    A file-backed SQLite DB (shared across connections) plus BEGIN IMMEDIATE
+    serializes the check-and-set. A busy_timeout on the store's connections lets
+    the loser wait for the winner to commit and then observe the cap is full,
+    returning False cleanly (never a "database is locked" exception).
+    """
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        # One slot already taken (RUNNING on "x"), cap=2 -> one slot left.
+        taken = QueueEntry.new(make_spec())
+        taken.state = QueueState.RUNNING
+        taken.backend = "x"
+        store.save_entry(taken)
+
+        a = QueueEntry.new(make_spec("a"))
+        b = QueueEntry.new(make_spec("b"))
+        store.save_entry(a)
+        store.save_entry(b)
+
+        results: dict[str, bool] = {}
+        barrier = threading.Barrier(2)
+
+        def worker(qid: str) -> None:
+            barrier.wait()  # maximize contention on the reserve txn
+            results[qid] = store.reserve_entry(qid, "x", 2)
+
+        threads = [
+            threading.Thread(target=worker, args=(a.qid,)),
+            threading.Thread(target=worker, args=(b.qid,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 2
+        assert sum(results.values()) == 1, (
+            f"expected exactly one winner for the last slot, got {results}"
+        )
+        # The winner is PLACING; the loser is still PENDING.
+        placing = [e for e in store.load_entries() if e.state is QueueState.PLACING]
+        pending = [
+            e
+            for e in store.load_entries()
+            if e.qid in (a.qid, b.qid) and e.state is QueueState.PENDING
+        ]
+        assert len(placing) == 1
+        assert len(pending) == 1
+    finally:
+        store.close()

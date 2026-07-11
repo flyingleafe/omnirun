@@ -26,6 +26,7 @@ from sqlalchemy import (
     create_engine,
     delete,
     event,
+    func,
     insert,
     select,
     update,
@@ -34,7 +35,21 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnirun.models import JobRecord, ProviderFacts, StatusReport
-from omnirun.state.schema import ALL_TABLES, facts, jobs, meta, metadata, wait_samples
+from omnirun.queue import QueueEntry, QueueState
+from omnirun.state.schema import (
+    ALL_TABLES,
+    facts,
+    jobs,
+    meta,
+    metadata,
+    queue,
+    wait_samples,
+)
+
+# Queue states that still occupy a backend slot (the cap counts these) — the
+# non-terminal states (PENDING/PLACING/RUNNING), derived from QueueState.terminal
+# so it tracks any future state additions.
+_ACTIVE_QUEUE_STATES = tuple(s.value for s in QueueState if not s.terminal)
 
 # SQL era. The DB carries its own meta(schema_version) row.
 STATE_SCHEMA_VERSION = 2
@@ -55,6 +70,14 @@ def default_db_url() -> str:
     return f"sqlite:///{default_store_dir() / 'omnirun.db'}"
 
 
+# How long a SQLite connection waits for a held write lock before giving up
+# with "database is locked". `reserve_entry` relies on this: when two threads
+# race for the last slot, the loser's ``BEGIN IMMEDIATE`` blocks here until the
+# winner commits, then proceeds and finds the cap full — returning False cleanly
+# instead of raising. Generous so real contention never surfaces as an error.
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
 def _install_sqlite_write_lock(engine: Engine) -> None:
     """Wire the standard SQLAlchemy-SQLite serialized-write recipe onto *engine*.
 
@@ -62,8 +85,11 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
     until the first write, which would let a concurrent ``reserve`` read slip
     past. We disable that implicit begin (``isolation_level = None``) and issue
     ``BEGIN IMMEDIATE`` ourselves at transaction start so ``engine.begin()``
-    acquires the reserved write lock up front. Guarded to the sqlite dialect so
-    Postgres is untouched.
+    acquires the reserved write lock up front. A ``busy_timeout`` makes a
+    contending ``BEGIN IMMEDIATE`` wait for the holder to commit rather than fail
+    immediately, so the concurrency-loser in ``reserve_entry`` serializes and
+    returns False instead of hitting "database is locked". Guarded to the sqlite
+    dialect so Postgres is untouched.
     """
 
     @event.listens_for(engine, "connect")
@@ -71,6 +97,7 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
         dbapi_connection: sqlite3.Connection, _record: object
     ) -> None:
         dbapi_connection.isolation_level = None
+        dbapi_connection.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
 
     @event.listens_for(engine, "begin")
     def _begin_immediate(conn: Connection) -> None:
@@ -331,6 +358,119 @@ class Store:
                 select(facts.c.data).order_by(facts.c.backend)
             ).fetchall()
         return [ProviderFacts.model_validate(row[0]) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Queue CRUD (mirrors QueueStore) + the atomic reserve primitive.
+    # ------------------------------------------------------------------
+
+    def _entry_values(self, e: QueueEntry) -> dict[str, Any]:
+        """The full ``queue`` row for *e* (indexed cols + the JSON blob)."""
+        return {
+            "qid": e.qid,
+            "state": e.state.value,
+            "created_at": e.created_at.isoformat(),
+            "only_backend": e.only_backend,
+            "backend": e.backend,
+            "job_id": e.job_id,
+            "data": e.model_dump(mode="json"),
+        }
+
+    def save_entry(self, e: QueueEntry) -> None:
+        """Upsert *e* into the ``queue`` table, keyed on ``qid``.
+
+        Stamps ``e.updated_at`` before writing (the touch that used to live in
+        ``QueueStore.save``). Mutates *e* in place so the caller's object matches
+        what was persisted.
+        """
+        e.updated_at = datetime.now(timezone.utc)
+        with self.transaction() as conn:
+            self._upsert(conn, queue, ["qid"], self._entry_values(e))
+
+    def get_entry(self, qid: str) -> QueueEntry | None:
+        """Return the ``QueueEntry`` for *qid*, or ``None`` if not found."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(queue.c.data).where(queue.c.qid == qid)
+            ).fetchone()
+        if row is None:
+            return None
+        return QueueEntry.model_validate(row[0])
+
+    def load_entries(self) -> list[QueueEntry]:
+        """Return all queue entries, sorted by ``created_at``."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(queue.c.data).order_by(queue.c.created_at)
+            ).fetchall()
+        return [QueueEntry.model_validate(row[0]) for row in rows]
+
+    def delete_entry(self, qid: str) -> None:
+        """Delete the queue entry *qid* (no-op if it does not exist)."""
+        with self.transaction() as conn:
+            conn.execute(delete(queue).where(queue.c.qid == qid))
+
+    def _count_active(self, conn: Connection, backend: str) -> int:
+        """Count non-terminal queue rows placed on *backend*, on *conn*.
+
+        The cap check. Shared by ``count_active`` (its own connection) and
+        ``reserve_entry`` (the reserve transaction's connection, so the
+        count-and-set is one atomic unit).
+        """
+        return conn.execute(
+            select(func.count())
+            .select_from(queue)
+            .where(queue.c.backend == backend)
+            .where(queue.c.state.in_(_ACTIVE_QUEUE_STATES))
+        ).scalar_one()
+
+    def count_active(self, backend: str) -> int:
+        """Number of non-terminal (PENDING/PLACING/RUNNING) entries on *backend*."""
+        with self._engine.connect() as conn:
+            return self._count_active(conn, backend)
+
+    def reserve_entry(self, qid: str, backend: str, cap: int) -> bool:
+        """Atomically reserve entry *qid* onto *backend* if under *cap*.
+
+        The #12 double-book guard. Inside ONE ``transaction()`` (which holds the
+        SQLite reserved write lock / lets Postgres take a ``FOR UPDATE`` row
+        lock) we re-read the entry ``with_for_update()``, then — only if it is
+        still ``PENDING`` and ``_count_active(backend) < cap`` — flip it to
+        ``PLACING`` with *backend* set, all on the same connection. Because the
+        count and the update share the one transaction, no concurrent tick or
+        machine can slip a second reservation past the cap.
+
+        Returns ``True`` if the entry was reserved, ``False`` otherwise (missing,
+        not ``PENDING``, or the cap is already full).
+        """
+        with self.transaction() as conn:
+            # Re-read under the lock: FOR UPDATE on Postgres, a no-op clause on
+            # SQLite where BEGIN IMMEDIATE already serializes the whole txn.
+            row = conn.execute(
+                select(queue.c.data).where(queue.c.qid == qid).with_for_update()
+            ).fetchone()
+            if row is None:
+                return False
+            entry = QueueEntry.model_validate(row[0])
+            if entry.state is not QueueState.PENDING:
+                return False
+            if self._count_active(backend=backend, conn=conn) >= cap:
+                return False
+
+            entry.state = QueueState.PLACING
+            entry.backend = backend
+            entry.updated_at = datetime.now(timezone.utc)
+            # UPDATE directly on this connection — NOT save_entry(), which would
+            # open a nested transaction and break atomicity.
+            conn.execute(
+                update(queue)
+                .where(queue.c.qid == qid)
+                .values(
+                    state=entry.state.value,
+                    backend=entry.backend,
+                    data=entry.model_dump(mode="json"),
+                )
+            )
+            return True
 
 
 def open_store(url: str | None = None) -> Store:
