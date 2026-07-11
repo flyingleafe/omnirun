@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import types
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
@@ -18,11 +18,15 @@ from omnirun.backends.base import (  # noqa: E402
     register,
 )
 from omnirun.cli import app  # noqa: E402
+from omnirun.factstore import FactStore as _FactStore  # noqa: E402
 from omnirun.models import (  # noqa: E402
+    Capabilities as _Capabilities,
+    Health as _Health,
     JobHandle,
     JobSpec,
     JobStatus,
     Offer,
+    ProviderFacts as _ProviderFacts,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -629,3 +633,48 @@ def test_backends_discover_unknown_backend_errors(env):
     result = runner.invoke(app, ["backends", "discover", "no-such-backend"])
     assert result.exit_code == 1
     assert "not configured" in result.output
+
+
+# ------------------------------------------------------------------ admission
+
+
+def _seed_facts(
+    caps: _Capabilities,
+    *,
+    discovered_at: datetime | None = None,
+    ttl_s: float = 3600.0,
+) -> None:
+    _FactStore().save(
+        _ProviderFacts(
+            backend="stub",
+            discovered_at=discovered_at or datetime.now(timezone.utc),
+            ttl_s=ttl_s,
+            capabilities=caps,
+            health=_Health.OK,
+        )
+    )
+
+
+def test_offer_marked_unfit_when_time_exceeds_max_walltime(env):
+    _seed_facts(_Capabilities(max_walltime=timedelta(hours=1)))
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
+    assert result.exit_code == 0, result.output
+    assert "exceeds max walltime" in result.output
+
+
+def test_offer_marked_unfit_when_cuda_too_low(env):
+    _seed_facts(_Capabilities(cuda_version="12.0"))
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--min-cuda", "12.4"])
+    assert result.exit_code == 0, result.output
+    assert "CUDA 12.0 < required 12.4" in result.output
+
+
+def test_stale_facts_do_not_block(env):
+    _seed_facts(
+        _Capabilities(max_walltime=timedelta(hours=1)),
+        discovered_at=datetime.now(timezone.utc) - timedelta(hours=10),
+        ttl_s=3600,  # facts are 10h old with a 1h TTL -> stale
+    )
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
+    assert result.exit_code == 0, result.output
+    assert "exceeds max walltime" not in result.output  # stale facts must not block

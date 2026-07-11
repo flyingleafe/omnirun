@@ -161,6 +161,7 @@ def _build_resources(
     cpus: int | None,
     mem: float | None,
     disk: float | None,
+    min_cuda: str | None = None,
 ) -> ResourceSpec:
     """Repo omnirun.toml [job.resources] defaults, CLI flags win."""
     vals = dict(defaults)
@@ -173,6 +174,7 @@ def _build_resources(
         "cpus": cpus,
         "mem_gb": mem,
         "disk_gb": disk,
+        "min_cuda": min_cuda,
     }
     vals.update({k: v for k, v in overrides.items() if v is not None})
     if time is not None:
@@ -227,6 +229,25 @@ def _make_backends(
     return backends, broken
 
 
+def _apply_admission(
+    offers: list[Offer], res: ResourceSpec, store: FactStore
+) -> list[Offer]:
+    """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
+    Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
+    now = datetime.now(timezone.utc)
+    for o in offers:
+        if not o.fits:
+            continue
+        facts = store.load(o.backend)
+        if facts is None or not facts.is_fresh(now):
+            continue
+        reasons = facts.capabilities.satisfies(res)
+        if reasons:
+            o.fits = False
+            o.unfit_reasons.extend(reasons)
+    return offers
+
+
 def _probe(
     cfg: Config, res: ResourceSpec, only: str | None
 ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
@@ -235,6 +256,7 @@ def _probe(
         chooser.gather_offers(backends, res, timeout_s=cfg.policy.probe_timeout_s)
         + broken
     )
+    offers = _apply_admission(offers, res, FactStore())
     ranked = chooser.rank(offers, res, cfg.policy)
     unfit = [o for o in offers if not o.fits]
     return backends, ranked, unfit
@@ -296,6 +318,7 @@ def _build_job_spec(
     cpus: int | None,
     mem: float | None,
     disk: float | None,
+    min_cuda: str | None = None,
     outputs: list[str] | None,
     env: list[str] | None,
     push: bool,
@@ -322,6 +345,7 @@ def _build_job_spec(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
     )
     env_vars = dict(job_defaults.get("env_vars", {}) or {})
     env_vars.update(_parse_env(env or []))
@@ -367,6 +391,9 @@ def submit(
     cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
     mem: float | None = typer.Option(None, "--mem", help="RAM in GB."),
     disk: float | None = typer.Option(None, "--disk", help="Disk in GB."),
+    min_cuda: str | None = typer.Option(
+        None, "--min-cuda", help="Require host CUDA >= this (e.g. 12.4)."
+    ),
     outputs: list[str] | None = typer.Option(
         None, "--outputs", help="Output glob relative to repo root (repeatable)."
     ),
@@ -404,6 +431,7 @@ def submit(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
         outputs=outputs,
         env=env,
         push=push,
@@ -491,6 +519,9 @@ def offers(
     cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
     mem: float | None = typer.Option(None, "--mem", help="RAM in GB."),
     disk: float | None = typer.Option(None, "--disk", help="Disk in GB."),
+    min_cuda: str | None = typer.Option(
+        None, "--min-cuda", help="Require host CUDA >= this (e.g. 12.4)."
+    ),
     backend: str | None = typer.Option(
         None, "--backend", help="Restrict to one configured backend."
     ),
@@ -504,6 +535,7 @@ def offers(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
     )
     cfg = _load_cfg()
     _, ranked, unfit = _probe(cfg, res, backend)
