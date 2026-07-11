@@ -73,6 +73,14 @@ COLAB_ROOT = "/content/omnirun"
 COST_NOTE = "consumes Colab compute units on paid tiers; free tier = T4 lottery"
 LOST_DETAIL = "session terminated (12h cap or idle reclaim)"
 
+# Canned RUNNING status beacon: used in tests to seed a successful status read.
+# Heartbeat is ISO-format (parsed by _ts via datetime.fromisoformat), far-future
+# so it is never considered stale; exists=true, no result means RUNNING.
+COLAB_RUNNING_BEACON = (
+    'OMNIRUN_STATUS {"exists": true, "phase": "run",'
+    ' "heartbeat": "9999-12-31T23:59:59+00:00", "result": null}'
+)
+
 DEFAULT_TIMEOUT_S = 60.0
 PROVISION_TIMEOUT_S = 600.0
 UPLOAD_TIMEOUT_S = 600.0
@@ -449,19 +457,12 @@ class ColabBackend(Backend):
 
     # ---- status ------------------------------------------------------------------
 
-    def status(self, handle: JobHandle) -> StatusReport:
-        if cached := self._terminal.get(handle.job_id):
-            return cached
-        try:
-            out = self._colab(
-                "exec",
-                "-s",
-                handle.data["session"],
-                stdin=_status_snippet(handle.data["job_dir"]),
-                timeout=EXEC_TIMEOUT_S,
-            )
-        except BackendError as e:
-            return StatusReport(status=JobStatus.LOST, detail=f"{LOST_DETAIL}: {e}")
+    def _parse_status_output(self, out: str) -> StatusReport:
+        """Parse the raw output of a status-beacon exec into a StatusReport.
+
+        Preserves all existing behaviour: missing marker -> LOST,
+        unparseable JSON -> LOST, otherwise delegates to _derive.
+        """
         raw = _marker_line(out, "OMNIRUN_STATUS ")
         if raw is None:
             return StatusReport(
@@ -474,14 +475,34 @@ class ColabBackend(Backend):
             return StatusReport(
                 status=JobStatus.LOST, detail="unparseable status beacon"
             )
-        report = self._derive(blob)
-        if report.status in (
-            JobStatus.SUCCEEDED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        ):
-            self._terminal[handle.job_id] = report
-        return report
+        return self._derive(blob)
+
+    def status(self, handle: JobHandle) -> StatusReport:
+        if cached := self._terminal.get(handle.job_id):
+            return cached
+        attempts = int(self.config.extra("status_retries", 2)) + 1
+        last_err: Exception | None = None
+        for _ in range(attempts):
+            try:
+                out = self._colab(
+                    "exec",
+                    "-s",
+                    handle.data["session"],
+                    stdin=_status_snippet(handle.data["job_dir"]),
+                    timeout=EXEC_TIMEOUT_S,
+                )
+            except Exception as e:  # transient churn — retry before concluding LOST
+                last_err = e
+                continue
+            report = self._parse_status_output(out)
+            if report.status in (
+                JobStatus.SUCCEEDED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            ):
+                self._terminal[handle.job_id] = report
+            return report
+        return StatusReport(status=JobStatus.LOST, detail=f"{LOST_DETAIL}: {last_err}")
 
     @staticmethod
     def _derive(blob: dict[str, Any]) -> StatusReport:
