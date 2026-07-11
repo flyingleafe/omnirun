@@ -282,11 +282,14 @@ class KaggleBackend(Backend):
     def _weekly_gpu_hours_used(self) -> float:
         """Best-effort sum of this week's kaggle GPU job durations (no quota API)."""
         try:
-            from omnirun.store import JobStore
+            from omnirun.state import default_db_url, open_store
 
             cutoff = datetime.now(timezone.utc) - timedelta(days=7)
             used = 0.0
-            for rec in JobStore().list_records():
+            store = open_store(default_db_url())
+            records = store.list_jobs()
+            store.close()
+            for rec in records:
                 if rec.handle is None or rec.handle.backend != self.name:
                     continue
                 if not rec.spec.resources.wants_gpu():

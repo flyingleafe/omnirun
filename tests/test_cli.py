@@ -18,7 +18,6 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.cli import app
-from omnirun.factstore import FactStore as _FactStore
 from omnirun.models import (
     Capabilities as _Capabilities,
     Health as _Health,
@@ -32,9 +31,15 @@ from omnirun.models import (
     StatusReport,
 )
 from omnirun.repo import RepoError
-from omnirun.store import JobStore
+from omnirun.state import Store, default_db_url, open_store
 
 runner = CliRunner()
+
+
+def _store() -> Store:
+    """Open the same SQL state store the CLI uses (default DB under
+    ``$OMNIRUN_STATE_DIR``, which the ``env`` fixture points at a tmp dir)."""
+    return open_store(default_db_url())
 
 
 @register("stub")
@@ -227,7 +232,7 @@ def submit_one(*extra: str) -> str:
     """Submit a job through the CLI and return its job_id."""
     result = runner.invoke(app, ["submit", "--yes", *extra, "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
-    ids = JobStore().list_ids()
+    ids = _store().list_job_ids()
     assert len(ids) == 1
     return ids[0]
 
@@ -243,9 +248,9 @@ def test_submit_interrupted_after_provision_leaves_reclaimable_stub(env):
     )
     assert result.exit_code != 0  # the submit failed...
 
-    ids = JobStore().list_ids()
+    ids = _store().list_job_ids()
     assert len(ids) == 1  # ...but a record survived
-    rec = JobStore().load(ids[0])
+    rec = _store().load_job(ids[0])
     assert rec is not None and rec.handle is not None
     assert rec.handle.data == {"instance_id": "inst-42", "provisioning": True}
 
@@ -257,14 +262,14 @@ def test_submit_yes_happy_path(env):
     )
     assert result.exit_code == 0, result.output
 
-    ids = JobStore().list_ids()
+    ids = _store().list_job_ids()
     assert len(ids) == 1
     job_id = ids[0]
     assert job_id.startswith("python-")
     assert job_id in result.output
     assert "omnirun logs -f" in result.output
 
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None
     assert rec.handle is not None and rec.handle.data["token"] == f"t-{job_id}"
     assert rec.offer is not None and rec.offer.backend == "stub"
@@ -301,7 +306,7 @@ def test_submit_dirty_repo_error(env, monkeypatch):
     assert result.exit_code == 1
     assert "uncommitted changes" in result.output
     assert not StubBackend.submitted
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_rejects_dirty_flag(env):
@@ -322,7 +327,7 @@ def test_submit_dry_run_prints_payload_without_submitting(env):
     assert "python train.py" in result.output
     assert "dry run" in result.output
     assert not StubBackend.submitted
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_dry_run_offline_backend_skips_probe(env):
@@ -335,7 +340,7 @@ def test_submit_dry_run_offline_backend_skips_probe(env):
     assert result.exit_code == 0, result.output
     assert "#!/usr/bin/env bash" in result.output
     assert "python train.py" in result.output
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_backend_restriction(env):
@@ -371,7 +376,7 @@ cost_per_hour = 1.0
     assert "pick an offer #" in result.output
     [(job_id, (_, offer))] = StubBackend.submitted.items()
     assert offer.backend == "cheap"
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.offer is not None
     assert rec.offer.backend == "cheap"
 
@@ -459,7 +464,7 @@ def test_ps_lists_and_persists_refreshed_status(env):
     assert job_id in result.output
     assert "running" in result.output
     assert "python train.py" in result.output
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.RUNNING
 
@@ -513,7 +518,7 @@ def test_cancel_updates_store(env):
     result = runner.invoke(app, ["cancel", job_id])
     assert result.exit_code == 0, result.output
     assert StubBackend.cancelled == [job_id]
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.CANCELLED
 
@@ -524,7 +529,7 @@ def test_pull_outputs(env, tmp_path):
     result = runner.invoke(app, ["pull", job_id, str(dest)])
     assert result.exit_code == 0, result.output
     assert (dest / "result.txt").read_text() == "42"
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.outputs_pulled_to == str(dest)
 
 
@@ -545,7 +550,7 @@ def test_gc_skips_non_terminal_unless_all(env):
     assert "1 cleaned" in result.output
     # a still-live job is cancelled (best-effort) before its resources are reaped
     assert StubBackend.cancelled == [job_id]
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.LOST
 
@@ -561,7 +566,7 @@ def test_gc_all_tolerates_cancel_failure(env, monkeypatch):
     result = runner.invoke(app, ["gc", "--all"])
     assert result.exit_code == 0, result.output
     assert "1 cleaned" in result.output  # gc proceeded despite the failed cancel
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.LOST
 
@@ -599,26 +604,22 @@ def test_config_path_reports_existence(env):
 
 
 def test_backends_discover_populates_cache(env):
-    from omnirun.factstore import FactStore
-
     result = runner.invoke(app, ["backends", "discover"])
     assert result.exit_code == 0, result.output
-    facts = FactStore().load("stub")
+    facts = _store().load_facts("stub")
     assert facts is not None
     assert facts.health.value in {"ok", "degraded", "unreachable"}
     assert "stub" in result.output
 
 
 def test_backends_discover_named_backend(env):
-    from omnirun.factstore import FactStore
-
     result = runner.invoke(app, ["backends", "discover", "stub"])
     assert result.exit_code == 0, result.output
-    facts = FactStore().load("stub")
+    facts = _store().load_facts("stub")
     assert facts is not None
     assert "stub" in result.output
     # The other configured backends are not discovered when a name is given
-    assert FactStore().load("offline") is None
+    assert _store().load_facts("offline") is None
 
 
 def test_backends_discover_unknown_backend_errors(env):
@@ -636,7 +637,7 @@ def _seed_facts(
     discovered_at: datetime | None = None,
     ttl_s: float = 3600.0,
 ) -> None:
-    _FactStore().save(
+    _store().save_facts(
         _ProviderFacts(
             backend="stub",
             discovered_at=discovered_at or datetime.now(timezone.utc),

@@ -30,7 +30,7 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
-from omnirun.store import JobStore
+from omnirun.state import default_db_url, open_store
 
 JOB_ID = "train-abc123"
 SHA = "a" * 40
@@ -280,7 +280,7 @@ def _store_gpu_job(hours: float) -> None:
             finished_at=now,
         ),
     )
-    JobStore().save(rec)
+    open_store(default_db_url()).save_job(rec)
 
 
 def test_probe_quota_exhausted_makes_gpu_offers_unfit(backend):

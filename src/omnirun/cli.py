@@ -25,7 +25,6 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
-from omnirun.factstore import FactStore
 from omnirun.models import (
     EnvSpec,
     Health,
@@ -38,7 +37,7 @@ from omnirun.models import (
     StatusReport,
 )
 from omnirun.queue import QueueState
-from omnirun.store import JobStore
+from omnirun.state import Store, open_store
 
 app = typer.Typer(
     name="omnirun",
@@ -233,7 +232,7 @@ def _make_backends(
 
 
 def _apply_admission(
-    offers: list[Offer], res: ResourceSpec, store: FactStore
+    offers: list[Offer], res: ResourceSpec, store: Store
 ) -> list[Offer]:
     """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
     Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
@@ -241,7 +240,7 @@ def _apply_admission(
     for o in offers:
         if not o.fits:
             continue
-        facts = store.load(o.backend)
+        facts = store.load_facts(o.backend)
         if facts is None or not facts.is_fresh(now):
             continue
         reasons = facts.capabilities.satisfies(res)
@@ -259,7 +258,11 @@ def _probe(
         chooser.gather_offers(backends, res, timeout_s=cfg.policy.probe_timeout_s)
         + broken
     )
-    offers = _apply_admission(offers, res, FactStore())
+    store = open_store(cfg.state.resolved_url())
+    try:
+        offers = _apply_admission(offers, res, store)
+    finally:
+        store.close()
     ranked = chooser.rank(offers, res, cfg.policy)
     unfit = [o for o in offers if not o.fits]
     return backends, ranked, unfit
@@ -275,7 +278,7 @@ def _backend_for(cfg: Config, name: str) -> Backend:
 
 
 def _refresh_status(
-    store: JobStore, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
+    store: Store, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
 ) -> StatusReport | None:
     """Refresh a non-terminal record's status via its backend; persist it.
     Returns the (possibly stale) best-known report, None if never had one."""
@@ -289,7 +292,7 @@ def _refresh_status(
         report = cache[name].status(rec.handle)
     except Exception:
         return st  # tolerate: unreachable backend must not break `ps`
-    store.update_status(rec.spec.job_id, report)
+    store.update_job_status(rec.spec.job_id, report)
     return report
 
 
@@ -475,14 +478,14 @@ def submit(
         _render_payload(backend_obj, spec, picked.offer)
         return
 
-    store = JobStore()
+    store = open_store(cfg.state.resolved_url())
     picked_offer = picked.offer
 
     def _persist(h: JobHandle) -> None:
         # Called once with a provisioning stub (if the backend rents something
         # before the handle is ready) and again with the final handle, so an
         # interrupted submit still leaves a reclaimable record (#7).
-        store.save(
+        store.save_job(
             JobRecord(
                 spec=spec,
                 handle=h,
@@ -703,12 +706,12 @@ def _queue_wait(host: str, port: int) -> None:
 @app.command(help="List all known jobs with refreshed statuses.")
 @friendly_errors
 def ps() -> None:
-    store = JobStore()
-    records = store.list_records()
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    records = store.list_jobs()
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
-    cfg = _load_cfg()
     cache: dict[str, Backend] = {}
     now = datetime.now(timezone.utc)
 
@@ -740,14 +743,14 @@ def ps() -> None:
 @app.command(help="Refresh and show one job's details (accepts a unique id prefix).")
 @friendly_errors
 def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
     cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
     st = rec.last_status
     if rec.handle is not None and (st is None or not st.status.terminal):
         be = _backend_for(cfg, rec.handle.backend)
         st = be.status(rec.handle)
-        store.update_status(rec.spec.job_id, st)
+        store.update_job_status(rec.spec.job_id, st)
 
     rows: list[tuple[str, str]] = [
         ("job", rec.spec.job_id),
@@ -786,10 +789,11 @@ def logs(
         False, "--follow", "-f", help="Tail until the job finishes."
     ),
 ) -> None:
-    rec = JobStore().resolve(job)
+    cfg = _load_cfg()
+    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
     if rec.handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
-    be = _backend_for(_load_cfg(), rec.handle.backend)
+    be = _backend_for(cfg, rec.handle.backend)
     for line in be.logs(rec.handle, follow=follow):
         typer.echo(line.rstrip("\n"))
 
@@ -797,15 +801,16 @@ def logs(
 @app.command(help="Cancel a running job.")
 @friendly_errors
 def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
     if rec.handle is None:
         raise BackendError(
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
-    be = _backend_for(_load_cfg(), rec.handle.backend)
+    be = _backend_for(cfg, rec.handle.backend)
     be.cancel(rec.handle)
-    store.update_status(
+    store.update_job_status(
         rec.spec.job_id,
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
     )
@@ -820,15 +825,16 @@ def pull(
         None, help="Destination dir (default: ./omnirun-outputs/<job_id>)."
     ),
 ) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
     if rec.handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
     dest = dest or Path("omnirun-outputs") / rec.spec.job_id
-    be = _backend_for(_load_cfg(), rec.handle.backend)
+    be = _backend_for(cfg, rec.handle.backend)
     paths = be.pull_outputs(rec.handle, dest)
     rec.outputs_pulled_to = str(dest)
-    store.save(rec)
+    store.save_job(rec)
     console.print(f"pulled {len(paths)} path(s) to {dest}")
 
 
@@ -839,10 +845,10 @@ def gc(
         False, "--all", help="Also gc non-terminal jobs (they are marked LOST)."
     ),
 ) -> None:
-    store = JobStore()
     cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
     cleaned = failed = skipped = 0
-    for rec in store.list_records():
+    for rec in store.list_jobs():
         st = rec.last_status
         terminal = st is not None and st.status.terminal
         if rec.handle is None:
@@ -864,7 +870,7 @@ def gc(
             continue
         cleaned += 1
         if not terminal:
-            store.update_status(
+            store.update_job_status(
                 rec.spec.job_id,
                 StatusReport(status=JobStatus.LOST, detail="reaped by gc --all"),
             )
@@ -935,14 +941,14 @@ def backends_discover(
             known = ", ".join(sorted(sections)) or "none configured"
             raise BackendError(f"backend {name!r} is not configured (known: {known})")
         sections = {name: sections[name]}
-    store = FactStore()
+    store = open_store(cfg.state.resolved_url())
     table = Table("backend", "health", "GPUs", "max walltime", "max parallel", "notes")
     for nm, bcfg in sections.items():
         if not bcfg.enabled:
             table.add_row(nm, "disabled", "-", "-", "-", "", style="dim")
             continue
         facts = make_backend(nm, bcfg).discover()
-        store.save(facts)
+        store.save_facts(facts)
         c = facts.capabilities
         table.add_row(
             nm,
@@ -988,14 +994,12 @@ def state_migrate(
         help="Parse and count records but write nothing to the DB.",
     ),
 ) -> None:
-    from omnirun.state import default_db_url, default_store_dir, open_store
+    from omnirun.state import default_store_dir
     from omnirun.state.migrate import import_json_tree
 
     src = from_dir if from_dir is not None else default_store_dir()
-    db_url = default_db_url()
-    # Ensure the state directory exists before SQLAlchemy tries to open the DB file.
-    default_store_dir().mkdir(parents=True, exist_ok=True)
-    store = open_store(db_url)
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
     try:
         report = import_json_tree(src, store, dry_run=dry_run)
     finally:

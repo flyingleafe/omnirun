@@ -36,7 +36,7 @@ from omnirun.models import (
     normalize_gpu_type,
 )
 from omnirun.repo import local_root_of
-from omnirun.store import JobStore
+from omnirun.state import default_db_url, open_store
 
 # Slurm states that mean "not started yet" / "still occupying a slot".
 QUEUED_STATES = {
@@ -326,7 +326,11 @@ class SlurmBackend(Backend):
         except Exception:
             pass
         try:
-            median = JobStore().median_wait_s(self.name, self._wait_key(res.gpu_type))
+            store = open_store(default_db_url())
+            try:
+                median = store.median_wait_s(self.name, self._wait_key(res.gpu_type))
+            finally:
+                store.close()
         except Exception:
             median = None
         if median is not None:
@@ -554,7 +558,11 @@ class SlurmBackend(Backend):
             if wait_s < 0:
                 return
             key = handle.data.get("wait_key") or self._wait_key(None)
-            JobStore().record_wait(self.name, key, wait_s)
+            store = open_store(default_db_url())
+            try:
+                store.record_wait(self.name, key, wait_s)
+            finally:
+                store.close()
         except Exception:
             pass
 

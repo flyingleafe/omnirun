@@ -1,8 +1,8 @@
 """Long-lived localhost scheduler daemon.
 
-Owns the durable queue (QueueStore) and spreads its jobs across the configured
-backends, honoring each backend's ``max_parallel`` cap and backfilling as jobs
-finish. Clients talk to it over a tiny line-oriented JSON protocol: one JSON
+Owns the durable queue (the SQL ``Store``) and spreads its jobs across the
+configured backends, honoring each backend's ``max_parallel`` cap and
+backfilling as jobs finish. Clients talk to it over a tiny line-oriented JSON protocol: one JSON
 object per line each way.
 
 No warm-worker reuse yet — every placement is a plain one-shot ``backend.submit``
@@ -34,8 +34,8 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
-from omnirun.queue import QueueEntry, QueueState, QueueStore
-from omnirun.store import JobStore, default_store_dir
+from omnirun.queue import QueueEntry, QueueState
+from omnirun.state import Store, default_store_dir, open_store
 
 BackendFactory = Callable[[str, Any], Backend]
 
@@ -121,8 +121,17 @@ class Daemon:
         self._backend_cache: dict[str, Backend] | None = None
         self._offer_cache: dict[tuple[str, str], tuple[float, list[Offer]]] = {}
 
-        self._store = QueueStore(self.state_root)
-        self._jobstore = JobStore(self.state_root)
+        # One Store for the whole daemon (queue + job persistence). An explicit
+        # state_dir (tests, or a caller relocating the daemon's state home) puts
+        # the SQLite DB there; otherwise honor the configured state URL (which
+        # may be Postgres). daemon.json still tracks the liveness address under
+        # state_root regardless.
+        db_url = (
+            f"sqlite:///{self.state_root / 'omnirun.db'}"
+            if state_dir is not None
+            else cfg.state.resolved_url()
+        )
+        self._store: Store = open_store(db_url)
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="omnirun-submit"
@@ -175,11 +184,11 @@ class Daemon:
     def _recover_placing(self) -> None:
         """A crash mid-place leaves PLACING entries; re-place them."""
         with self._lock:
-            for entry in self._store.load_all():
+            for entry in self._store.load_entries():
                 if entry.state == QueueState.PLACING:
                     entry.state = QueueState.PENDING
                     entry.backend = None
-                    self._store.save(entry)
+                    self._store.save_entry(entry)
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -249,7 +258,7 @@ class Daemon:
 
     def _cmd_ping(self, _req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
         pending = sum(
             e.state in (QueueState.PENDING, QueueState.PLACING) for e in entries
         )
@@ -274,19 +283,19 @@ class Daemon:
                     update={"job_id": JobSpec.make_job_id(spec.name)}
                 )
                 entry = QueueEntry.new(job_spec, only_backend=only_backend)
-                self._store.save(entry)
+                self._store.save_entry(entry)
                 qids.append(entry.qid)
         return {"ok": True, "qids": qids}
 
     def _cmd_list(self, _req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
         return {"ok": True, "entries": [e.model_dump(mode="json") for e in entries]}
 
     def _cmd_cancel(self, req: dict[str, Any]) -> dict[str, Any]:
         qid = req.get("qid")
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
             targets = entries if qid == "all" else [e for e in entries if e.qid == qid]
             backends = self._get_backends()
             cancelled = 0
@@ -294,14 +303,14 @@ class Daemon:
                 if entry.state.terminal:
                     continue
                 if entry.state == QueueState.RUNNING and entry.job_id and entry.backend:
-                    rec = self._jobstore.load(entry.job_id)
+                    rec = self._store.load_job(entry.job_id)
                     be = backends.get(entry.backend)
                     if rec is not None and rec.handle is not None and be is not None:
                         try:
                             be.cancel(rec.handle)
                         except Exception:
                             pass
-                        self._jobstore.update_status(
+                        self._store.update_job_status(
                             entry.job_id,
                             StatusReport(
                                 status=JobStatus.CANCELLED,
@@ -309,7 +318,7 @@ class Daemon:
                             ),
                         )
                 entry.state = QueueState.CANCELLED
-                self._store.save(entry)
+                self._store.save_entry(entry)
                 cancelled += 1
         return {"ok": True, "cancelled": cancelled}
 
@@ -334,12 +343,12 @@ class Daemon:
 
     def _refresh_running(self) -> None:
         backends = self._get_backends()
-        for entry in self._store.load_all():
+        for entry in self._store.load_entries():
             if entry.state != QueueState.RUNNING:
                 continue
             if not entry.job_id or not entry.backend:
                 continue
-            rec = self._jobstore.load(entry.job_id)
+            rec = self._store.load_job(entry.job_id)
             be = backends.get(entry.backend)
             if rec is None or rec.handle is None or be is None:
                 continue
@@ -347,14 +356,14 @@ class Daemon:
                 report = be.status(rec.handle)
             except Exception:
                 continue  # tolerate transient backend errors; retry next tick
-            self._jobstore.update_status(entry.job_id, report)
+            self._store.update_job_status(entry.job_id, report)
             if report.status.terminal:
                 if report.status == JobStatus.SUCCEEDED:
                     entry.state = QueueState.SUCCEEDED
                 else:
                     entry.state = QueueState.FAILED
                     entry.error = report.detail or report.status.value
-                self._store.save(entry)
+                self._store.save_entry(entry)
 
     def _running_counts(self, entries: list[QueueEntry]) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -365,7 +374,7 @@ class Daemon:
 
     def _place_pending(self) -> None:
         backends = self._get_backends()
-        entries = self._store.load_all()  # sorted oldest-first
+        entries = self._store.load_entries()  # sorted oldest-first
         pending = [e for e in entries if e.state == QueueState.PENDING]
         for entry in pending:
             counts = self._running_counts(entries)
@@ -391,7 +400,7 @@ class Daemon:
             # concurrent ticks) sees it taken and can't double-book the backend.
             entry.state = QueueState.PLACING
             entry.backend = picked.backend
-            self._store.save(entry)
+            self._store.save_entry(entry)
             self._executor.submit(self._run_submit, entry.qid, picked)
 
     def _offers_for(
@@ -425,7 +434,7 @@ class Daemon:
     def _run_submit(self, qid: str, offer: Offer) -> None:
         """Blocking one-shot submit, dispatched off the scheduler thread."""
         with self._lock:
-            entry = self._store.get(qid)
+            entry = self._store.get_entry(qid)
             if entry is None or entry.state != QueueState.PLACING:
                 return  # cancelled or already handled
             spec = entry.spec
@@ -438,7 +447,7 @@ class Daemon:
         def _persist(h: JobHandle) -> None:
             # Persist a stub the instant a billable resource is created, then
             # the final handle — an interrupted submit stays reclaimable (#7).
-            self._jobstore.save(
+            self._store.save_job(
                 JobRecord(
                     spec=spec,
                     handle=h,
@@ -454,7 +463,7 @@ class Daemon:
             return
         _persist(handle)
         with self._lock:
-            entry = self._store.get(qid)
+            entry = self._store.get_entry(qid)
             if entry is None:
                 return
             if entry.state == QueueState.CANCELLED:
@@ -467,11 +476,11 @@ class Daemon:
             entry.job_id = spec.job_id
             entry.offer_label = offer.label
             entry.error = None
-            self._store.save(entry)
+            self._store.save_entry(entry)
 
     def _retry_or_fail(self, qid: str, error: str) -> None:
         with self._lock:
-            entry = self._store.get(qid)
+            entry = self._store.get_entry(qid)
             if entry is None or entry.state != QueueState.PLACING:
                 return
             entry.attempts += 1
@@ -481,13 +490,13 @@ class Daemon:
             else:
                 entry.state = QueueState.PENDING  # release the slot, retry later
                 entry.backend = None
-            self._store.save(entry)
+            self._store.save_entry(entry)
 
     def _fail_submit(self, qid: str, error: str) -> None:
         with self._lock:
-            entry = self._store.get(qid)
+            entry = self._store.get_entry(qid)
             if entry is None:
                 return
             entry.state = QueueState.FAILED
             entry.error = error
-            self._store.save(entry)
+            self._store.save_entry(entry)
