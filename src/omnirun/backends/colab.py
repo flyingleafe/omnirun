@@ -73,6 +73,20 @@ COLAB_ROOT = "/content/omnirun"
 COST_NOTE = "consumes Colab compute units on paid tiers; free tier = T4 lottery"
 LOST_DETAIL = "session terminated (12h cap or idle reclaim)"
 
+# A bundle upload rides the Jupyter contents API (base64), which chokes on large
+# blobs. Fail fast above this guard instead of an opaque content-API error; a
+# code-only bundle is well under it, and a public repo clones on the worker (no
+# upload at all). Override with `max_upload_bytes`.
+COLAB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+# Canned RUNNING status beacon: used in tests to seed a successful status read.
+# Heartbeat is ISO-format (parsed by _ts via datetime.fromisoformat), far-future
+# so it is never considered stale; exists=true, no result means RUNNING.
+COLAB_RUNNING_BEACON = (
+    'OMNIRUN_STATUS {"exists": true, "phase": "run",'
+    ' "heartbeat": "9999-12-31T23:59:59+00:00", "result": null}'
+)
+
 DEFAULT_TIMEOUT_S = 60.0
 PROVISION_TIMEOUT_S = 600.0
 UPLOAD_TIMEOUT_S = 600.0
@@ -329,6 +343,15 @@ class ColabBackend(Backend):
 
     # ---- submit -----------------------------------------------------------------
 
+    def _code_source(self, spec: JobSpec, job_dir: str) -> CodeSource:
+        """Where the worker gets the repo: clone a public+pushed repo directly,
+        else ship a bundle. Shared by submit and render_payload so `--dry-run`
+        previews the real delivery."""
+        clone_url = _remote_clone_plan(spec)
+        if clone_url is not None:
+            return CodeSource(kind="remote", clone_url=clone_url)
+        return CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git")
+
     def submit(
         self,
         spec: JobSpec,
@@ -352,13 +375,8 @@ class ColabBackend(Backend):
 
         # a public repo is cloned by the worker directly (bootstrap does the git
         # clone over the VM's internet); only a private/unpushed sha is uploaded
-        # as a bundle.
-        clone_url = _remote_clone_plan(spec)
-        code = (
-            CodeSource(kind="remote", clone_url=clone_url)
-            if clone_url is not None
-            else CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git")
-        )
+        # as a bundle. Decided once here and reused by render_payload (dry-run).
+        code = self._code_source(spec, job_dir)
         try:
             script = generate_bootstrap(
                 notebook_env_spec(spec),
@@ -392,15 +410,26 @@ class ColabBackend(Backend):
                     f"{job_dir}/bootstrap.sh",
                     timeout=UPLOAD_TIMEOUT_S,
                 )
-                if clone_url is None:  # private repo → upload the bundle
-                    _create_bundle(
+                if code.kind == "bundle":  # private repo → upload the bundle
+                    bundle = _create_bundle(
                         _local_root(spec), spec.repo.sha, local / "bundle.git"
                     )
+                    limit = int(
+                        self.config.extra("max_upload_bytes", COLAB_MAX_UPLOAD_BYTES)
+                    )
+                    size = bundle.stat().st_size
+                    if size > limit:
+                        raise BackendError(
+                            f"repo bundle is {size / 1e6:.1f} MB, over the "
+                            f"{limit / 1e6:.0f} MB Colab upload guard — push HEAD to a "
+                            "public remote so the worker clones it (no upload), or "
+                            "raise `max_upload_bytes`"
+                        )
                     self._colab(
                         "upload",
                         "-s",
                         session,
-                        str(local / "bundle.git"),
+                        str(bundle),
                         f"{job_dir}/bundle.git",
                         timeout=UPLOAD_TIMEOUT_S,
                     )
@@ -447,21 +476,31 @@ class ColabBackend(Backend):
             },
         )
 
+    def render_payload(self, spec: JobSpec, offer: Offer | None = None) -> str:
+        """The bootstrap `omnirun submit --dry-run` prints — with the real code
+        source (clone vs bundle) instead of the generic bare-repo fallback."""
+        job_dir = f"{COLAB_ROOT}/jobs/{spec.job_id}"
+        return generate_bootstrap(
+            notebook_env_spec(spec),
+            BootstrapParams(
+                omnirun_root=COLAB_ROOT,
+                project_root=jobdir.project_root_of(
+                    COLAB_ROOT,
+                    spec.repo.slug,
+                    self.config.project_root_for(spec.repo.slug),
+                ),
+                code=self._code_source(spec, job_dir),
+            ),
+        )
+
     # ---- status ------------------------------------------------------------------
 
-    def status(self, handle: JobHandle) -> StatusReport:
-        if cached := self._terminal.get(handle.job_id):
-            return cached
-        try:
-            out = self._colab(
-                "exec",
-                "-s",
-                handle.data["session"],
-                stdin=_status_snippet(handle.data["job_dir"]),
-                timeout=EXEC_TIMEOUT_S,
-            )
-        except BackendError as e:
-            return StatusReport(status=JobStatus.LOST, detail=f"{LOST_DETAIL}: {e}")
+    def _parse_status_output(self, out: str) -> StatusReport:
+        """Parse the raw output of a status-beacon exec into a StatusReport.
+
+        Preserves all existing behaviour: missing marker -> LOST,
+        unparseable JSON -> LOST, otherwise delegates to _derive.
+        """
         raw = _marker_line(out, "OMNIRUN_STATUS ")
         if raw is None:
             return StatusReport(
@@ -474,14 +513,34 @@ class ColabBackend(Backend):
             return StatusReport(
                 status=JobStatus.LOST, detail="unparseable status beacon"
             )
-        report = self._derive(blob)
-        if report.status in (
-            JobStatus.SUCCEEDED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        ):
-            self._terminal[handle.job_id] = report
-        return report
+        return self._derive(blob)
+
+    def status(self, handle: JobHandle) -> StatusReport:
+        if cached := self._terminal.get(handle.job_id):
+            return cached
+        attempts = int(self.config.extra("status_retries", 2)) + 1
+        last_err: Exception | None = None
+        for _ in range(attempts):
+            try:
+                out = self._colab(
+                    "exec",
+                    "-s",
+                    handle.data["session"],
+                    stdin=_status_snippet(handle.data["job_dir"]),
+                    timeout=EXEC_TIMEOUT_S,
+                )
+            except Exception as e:  # transient churn — retry before concluding LOST
+                last_err = e
+                continue
+            report = self._parse_status_output(out)
+            if report.status in (
+                JobStatus.SUCCEEDED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            ):
+                self._terminal[handle.job_id] = report
+            return report
+        return StatusReport(status=JobStatus.LOST, detail=f"{LOST_DETAIL}: {last_err}")
 
     @staticmethod
     def _derive(blob: dict[str, Any]) -> StatusReport:
@@ -525,11 +584,11 @@ class ColabBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
-        files = [
-            f"{job_dir}/logs/bootstrap.log",
-            f"{job_dir}/logs/stdout.log",
-            f"{job_dir}/logs/stderr.log",
-        ]
+        # Read only bootstrap.log — the canonical merged log (diagnostics + the
+        # command's stdout+stderr, which the run step tees back through fd 1/2).
+        # Also reading stdout/stderr.log would double every command line; they
+        # stay on disk for `pull`. Matches jobdir.tail_logs and the Kaggle harness.
+        files = [f"{job_dir}/logs/bootstrap.log"]
         offsets = self._log_offsets.setdefault(handle.job_id, dict.fromkeys(files, 0))
         while True:
             try:

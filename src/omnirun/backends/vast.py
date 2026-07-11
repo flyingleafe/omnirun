@@ -29,7 +29,13 @@ from omnirun.backends.marketplace import (
     Instance,
     MarketplaceBackend,
 )
-from omnirun.models import JobSpec, Offer, ResourceSpec, normalize_gpu_type
+from omnirun.models import (
+    JobSpec,
+    Offer,
+    ResourceSpec,
+    cuda_at_least,
+    normalize_gpu_type,
+)
 
 BASE = "https://console.vast.ai/api/v0"
 DEFAULT_IMAGE = "vastai/base-image:cuda-12.4.1-auto"
@@ -96,6 +102,9 @@ class VastBackend(MarketplaceBackend):
         data = self._request("POST", f"{BASE}/bundles/", json_body=filt).json()
         offers: list[Offer] = []
         for raw in data.get("offers", []):
+            host_cuda = raw.get("cuda_max_good")
+            if not cuda_at_least(host_cuda, res.min_cuda):
+                continue
             dph = raw.get("dph_total")
             norm = normalize_vast_gpu(raw.get("gpu_name") or "", raw.get("gpu_ram"))
             geo = raw.get("geolocation") or "?"
@@ -112,7 +121,11 @@ class VastBackend(MarketplaceBackend):
                     gpus=n,
                     cost_per_hour=dph,  # dph_total is already the whole-machine rate
                     notes=f"{rel_note}{geo}; offers churn — may be taken by submit time",
-                    details={"ask_id": raw["id"], "gpu_name": raw.get("gpu_name")},
+                    details={
+                        "ask_id": raw["id"],
+                        "gpu_name": raw.get("gpu_name"),
+                        "cuda_max_good": host_cuda,
+                    },
                 )
             )
         return offers

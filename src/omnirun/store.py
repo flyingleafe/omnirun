@@ -15,6 +15,9 @@ from pathlib import Path
 from omnirun.models import JobRecord, StatusReport
 
 
+STATE_SCHEMA_VERSION = 1
+
+
 def default_store_dir() -> Path:
     if p := os.environ.get("OMNIRUN_STATE_DIR"):
         return Path(p)
@@ -31,6 +34,7 @@ class JobStore:
         return self.jobs_dir / job_id / "meta.json"
 
     def save(self, record: JobRecord) -> None:
+        record.schema_version = STATE_SCHEMA_VERSION
         p = self._meta(record.spec.job_id)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".json.tmp")

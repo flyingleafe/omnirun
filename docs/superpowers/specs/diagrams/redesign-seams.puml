@@ -1,0 +1,47 @@
+@startuml seams
+title omnirun — the four seam contracts (everything crosses here)
+skinparam shadowing false
+skinparam defaultTextAlignment left
+
+interface Control {
+  submit(spec) : JobId
+  ps() / status(job)
+  logs(job, follow)
+  cancel(job)
+  reprioritize(job, priority | deadline | pay)
+  budget(window, cap)
+}
+
+interface Scheduler <<pure>> {
+  tick(jobs, slots, ledger, now) : Decision[]
+  --
+  no I/O, no backend knowledge
+}
+
+interface Store {
+  jobs / placements / facts / ledger : CRUD
+  reserve(slot, job) : bool  <<atomic txn>>
+  transaction() : context
+  --
+  impl: SQLite | Postgres
+}
+
+interface Provider {
+  name : str
+  discover() : ProviderFacts
+  offer(Requirements) : Slot[]
+  place(Job, Slot) : Placement
+  poll(Placement) : Status
+  cancel(Placement, mode) : None
+  stream_logs(Placement) : Iterator
+  collect_outputs(Placement, dest)
+  gc() : None
+}
+
+Control ..> Scheduler : drives
+Control ..> Store : reads / writes
+Control ..> Provider : dispatch place/poll/cancel/stream
+Scheduler ..> Store : (state passed in — pure)
+Provider ..> Store : facts (via Discovery)
+note bottom of Scheduler : sees only Slot.capabilities / cost /\navailability / capacity — never provider_name
+@enduml

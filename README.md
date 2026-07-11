@@ -32,8 +32,8 @@ pulled 3 path(s) to omnirun-outputs/train-a3f9c1
 ## How it works
 
 A job is `(pushed git revision, command, resources)`. On submit, omnirun checks
-your working tree is clean and HEAD is pushed (it offers `--push` / `--dirty`
-escape hatches), then every backend executes the same generated `bootstrap.sh`
+your working tree is clean and HEAD is pushed (with a `--push` escape hatch that
+pushes for you), then every backend executes the same generated `bootstrap.sh`
 on the worker:
 
 1. keep the repo's object store under a per-project `project_root` (default
@@ -256,7 +256,6 @@ unique id prefix.
 | `--yes`, `-y` | don't ask; take the top-ranked offer |
 | `--max-cost $` | drop offers whose estimated total cost exceeds this |
 | `--push` | auto-push an unpushed HEAD to origin |
-| `--dirty` | allow a dirty working tree (submits HEAD — uncommitted changes are **not** included) |
 | `--dry-run` | print the rendered payload (Slurm: full sbatch script) and exit |
 
 **`omnirun offers [resource flags] [--backend NAME]`** — probe and print the
@@ -269,7 +268,7 @@ the foreground (background it yourself). Listens on a localhost TCP socket
 **`omnirun enqueue [OPTIONS] --count N -- COMMAND...`** — hand a job to the
 running daemon's queue. Takes all of `submit`'s resource flags (`--gpus`,
 `--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`, `--outputs`,
-`--env`, `--push`, `--dirty`) plus `--count N` (enqueue N copies) and
+`--env`, `--push`) plus `--count N` (enqueue N copies) and
 `--backend NAME` (restrict placement to one backend).
 
 **`omnirun queue [--wait] [--cancel QID|all]`** — show the daemon's queue;
@@ -369,8 +368,9 @@ whole flow, and your configs, without touching a network.
   out. The one out-of-band exception is secrets: a gitignored `<repo>/.env` is
   shipped separately (never written into the shared tree) and exported into the
   job's environment, so API keys reach the worker without being committed.
-- **Dirty trees are not shipped**: submit requires a clean, pushed HEAD.
-  `--dirty` only skips the check and runs HEAD — your uncommitted edits stay home.
+- **Dirty trees are not shipped**: submit requires a clean, pushed HEAD, so
+  every job runs a real, reproducible revision. Commit (or stash) first — a
+  dirty working tree is refused with no escape hatch.
 - No DAGs/pipelines, no multi-node jobs, no spot-preemption recovery, no image
   building, no artifact versioning, no web UI.
 - One job = one machine = one command. Cross-backend queueing now exists via the

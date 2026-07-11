@@ -1,0 +1,39 @@
+@startuml seq_happy
+title Submit -> run -> collect (happy path)
+skinparam shadowing false
+actor User
+participant CLI
+participant Control
+participant Scheduler
+participant Discovery
+database Store
+participant "Provider\n(e.g. colab)" as P
+
+User -> CLI : omnirun submit --gpu t4 --finish-by 18:00 -- python train.py
+CLI -> Control : submit(spec)
+Control -> Store : persist Job (QUEUED)
+
+== scheduler tick(now) ==
+Control -> Discovery : facts fresh?
+Discovery -> P : discover()  (only if stale)
+P --> Discovery : ProviderFacts (quota, cuda, limits, health)
+Discovery -> Store : cache facts (ttl)
+Control -> P : offer(requirements)
+P --> Control : [ Slot(free, T4, ready_now) ]
+Control -> Scheduler : tick(jobs, slots, ledger, now)
+Scheduler --> Control : place Job -> free Slot (meets deadline)
+Control -> Store : reserve() atomic  (Job -> PLACING)
+Control -> P : place(Job, Slot)
+P --> Control : Placement(links=[notebook url])
+Control -> Store : Job -> RUNNING, save links
+
+User -> CLI : omnirun ps
+CLI -> Control : list
+Control --> CLI : colab -> <notebook url>   RUNNING
+
+== later ticks ==
+Control -> P : poll(Placement)
+P --> Control : SUCCEEDED
+Control -> P : collect_outputs()
+Control -> Store : Job -> SUCCEEDED, budget spent = 0 (free)
+@enduml

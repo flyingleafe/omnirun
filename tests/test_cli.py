@@ -4,31 +4,35 @@ from __future__ import annotations
 
 import types
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
 
-from omnirun.backends.base import (  # noqa: E402
+from omnirun.backends.base import (
     Backend,
     BackendError,
     ProvisioningSink,
     register,
 )
-from omnirun.cli import app  # noqa: E402
-from omnirun.models import (  # noqa: E402
+from omnirun.cli import app
+from omnirun.factstore import FactStore as _FactStore
+from omnirun.models import (
+    Capabilities as _Capabilities,
+    Health as _Health,
     JobHandle,
     JobSpec,
     JobStatus,
     Offer,
+    ProviderFacts as _ProviderFacts,
     RepoRef,
     ResourceSpec,
     StatusReport,
 )
-from omnirun.repo import RepoError  # noqa: E402
-from omnirun.store import JobStore  # noqa: E402
+from omnirun.repo import RepoError
+from omnirun.store import JobStore
 
 runner = CliRunner()
 
@@ -210,7 +214,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("omnirun.repo.find_repo_root", lambda start=None: repo_root)
     monkeypatch.setattr(
         "omnirun.repo.capture_repo_state",
-        lambda root, *, allow_dirty=False, auto_push=False: ref,
+        lambda root, *, auto_push=False: ref,
     )
     StubBackend.submitted.clear()
     StubBackend.cancelled.clear()
@@ -289,8 +293,8 @@ def test_submit_rejects_malformed_env(env):
 
 
 def test_submit_dirty_repo_error(env, monkeypatch):
-    def raise_dirty(root, *, allow_dirty=False, auto_push=False):
-        raise RepoError("working tree has uncommitted changes (use --dirty)")
+    def raise_dirty(root, *, auto_push=False):
+        raise RepoError("working tree has uncommitted changes — commit them first")
 
     monkeypatch.setattr("omnirun.repo.capture_repo_state", raise_dirty)
     result = runner.invoke(app, ["submit", "--yes", "--", "python", "train.py"])
@@ -300,21 +304,13 @@ def test_submit_dirty_repo_error(env, monkeypatch):
     assert JobStore().list_ids() == []
 
 
-def test_submit_dirty_flag_forwarded_and_warns(env, monkeypatch):
-    seen = {}
-
-    def capture(root, *, allow_dirty=False, auto_push=False):
-        seen["allow_dirty"] = allow_dirty
-        seen["auto_push"] = auto_push
-        return env.ref.model_copy(update={"dirty": True, "sha": "b" * 40})
-
-    monkeypatch.setattr("omnirun.repo.capture_repo_state", capture)
+def test_submit_rejects_dirty_flag(env):
+    # --dirty was removed: dirty trees are always refused, with no escape hatch
     result = runner.invoke(
-        app, ["submit", "--yes", "--dirty", "--push", "--", "python", "train.py"]
+        app, ["submit", "--yes", "--dirty", "--", "python", "train.py"]
     )
-    assert result.exit_code == 0, result.output
-    assert seen == {"allow_dirty": True, "auto_push": True}
-    assert "warning" in result.output and "dirty" in result.output
+    assert result.exit_code != 0
+    assert not StubBackend.submitted
 
 
 def test_submit_dry_run_prints_payload_without_submitting(env):
@@ -597,3 +593,80 @@ def test_config_path_reports_existence(env):
     )
     assert result.exit_code == 0, result.output
     assert "missing" in result.output
+
+
+# ------------------------------------------------------------------ backends discover
+
+
+def test_backends_discover_populates_cache(env):
+    from omnirun.factstore import FactStore
+
+    result = runner.invoke(app, ["backends", "discover"])
+    assert result.exit_code == 0, result.output
+    facts = FactStore().load("stub")
+    assert facts is not None
+    assert facts.health.value in {"ok", "degraded", "unreachable"}
+    assert "stub" in result.output
+
+
+def test_backends_discover_named_backend(env):
+    from omnirun.factstore import FactStore
+
+    result = runner.invoke(app, ["backends", "discover", "stub"])
+    assert result.exit_code == 0, result.output
+    facts = FactStore().load("stub")
+    assert facts is not None
+    assert "stub" in result.output
+    # The other configured backends are not discovered when a name is given
+    assert FactStore().load("offline") is None
+
+
+def test_backends_discover_unknown_backend_errors(env):
+    result = runner.invoke(app, ["backends", "discover", "no-such-backend"])
+    assert result.exit_code == 1
+    assert "not configured" in result.output
+
+
+# ------------------------------------------------------------------ admission
+
+
+def _seed_facts(
+    caps: _Capabilities,
+    *,
+    discovered_at: datetime | None = None,
+    ttl_s: float = 3600.0,
+) -> None:
+    _FactStore().save(
+        _ProviderFacts(
+            backend="stub",
+            discovered_at=discovered_at or datetime.now(timezone.utc),
+            ttl_s=ttl_s,
+            capabilities=caps,
+            health=_Health.OK,
+        )
+    )
+
+
+def test_offer_marked_unfit_when_time_exceeds_max_walltime(env):
+    _seed_facts(_Capabilities(max_walltime=timedelta(hours=1)))
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
+    assert result.exit_code == 0, result.output
+    assert "exceeds max walltime" in result.output
+
+
+def test_offer_marked_unfit_when_cuda_too_low(env):
+    _seed_facts(_Capabilities(cuda_version="12.0"))
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--min-cuda", "12.4"])
+    assert result.exit_code == 0, result.output
+    assert "CUDA 12.0 < required 12.4" in result.output
+
+
+def test_stale_facts_do_not_block(env):
+    _seed_facts(
+        _Capabilities(max_walltime=timedelta(hours=1)),
+        discovered_at=datetime.now(timezone.utc) - timedelta(hours=10),
+        ttl_s=3600,  # facts are 10h old with a 1h TTL -> stale
+    )
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
+    assert result.exit_code == 0, result.output
+    assert "exceeds max walltime" not in result.output  # stale facts must not block

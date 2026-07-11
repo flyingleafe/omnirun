@@ -25,8 +25,10 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
+from omnirun.factstore import FactStore
 from omnirun.models import (
     EnvSpec,
+    Health,
     JobHandle,
     JobRecord,
     JobSpec,
@@ -159,6 +161,7 @@ def _build_resources(
     cpus: int | None,
     mem: float | None,
     disk: float | None,
+    min_cuda: str | None = None,
 ) -> ResourceSpec:
     """Repo omnirun.toml [job.resources] defaults, CLI flags win."""
     vals = dict(defaults)
@@ -171,6 +174,7 @@ def _build_resources(
         "cpus": cpus,
         "mem_gb": mem,
         "disk_gb": disk,
+        "min_cuda": min_cuda,
     }
     vals.update({k: v for k, v in overrides.items() if v is not None})
     if time is not None:
@@ -225,6 +229,25 @@ def _make_backends(
     return backends, broken
 
 
+def _apply_admission(
+    offers: list[Offer], res: ResourceSpec, store: FactStore
+) -> list[Offer]:
+    """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
+    Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
+    now = datetime.now(timezone.utc)
+    for o in offers:
+        if not o.fits:
+            continue
+        facts = store.load(o.backend)
+        if facts is None or not facts.is_fresh(now):
+            continue
+        reasons = facts.capabilities.satisfies(res)
+        if reasons:
+            o.fits = False
+            o.unfit_reasons.extend(reasons)
+    return offers
+
+
 def _probe(
     cfg: Config, res: ResourceSpec, only: str | None
 ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
@@ -233,6 +256,7 @@ def _probe(
         chooser.gather_offers(backends, res, timeout_s=cfg.policy.probe_timeout_s)
         + broken
     )
+    offers = _apply_admission(offers, res, FactStore())
     ranked = chooser.rank(offers, res, cfg.policy)
     unfit = [o for o in offers if not o.fits]
     return backends, ranked, unfit
@@ -294,21 +318,16 @@ def _build_job_spec(
     cpus: int | None,
     mem: float | None,
     disk: float | None,
+    min_cuda: str | None = None,
     outputs: list[str] | None,
     env: list[str] | None,
     push: bool,
-    dirty: bool,
 ) -> JobSpec:
     """Repo capture + defaults merge shared by `submit` and `enqueue`."""
     from omnirun import repo as repo_mod
 
     root = repo_mod.find_repo_root()
-    repo_ref = repo_mod.capture_repo_state(root, allow_dirty=dirty, auto_push=push)
-    if repo_ref.dirty:
-        console.print(
-            "[yellow]warning:[/yellow] working tree is dirty — running a wip "
-            f"commit ({repo_ref.sha[:12]}), not your last pushed revision"
-        )
+    repo_ref = repo_mod.capture_repo_state(root, auto_push=push)
 
     job_defaults = load_repo_defaults(root).get("job", {}) or {}
     res = _build_resources(
@@ -320,6 +339,7 @@ def _build_job_spec(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
     )
     env_vars = dict(job_defaults.get("env_vars", {}) or {})
     env_vars.update(_parse_env(env or []))
@@ -365,6 +385,9 @@ def submit(
     cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
     mem: float | None = typer.Option(None, "--mem", help="RAM in GB."),
     disk: float | None = typer.Option(None, "--disk", help="Disk in GB."),
+    min_cuda: str | None = typer.Option(
+        None, "--min-cuda", help="Require host CUDA >= this (e.g. 12.4)."
+    ),
     outputs: list[str] | None = typer.Option(
         None, "--outputs", help="Output glob relative to repo root (repeatable)."
     ),
@@ -383,9 +406,6 @@ def submit(
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
-    dirty: bool = typer.Option(
-        False, "--dirty", help="Allow a dirty working tree (runs a wip commit)."
-    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -402,10 +422,10 @@ def submit(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
         outputs=outputs,
         env=env,
         push=push,
-        dirty=dirty,
     )
     res = spec.resources
 
@@ -489,6 +509,9 @@ def offers(
     cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
     mem: float | None = typer.Option(None, "--mem", help="RAM in GB."),
     disk: float | None = typer.Option(None, "--disk", help="Disk in GB."),
+    min_cuda: str | None = typer.Option(
+        None, "--min-cuda", help="Require host CUDA >= this (e.g. 12.4)."
+    ),
     backend: str | None = typer.Option(
         None, "--backend", help="Restrict to one configured backend."
     ),
@@ -502,6 +525,7 @@ def offers(
         cpus=cpus,
         mem=mem,
         disk=disk,
+        min_cuda=min_cuda,
     )
     cfg = _load_cfg()
     _, ranked, unfit = _probe(cfg, res, backend)
@@ -566,9 +590,6 @@ def enqueue(
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
-    dirty: bool = typer.Option(
-        False, "--dirty", help="Allow a dirty working tree (runs a wip commit)."
-    ),
     count: int = typer.Option(1, "--count", help="Enqueue N copies of the job."),
 ) -> None:
     spec = _build_job_spec(
@@ -584,7 +605,6 @@ def enqueue(
         outputs=outputs,
         env=env,
         push=push,
-        dirty=dirty,
     )
     host, port = _require_daemon()
     resp = send_request(
@@ -888,6 +908,48 @@ def backends_check(
     console.print(table)
     if any_failed:
         raise typer.Exit(1)
+
+
+def _health_markup(h: Health) -> str:
+    return {
+        Health.OK: "[green]ok[/green]",
+        Health.DEGRADED: "[yellow]degraded[/yellow]",
+        Health.UNREACHABLE: "[red]unreachable[/red]",
+    }[h]
+
+
+@backends_app.command(
+    "discover", help="Probe each backend's live capabilities/limits and cache them."
+)
+@friendly_errors
+def backends_discover(
+    name: str | None = typer.Argument(None, help="Discover only this backend."),
+) -> None:
+    cfg = _load_cfg()
+    sections = cfg.backends
+    if name is not None:
+        if name not in sections:
+            known = ", ".join(sorted(sections)) or "none configured"
+            raise BackendError(f"backend {name!r} is not configured (known: {known})")
+        sections = {name: sections[name]}
+    store = FactStore()
+    table = Table("backend", "health", "GPUs", "max walltime", "max parallel", "notes")
+    for nm, bcfg in sections.items():
+        if not bcfg.enabled:
+            table.add_row(nm, "disabled", "-", "-", "-", "", style="dim")
+            continue
+        facts = make_backend(nm, bcfg).discover()
+        store.save(facts)
+        c = facts.capabilities
+        table.add_row(
+            nm,
+            _health_markup(facts.health),
+            ", ".join(c.gpu_types) or "-",
+            str(c.max_walltime) if c.max_walltime is not None else "-",
+            str(c.max_parallel_jobs) if c.max_parallel_jobs is not None else "-",
+            facts.health_detail,
+        )
+    console.print(table)
 
 
 @app.command(

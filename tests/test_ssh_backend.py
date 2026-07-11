@@ -369,9 +369,22 @@ def test_cancel_terms_process_group():
 
 def test_logs_reads_job_dir_files():
     fake = FakeExec()
-    fake.add(r"tail -c \+1 .*stdout\.log", stdout="epoch 1\n")
+    # logs merges from bootstrap.log, the canonical log (the run step tees the
+    # command's stdout+stderr into it alongside the bootstrap's own diagnostics).
+    fake.add(r"tail -c \+1 .*bootstrap\.log", stdout="epoch 1\n")
     lines = list(make_backend(fake).logs(HANDLE, follow=False))
     assert "epoch 1" in lines
+
+
+def test_logs_no_duplicate_lines_across_stream_files():
+    # Regression: the run step tees the command's output into bootstrap.log AND
+    # stdout.log, so both hold it on disk. logs must read only bootstrap.log and
+    # yield each line once — not once per file (the old double-logging bug).
+    fake = FakeExec()
+    fake.add(r"tail -c \+1 .*bootstrap\.log", stdout="hello\n")
+    fake.add(r"tail -c \+1 .*stdout\.log", stdout="hello\n")
+    lines = list(make_backend(fake).logs(HANDLE, follow=False))
+    assert lines.count("hello") == 1
 
 
 def test_pull_outputs_uses_trailing_slash(tmp_path):

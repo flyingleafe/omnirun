@@ -55,8 +55,12 @@ def ex(recorder, cm_dir):
 
 
 def opt_pairs(argv):
-    """All '-o Value' option values in an argv."""
-    return [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-o"]
+    """All `-o` option values in an argv — attached `-oKEY=VAL` (what SSHExec
+    emits, so a PATH ssh-wrapper scanning argv still finds the host) plus split
+    `-o KEY=VAL` (e.g. user-supplied extra_opts, passed through verbatim)."""
+    attached = [a[2:] for a in argv if a.startswith("-o") and len(a) > 2]
+    split = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-o"]
+    return attached + split
 
 
 # --- run() command assembly ---------------------------------------------------

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from omnirun.backends import jobdir
 from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
@@ -53,6 +54,9 @@ class SshBackend(Backend):
                 # opt-in: a personal box may need `module`/conda from the login
                 # profile — [backends.x] login_shell = true
                 login_shell=self.config.extra("login_shell", False),
+                ssh_command=_ssh_command(self.config),
+                control_master=self.config.extra("control_master", True),
+                batch_mode=self.config.extra("batch_mode", True),
             )
         return self._exec
 

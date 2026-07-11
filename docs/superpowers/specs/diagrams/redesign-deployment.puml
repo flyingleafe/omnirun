@@ -1,0 +1,44 @@
+@startuml deployment
+title Three deployment tiers — same logic, different driver + store
+skinparam shadowing false
+skinparam defaultTextAlignment center
+
+node "Tier 0 — daemonless laptop" as t0node {
+  component "CLI" as cli0
+  component "in-process tick\n(runs inside CLI cmd)" as t0
+  database "SQLite" as db0
+  cli0 --> t0
+  t0 --> db0
+}
+
+node "Tier 1 — local daemon (opt-in)" as t1node {
+  component "CLI" as cli1
+  component "omnirun serve\n(background loop -> auto wake-up)" as d1
+  database "SQLite" as db1
+  cli1 --> d1
+  d1 --> db1
+}
+
+node "Tier 2 — central daemon (your VPS)" as t2node {
+  component "omnirun daemon" as d2
+  database "Postgres\n(backups, concurrency)" as pg
+  folder "staging store\nbare repo + .env blobs" as stage
+  d2 --> pg
+  d2 --> stage
+}
+
+node "Laptop A" {
+  component "thin client" as ca
+}
+node "Laptop B" {
+  component "thin client" as cb
+}
+ca --> d2 : Control API
+cb --> d2 : Control API
+ca ..> stage : push sha + .env (durable,\nso laptop can go offline)
+
+cloud "Backends\nslurm / ssh / kaggle / colab / marketplace" as be
+t0 --> be
+d1 --> be
+d2 --> be
+@enduml

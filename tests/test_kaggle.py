@@ -394,6 +394,35 @@ def test_submit_public_repo_clones_directly(fake_api, backend, monkeypatch):
     assert "bundle.git" not in bootstrap  # no bundle path referenced
 
 
+def test_render_payload_public_repo_clones_without_submit(
+    backend, fake_api, monkeypatch
+):
+    # dry-run renders the REAL code source: a public repo → git clone from the
+    # anon https url, and nothing is pushed to Kaggle.
+    monkeypatch.setattr(
+        kaggle_mod,
+        "_remote_clone_plan",
+        lambda ref, root: "https://github.com/me/proj.git",
+    )
+    payload = backend.render_payload(make_spec(gpu_type="P100"), offer=None)
+    assert "git clone --bare" in payload
+    assert "https://github.com/me/proj.git" in payload
+    assert "bundle.git" not in payload
+    assert fake_api.kernel_folders == []  # nothing submitted
+
+
+def test_render_payload_private_repo_shows_bundle_without_submit(
+    backend, fake_api, monkeypatch
+):
+    # private/unpushed → the payload references the embedded bundle path, not a
+    # clone url, and nothing is pushed.
+    monkeypatch.setattr(kaggle_mod, "_remote_clone_plan", lambda ref, root: None)
+    payload = backend.render_payload(make_spec(gpu_type="P100"), offer=None)
+    assert f'BUNDLE="{kaggle_mod.KAGGLE_ROOT}/jobs/{JOB_ID}/bundle.git"' in payload
+    assert "CLONE_URL=" not in payload
+    assert fake_api.kernel_folders == []  # nothing submitted
+
+
 def test_submit_embeds_env_file(fake_api, backend, monkeypatch, tmp_path):
     envf = tmp_path / ".env"
     envf.write_text("SECRET=hunter2\n")

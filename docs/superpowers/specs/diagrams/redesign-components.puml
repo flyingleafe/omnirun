@@ -1,0 +1,46 @@
+@startuml components
+title omnirun — subsystem spine (the Slot seam sits in the middle)
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+skinparam packageStyle rectangle
+
+actor User
+
+package "Client" {
+  component "CLI" as cli
+  component "Thin client" as thin
+}
+
+interface "Control API" as ctrl
+
+package "Control plane\n(driver: daemonless tick | local daemon | central daemon)" as cp {
+  component "Scheduler\n(pure decision logic)" as sched
+  component "Discovery\n+ Fact cache" as disc
+  database "Store\n(SQLite | Postgres)" as store
+}
+
+interface "Provider seam\noffer / place / poll / cancel / stream / collect / gc" as pseam
+
+package "Providers\n(all backend detail lives here, and only here)" {
+  component "slurm" as slurm
+  component "ssh / local" as ssh
+  component "kaggle" as kaggle
+  component "colab" as colab
+  component "vast / runpod / thunder" as mkt
+}
+
+User --> cli
+cli --> ctrl
+thin --> ctrl
+ctrl --> cp
+sched ..> store
+disc ..> store
+sched --> pseam : slots / placements\n(no backend detail)
+disc --> pseam : discover()
+pseam --> slurm
+pseam --> ssh
+pseam --> kaggle
+pseam --> colab
+pseam --> mkt
+@enduml

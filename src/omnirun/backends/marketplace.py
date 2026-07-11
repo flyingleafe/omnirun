@@ -227,11 +227,13 @@ class MarketplaceBackend(Backend, ABC):
             raise BackendError("ssh exec layer missing (omnirun.execlayer.ssh)")
         # Freshly provisioned hosts are never in known_hosts; accept-new keeps
         # background polling non-interactive without disabling checking entirely.
+        # Attached `-oKEY=VALUE` (one token) — see SSHExec._control_opts: a lone
+        # `-o` before the host breaks PATH ssh-wrappers that scan argv for it.
         return cls(
             target,
             port=port,
             identity=self._identity_file(),
-            extra_opts=["-o", "StrictHostKeyChecking=accept-new"],
+            extra_opts=["-oStrictHostKeyChecking=accept-new"],
         )
 
     def _exec_from_handle(self, handle: JobHandle) -> Exec:

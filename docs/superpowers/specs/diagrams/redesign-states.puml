@@ -1,0 +1,31 @@
+@startuml states
+title Job lifecycle — the universal state machine
+skinparam shadowing false
+
+[*] --> QUEUED : submit
+
+QUEUED --> HELD : no slot can EVER satisfy\nrequirements (admission, #8)
+HELD --> QUEUED : constraints / budget / facts change
+HELD --> CANCELLED : user cancel
+
+QUEUED --> PLACING : reserve slot (atomic txn)
+QUEUED --> CANCELLED : user cancel
+
+PLACING --> RUNNING : provider.place() ok
+PLACING --> QUEUED : place failed (attempts++)
+PLACING --> CANCELLED : user cancel
+
+RUNNING --> SUCCEEDED : result.json, exit 0
+RUNNING --> QUEUED : LOST / ghost / preempted\n(reconcile re-queues — never wedged)
+RUNNING --> FAILED : exit != 0 & retries exhausted
+RUNNING --> CANCELLED : user cancel\n(SIGTERM -> SIGKILL, then reap)
+
+SUCCEEDED --> [*]
+FAILED --> [*]
+CANCELLED --> [*]
+
+note right of QUEUED
+  A job that is not explicitly cancelled
+  always eventually runs (liveness invariant).
+end note
+@enduml

@@ -217,6 +217,23 @@ def test_submit_sequence(cli, backend):
     }
 
 
+def test_submit_bundle_over_upload_guard_fails_fast(cli):
+    # bundle path (private repo, per the fake_bundle fixture) + a tiny
+    # max_upload_bytes: the guard must reject before uploading the oversized
+    # bundle, and the session must be stopped (no compute-unit leak).
+    backend = ColabBackend(
+        "colab", BackendConfig.model_validate({"type": "colab", "max_upload_bytes": 4})
+    )
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(BackendError, match="upload guard"):
+        backend.submit(spec, offer)
+    uploaded = [c["argv"][-1] for c in cli.calls if c["argv"][1:2] == ["upload"]]
+    assert f"{JOB_DIR}/bundle.git" not in uploaded
+    assert "stop" in cli.subcommands()
+
+
 def test_submit_public_repo_skips_bundle(cli, backend, monkeypatch):
     # public repo → no bundle upload; bootstrap clones the anon https url
     monkeypatch.setattr(
@@ -251,6 +268,36 @@ def test_submit_failure_stops_session(cli, backend):
     with pytest.raises(BackendError, match="pid"):
         backend.submit(spec, offer)
     assert cli.subcommands()[-1] == "stop"
+
+
+# ---- render_payload (submit --dry-run) ---------------------------------------
+
+
+def test_render_payload_public_repo_clones_without_submit(backend, cli, monkeypatch):
+    # dry-run renders the REAL code source: a public repo → git clone from the
+    # anon https url, and nothing is submitted (no colab CLI calls at all).
+    monkeypatch.setattr(
+        colab_mod, "_remote_clone_plan", lambda spec: "https://github.com/me/proj.git"
+    )
+    cli.calls.clear()
+    payload = backend.render_payload(make_spec(gpu_type="T4"), offer=None)
+    assert "git clone --bare" in payload
+    assert "https://github.com/me/proj.git" in payload
+    assert "bundle.git" not in payload
+    assert cli.calls == []
+
+
+def test_render_payload_private_repo_shows_bundle_without_submit(
+    backend, cli, monkeypatch
+):
+    # private/unpushed → the payload references the bundle path, not a clone url,
+    # and still nothing is submitted.
+    monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
+    cli.calls.clear()
+    payload = backend.render_payload(make_spec(gpu_type="T4"), offer=None)
+    assert f'BUNDLE="{JOB_DIR}/bundle.git"' in payload
+    assert "CLONE_URL=" not in payload
+    assert cli.calls == []
 
 
 # ---- status ------------------------------------------------------------------
@@ -325,20 +372,19 @@ def test_status_missing_job_dir_is_lost(cli, backend):
 
 
 def test_logs_incremental_offsets(cli, backend):
-    first = {
-        f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n",
-        f"{JOB_DIR}/logs/stdout.log": "out1\n",
-        f"{JOB_DIR}/logs/stderr.log": "",
-    }
+    # logs reads only bootstrap.log — the canonical merged log; the run step tees
+    # the command's stdout/stderr into it, so reading the per-stream files too
+    # would double every line.
+    first = {f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n"}
     cli.handlers["exec"] = lambda argv, stdin: (
         0,
         "OMNIRUN_LOGS " + json.dumps(first) + "\n",
         "",
     )
     handle = make_handle()
-    assert list(backend.logs(handle)) == ["line1", "line2", "out1"]
+    assert list(backend.logs(handle)) == ["line1", "line2"]
 
-    # second read sends the advanced offsets and yields nothing new
+    # second read sends the advanced offset and yields nothing new
     empty = dict.fromkeys(first, "")
     cli.handlers["exec"] = lambda argv, stdin: (
         0,
@@ -350,8 +396,6 @@ def test_logs_incremental_offsets(cli, backend):
     inner = cli.calls[-1]["stdin"].split("json.loads(", 1)[1].split(")\n", 1)[0]
     sent_offsets = json.loads(ast.literal_eval(inner))
     assert sent_offsets[f"{JOB_DIR}/logs/bootstrap.log"] == len("line1\nline2\n")
-    assert sent_offsets[f"{JOB_DIR}/logs/stdout.log"] == len("out1\n")
-    assert sent_offsets[f"{JOB_DIR}/logs/stderr.log"] == 0
 
 
 # ---- outputs / cancel / gc / check ---------------------------------------------
