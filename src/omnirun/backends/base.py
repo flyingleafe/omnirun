@@ -9,10 +9,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-from omnirun.models import JobHandle, JobSpec, Offer, ResourceSpec, StatusReport
+from omnirun.models import (
+    Capabilities,
+    Health,
+    JobHandle,
+    JobSpec,
+    Offer,
+    ProviderFacts,
+    ResourceSpec,
+    StatusReport,
+)
 
 if TYPE_CHECKING:
     from omnirun.config import BackendConfig
@@ -93,6 +103,26 @@ class Backend(ABC):
 
         Return a short human 'ok: ...' description or raise BackendError."""
         return "ok"
+
+    def discover(self) -> ProviderFacts:
+        """Gather live facts about this backend (capabilities, limits, quota, health).
+
+        Default: capabilities from statically declared config GPUs, health from
+        check(). Backends with queryable limits/quota override this. Must NOT raise.
+        """
+        caps = Capabilities(gpu_types=[g.normalized() for g in self.config.gpus])
+        try:
+            detail = self.check()
+            health, health_detail = Health.OK, detail
+        except Exception as e:  # discover never raises
+            health, health_detail = Health.UNREACHABLE, str(e)
+        return ProviderFacts(
+            backend=self.name,
+            discovered_at=datetime.now(timezone.utc),
+            capabilities=caps,
+            health=health,
+            health_detail=health_detail,
+        )
 
 
 _REGISTRY: dict[str, type[Backend]] = {}
