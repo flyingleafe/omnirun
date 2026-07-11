@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import re
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -367,6 +367,14 @@ class JobRecord(BaseModel):
             return 0.0
         est_runtime = self.spec.resources.time or timedelta(0)
         latest_safe_start = deadline.finish_by - est_runtime
+        # Defensive: a naive/aware datetime mix would make subtraction raise
+        # TypeError, which would propagate out of the pure scheduler tick.
+        # If exactly one side is naive, treat the naive one as UTC.
+        if (latest_safe_start.tzinfo is None) != (now.tzinfo is None):
+            if latest_safe_start.tzinfo is None:
+                latest_safe_start = latest_safe_start.replace(tzinfo=timezone.utc)
+            else:
+                now = now.replace(tzinfo=timezone.utc)
         return -(latest_safe_start - now).total_seconds()
 
 

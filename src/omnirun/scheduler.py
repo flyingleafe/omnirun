@@ -20,7 +20,7 @@ to ``PLACING`` they drop out of the pending set, so the tick converges.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
 
@@ -67,6 +67,14 @@ def _meets_deadline(slot: Slot, rec: JobRecord, now: datetime) -> bool:
         return True  # runtime unknown → optimistic
     wait = slot.availability.wait_s or 0.0
     est_finish = now + timedelta(seconds=wait) + est_runtime
+    # Defensive: a naive/aware mix (est_finish inherits now's tz; finish_by may
+    # differ) would make this comparison raise. Treat a lone naive side as UTC
+    # so the tick never crashes on mixed-awareness datetimes.
+    if (est_finish.tzinfo is None) != (finish_by.tzinfo is None):
+        if est_finish.tzinfo is None:
+            est_finish = est_finish.replace(tzinfo=timezone.utc)
+        else:
+            finish_by = finish_by.replace(tzinfo=timezone.utc)
     return est_finish <= finish_by
 
 
@@ -161,9 +169,15 @@ def tick(
 
     Returns:
         A list of ``hold`` and ``place`` decisions. Holds come from step 2;
-        places are ordered by job ranking (step 3). Jobs that can't be placed
-        (no fitting/affordable slot) emit nothing — an implicit noop, staying
-        ``QUEUED`` for a future tick (liveness: cost is never a refusal).
+        places are ordered by job ranking (step 3). Per job the match tries, in
+        order: (4a) the best free slot that meets the deadline; (4b) the
+        cheapest affordable paid slot that meets it (against a working ledger so
+        one tick's total paid commitment never exceeds the cap); and finally
+        (4c) — if neither met the deadline — the best free slot IGNORING the
+        deadline ("run late"), so a job with an unmeetable/overdue deadline is
+        never starved. Only a job with NO fitting free slot (and no affordable
+        paid one that meets the deadline) emits nothing — an implicit noop,
+        staying ``QUEUED`` for a future tick (liveness: cost is never a refusal).
     """
     policy = policy or SchedPolicy()
 
@@ -201,8 +215,11 @@ def tick(
     admittable.sort(key=lambda rec: _rank_key(rec, now))
 
     # Step 4: match. Track a LOCAL mutable copy of each slot's remaining
-    # capacity (by index) so one tick never over-assigns a slot.
+    # capacity (by index) so one tick never over-assigns a slot, and a LOCAL
+    # working ledger so the SUM of this tick's paid commitments never exceeds
+    # the cap (the caller commits *all* of a tick's decisions at once).
     remaining: list[int] = [slot.capacity for slot in slots]
+    working = ledger
 
     for rec in admittable:
         req = rec.spec.resources
@@ -215,6 +232,7 @@ def tick(
         ]
 
         chosen: tuple[int, Slot] | None = None
+        paid_cost: float | None = None  # set only when a PAID slot is chosen
 
         # 4a: any FREE candidate that meets the deadline → best availability
         # (smallest wait_s). Never escalate to paid while this holds.
@@ -227,14 +245,35 @@ def tick(
             chosen = min(free_ok, key=lambda pair: _wait_key(pair[1]))
         elif policy.allow_paid:
             # 4b: last-responsible-moment escalation to the cheapest affordable
-            # paid slot that meets the deadline.
-            chosen = _pick_paid_slot(candidates, rec, ledger, now)
-        # 4c (no free, no paid, or allow_paid=False): nothing emitted — the job
-        # stays QUEUED for a future free slot. Cost is NEVER a hold/refuse.
+            # paid slot that meets the deadline. Affordability is checked
+            # against the LOCAL working ledger (this tick's prior commitments
+            # count), not the pristine passed-in one.
+            chosen = _pick_paid_slot(candidates, rec, working, now)
+            if chosen is not None:
+                paid_cost = chosen[1].cost.total(rec.spec.resources.time)
+
+        # 4c (run late): rules 4a and 4b both failed and the job can't meet its
+        # deadline anywhere. Rather than starve it forever (an overdue job can
+        # NEVER meet its deadline, yet ranks first every tick), place it on the
+        # BEST fitting FREE slot IGNORING the deadline — liveness. This is FREE:
+        # we never spend money to run a job that is already going to be late.
+        if chosen is None:
+            free_late = [(idx, slot) for idx, slot in candidates if _is_free(slot)]
+            if free_late:
+                chosen = min(free_late, key=lambda pair: _wait_key(pair[1]))
+        # 4d (no free slot with capacity at all, or allow_paid=False and no free
+        # that meets the deadline): nothing emitted — the job stays QUEUED,
+        # waiting for free capacity. Cost is NEVER a hold/refuse.
 
         if chosen is not None:
             idx, slot = chosen
             remaining[idx] -= 1
+            # Reserve against the working ledger ONLY for the paid escalation
+            # branch, so later jobs this tick see the reduced remaining budget.
+            if paid_cost is not None:
+                working = working.commit(
+                    rec.spec.job_id, slot.provider_name, paid_cost, now
+                )
             decisions.append(Decision(kind="place", job_id=rec.spec.job_id, slot=slot))
 
     return decisions

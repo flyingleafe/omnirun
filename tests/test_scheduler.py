@@ -387,23 +387,25 @@ class TestEscalation:
         assert _placed_on(places[0]) == "free"
 
     def test_paid_missing_deadline_not_placed(self) -> None:
-        """A paid slot that also misses the deadline is not chosen → noop."""
+        """A paid slot that misses the deadline is not chosen → noop.
+
+        Paid-ONLY scenario: with no free slot, the run-late fallback (rule 4c,
+        free-only) can't fire, so a paid slot that also misses the deadline
+        leaves the job unplaced. (The free-slot-present case now runs late — see
+        ``TestRunLate``.)
+        """
         finish = NOW + timedelta(hours=1)
         rec = _rec(
             resources=ResourceSpec(time=timedelta(hours=1)),
             policy=JobPolicy(deadline=Deadline(finish_by=finish), max_cost=100.0),
         )
-        # Both slots wait too long: est finish = now + 2h + 1h > finish_by.
-        free = _slot(
-            provider_name="free",
-            availability=Availability(wait_s=2 * 3600),
-        )
+        # Paid slot waits too long: est finish = now + 2h + 1h > finish_by.
         paid = _slot(
             provider_name="paid",
             cost=Cost(per_hour=2.0),
             availability=Availability(wait_s=2 * 3600),
         )
-        out = tick([rec], [free, paid], BudgetLedger(cap=1000.0), NOW)
+        out = tick([rec], [paid], BudgetLedger(cap=1000.0), NOW)
         assert _places(out) == []
 
     def test_unknown_cost_paid_allowed_when_no_ceilings(self) -> None:
@@ -713,3 +715,234 @@ class TestSchedPolicy:
             policy=SchedPolicy(allow_paid=False),
         )
         assert len(_places(out)) == 1
+
+
+# ---------------------------------------------------------------------------
+# C1 — intra-tick budget cap (one tick's total paid commitment ≤ cap)
+# ---------------------------------------------------------------------------
+
+
+class TestIntraTickBudget:
+    def test_intra_tick_budget_not_over_committed(self) -> None:
+        """Two paid placements in one tick must not jointly exceed the cap.
+
+        j1 (priority 5) and j2 (priority 1) each want 1h on a $2/h slot with
+        capacity 2. The ledger cap is $3 (empty). Placing both would commit $4
+        > $3 — but the caller commits ALL of a tick's decisions at once. Only
+        j1 (higher priority) may place ($2); j2 must be refused ($2+$2=$4).
+        """
+        finish = NOW + timedelta(hours=100)  # far future → deadline met
+        j1 = _rec(
+            job_id="j1",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=5, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        j2 = _rec(
+            job_id="j2",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=1, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        paid = _slot(provider_name="paid", cost=Cost(per_hour=2.0), capacity=2)
+        out = tick([j1, j2], [paid], BudgetLedger(window="day", cap=3.0), NOW)
+
+        places = _places(out)
+        placed_ids = {d.job_id for d in places}
+        # Only the higher-priority job fits within the $3 cap.
+        assert placed_ids == {"j1"}
+        # Total committed across the tick's paid places ≤ cap.
+        total = sum(
+            d.slot.cost.total(timedelta(hours=1)) or 0.0
+            for d in places
+            if d.slot is not None
+        )
+        assert total <= 3.0
+
+    def test_intra_tick_budget_two_cap1_slots(self) -> None:
+        """Same over-commit shape but split across two capacity-1 paid slots."""
+        finish = NOW + timedelta(hours=100)
+        j1 = _rec(
+            job_id="j1",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=5, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        j2 = _rec(
+            job_id="j2",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=1, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        a = _slot(provider_name="a", cost=Cost(per_hour=2.0), capacity=1)
+        b = _slot(provider_name="b", cost=Cost(per_hour=2.0), capacity=1)
+        out = tick([j1, j2], [a, b], BudgetLedger(window="day", cap=3.0), NOW)
+        placed_ids = {d.job_id for d in _places(out)}
+        assert placed_ids == {"j1"}
+
+    def test_intra_tick_budget_both_fit_within_cap(self) -> None:
+        """When the cap covers both paid placements, both are placed."""
+        finish = NOW + timedelta(hours=100)
+        j1 = _rec(
+            job_id="j1",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=5, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        j2 = _rec(
+            job_id="j2",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                priority=1, deadline=Deadline(finish_by=finish), max_cost=100.0
+            ),
+        )
+        paid = _slot(provider_name="paid", cost=Cost(per_hour=2.0), capacity=2)
+        # cap 5 ≥ $4 total → both fit.
+        out = tick([j1, j2], [paid], BudgetLedger(window="day", cap=5.0), NOW)
+        assert {d.job_id for d in _places(out)} == {"j1", "j2"}
+
+
+# ---------------------------------------------------------------------------
+# C2 — unmeetable-deadline liveness ("run late" on a free slot)
+# ---------------------------------------------------------------------------
+
+
+class TestRunLate:
+    def test_unmeetable_deadline_runs_late_on_free_overdue(self) -> None:
+        """finish_by already in the past → NO slot can meet it → run late on free."""
+        rec = _rec(
+            job_id="overdue",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=NOW - timedelta(hours=10))),
+        )
+        free = _slot(provider_name="free", availability=Availability(kind="ready_now"))
+        out = tick([rec], [free], BudgetLedger(), NOW)
+        places = _places(out)
+        assert len(places) == 1
+        assert _placed_on(places[0]) == "free"
+
+    def test_unmeetable_deadline_runs_late_on_free_too_short(self) -> None:
+        """finish_by sooner than the runtime → unmeetable → run late on free."""
+        rec = _rec(
+            job_id="tight",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=NOW + timedelta(minutes=10))),
+        )
+        free = _slot(provider_name="free", availability=Availability(kind="ready_now"))
+        out = tick([rec], [free], BudgetLedger(), NOW)
+        places = _places(out)
+        assert len(places) == 1
+        assert _placed_on(places[0]) == "free"
+
+    def test_meetable_deadline_still_prefers_deadline_meeting_free(self) -> None:
+        """Sanity: a meetable deadline still uses rule 4a (don't regress)."""
+        rec = _rec(
+            job_id="ok",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=NOW + timedelta(hours=5))),
+        )
+        # Two free slots: fast one meets the deadline (ready now), slow one
+        # blows it (huge wait). Rule 4a must pick the deadline-meeting fast one.
+        fast = _slot(provider_name="fast", availability=Availability(kind="ready_now"))
+        slow = _slot(
+            provider_name="slow",
+            availability=Availability(kind="queued", wait_s=100 * 3600),
+        )
+        out = tick([rec], [slow, fast], BudgetLedger(), NOW)
+        places = _places(out)
+        assert len(places) == 1
+        assert _placed_on(places[0]) == "fast"
+
+    def test_run_late_picks_best_availability_free(self) -> None:
+        """Run late still tie-breaks on best availability (smallest wait_s)."""
+        rec = _rec(
+            job_id="overdue",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=NOW - timedelta(hours=10))),
+        )
+        slow = _slot(
+            provider_name="slow",
+            availability=Availability(kind="queued", wait_s=3600),
+        )
+        fast = _slot(provider_name="fast", availability=Availability(kind="ready_now"))
+        out = tick([rec], [slow, fast], BudgetLedger(), NOW)
+        places = _places(out)
+        assert len(places) == 1
+        assert _placed_on(places[0]) == "fast"
+
+    def test_run_late_never_uses_paid_only_slots(self) -> None:
+        """Rule 4c is FREE-only: a blown deadline with only paid slots stays unplaced.
+
+        The paid slot also misses the deadline, so rule 4b won't take it; and
+        run-late (4c) refuses paid. The job waits for free capacity — never
+        spends to run a job that's already late.
+        """
+        rec = _rec(
+            job_id="overdue",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                deadline=Deadline(finish_by=NOW - timedelta(hours=10)),
+                max_cost=100.0,
+            ),
+        )
+        paid = _slot(
+            provider_name="paid",
+            cost=Cost(per_hour=2.0),
+            availability=Availability(kind="ready_now"),
+        )
+        out = tick([rec], [paid], BudgetLedger(cap=1000.0), NOW)
+        assert _places(out) == []
+
+    def test_run_late_no_fitting_free_slot_stays_unplaced(self) -> None:
+        """No fitting free slot (only a paid one) + blown deadline → wait."""
+        rec = _rec(
+            job_id="overdue",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(
+                deadline=Deadline(finish_by=NOW - timedelta(hours=10)),
+                max_cost=0.0,  # can't afford the paid slot either
+            ),
+        )
+        paid = _slot(provider_name="paid", cost=Cost(per_hour=2.0))
+        out = tick([rec], [paid], BudgetLedger(), NOW)
+        assert _places(out) == []
+        assert _holds(out) == []
+
+
+# ---------------------------------------------------------------------------
+# M2 — urgency naive/aware datetime mix must not crash the tick
+# ---------------------------------------------------------------------------
+
+
+class TestUrgencyTzSafety:
+    def test_urgency_naive_aware_mix_no_crash(self) -> None:
+        """finish_by naive + now aware → urgency returns a float, tick doesn't raise."""
+        naive_finish = datetime(2026, 7, 11, 22, 0, 0)  # tz-naive
+        rec = _rec(
+            job_id="j",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=naive_finish)),
+        )
+        # urgency itself must not raise on the naive/aware mix.
+        val = rec.urgency(NOW)  # NOW is tz-aware
+        assert isinstance(val, float)
+
+        # And the whole tick must not raise either.
+        out = tick([rec], [_slot(provider_name="free")], BudgetLedger(), NOW)
+        assert len(_places(out)) == 1
+
+    def test_urgency_aware_naive_mix_no_crash(self) -> None:
+        """Mirror: finish_by aware + now naive → also robust."""
+        rec = _rec(
+            job_id="j",
+            resources=ResourceSpec(time=timedelta(hours=1)),
+            policy=JobPolicy(deadline=Deadline(finish_by=NOW)),  # aware
+        )
+        naive_now = datetime(2026, 7, 11, 12, 0, 0)  # tz-naive
+        val = rec.urgency(naive_now)
+        assert isinstance(val, float)
