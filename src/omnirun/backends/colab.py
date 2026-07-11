@@ -343,6 +343,15 @@ class ColabBackend(Backend):
 
     # ---- submit -----------------------------------------------------------------
 
+    def _code_source(self, spec: JobSpec, job_dir: str) -> CodeSource:
+        """Where the worker gets the repo: clone a public+pushed repo directly,
+        else ship a bundle. Shared by submit and render_payload so `--dry-run`
+        previews the real delivery."""
+        clone_url = _remote_clone_plan(spec)
+        if clone_url is not None:
+            return CodeSource(kind="remote", clone_url=clone_url)
+        return CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git")
+
     def submit(
         self,
         spec: JobSpec,
@@ -366,13 +375,8 @@ class ColabBackend(Backend):
 
         # a public repo is cloned by the worker directly (bootstrap does the git
         # clone over the VM's internet); only a private/unpushed sha is uploaded
-        # as a bundle.
-        clone_url = _remote_clone_plan(spec)
-        code = (
-            CodeSource(kind="remote", clone_url=clone_url)
-            if clone_url is not None
-            else CodeSource(kind="bundle", bundle_path=f"{job_dir}/bundle.git")
-        )
+        # as a bundle. Decided once here and reused by render_payload (dry-run).
+        code = self._code_source(spec, job_dir)
         try:
             script = generate_bootstrap(
                 notebook_env_spec(spec),
@@ -406,7 +410,7 @@ class ColabBackend(Backend):
                     f"{job_dir}/bootstrap.sh",
                     timeout=UPLOAD_TIMEOUT_S,
                 )
-                if clone_url is None:  # private repo → upload the bundle
+                if code.kind == "bundle":  # private repo → upload the bundle
                     bundle = _create_bundle(
                         _local_root(spec), spec.repo.sha, local / "bundle.git"
                     )
@@ -470,6 +474,23 @@ class ColabBackend(Backend):
                 "root": COLAB_ROOT,
                 "pid": pid,
             },
+        )
+
+    def render_payload(self, spec: JobSpec, offer: Offer | None = None) -> str:
+        """The bootstrap `omnirun submit --dry-run` prints — with the real code
+        source (clone vs bundle) instead of the generic bare-repo fallback."""
+        job_dir = f"{COLAB_ROOT}/jobs/{spec.job_id}"
+        return generate_bootstrap(
+            notebook_env_spec(spec),
+            BootstrapParams(
+                omnirun_root=COLAB_ROOT,
+                project_root=jobdir.project_root_of(
+                    COLAB_ROOT,
+                    spec.repo.slug,
+                    self.config.project_root_for(spec.repo.slug),
+                ),
+                code=self._code_source(spec, job_dir),
+            ),
         )
 
     # ---- status ------------------------------------------------------------------

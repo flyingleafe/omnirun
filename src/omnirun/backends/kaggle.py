@@ -434,6 +434,22 @@ class KaggleBackend(Backend):
             "the backend's `max_source_bytes` if Kaggle accepts more"
         )
 
+    def _code_source(self, spec: JobSpec, job_id: str) -> CodeSource:
+        """Where the worker gets the repo. A public+pushed repo is cloned by the
+        worker directly (bootstrap does the git clone over the kernel's own
+        internet); only a private/unpushed sha rides along as a bundle. The
+        bundle, when needed, is embedded in the kernel itself (base64 in run.py),
+        NOT shipped as a dataset: a dataset would 409 the kernel push until it
+        finished processing and needs a create/delete lifecycle. Cost of
+        embedding: the kernel source carries the bundle, so only code-sized repos
+        fit. Shared by submit and render_payload so `--dry-run` previews it."""
+        clone_url = _remote_clone_plan(spec.repo, _local_root(spec))
+        if clone_url is not None:
+            return CodeSource(kind="remote", clone_url=clone_url)
+        return CodeSource(
+            kind="bundle", bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git"
+        )
+
     def submit(
         self,
         spec: JobSpec,
@@ -450,25 +466,15 @@ class KaggleBackend(Backend):
         with tempfile.TemporaryDirectory(prefix="omnirun-kaggle-") as td:
             stage = Path(td)
             local_root = _local_root(spec)
-            # A public repo is cloned by the worker directly (bootstrap does the
-            # git clone over the kernel's own internet); only a private/unpushed
-            # sha rides along as a bundle. The bundle, when needed, is embedded in
-            # the kernel itself (base64 in run.py), NOT shipped as a dataset: a
-            # dataset would 409 the kernel push until it finished processing and
-            # needs a create/delete lifecycle. Cost of embedding: the kernel
-            # source carries the bundle, so only code-sized repos fit.
-            clone_url = _remote_clone_plan(spec.repo, local_root)
-            if clone_url is not None:
-                bundle_b64 = ""
-                code = CodeSource(kind="remote", clone_url=clone_url)
-            else:
+            # Decided once in _code_source (also drives --dry-run); when it's a
+            # bundle, materialise the bytes here and embed them (base64 in run.py).
+            code = self._code_source(spec, job_id)
+            if code.kind == "bundle":
                 bundle_path = stage / "bundle.git"
                 _create_bundle(local_root, spec.repo.sha, bundle_path)
                 bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
-                code = CodeSource(
-                    kind="bundle",
-                    bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
-                )
+            else:
+                bundle_b64 = ""
 
             # uncommitted, gitignored .env ships as its own blob (never via git)
             envf = _env_file(spec)
@@ -533,6 +539,23 @@ class KaggleBackend(Backend):
             backend=self.name,
             job_id=job_id,
             data={"kernel_ref": kernel_ref, "machine_shape": shape},
+        )
+
+    def render_payload(self, spec: JobSpec, offer: Offer | None = None) -> str:
+        """The bootstrap `omnirun submit --dry-run` prints — with the real code
+        source (clone vs embedded bundle) instead of the generic bare-repo
+        fallback."""
+        return generate_bootstrap(
+            notebook_env_spec(spec),
+            BootstrapParams(
+                omnirun_root=KAGGLE_ROOT,
+                project_root=jobdir.project_root_of(
+                    KAGGLE_ROOT,
+                    spec.repo.slug,
+                    self.config.project_root_for(spec.repo.slug),
+                ),
+                code=self._code_source(spec, spec.job_id),
+            ),
         )
 
     # ---- status ----------------------------------------------------------------

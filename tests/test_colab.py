@@ -270,6 +270,36 @@ def test_submit_failure_stops_session(cli, backend):
     assert cli.subcommands()[-1] == "stop"
 
 
+# ---- render_payload (submit --dry-run) ---------------------------------------
+
+
+def test_render_payload_public_repo_clones_without_submit(backend, cli, monkeypatch):
+    # dry-run renders the REAL code source: a public repo → git clone from the
+    # anon https url, and nothing is submitted (no colab CLI calls at all).
+    monkeypatch.setattr(
+        colab_mod, "_remote_clone_plan", lambda spec: "https://github.com/me/proj.git"
+    )
+    cli.calls.clear()
+    payload = backend.render_payload(make_spec(gpu_type="T4"), offer=None)
+    assert "git clone --bare" in payload
+    assert "https://github.com/me/proj.git" in payload
+    assert "bundle.git" not in payload
+    assert cli.calls == []
+
+
+def test_render_payload_private_repo_shows_bundle_without_submit(
+    backend, cli, monkeypatch
+):
+    # private/unpushed → the payload references the bundle path, not a clone url,
+    # and still nothing is submitted.
+    monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
+    cli.calls.clear()
+    payload = backend.render_payload(make_spec(gpu_type="T4"), offer=None)
+    assert f'BUNDLE="{JOB_DIR}/bundle.git"' in payload
+    assert "CLONE_URL=" not in payload
+    assert cli.calls == []
+
+
 # ---- status ------------------------------------------------------------------
 
 
