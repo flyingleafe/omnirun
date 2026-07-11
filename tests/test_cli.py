@@ -17,12 +17,14 @@ from omnirun.backends.base import (
     ProvisioningSink,
     register,
 )
+from omnirun.budget import LedgerEntry as _LedgerEntry
 from omnirun.cli import app
 from omnirun.models import (
     Capabilities as _Capabilities,
     Health as _Health,
     JobHandle,
     JobSpec,
+    JobState,
     JobStatus,
     Offer,
     ProviderFacts as _ProviderFacts,
@@ -240,19 +242,26 @@ def submit_one(*extra: str) -> str:
 # ------------------------------------------------------------------ submit
 
 
-def test_submit_interrupted_after_provision_leaves_reclaimable_stub(env):
-    """A submit that dies after renting still persists a stub record carrying the
-    instance id, so `ps`/`gc` can see and reclaim the orphan (issue #7)."""
+def test_submit_failed_placement_leaves_retryable_queued_job(env):
+    """A backend.submit that raises during placement no longer aborts silently:
+    the scheduler releases the reservation back to QUEUED (attempts bumped) and
+    submit reports it could not place. NOTE (Phase-3 regression vs. the old direct
+    path): ``BackendProvider.place`` does not thread ``on_provisioning``, so a
+    marketplace instance rented mid-submit is NOT captured as a reclaimable stub
+    here — that anti-orphan hook is a Phase-4 concern (see task report)."""
     result = runner.invoke(
-        app, ["submit", "--yes", "--backend", "provfail", "--", "python", "train.py"]
+        app, ["submit", "--backend", "provfail", "--", "python", "train.py"]
     )
-    assert result.exit_code != 0  # the submit failed...
+    assert result.exit_code != 0  # the placement failed...
+    assert "could not be placed" in result.output
 
     ids = _store().list_job_ids()
-    assert len(ids) == 1  # ...but a record survived
+    assert len(ids) == 1  # ...but the QUEUED record survives for a retry
     rec = _store().load_job(ids[0])
-    assert rec is not None and rec.handle is not None
-    assert rec.handle.data == {"instance_id": "inst-42", "provisioning": True}
+    assert rec is not None
+    assert rec.state is JobState.QUEUED
+    assert rec.placement is None
+    assert rec.attempts >= 1  # the failed place counted as an attempt
 
 
 def test_submit_yes_happy_path(env):
@@ -358,8 +367,10 @@ def test_submit_unknown_backend_errors(env):
     assert "not configured" in result.output
 
 
-def test_submit_interactive_pick(env):
-    # two paid offers -> genuine tradeoff -> prompt; cheaper one ranks first
+def test_submit_scheduler_picks_cheapest_paid(env):
+    # Two paid offers, no free option: the scheduler auto-escalates to the
+    # cheapest affordable one (needs a --time so total cost is knowable). This
+    # supersedes the old interactive offer-table pick — placement is automatic.
     env.config_file.write_text(
         """\
 [backends.pricey]
@@ -371,17 +382,17 @@ type = "stub"
 cost_per_hour = 1.0
 """
     )
-    result = runner.invoke(app, ["submit", "--", "python", "train.py"], input="1\n")
+    result = runner.invoke(app, ["submit", "--time", "1h", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
-    assert "pick an offer #" in result.output
+    assert "pick an offer #" not in result.output  # no prompt: auto-placed
     [(job_id, (_, offer))] = StubBackend.submitted.items()
     assert offer.backend == "cheap"
     rec = _store().load_job(job_id)
-    assert rec is not None and rec.offer is not None
-    assert rec.offer.backend == "cheap"
+    assert rec is not None and rec.placement is not None
+    assert rec.placement.provider_name == "cheap"
 
 
-def test_submit_max_cost_filters_to_single_offer(env):
+def test_submit_max_cost_excludes_over_ceiling(env):
     env.config_file.write_text(
         """\
 [backends.pricey]
@@ -393,8 +404,12 @@ type = "stub"
 cost_per_hour = 1.0
 """
     )
-    # no --yes: max-cost filter leaves exactly one fitting offer -> auto-pick
-    result = runner.invoke(app, ["submit", "--max-cost", "2", "--", "x"])
+    # --max-cost is now a per-job total-USD ceiling: with a 1h estimate, pricey
+    # ($5) is over the $2 ceiling and cheap ($1) fits, so the scheduler places
+    # on cheap.
+    result = runner.invoke(
+        app, ["submit", "--time", "1h", "--max-cost", "2", "--", "x"]
+    )
     assert result.exit_code == 0, result.output
     [(_, (_, offer))] = StubBackend.submitted.items()
     assert offer.backend == "cheap"
@@ -404,9 +419,13 @@ def test_submit_max_cost_can_exclude_everything(env):
     env.config_file.write_text(
         '[backends.pricey]\ntype = "stub"\ncost_per_hour = 5.0\n'
     )
-    result = runner.invoke(app, ["submit", "--yes", "--max-cost", "0.5", "--", "x"])
+    # Only a $5/h offer, ceiling $0.5: nothing is affordable, so the job is left
+    # queued-but-unplaced and submit reports it could not place (exit 1).
+    result = runner.invoke(
+        app, ["submit", "--time", "1h", "--max-cost", "0.5", "--", "x"]
+    )
     assert result.exit_code == 1
-    assert "no fitting offers" in result.output
+    assert "could not be placed" in result.output
     assert not StubBackend.submitted
 
 
@@ -432,6 +451,168 @@ WANDB_MODE = "offline"
     assert spec.resources.time == timedelta(hours=4)
     assert spec.outputs == ["results/*.json"]
     assert spec.env_vars == {"WANDB_MODE": "offline", "EXTRA": "1"}
+
+
+# ------------------------------------------------ deadline / priority / max-cost
+
+
+def test_submit_policy_flags_reach_persisted_spec(env):
+    job_id = submit_one(
+        "--priority",
+        "7",
+        "--max-cost",
+        "3.5",
+        "--finish-by",
+        "+2h",
+        "--time",
+        "30m",
+    )
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    pol = rec.spec.policy
+    assert pol.priority == 7
+    assert pol.max_cost == 3.5
+    assert pol.deadline is not None and pol.deadline.finish_by is not None
+    # +2h relative deadline lands ~2h in the future (UTC-aware).
+    now = datetime.now(timezone.utc)
+    assert pol.deadline.finish_by > now + timedelta(minutes=110)
+    assert pol.deadline.start_by is None
+
+
+def test_submit_start_by_absolute_iso(env):
+    job_id = submit_one("--start-by", "2999-01-02T03:04:05+00:00")
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.deadline is not None
+    assert rec.spec.policy.deadline.start_by == datetime(
+        2999, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+    )
+
+
+def test_submit_rejects_bad_deadline(env):
+    result = runner.invoke(
+        app, ["submit", "--finish-by", "not-a-date", "--", "python", "x.py"]
+    )
+    assert result.exit_code == 1
+    assert "bad deadline" in result.output
+    assert not StubBackend.submitted
+
+
+def test_enqueue_policy_flags_reach_sent_spec(env, monkeypatch):
+    """`enqueue`'s deadline/priority/max-cost flags must ride on the JobSpec sent
+    to the daemon (so the daemon's tick honors them). We capture the request
+    instead of standing up a daemon."""
+    sent: list[JobSpec] = []
+
+    def fake_send(host, port, req, timeout=30.0):
+        sent.append(JobSpec.model_validate(req["spec"]))
+        return {"ok": True, "qids": ["q-abc"]}
+
+    monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
+    monkeypatch.setattr("omnirun.cli.send_request", fake_send)
+
+    result = runner.invoke(
+        app,
+        [
+            "enqueue",
+            "--priority",
+            "4",
+            "--max-cost",
+            "9",
+            "--finish-by",
+            "+1h",
+            "--time",
+            "10m",
+            "--",
+            "python",
+            "train.py",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    [spec] = sent
+    assert spec.policy.priority == 4
+    assert spec.policy.max_cost == 9
+    assert spec.policy.deadline is not None
+    assert spec.policy.deadline.finish_by is not None
+
+
+# ------------------------------------------------------------------ reprioritize
+
+
+def test_reprioritize_changes_priority_and_deadline(env):
+    job_id = submit_one("--priority", "1")
+    result = runner.invoke(
+        app, ["reprioritize", job_id, "--priority", "9", "--finish-by", "+3h"]
+    )
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    assert rec.spec.policy.priority == 9
+    assert rec.spec.policy.deadline is not None
+    assert rec.spec.policy.deadline.finish_by is not None
+
+
+def test_reprioritize_free_only_and_allow_paid_flip_max_cost(env):
+    job_id = submit_one()
+    # --free-only pins max_cost to 0.0
+    result = runner.invoke(app, ["reprioritize", job_id, "--free-only"])
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.max_cost == 0.0
+
+    # --allow-paid clears the ceiling back to None
+    result = runner.invoke(app, ["reprioritize", job_id, "--allow-paid"])
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.max_cost is None
+
+
+def test_reprioritize_terminal_job_errors(env):
+    job_id = submit_one()
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    rec.state = JobState.SUCCEEDED  # simulate a finished job
+    _store().save_job(rec)
+    result = runner.invoke(app, ["reprioritize", job_id, "--priority", "5"])
+    assert result.exit_code == 1
+    assert "finished job" in result.output
+
+
+def test_reprioritize_unknown_job_errors(env):
+    result = runner.invoke(app, ["reprioritize", "nope", "--priority", "5"])
+    assert result.exit_code == 1
+    assert "no job matching" in result.output
+
+
+# ------------------------------------------------------------------ budget
+
+
+def test_budget_set_daily_then_show_roundtrips(env):
+    result = runner.invoke(app, ["budget", "--daily", "12.5"])
+    assert result.exit_code == 0, result.output
+    assert "budget updated" in result.output
+    # Persisted via set_meta and reflected by get_meta.
+    assert _store().get_meta("budget.day") == repr(12.5)
+
+    # `budget` with no set-flags shows current spend vs cap for each window.
+    result = runner.invoke(app, ["budget"])
+    assert result.exit_code == 0, result.output
+    assert "$12.5" in result.output  # the cap column
+    assert "$0" in result.output  # spent nothing this window
+
+
+def test_budget_show_reads_ledger_spend(env):
+    from datetime import datetime as _dt
+
+    now = _dt.now(timezone.utc)
+    _store().set_meta("budget.day", repr(20.0))
+    _store().ledger_add(
+        "day",
+        _LedgerEntry(job_id="j1", provider="stub", amount=8.0, kind="spent", at=now),
+    )
+    result = runner.invoke(app, ["budget"])
+    assert result.exit_code == 0, result.output
+    assert "$8" in result.output  # spent this window (loaded from the ledger)
+    assert "$20" in result.output  # cap
 
 
 # ------------------------------------------------------------------ offers

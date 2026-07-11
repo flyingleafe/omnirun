@@ -157,6 +157,26 @@ class Store:
             return 0
         return int(row)
 
+    def get_meta(self, key: str) -> str | None:
+        """Return the ``meta`` value for *key*, or ``None`` if unset.
+
+        The generic key/value accessor backing runtime settings the scheduler
+        reads live each tick (e.g. ``budget.day`` set by ``omnirun budget``).
+        Mirrors ``schema_version``'s read pattern.
+        """
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(meta.c.value).where(meta.c.key == key)
+            ).scalar_one_or_none()
+        if row is None:
+            return None
+        return str(row)
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Upsert ``meta[key] = value`` (dialect-aware, one transaction)."""
+        with self.transaction() as conn:
+            self._upsert(conn, meta, ["key"], {"key": key, "value": value})
+
     @contextmanager
     def transaction(self) -> Iterator[Connection]:
         """Open a write transaction.

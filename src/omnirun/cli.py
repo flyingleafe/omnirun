@@ -7,7 +7,7 @@ import functools
 import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -25,17 +25,22 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
+from omnirun.control import Control
 from omnirun.models import (
+    Deadline,
     EnvSpec,
     Health,
     JobHandle,
+    JobPolicy,
     JobRecord,
     JobSpec,
+    JobState,
     JobStatus,
     Offer,
     ResourceSpec,
     StatusReport,
 )
+from omnirun.providers import BackendProvider, Provider
 from omnirun.queue import QueueState
 from omnirun.state import Store, open_store
 
@@ -105,7 +110,7 @@ def friendly_errors(fn):
     return wrapper
 
 
-def _die(msg: str) -> None:
+def _die(msg: str) -> NoReturn:
     console.print(f"[red]error:[/red] {msg}")
     raise typer.Exit(1)
 
@@ -141,6 +146,30 @@ def _parse_time(s: str | int | float) -> timedelta:
         return parse_duration(s)
     except ValueError as e:
         raise ConfigError(str(e)) from e
+
+
+def _parse_deadline(s: str) -> datetime:
+    """Parse a deadline: an ISO-8601 absolute time OR a relative ``+<N><unit>``.
+
+    ``+90m`` / ``+15h`` / ``+2d`` (also bare ``h``/``m``/``d`` combos like
+    ``+2h30m``) means ``now + duration``. Anything else is parsed as ISO-8601 via
+    ``datetime.fromisoformat``. A naive result is stamped UTC, matching how the
+    codebase records ``submitted_at`` (``datetime.now(timezone.utc)``), so the
+    scheduler never mixes naive/aware datetimes.
+    """
+    s = s.strip()
+    if s.startswith("+"):
+        dt = datetime.now(timezone.utc) + _parse_time(s[1:])
+    else:
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError as e:
+            raise ConfigError(
+                f"bad deadline {s!r}: use ISO-8601 (2026-07-11T18:00) or +<N>[dhm]"
+            ) from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _parse_env(pairs: list[str]) -> dict[str, str]:
@@ -277,6 +306,36 @@ def _backend_for(cfg: Config, name: str) -> Backend:
     return make_backend(name, bcfg)
 
 
+def _bridge_placement(store: Store, rec: JobRecord) -> None:
+    """Project a scheduler ``placement`` onto the legacy ``handle``/``offer`` view.
+
+    The scheduler persists a job's live target as a :class:`Placement`; the
+    daemonless lifecycle commands (``ps``/``status``/``logs``/``cancel``/``pull``/
+    ``gc``) still speak the ``JobHandle``/``Offer``/``last_status`` vocabulary. To
+    keep both working off one record we mirror a placed record's placement into
+    those fields (additively — the placement stays authoritative for the
+    scheduler's capacity view). A record with no real placement is left untouched.
+    Persists in place; a no-op when there is nothing to bridge.
+    """
+    p = rec.placement
+    if p is None or not p.handle:
+        return
+    rec.handle = JobHandle(
+        backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle
+    )
+    if rec.offer is None:
+        rec.offer = Offer(
+            backend=p.provider_name,
+            label=f"{p.provider_name}: {p.state.value}",
+            gpu_type=rec.spec.resources.gpu_type,
+            gpus=rec.spec.resources.effective_gpus(),
+        )
+    # NB: last_status is intentionally left as-is (usually None right after a
+    # place): the lifecycle commands refresh it live via the backend, matching
+    # the pre-scheduler UX where a just-submitted job shows "?" until refreshed.
+    store.save_job(rec)
+
+
 def _refresh_status(
     store: Store, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
 ) -> StatusReport | None:
@@ -313,6 +372,23 @@ def _truncate(s: str, n: int = 40) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _build_policy(
+    *,
+    finish_by: str | None,
+    start_by: str | None,
+    priority: int,
+    max_cost: float | None,
+) -> JobPolicy:
+    """Assemble a ``JobPolicy`` from the CLI deadline/priority/cost flags."""
+    deadline: Deadline | None = None
+    if start_by is not None or finish_by is not None:
+        deadline = Deadline(
+            start_by=_parse_deadline(start_by) if start_by is not None else None,
+            finish_by=_parse_deadline(finish_by) if finish_by is not None else None,
+        )
+    return JobPolicy(deadline=deadline, max_cost=max_cost, priority=priority)
+
+
 def _build_job_spec(
     command: list[str],
     *,
@@ -328,6 +404,10 @@ def _build_job_spec(
     outputs: list[str] | None,
     env: list[str] | None,
     push: bool,
+    finish_by: str | None = None,
+    start_by: str | None = None,
+    priority: int = 0,
+    max_cost: float | None = None,
 ) -> JobSpec:
     """Repo capture + defaults merge shared by `submit` and `enqueue`."""
     from omnirun import repo as repo_mod
@@ -363,6 +443,12 @@ def _build_job_spec(
         else list(job_defaults.get("outputs", []) or []),
         repo=repo_ref,
         env_vars=env_vars,
+        policy=_build_policy(
+            finish_by=finish_by,
+            start_by=start_by,
+            priority=priority,
+            max_cost=max_cost,
+        ),
     )
 
 
@@ -404,10 +490,21 @@ def submit(
         None, "--backend", help="Restrict to one configured backend."
     ),
     yes: bool = typer.Option(
-        False, "--yes", "-y", help="Don't ask; take the top-ranked offer."
+        False, "--yes", "-y", help="Accept the scheduler's automatic placement."
     ),
     max_cost: float | None = typer.Option(
-        None, "--max-cost", help="Drop offers whose est. total $ exceeds this."
+        None, "--max-cost", help="USD ceiling for this job's paid placement."
+    ),
+    finish_by: str | None = typer.Option(
+        None,
+        "--finish-by",
+        help="Deadline to finish by: ISO-8601 (2026-07-11T18:00) or +<N>[dhm].",
+    ),
+    start_by: str | None = typer.Option(
+        None, "--start-by", help="Deadline to start by (same format as --finish-by)."
+    ),
+    priority: int = typer.Option(
+        0, "--priority", help="Higher = scheduled sooner (reprioritizable later)."
     ),
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
@@ -418,6 +515,7 @@ def submit(
         help="Print the rendered payload for the chosen backend; do not submit.",
     ),
 ) -> None:
+    _ = yes  # placement is automatic now; --yes kept for backward compatibility
     spec = _build_job_spec(
         command,
         name=name,
@@ -432,6 +530,10 @@ def submit(
         outputs=outputs,
         env=env,
         push=push,
+        finish_by=finish_by,
+        start_by=start_by,
+        priority=priority,
+        max_cost=max_cost,
     )
     res = spec.resources
 
@@ -453,51 +555,70 @@ def submit(
         _render_payload(backend_obj, spec, synthetic)
         return
 
-    backends, ranked, unfit = _probe(cfg, res, backend)
-    ranked = chooser.apply_max_cost(ranked, max_cost)
-    if not ranked:
-        console.print(chooser.render_offer_table(ranked, unfit, res))
-        suffix = f" under --max-cost {max_cost:g}" if max_cost is not None else ""
-        _die(f"no fitting offers{suffix}")
-
-    picked = chooser.auto_pick(ranked, cfg.policy)
-    if picked is None and yes:
-        picked = ranked[0]
-    if picked is not None:
-        console.print(f"picked: {picked.offer.label}")
-    else:
-        console.print(chooser.render_offer_table(ranked, unfit, res))
-        n = typer.prompt("pick an offer #", type=int)
-        if not 1 <= n <= len(ranked):
-            _die(f"offer #{n} is not on the table")
-        picked = ranked[n - 1]
-
-    backend_obj = backends[picked.offer.backend]
-
+    # --dry-run without a named backend: the chooser still selects which backend
+    # to preview (display only — nothing is submitted, no Control involved).
     if dry_run:
-        _render_payload(backend_obj, spec, picked.offer)
+        backends, ranked, unfit = _probe(cfg, res, backend)
+        if not ranked:
+            console.print(chooser.render_offer_table(ranked, unfit, res))
+            _die("no fitting offers")
+        picked = chooser.auto_pick(ranked, cfg.policy) or ranked[0]
+        _render_payload(backends[picked.offer.backend], spec, picked.offer)
         return
 
+    # Real placement now runs through the scheduler: the pure ``tick`` inside
+    # ``Control`` reconciles, reserves atomically, and places on the cheapest
+    # offer that fits the deadline/budget — the same tick the daemon runs. The
+    # chooser remains the engine of ``omnirun offers`` (display only).
     store = open_store(cfg.state.resolved_url())
-    picked_offer = picked.offer
+    try:
+        _submit_via_control(store, cfg, spec, backend)
+    finally:
+        store.close()
 
-    def _persist(h: JobHandle) -> None:
-        # Called once with a provisioning stub (if the backend rents something
-        # before the handle is ready) and again with the final handle, so an
-        # interrupted submit still leaves a reclaimable record (#7).
-        store.save_job(
-            JobRecord(
-                spec=spec,
-                handle=h,
-                offer=picked_offer,
-                submitted_at=datetime.now(timezone.utc),
-            )
+
+def _submit_via_control(
+    store: Store, cfg: Config, spec: JobSpec, backend: str | None
+) -> None:
+    """Persist *spec* QUEUED, run one synchronous tick, and report the outcome.
+
+    Daemonless: ``Control`` does its own single tick here — no background process
+    is required (a placed job then runs on the backend while the laptop is free).
+    ``--backend`` narrows the provider set the scheduler may place onto.
+    """
+    backends, _broken = _make_backends(cfg, backend)
+    providers: dict[str, Provider] = {
+        name: BackendProvider(be, store) for name, be in backends.items()
+    }
+    control = Control(
+        store, providers, budget_window="day", budget_cap=cfg.budget.daily
+    )
+    now = datetime.now(timezone.utc)
+    job_id = control.submit(spec, now=now)
+    control.run_tick(now)
+
+    rec = store.load_job(job_id)
+    if rec is None:  # pragma: no cover — we just wrote it
+        _die(f"job {job_id} vanished after submit")
+    _bridge_placement(store, rec)
+
+    if rec.placement is not None and rec.placement.handle:
+        label = (
+            rec.offer.label if rec.offer is not None else rec.placement.provider_name
         )
-
-    handle = backend_obj.submit(spec, picked_offer, on_provisioning=_persist)
-    _persist(handle)
-    console.print(f"[green]submitted[/green] {spec.job_id} -> {picked.offer.label}")
-    console.print(f"follow logs with: omnirun logs -f {spec.job_id}")
+        console.print(f"[green]submitted[/green] {job_id} -> {label}")
+        console.print(f"follow logs with: omnirun logs -f {job_id}")
+        return
+    if rec.state is JobState.HELD:
+        reason = rec.last_status.detail if rec.last_status else "no slot can satisfy it"
+        _die(f"job {job_id} cannot be placed: {reason}")
+    # QUEUED but unplaced: admissible yet no fitting/affordable offer right now.
+    # The record persists; a running `omnirun serve` (or a later manual submit)
+    # can still place it, but a daemonless submit has no auto-wakeup.
+    _die(
+        f"job {job_id} could not be placed now: no fitting/affordable offer "
+        "(raise --max-cost / budget, relax the deadline, or run `omnirun serve`)"
+    )
 
 
 # --------------------------------------------------------------------------- offers
@@ -593,6 +714,20 @@ def enqueue(
     backend: str | None = typer.Option(
         None, "--backend", help="Restrict placement to one configured backend."
     ),
+    max_cost: float | None = typer.Option(
+        None, "--max-cost", help="USD ceiling for this job's paid placement."
+    ),
+    finish_by: str | None = typer.Option(
+        None,
+        "--finish-by",
+        help="Deadline to finish by: ISO-8601 (2026-07-11T18:00) or +<N>[dhm].",
+    ),
+    start_by: str | None = typer.Option(
+        None, "--start-by", help="Deadline to start by (same format as --finish-by)."
+    ),
+    priority: int = typer.Option(
+        0, "--priority", help="Higher = scheduled sooner (reprioritizable later)."
+    ),
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
@@ -611,6 +746,10 @@ def enqueue(
         outputs=outputs,
         env=env,
         push=push,
+        finish_by=finish_by,
+        start_by=start_by,
+        priority=priority,
+        max_cost=max_cost,
     )
     host, port = _require_daemon()
     resp = send_request(
@@ -815,6 +954,121 @@ def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
     )
     console.print(f"cancelled {rec.spec.job_id}")
+
+
+@app.command(help="Change a queued/running job's scheduling policy.")
+@friendly_errors
+def reprioritize(
+    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    priority: int | None = typer.Option(
+        None, "--priority", help="New priority (higher = scheduled sooner)."
+    ),
+    finish_by: str | None = typer.Option(
+        None, "--finish-by", help="New finish-by deadline: ISO-8601 or +<N>[dhm]."
+    ),
+    start_by: str | None = typer.Option(
+        None, "--start-by", help="New start-by deadline (same format)."
+    ),
+    allow_paid: bool | None = typer.Option(
+        None,
+        "--allow-paid/--free-only",
+        help="Allow paid placement (within budget) or restrict to free offers.",
+    ),
+) -> None:
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    try:
+        rec = store.resolve_job(job)
+        deadline: Deadline | None = None
+        if start_by is not None or finish_by is not None:
+            existing = rec.spec.policy.deadline or Deadline()
+            deadline = Deadline(
+                start_by=_parse_deadline(start_by)
+                if start_by is not None
+                else existing.start_by,
+                finish_by=_parse_deadline(finish_by)
+                if finish_by is not None
+                else existing.finish_by,
+            )
+        control = Control(store, {})
+        new_policy = control.reprioritize(
+            rec.spec.job_id,
+            priority=priority,
+            deadline=deadline,
+            allow_paid=allow_paid,
+        )
+    except ValueError as e:
+        _die(str(e))
+    finally:
+        store.close()
+    console.print(f"reprioritized {rec.spec.job_id}:")
+    console.print(f"[bold]priority:[/bold] {new_policy.priority}")
+    pay = "free-only" if new_policy.max_cost == 0.0 else "paid allowed"
+    if new_policy.max_cost not in (None, 0.0):
+        pay = f"<= ${new_policy.max_cost:g}"
+    console.print(f"[bold]pay:[/bold] {pay}")
+    if new_policy.deadline is not None:
+        d = new_policy.deadline
+        console.print(
+            f"[bold]deadline:[/bold] start_by={d.start_by} finish_by={d.finish_by}"
+        )
+
+
+@app.command(help="Show or set the global spend budget (per day/week).")
+@friendly_errors
+def budget(
+    daily: float | None = typer.Option(
+        None, "--daily", help="Set the daily USD cap (0 = free-only)."
+    ),
+    weekly: float | None = typer.Option(
+        None, "--weekly", help="Set the weekly USD cap (0 = free-only)."
+    ),
+) -> None:
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    try:
+        control = Control(store, {})
+        changed = False
+        if daily is not None:
+            control.budget("day", daily)
+            changed = True
+        if weekly is not None:
+            control.budget("week", weekly)
+            changed = True
+        if changed:
+            console.print("[green]budget updated[/green]")
+        now = datetime.now(timezone.utc)
+        table = Table("window", "spent", "cap")
+        for window, cfg_default in (
+            ("day", cfg.budget.daily),
+            ("week", cfg.budget.weekly),
+        ):
+            cap = _resolve_budget_cap(store, window, cfg_default)
+            spent = store.load_ledger(window, cap, now).in_window_total(now)
+            table.add_row(
+                window,
+                f"${spent:g}",
+                "unbounded" if cap is None else f"${cap:g}",
+            )
+        console.print(table)
+    finally:
+        store.close()
+
+
+def _resolve_budget_cap(
+    store: Store, window: str, cfg_default: float | None
+) -> float | None:
+    """The live cap for *window*: the meta override if set, else the config default."""
+    raw = store.get_meta(f"budget.{window}")
+    if raw is not None:
+        raw = raw.strip()
+        if raw == "":
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return cfg_default
 
 
 @app.command(help="Pull a job's collected outputs to a local directory.")

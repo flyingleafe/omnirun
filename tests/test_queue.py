@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 
 from omnirun.backends.base import Backend, ProvisioningSink
@@ -50,11 +51,13 @@ class FakeBackend(Backend):
         runs_before_done: int = 1,
         fail_submit: bool = False,
         submitted: list[str] | None = None,
+        cost_per_hour: float | None = None,
     ) -> None:
         super().__init__(name, config)
         self.runs_before_done = runs_before_done
         self.fail_submit = fail_submit
         self.submitted = submitted if submitted is not None else []
+        self.cost_per_hour = cost_per_hour
         self.cancelled: list[str] = []
         self._polls: dict[str, int] = {}
 
@@ -64,7 +67,7 @@ class FakeBackend(Backend):
                 backend=self.name,
                 label=f"{self.name}: fake box",
                 fits=True,
-                cost_per_hour=None,
+                cost_per_hour=self.cost_per_hour,
                 wait_estimate_s=0.0,
             )
         ]
@@ -103,6 +106,7 @@ def make_daemon(
     runs_before_done: int = 1,
     fail_submit: bool = False,
     submitted: list[str] | None = None,
+    cost_per_hour: float | None = None,
 ) -> Daemon:
     cfg = Config(
         daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
@@ -119,19 +123,20 @@ def make_daemon(
             runs_before_done=runs_before_done,
             fail_submit=fail_submit,
             submitted=submitted,
+            cost_per_hour=cost_per_hour,
         )
 
     return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
 
 
 def _drain(daemon: Daemon, timeout: float = 5.0) -> None:
-    """Block until every in-flight submit worker has left the PLACING state."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not any(e.state == QueueState.PLACING for e in daemon._store.load_entries()):
-            return
-        time.sleep(0.005)
-    raise AssertionError("submits did not drain out of PLACING")
+    """No-op: placement is now synchronous inside ``_tick`` (the scheduler
+    reconciles, reserves, and places inline), so nothing lingers in PLACING
+    after a tick returns. Kept so the existing test bodies read unchanged."""
+    del timeout
+    assert not any(
+        e.state == QueueState.PLACING for e in daemon._store.load_entries()
+    ), "a synchronous tick must not leave an entry PLACING"
 
 
 def _states(daemon: Daemon) -> list[QueueState]:
@@ -156,72 +161,88 @@ def test_queue_state_terminal() -> None:
 def test_respects_cap_and_backfills(tmp_path: Path) -> None:
     submitted: list[str] = []
     daemon = make_daemon(tmp_path, {"a": 2}, submitted=submitted)
-    try:
-        for _ in range(5):
-            daemon._store.save_entry(QueueEntry.new(make_spec()))
+    for _ in range(5):
+        daemon._store.save_entry(QueueEntry.new(make_spec()))
 
-        peak = 0
-        for _ in range(40):
-            daemon._tick()
-            _drain(daemon)
-            running = sum(s == QueueState.RUNNING for s in _states(daemon))
-            peak = max(peak, running)
-            if all(s.terminal for s in _states(daemon)):
-                break
+    peak = 0
+    for _ in range(40):
+        daemon._tick()
+        _drain(daemon)
+        running = sum(s == QueueState.RUNNING for s in _states(daemon))
+        peak = max(peak, running)
+        if all(s.terminal for s in _states(daemon)):
+            break
 
-        assert all(s is QueueState.SUCCEEDED for s in _states(daemon))
-        assert peak == 2  # never exceeded the per-backend cap, and did reach it
-        assert len(submitted) == 5  # every job ran exactly once
-    finally:
-        daemon._executor.shutdown(wait=True)
+    assert all(s is QueueState.SUCCEEDED for s in _states(daemon))
+    assert peak == 2  # never exceeded the per-backend cap, and did reach it
+    assert len(submitted) == 5  # every job ran exactly once
 
 
 def test_spreads_across_two_backends(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    try:
-        daemon._store.save_entry(QueueEntry.new(make_spec("j1")))
-        daemon._store.save_entry(QueueEntry.new(make_spec("j2")))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j1")))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j2")))
 
-        daemon._tick()
-        _drain(daemon)
+    daemon._tick()
+    _drain(daemon)
 
-        entries = daemon._store.load_entries()
-        assert all(e.state is QueueState.RUNNING for e in entries)
-        assert {e.backend for e in entries} == {"a", "b"}  # one on each
-    finally:
-        daemon._executor.shutdown(wait=True)
+    entries = daemon._store.load_entries()
+    assert all(e.state is QueueState.RUNNING for e in entries)
+    assert {e.backend for e in entries} == {"a", "b"}  # one on each
 
 
 def test_only_backend_restriction(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    try:
-        daemon._store.save_entry(QueueEntry.new(make_spec("j"), only_backend="b"))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j"), only_backend="b"))
+    daemon._tick()
+    _drain(daemon)
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.RUNNING
+    assert entry.backend == "b"
+
+
+def test_budget_cap_blocks_paid_escalation(tmp_path: Path) -> None:
+    """A paid-only backend at a zero daily cap: the tick's escalation to the paid
+    slot is unaffordable, so the job stays PENDING (unplaced) and is never
+    submitted. The cap is set live via meta (dynamic-cap path)."""
+    submitted: list[str] = []
+    daemon = make_daemon(tmp_path, {"paid": 1}, submitted=submitted, cost_per_hour=2.0)
+    daemon._store.set_meta("budget.day", "0.0")  # no room for any paid job today
+    spec = make_spec("pricey").model_copy(
+        update={"resources": ResourceSpec(time=timedelta(hours=1))}
+    )
+    daemon._store.save_entry(QueueEntry.new(spec))
+
+    for _ in range(5):
         daemon._tick()
-        _drain(daemon)
-        [entry] = daemon._store.load_entries()
-        assert entry.state is QueueState.RUNNING
-        assert entry.backend == "b"
-    finally:
-        daemon._executor.shutdown(wait=True)
+
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.PENDING  # never placed: over budget
+    assert submitted == []  # backend.submit was never called
+
+    # Lifting the cap lets the very next tick place it (proving it was the cap,
+    # not an unfit job, that blocked placement).
+    daemon._store.set_meta("budget.day", "100.0")
+    daemon._tick()
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.RUNNING
+    assert submitted == [spec.job_id]
 
 
 def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1}, fail_submit=True)
-    try:
-        daemon._store.save_entry(QueueEntry.new(make_spec()))
+    daemon._store.save_entry(QueueEntry.new(make_spec()))
 
-        for _ in range(10):
-            daemon._tick()
-            _drain(daemon)
-            if all(s.terminal for s in _states(daemon)):
-                break
+    for _ in range(10):
+        daemon._tick()
+        _drain(daemon)
+        if all(s.terminal for s in _states(daemon)):
+            break
 
-        [entry] = daemon._store.load_entries()
-        assert entry.state is QueueState.FAILED
-        assert entry.attempts == 3
-        assert entry.error is not None and "boom" in entry.error
-    finally:
-        daemon._executor.shutdown(wait=True)
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.FAILED
+    assert entry.attempts == 3
+    assert entry.error is not None and "boom" in entry.error
 
 
 def test_recover_resets_placing_to_pending(tmp_path: Path) -> None:
@@ -235,13 +256,10 @@ def test_recover_resets_placing_to_pending(tmp_path: Path) -> None:
     store.close()
 
     daemon = make_daemon(tmp_path, {"a": 1})
-    try:
-        daemon._recover_placing()
-        [reloaded] = daemon._store.load_entries()
-        assert reloaded.state is QueueState.PENDING
-        assert reloaded.backend is None
-    finally:
-        daemon._executor.shutdown(wait=True)
+    daemon._recover_placing()
+    [reloaded] = daemon._store.load_entries()
+    assert reloaded.state is QueueState.PENDING
+    assert reloaded.backend is None
 
 
 # ------------------------------------------------------------------ protocol

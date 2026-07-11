@@ -87,6 +87,18 @@ class BackendConfig(BaseModel, extra="allow"):
         return pr
 
 
+class BudgetConfig(BaseModel):
+    """Global spend envelope (DESIGN §7): one wallet per user, per rolling window.
+
+    A ``None`` cap means that window is unbounded. The daemonless ``submit`` and
+    the daemon both feed ``daily`` into the ``Control`` day-window ledger; the
+    ``omnirun budget`` command can override either at runtime (stored in ``meta``).
+    """
+
+    daily: float | None = None
+    weekly: float | None = None
+
+
 class DaemonConfig(BaseModel):
     host: str = "127.0.0.1"  # localhost socket; bind 0.0.0.0 + auth to go remote
     port: int = 8787
@@ -117,6 +129,7 @@ class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     state: StateConfig = Field(default_factory=StateConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
 

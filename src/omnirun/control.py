@@ -28,7 +28,9 @@ from datetime import datetime, timezone
 
 from omnirun.budget import LedgerEntry
 from omnirun.models import (
+    Deadline,
     Decision,
+    JobPolicy,
     JobRecord,
     JobSpec,
     JobState,
@@ -109,6 +111,68 @@ class Control:
         return spec.job_id
 
     # ------------------------------------------------------------------
+    # Reprioritization + budget controls (Task 9)
+    # ------------------------------------------------------------------
+
+    def reprioritize(
+        self,
+        job_id: str,
+        *,
+        priority: int | None = None,
+        deadline: Deadline | None = None,
+        allow_paid: bool | None = None,
+    ) -> JobPolicy:
+        """Mutate a live job's scheduling policy; return the new policy.
+
+        A finished job cannot be reprioritized (``ValueError``); an unknown one
+        likewise (``ValueError``). Only the arguments that are not ``None`` are
+        applied, layered over the job's current ``JobPolicy``:
+
+        * ``priority`` — the new priority tier (higher = scheduled sooner).
+        * ``deadline`` — the new start/finish window.
+        * ``allow_paid`` — the willingness-to-pay gate expressed as a ``max_cost``
+          ceiling: ``True`` clears the ceiling (``None`` — paid allowed within the
+          global budget), ``False`` pins it to ``0.0`` (free-only), and the
+          default ``None`` leaves the existing ``max_cost`` untouched.
+
+        The change is persisted; a QUEUED/HELD job is re-evaluated by the next
+        ``run_tick`` automatically (no placement happens here).
+        """
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            raise ValueError(f"unknown job {job_id!r}")
+        if rec.state.terminal:
+            raise ValueError(
+                f"job {job_id!r} is {rec.state.value}; cannot reprioritize a finished job"
+            )
+        current = rec.spec.policy
+        new_max_cost = current.max_cost
+        if allow_paid is True:
+            new_max_cost = None
+        elif allow_paid is False:
+            new_max_cost = 0.0
+        new_policy = JobPolicy(
+            deadline=deadline if deadline is not None else current.deadline,
+            max_cost=new_max_cost,
+            priority=priority if priority is not None else current.priority,
+        )
+        self._store.save_job(
+            rec.model_copy(
+                update={"spec": rec.spec.model_copy(update={"policy": new_policy})}
+            )
+        )
+        return new_policy
+
+    def budget(self, window: str, cap: float | None) -> None:
+        """Set (or clear) the live spend cap for *window* in the ``meta`` table.
+
+        ``cap is None`` stores an empty string (no cap). The value is read fresh
+        by ``_resolve_cap`` on every tick, so both ``omnirun budget`` and a
+        running daemon see the change immediately.
+        """
+        self._store.set_meta(f"budget.{window}", "" if cap is None else repr(cap))
+
+    # ------------------------------------------------------------------
     # Cancellation (spec §11 invariant 5). Phase-3 minimal: best-effort
     # reap the live placement, then mark the job CANCELLED. Phase 4
     # deepens this to graceful→force→reap with confirmation.
@@ -156,12 +220,60 @@ class Control:
     # The tick loop (spec §7)
     # ------------------------------------------------------------------
 
-    def run_tick(self, now: datetime) -> list[Decision]:
+    def _resolve_cap(self) -> float | None:
+        """The live spend cap for this driver's window, resolved fresh each tick.
+
+        ``omnirun budget`` (and the daemon) write the current cap into the
+        ``meta`` table under ``budget.<window>`` — an empty string means "no
+        cap". A parseable float there wins; otherwise we fall back to the
+        ``budget_cap`` passed at construction (the config-derived default). This
+        is what lets a running daemon or a fresh CLI process see a cap change
+        without a restart.
+        """
+        raw = self._store.get_meta(f"budget.{self._budget_window}")
+        if raw is not None:
+            raw = raw.strip()
+            if raw == "":
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                _log.warning(
+                    "unparseable budget cap %r for window %s; using config default",
+                    raw,
+                    self._budget_window,
+                )
+        return self._budget_cap
+
+    def run_tick(
+        self,
+        now: datetime,
+        *,
+        only_providers: set[str] | None = None,
+        only_job_ids: set[str] | None = None,
+        reconcile: bool = True,
+    ) -> list[Decision]:
         """Run one scheduling round: reconcile → gather → load → tick → enact.
 
         Returns the decisions produced by ``tick`` (already enacted). Reconcile
         runs *first* so any capacity freed by a job that just finished/was lost
         is visible when the tick matches this round's pending jobs.
+
+        The optional scoping arguments exist ONLY for the daemon's per-restriction
+        placement (a job pinned to one backend via ``only_backend``): the pure
+        ``tick`` is slot-blind and cannot express per-job provider affinity, so the
+        daemon instead runs one scoped tick per restriction group over ONE shared
+        ``Store``. With every argument at its default this method behaves exactly
+        as the daemonless ``submit`` and the invariant suite expect — full
+        reconcile, all providers offer, all pending jobs considered.
+
+        * ``only_providers`` — gather slots only from these providers (a
+          restriction group's allowed backend).
+        * ``only_job_ids`` — consider only these jobs for holding/placement (so a
+          group's tick never places another group's job on the wrong provider).
+        * ``reconcile`` — set ``False`` on the secondary grouped calls within one
+          daemon tick so the global reconcile poll runs exactly once (no double
+          poll of the same placement).
 
         The place/persist seam is **at-least-once**, not exactly-once: if the
         process dies between a successful ``provider.place`` and the RUNNING
@@ -172,11 +284,17 @@ class Control:
         orphan-recovery (re-adopt a live handle before relaunching), deferred to
         Phase 4/5.
         """
-        self._reconcile(now)
-        slots = self._gather_slots()
-        ledger = self._store.load_ledger(self._budget_window, self._budget_cap, now)
+        if reconcile:
+            self._reconcile(now)
         jobs = self._store.list_jobs()
-        decisions = tick(jobs, slots, ledger, now, policy=self._policy)
+        considered = (
+            jobs
+            if only_job_ids is None
+            else [j for j in jobs if j.spec.job_id in only_job_ids]
+        )
+        slots = self._gather_slots(considered, only_providers)
+        ledger = self._store.load_ledger(self._budget_window, self._resolve_cap(), now)
+        decisions = tick(considered, slots, ledger, now, policy=self._policy)
         for decision in decisions:
             self._enact(decision, now)
         return decisions
@@ -320,20 +438,20 @@ class Control:
     # Step 2: gather slots offered by every provider for the pending reqs
     # ------------------------------------------------------------------
 
-    def _gather_slots(self) -> list[Slot]:
+    def _gather_slots(
+        self, jobs: list[JobRecord], only_providers: set[str] | None
+    ) -> list[Slot]:
         """Ask each provider to ``offer`` slots for every distinct pending req.
 
-        Only QUEUED/HELD jobs need slots; their DISTINCT ``ResourceSpec``s are
-        the reqs we ask about. No dedup of the returned slots — ``reserve`` is
-        the atomic capacity truth, so an over-emitted place simply fails reserve
-        gracefully. A provider whose ``offer`` raises is treated as offering
-        nothing this tick (circuit-breaker-lite) rather than crashing the tick.
+        Only QUEUED/HELD jobs among *jobs* need slots; their DISTINCT
+        ``ResourceSpec``s are the reqs we ask about. No dedup of the returned
+        slots — ``reserve`` is the atomic capacity truth, so an over-emitted
+        place simply fails reserve gracefully. A provider whose ``offer`` raises
+        is treated as offering nothing this tick (circuit-breaker-lite) rather
+        than crashing the tick. ``only_providers`` (daemon restriction groups)
+        narrows which providers are asked; ``None`` asks them all.
         """
-        pending = [
-            r
-            for r in self._store.list_jobs()
-            if r.state in (JobState.QUEUED, JobState.HELD)
-        ]
+        pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
         # Distinct reqs by their JSON shape (ResourceSpec is a pydantic model;
         # it is not hashable, so dedup on a canonical serialization).
         reqs: list[ResourceSpec] = []
@@ -345,7 +463,9 @@ class Control:
                 reqs.append(r.spec.resources)
 
         slots: list[Slot] = []
-        for provider in self._providers.values():
+        for name, provider in self._providers.items():
+            if only_providers is not None and name not in only_providers:
+                continue
             for req in reqs:
                 try:
                     slots.extend(provider.offer(req))
