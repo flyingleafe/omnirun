@@ -36,12 +36,16 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from omnirun.models import JobRecord, ProviderFacts, StatusReport
+from omnirun.budget import BudgetLedger, LedgerEntry
+from omnirun.models import JobRecord, Placement, ProviderFacts, Slot, StatusReport
+from omnirun.models import JobState as _JobState
+from omnirun.models import JobStatus as _JobStatus
 from omnirun.queue import QueueEntry, QueueState
 from omnirun.state.schema import (
     ALL_TABLES,
     facts,
     jobs,
+    ledger,
     meta,
     metadata,
     queue,
@@ -54,7 +58,14 @@ from omnirun.state.schema import (
 _ACTIVE_QUEUE_STATES = tuple(s.value for s in QueueState if not s.terminal)
 
 # SQL era. The DB carries its own meta(schema_version) row.
-STATE_SCHEMA_VERSION = 2
+# v3 (Phase 3): adds the ``ledger`` table and reuses the jobs ``backend``+``state``
+# columns for the scheduler capacity view (see ``save_job``). Additive — an
+# existing v2 DB gets ``ledger`` on next ``open_store``.
+STATE_SCHEMA_VERSION = 3
+
+# Scheduler states that occupy a provider slot (the #12 capacity guard counts
+# these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
+_ACTIVE_JOB_STATES = (_JobState.PLACING.value, _JobState.RUNNING.value)
 
 
 class StoreError(RuntimeError):
@@ -195,17 +206,28 @@ class Store:
     # ------------------------------------------------------------------
 
     def save_job(self, rec: JobRecord) -> None:
-        """Upsert *rec* into the ``jobs`` table; stamps ``rec.schema_version``."""
+        """Upsert *rec* into the ``jobs`` table; stamps ``rec.schema_version``.
+
+        The indexed ``backend`` and ``state`` columns hold the SCHEDULER view used
+        for capacity counting (``count_active_jobs`` / ``reserve``), NOT the
+        backend ``JobStatus``: ``state`` is ``rec.state`` (the scheduler
+        ``JobState``) and ``backend`` is the provider the job is reserved on. A
+        PLACING/RUNNING job must count under its reserved provider (from
+        ``rec.placement``) BEFORE a backend ``JobHandle`` exists, so the placement
+        provider takes precedence, then the handle/offer backend as a fallback.
+        These columns are internal (counting/filtering only); the full record —
+        including the human-facing ``last_status`` — lives in the ``data`` blob.
+        """
         rec.schema_version = STATE_SCHEMA_VERSION
         job_id = rec.spec.job_id
         backend: str | None = None
-        if rec.handle is not None:
+        if rec.placement is not None:
+            backend = rec.placement.provider_name
+        elif rec.handle is not None:
             backend = rec.handle.backend
         elif rec.offer is not None:
             backend = rec.offer.backend
-        state: str | None = (
-            rec.last_status.status.value if rec.last_status is not None else None
-        )
+        state: str | None = rec.state.value
         submitted_at: str | None = (
             rec.submitted_at.isoformat() if rec.submitted_at is not None else None
         )
@@ -282,6 +304,198 @@ class Store:
             raise KeyError(job_id)
         rec.last_status = report
         self.save_job(rec)
+
+    # ------------------------------------------------------------------
+    # Scheduler capacity view (#12 double-book guard) + atomic slot reserve.
+    # ------------------------------------------------------------------
+
+    def _count_active_jobs(self, conn: Connection, provider: str) -> int:
+        """Count jobs reserved/running on *provider*, on *conn*.
+
+        The slot-level cap check: jobs whose scheduler ``state`` is PLACING or
+        RUNNING and whose (scheduler-view) ``backend`` column equals *provider*.
+        Shared by ``count_active_jobs`` (own connection) and ``reserve`` (the
+        reserve transaction's connection, so count-and-set is one atomic unit),
+        mirroring ``_count_active``/``reserve_entry`` at the queue level.
+        """
+        return conn.execute(
+            select(func.count())
+            .select_from(jobs)
+            .where(jobs.c.backend == provider)
+            .where(jobs.c.state.in_(_ACTIVE_JOB_STATES))
+        ).scalar_one()
+
+    def count_active_jobs(self, provider: str) -> int:
+        """Number of PLACING/RUNNING jobs reserved on *provider*."""
+        with self._engine.connect() as conn:
+            return self._count_active_jobs(conn, provider)
+
+    def reserve(self, slot: Slot, rec: JobRecord) -> bool:
+        """Atomically reserve job *rec* onto *slot* if the provider is under cap.
+
+        The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly
+        (including the Postgres per-provider advisory lock). Inside ONE
+        ``transaction()`` we re-read the job row ``with_for_update()``, and — only
+        if the persisted record is still ``QUEUED`` and
+        ``_count_active_jobs(slot.provider_name) < slot.capacity`` — flip it to
+        ``PLACING`` with a fresh ``Placement`` on *slot*'s provider, UPDATEing the
+        row (state/backend/data) directly on the same connection. Because the
+        count and the update share the one transaction, no concurrent tick or
+        machine can slip a second reservation past the cap.
+
+        *rec* must already be saved as ``QUEUED`` before ``reserve`` is called.
+
+        Returns ``True`` if reserved, ``False`` otherwise (missing, not
+        ``QUEUED``, or the provider's capacity is already full). Does NOT mutate
+        the caller-held *rec*; reload via ``load_job`` for the post-reserve object.
+        """
+        job_id = rec.spec.job_id
+        provider = slot.provider_name
+        with self.transaction() as conn:
+            if conn.dialect.name == "postgresql":
+                # Postgres runs READ COMMITTED and the FOR UPDATE below locks only
+                # the target job row, leaving the cap count (which reads OTHER
+                # rows) unlocked — so two txns reserving DIFFERENT jobs on the same
+                # provider could both pass the check and over-book. Serialize
+                # reservers per-provider with a transaction-scoped advisory lock
+                # (auto-released at commit). SQLite needs none: its BEGIN IMMEDIATE
+                # already serializes the whole transaction. Same rule as
+                # ``reserve_entry``.
+                conn.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:p))"),
+                    {"p": provider},
+                )
+            # Re-read under the lock: FOR UPDATE on Postgres, a no-op clause on
+            # SQLite where BEGIN IMMEDIATE already serializes the whole txn.
+            row = conn.execute(
+                select(jobs.c.data).where(jobs.c.job_id == job_id).with_for_update()
+            ).fetchone()
+            if row is None:
+                return False
+            current = JobRecord.model_validate(row[0])
+            if current.state is not _JobState.QUEUED:
+                return False
+            if self._count_active_jobs(conn, provider) >= slot.capacity:
+                return False
+
+            current.state = _JobState.PLACING
+            current.placement = Placement(
+                provider_name=provider,
+                job_id=job_id,
+                state=_JobStatus.QUEUED,
+            )
+            current.schema_version = STATE_SCHEMA_VERSION
+            # UPDATE directly on this connection — NOT save_job(), which would
+            # open a nested transaction and break atomicity.
+            conn.execute(
+                update(jobs)
+                .where(jobs.c.job_id == job_id)
+                .values(
+                    state=current.state.value,
+                    backend=provider,
+                    data=current.model_dump(mode="json"),
+                )
+            )
+            return True
+
+    # ------------------------------------------------------------------
+    # Budget ledger persistence (Phase 3). The pure ops live in budget.py;
+    # these three methods bridge the ledger table to BudgetLedger/LedgerEntry.
+    # ------------------------------------------------------------------
+
+    def ledger_add(self, window: str, entry: LedgerEntry) -> None:
+        """Append one ``LedgerEntry`` row for *window* to the ledger table."""
+        with self.transaction() as conn:
+            conn.execute(
+                insert(ledger).values(
+                    window=window,
+                    job_id=entry.job_id,
+                    provider=entry.provider,
+                    amount=entry.amount,
+                    kind=entry.kind,
+                    at=entry.at.isoformat(),
+                )
+            )
+
+    def ledger_realize(
+        self, window: str, job_id: str, actual: float, now: datetime
+    ) -> None:
+        """Turn the earliest ``committed`` row for (*window*, *job_id*) into a
+        ``spent`` row of *actual* cost, keeping its original ``at`` (so the spend
+        stays attributed to the window it was committed in). If no committed row
+        exists, insert a fresh ``spent`` row at *now*. Mirrors
+        ``BudgetLedger.realize``.
+        """
+        with self.transaction() as conn:
+            earliest = conn.execute(
+                select(ledger.c.id)
+                .where(ledger.c.window == window)
+                .where(ledger.c.job_id == job_id)
+                .where(ledger.c.kind == "committed")
+                .order_by(ledger.c.at, ledger.c.id)
+                .limit(1)
+            ).fetchone()
+            if earliest is None:
+                conn.execute(
+                    insert(ledger).values(
+                        window=window,
+                        job_id=job_id,
+                        provider="",
+                        amount=actual,
+                        kind="spent",
+                        at=now.isoformat(),
+                    )
+                )
+                return
+            conn.execute(
+                update(ledger)
+                .where(ledger.c.id == earliest[0])
+                .values(kind="spent", amount=actual)
+            )
+
+    def load_ledger(
+        self, window: str, cap: float | None, now: datetime
+    ) -> BudgetLedger:
+        """Build a ``BudgetLedger`` from the in-window rows for *window*.
+
+        A row is in-window when its ``at`` falls in the SAME window as *now*,
+        determined exactly as ``BudgetLedger.in_window_total`` does: same UTC
+        calendar date for ``"day"``, same ISO (year, week) for ``"week"``. The
+        equality predicate (``.date()`` / ``.isocalendar()[:2]``) is not a plain
+        range, so we load the window's candidate rows and filter in Python with
+        the same rule the pure ledger uses.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(
+                    ledger.c.job_id,
+                    ledger.c.provider,
+                    ledger.c.amount,
+                    ledger.c.kind,
+                    ledger.c.at,
+                )
+                .where(ledger.c.window == window)
+                .order_by(ledger.c.at, ledger.c.id)
+            ).fetchall()
+        entries: list[LedgerEntry] = []
+        for job_id, provider, amount, kind, at in rows:
+            at_dt = datetime.fromisoformat(at)
+            if not _in_ledger_window(window, at_dt, now):
+                continue
+            entries.append(
+                LedgerEntry(
+                    job_id=job_id,
+                    provider=provider,
+                    amount=amount,
+                    kind=kind,
+                    at=at_dt,
+                )
+            )
+        # pydantic validates ``window`` against the Literal["day","week"] field
+        # (raising for any other value), narrowing the ``str`` parameter safely.
+        return BudgetLedger.model_validate(
+            {"window": window, "cap": cap, "entries": entries}
+        )
 
     # ------------------------------------------------------------------
     # Wait-history CRUD
@@ -488,6 +702,18 @@ class Store:
                 )
             )
             return True
+
+
+def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:
+    """Whether *at* is in the same *window* as *now* — the SAME rule as
+    ``BudgetLedger._in_window``: same UTC calendar date for ``"day"``, same ISO
+    (year, week) for ``"week"``. Any other window value matches nothing.
+    """
+    if window == "day":
+        return at.date() == now.date()
+    if window == "week":
+        return at.isocalendar()[:2] == now.isocalendar()[:2]
+    return False
 
 
 def _ensure_sqlite_parent(url: str) -> None:
