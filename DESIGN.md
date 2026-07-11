@@ -189,10 +189,11 @@ explicitly requested premium tier still surfaces, marked non-free.
 
 ## 5. State & config
 
-- Client state: `$OMNIRUN_STATE_DIR/jobs/<job_id>/meta.json` (default
-  `~/.local/share/omnirun/`; spec, handle, last-known status, offer chosen). Plain JSON,
-  greppable, no daemon. The optional scheduler (§6) persists its queue alongside it under
-  `$OMNIRUN_STATE_DIR/queue/` (one atomic JSON file per entry) plus `daemon.json`.
+- Client state: `$OMNIRUN_STATE_DIR/omnirun.db` (default `~/.local/share/omnirun/`)
+  — a SQLite database managed by the `Store` repository (SQLAlchemy Core 2.0). See §9
+  for the full SQL state layer description, including the Postgres option and the atomic
+  `reserve_entry` concurrency guard. The optional `[state]` config section selects the
+  backend/path/url; `omnirun state migrate` imports from legacy JSON files.
 - Config: `~/.config/omnirun/config.toml` (override `$OMNIRUN_CONFIG`; backends,
   credentials refs, policy, daemon) + optional per-repo `omnirun.toml` (resource defaults,
   outputs, env.setup overrides). Backend sections are permissive: common fields are typed,
@@ -354,7 +355,88 @@ ssh → run bootstrap detached → poll. Auto-terminate on completion (configura
 `keep_alive`), plus `omnirun gc` to reap leaked instances (safety net against
 billing surprises). Idle-timeout watchdog baked into the payload wrapper.
 
-## 9. Queue & scheduler daemon (optional)
+## 9. SQL state layer
+
+Client state lives under `$OMNIRUN_STATE_DIR` (default `~/.local/share/omnirun/`),
+managed by a single `Store` repository (class in `state/store.py`) over
+**SQLAlchemy Core 2.0**. On the laptop the engine points at
+`$OMNIRUN_STATE_DIR/omnirun.db` (SQLite, zero-setup, the default). On a VPS or shared
+server you point it at a Postgres database via `[state] url = "postgresql+psycopg://…"` —
+the same schema and interface work on both dialects.
+
+### Schema — hybrid document
+
+Each table carries a primary key plus the few columns we filter or sort on, and a
+`data` JSON column holding the full `model_dump(mode="json")` of the Pydantic domain
+object (`JobRecord`, `ProviderFacts`, `QueueEntry`). Pydantic stays the serialization
+source of truth; later field additions need no schema migration, only a `STATE_SCHEMA_VERSION`
+bump in `meta`. On Postgres the `data` column is `JSONB` (for indexing performance);
+on SQLite it is plain `JSON` — this difference is handled once in `schema.py`
+(`JSONText = JSON().with_variant(JSONB(), "postgresql")`), invisible at call sites.
+
+```
+meta:         key TEXT PK, value TEXT
+jobs:         job_id TEXT PK, name TEXT, backend TEXT, state TEXT,
+              submitted_at TEXT, schema_version INT, data JSON/JSONB
+wait_samples: id INTEGER PK autoincr, backend TEXT, key TEXT,
+              wait_s REAL, recorded_at TEXT  [index on (backend, key)]
+facts:        backend TEXT PK, discovered_at TEXT, ttl_s REAL, health TEXT, data JSON/JSONB
+queue:        qid TEXT PK, state TEXT, created_at TEXT, only_backend TEXT,
+              backend TEXT, job_id TEXT, data JSON/JSONB
+```
+
+Timestamps are stored as ISO-8601 TEXT (portable and sortable).
+
+### Atomic `reserve_entry` — the §12 double-book guard
+
+`Store.reserve_entry(qid, backend, cap)` is the only concurrency-critical operation.
+It must guarantee that no two callers can both pass the `count_active(backend) < cap`
+check and both flip to PLACING — which would over-book the backend.
+
+- **SQLite**: `Store.__init__` installs a pair of SQLAlchemy engine events that disable
+  pysqlite's implicit `BEGIN` and emit `BEGIN IMMEDIATE` at transaction start instead
+  (`_install_sqlite_write_lock`). `BEGIN IMMEDIATE` acquires the reserved write lock
+  up front, serializing all `reserve_entry` calls sequentially. `with_for_update()` on
+  the re-read query is a no-op clause on SQLite — the serialization comes from the write
+  lock. A generous `busy_timeout` (30 s) makes contending callers wait rather than raise.
+
+- **Postgres**: `engine.begin()` opens a transaction at the server default (READ COMMITTED).
+  A `FOR UPDATE` on the target row (qid) locks that single row, but leaves the count of
+  OTHER rows readable by concurrent transactions — two threads reserving different qids
+  can both read `count_active("x") == 1` before either commits, and both flip, over-booking.
+  The fix is a **transaction-scoped advisory lock per backend**:
+  ```sql
+  SELECT pg_advisory_xact_lock(hashtext(:b))
+  ```
+  issued at the top of the `reserve_entry` transaction. This serializes all reservers
+  for the same backend string; the second thread blocks until the first commits, then
+  re-reads the count and finds the cap full, returning False. The advisory lock is
+  auto-released at transaction commit/rollback. On PG 18.1 this eliminated 25/25
+  over-books observed without the guard (reproduction in `pg_overbook_raw.py`).
+
+The `_upsert` helper is the one place where dialect branching lives:
+`sqlite_insert(table).on_conflict_do_update(...)` vs `pg_insert(table).on_conflict_do_update(...)`.
+Call sites are dialect-unaware.
+
+### Opening a Store
+
+`open_store(url)` creates the engine, `create_all()` (idempotent), stamps
+`meta["schema_version"] = 2`, and returns the `Store`. The `[state]` TOML section
+controls which engine is used:
+
+```toml
+[state]
+backend = "sqlite"      # or "postgres"
+# path = "/custom/path/omnirun.db"   # explicit SQLite path (default: state_dir/omnirun.db)
+# url  = "postgresql+psycopg://user:pw@host/db"  # overrides backend/path
+```
+
+A one-time JSON→SQL importer (`omnirun state migrate [--from DIR] [--dry-run]`) reads
+the legacy `$OMNIRUN_STATE_DIR/jobs/*/meta.json`, `facts/*.json`, `queue/*.json`, and
+`wait_history.json` files, tolerating `schema_version` 0 and 1, and upserts them into
+the SQL store. `omnirun state path` prints the active database URL.
+
+## 10. Queue & scheduler daemon (optional)
 
 Direct `submit` stays daemonless. For fan-out — many jobs, or spreading a batch across
 backends with per-backend concurrency caps — an *optional* long-lived scheduler is
@@ -363,16 +445,15 @@ decides *when* and *where*, then calls the same `Backend.submit`.
 
 - **`omnirun serve`** runs the daemon in the foreground: a localhost TCP socket (default
   `127.0.0.1:8787`), newline-delimited JSON request/response, plus a scheduler thread
-  ticking every `poll_interval_s` (default 10s). It owns a durable queue persisted at
-  `$OMNIRUN_STATE_DIR/queue/` (one atomic JSON file per entry; a restart re-reads and
-  resumes) and records a `daemon.json` (host/port/pid) clients use to find it.
+  ticking every `poll_interval_s` (default 10s). It owns a durable queue persisted via
+  the SQL `Store`; a restart re-reads and resumes.
 - **Scheduler tick** (under a lock): refresh RUNNING entries against their backend, then
   place PENDING ones. Placement reserves a backend slot *synchronously*
-  (state → PLACING, so concurrent placements can't double-book) before dispatching the
-  blocking `submit` on a thread pool; it backfills as jobs complete, and retries a failed
-  submit up to 3 attempts before marking it FAILED. Each backend's `max_parallel` caps its
-  concurrent non-terminal jobs — per-partition Slurm limits = one backend section per
-  partition, each capped.
+  (`reserve_entry` in one atomic transaction, state → PLACING, so concurrent placements
+  can't double-book — see §9) before dispatching the blocking `submit` on a thread pool;
+  it backfills as jobs complete, and retries a failed submit up to 3 attempts before
+  marking it FAILED. Each backend's `max_parallel` caps its concurrent non-terminal
+  jobs — per-partition Slurm limits = one backend section per partition, each capped.
 - **Entry lifecycle**: PENDING → PLACING → RUNNING → SUCCEEDED / FAILED / CANCELLED.
 - **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...` (same resource flags as
   `submit`), `queue` (show the table), `queue --wait` (poll until all terminal),
@@ -382,7 +463,7 @@ decides *when* and *where*, then calls the same `Backend.submit`.
   every tick. Assignment/least-loaded fairness and warm-worker reuse (every placement is
   today a cold one-shot `submit`) are deferred refinements, not yet built.
 
-## 10. CLI
+## 11. CLI
 
 ```
 omnirun submit [--name N] [--gpus 1] [--gpu-type H100 | --vram 40] [--time 15h]
@@ -397,7 +478,7 @@ omnirun enqueue [resource flags] [--count N] [--backend NAME] -- CMD...  # queue
 omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemon queue
 ```
 
-## 11. Implementation notes
+## 12. Implementation notes
 
 - Python ≥3.12, deps: `typer`, `rich`, `httpx`, `pydantic`, `kaggle` (thin API
   client), `google-colab-cli` (optional extra). Marketplaces via plain REST
@@ -446,7 +527,7 @@ omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemo
   `local` backend — full submit→run→pull without network; (3) dockerized sshd and
   slurm cluster integration tests, opt-in; (4) live backends — needs user creds.
 
-## 12. Non-goals
+## 13. Non-goals
 
 Still out of scope: data syncing, artifact versioning, DAGs/pipelines, multi-node jobs,
 spot-preemption recovery, image building, a web UI. Cross-backend queueing is **no longer**

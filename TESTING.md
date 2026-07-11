@@ -7,17 +7,20 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
 
 ## 1. Current state
 
-- All backends, the chooser, bootstrap codegen, repo handling, store, the
-  optional queue daemon, and the full CLI are implemented. `uv run pytest -q`
-  → **287 passed in ~7s**.
+- All backends, the chooser, bootstrap codegen, repo handling, the SQL state
+  layer, the optional queue daemon, and the full CLI are implemented.
+  `uv run pytest -q` → **388 passed, 6 skipped in ~14s** (the 6 skips are the
+  `@pytest.mark.integration` Postgres tests, omitted unless `OMNIRUN_TEST_POSTGRES_URL`
+  is set).
 - **basedpyright** runs in **standard** mode with **0 errors / 0 warnings**.
 - **CI** (GitHub Actions) runs on every push/PR: ruff + ruff-format (via
   `nix flake check`), basedpyright, and pytest. **v0.1.0 is published to PyPI**
   via a tag-triggered trusted-publish (OIDC) workflow.
 - Coverage by tier:
   - **Unit**: bootstrap codegen, sbatch rendering, chooser ranking/auto-pick,
-    repo state capture + bundles, store, GPU-name normalization, CLI flows
-    (typer runner).
+    repo state capture + bundles, SQL state layer (jobs/facts/queue CRUD,
+    wait-history, atomic `reserve_entry` race test), GPU-name normalization, CLI
+    flows (typer runner).
   - **Real e2e without network**: the `local` backend runs actual jobs —
     submit → bare-repo push → worktree → bootstrap → detached run → status →
     logs → cancel → pull, against real git and real processes
@@ -25,6 +28,21 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   - **Mocked integration**: SSH exec (fake ssh binary), Slurm (canned
     sbatch/squeue/sacct output), Kaggle (fake `KaggleApi`), Colab (fake `colab`
     subprocess), marketplaces (respx HTTP mocks).
+  - **Dialect-compile (Postgres, serverless)**: `tests/test_state_postgres.py`
+    compiles representative Store SQL against `sqlalchemy.dialects.postgresql`
+    and asserts `ON CONFLICT`, `FOR UPDATE`, and the advisory-lock form are
+    correct — runs in CI without any server.
+- **SQL state layer — VERIFIED**:
+  - **SQLite**: unit tests + a real-threads race test (`test_reserve_entry_race_single_winner`
+    in `tests/test_state_store.py`) confirm BEGIN IMMEDIATE serialization prevents
+    over-booking with concurrent `reserve_entry` calls. Passes with 0 flakes.
+  - **Postgres**: dialect-compile tests run in CI (no server). The over-book
+    regression (`test_pg_reserve_no_overbook` in `tests/test_state_postgres.py`,
+    K=8 threads × 10 rounds) is opt-in via `OMNIRUN_TEST_POSTGRES_URL`. The
+    `pg_advisory_xact_lock` guard was **live-verified** during code review on
+    PG 18.1: the raw-psycopg reproduction (`pg_overbook_raw.py`) showed 25/25
+    over-books without the guard → 0/15 after adding it. Full CI-integrated
+    Postgres is deferred to Phase 5 / VPS provisioning.
 - **LIVE-VERIFIED this session** (real jobs, real outputs pulled back):
   - **local** — the no-network e2e above, run for real.
   - **uni Slurm** — on QMUL's Apocrita cluster (account `acw592`, partition

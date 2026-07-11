@@ -59,7 +59,8 @@ on the worker:
    holds only logs, outputs, and `result.json`) for `omnirun pull`.
 
 The direct `omnirun submit` path is **daemonless and has no control plane**.
-Client state is plain JSON under `~/.local/share/omnirun/jobs/<id>/meta.json`;
+Client state lives in a SQLite database at
+`~/.local/share/omnirun/omnirun.db` (see [State storage](#state-storage-optional));
 job status is derived by polling the worker's job dir (result.json presence,
 heartbeat freshness) merged with runtime-native signals (Slurm state, PID
 liveness, kernel status) — pull, not callbacks. Your laptop can be off while
@@ -70,12 +71,35 @@ an **optional** scheduler daemon you run yourself (`omnirun serve`) — see
 [Queueing many jobs](#queueing-many-jobs-optional). It's an add-on, not a
 requirement: single submits never touch it.
 
+## State storage (optional)
+
+By default omnirun stores all state in a SQLite database
+(`~/.local/share/omnirun/omnirun.db`). The `[state]` config section lets you
+point it at a Postgres database instead (e.g. when running the scheduler daemon
+on a VPS):
+
+```toml
+[state]
+backend = "sqlite"            # default; or "postgres"
+# path = "/custom/omnirun.db"  # explicit SQLite path
+# url  = "postgresql+psycopg://user:pw@host/db"  # overrides backend/path
+```
+
+**Migrating from an earlier omnirun version** (if you have JSON state files):
+
+```bash
+omnirun state migrate          # import from default state dir
+omnirun state migrate --from /path/to/state  # or from a custom dir
+omnirun state migrate --dry-run              # count what would be imported
+omnirun state path             # print the active database URL
+```
+
 ## Queueing many jobs (optional)
 
 `omnirun serve` runs an always-on scheduler daemon in the foreground (background
 it yourself — it's meant to live on a small VPS under `mosh`/`tmux`). It listens
 on a localhost TCP socket (default `127.0.0.1:8787`) and owns a durable queue
-persisted as plain JSON, so a restart resumes where it left off.
+persisted in the SQL state store, so a restart resumes where it left off.
 
 ```bash
 omnirun serve &                              # start the daemon (localhost only)
