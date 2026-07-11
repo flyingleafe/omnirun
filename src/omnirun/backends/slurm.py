@@ -220,6 +220,31 @@ class SlurmBackend(Backend):
         now = datetime.now(timezone.utc)
         try:
             self._connect(interactive=False)
+            caps = Capabilities()
+            part = self.config.partition
+            if part:
+                r = self.exec_.run(
+                    f"scontrol show partition {shell_quote(part)} -o", timeout=15
+                )
+                if r.ok:
+                    mt = _scontrol_field(r.stdout, "MaxTime")
+                    if mt is not None:
+                        caps.max_walltime = _parse_slurm_duration(mt)
+                g = self.exec_.run(
+                    f"sinfo -p {shell_quote(part)} -h -o '%G'", timeout=15
+                )
+                if g.ok:
+                    caps.gpu_types = _parse_sinfo_gres(g.stdout)
+            qos = self.config.qos
+            if qos:
+                q = self.exec_.run(
+                    f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxSubmitJobsPerUser",
+                    timeout=15,
+                )
+                if q.ok:
+                    field = q.stdout.strip().split("|")[0].strip()
+                    if field.isdigit():
+                        caps.max_parallel_jobs = int(field)
         except Exception as e:  # discover never raises
             return ProviderFacts(
                 backend=self.name,
@@ -227,29 +252,6 @@ class SlurmBackend(Backend):
                 health=Health.UNREACHABLE,
                 health_detail=str(e),
             )
-        caps = Capabilities()
-        part = self.config.partition
-        if part:
-            r = self.exec_.run(
-                f"scontrol show partition {shell_quote(part)} -o", timeout=15
-            )
-            if r.ok:
-                mt = _scontrol_field(r.stdout, "MaxTime")
-                if mt is not None:
-                    caps.max_walltime = _parse_slurm_duration(mt)
-            g = self.exec_.run(f"sinfo -p {shell_quote(part)} -h -o '%G'", timeout=15)
-            if g.ok:
-                caps.gpu_types = _parse_sinfo_gres(g.stdout)
-        qos = self.config.qos
-        if qos:
-            q = self.exec_.run(
-                f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxSubmitJobsPerUser",
-                timeout=15,
-            )
-            if q.ok:
-                field = q.stdout.strip().split("|")[0].strip()
-                if field.isdigit():
-                    caps.max_parallel_jobs = int(field)
         return ProviderFacts(
             backend=self.name,
             discovered_at=now,
