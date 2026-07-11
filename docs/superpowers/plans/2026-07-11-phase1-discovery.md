@@ -4,7 +4,7 @@
 
 **Goal:** Make omnirun learn each backend's real capabilities and limits *before* a job runs, remember them in a fact cache, refuse/flag doomed jobs up front, and connect reliably through the user's own ssh.
 
-**Architecture:** Add three plain-pydantic types to `models.py` (`Health`, `Capabilities`, `ProviderFacts`), a `FactStore` that persists facts as atomic JSON (same pattern as `JobStore`), and a non-raising `Backend.discover()` method (sibling of `check()`). A new `omnirun backends discover` command populates the cache; the existing probe path (`_probe`) cross-checks cached facts to mark impossible offers unfit. Per-backend `discover()` overrides pull real limits (slurm partition/QOS, kaggle `quota_view()`, vast per-offer CUDA). SSH gains config knobs so omnirun never overrides the user's own auth/multiplexing.
+**Architecture:** Add three plain-pydantic types to `models.py` (`Health`, `Capabilities`, `ProviderFacts`), a `FactStore` that persists facts as atomic JSON (same pattern as `JobStore`), and a non-raising `Backend.discover()` method (sibling of `check()`). A new `omnirun backends discover` command populates the cache; the existing probe path (`_probe`) cross-checks cached facts to mark impossible offers unfit. Per-backend `discover()` overrides pull real limits (slurm partition/QOS, kaggle `quota_view()`, vast per-offer CUDA). SSH gains config knobs so omnirun never overrides the user's own auth/multiplexing. A `schema_version` stamp on `JobRecord` plus a golden-state regression test lock backward-compatibility with existing on-disk job state; the JSON→SQL migration itself is Phase 2.
 
 **Tech Stack:** Python ≥3.12, pydantic v2, typer, rich, httpx; tests with pytest + respx + `typer.testing.CliRunner`. No new dependencies (SQLAlchemy/Postgres is Phase 2).
 
@@ -17,6 +17,110 @@
 - **Persistence uses the existing atomic-JSON pattern** (`tmp.write_text(...); tmp.replace(p)`), one file per backend under `$OMNIRUN_STATE_DIR`. No database in Phase 1.
 - **Fit is a generic predicate:** `Capabilities.satisfies(ResourceSpec) -> list[str]` (empty = fits). Never add per-constraint `if` ladders elsewhere.
 - Run the full gate before each commit: `uv run pytest -q && ruff check src tests && basedpyright`.
+- **Backward-compatibility is a hard requirement.** No field on a persisted model (`JobRecord`, `JobSpec`, `ResourceSpec`, `Offer`, `JobHandle`, `StatusReport`) may be removed, renamed, retyped, or made required. New fields are optional with a default so existing `meta.json` keeps loading. The `facts/` cache is additive.
+
+---
+
+### Task 0: State-compatibility baseline (schema_version + golden-state test)
+
+Locks backward-compatibility with existing on-disk job state *before* any field is added. Adds a `schema_version` stamp to `JobRecord` (default `0` = "written before versioning"; `JobStore.save` stamps the current version) and a golden-state regression test proving a pre-Phase-1 `meta.json` still loads under new code. This gives Phase 2's SQL importer a reliable version signal and fails CI the day a field change breaks old state.
+
+**Files:**
+- Modify: `src/omnirun/models.py` (`JobRecord`: add `schema_version: int = 0`)
+- Modify: `src/omnirun/store.py` (`STATE_SCHEMA_VERSION` const; `save()` stamps it)
+- Test: `tests/test_state_compat.py` (new)
+
+**Interfaces:**
+- Consumes: existing `JobRecord`, `JobStore`, the `job_spec` conftest fixture (`tests/conftest.py:70-80`).
+- Produces: `JobRecord.schema_version: int` (0 on files predating this task; `STATE_SCHEMA_VERSION` on every fresh save). `store.STATE_SCHEMA_VERSION: int = 1`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_state_compat.py`:
+
+```python
+import json
+from pathlib import Path
+
+from omnirun.models import JobRecord, JobSpec
+from omnirun.store import STATE_SCHEMA_VERSION, JobStore
+
+
+def test_pre_phase1_meta_json_loads(tmp_path: Path, job_spec: JobSpec):
+    # Emulate a meta.json written before Phase 1: no schema_version, no min_cuda.
+    rec = JobRecord(spec=job_spec)
+    d = json.loads(rec.model_dump_json())
+    d.pop("schema_version", None)
+    d["spec"]["resources"].pop("min_cuda", None)  # no-op until Task 2, meaningful after
+
+    store = JobStore(root=tmp_path)
+    p = store.jobs_dir / job_spec.job_id / "meta.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d))
+
+    loaded = store.load(job_spec.job_id)
+    assert loaded is not None                                       # old file still loads
+    assert loaded.schema_version == 0                              # detectable as pre-versioned
+    assert getattr(loaded.spec.resources, "min_cuda", None) is None  # missing optional -> default
+
+
+def test_save_stamps_current_schema_version(tmp_path: Path, job_spec: JobSpec):
+    store = JobStore(root=tmp_path)
+    store.save(JobRecord(spec=job_spec))
+    loaded = store.load(job_spec.job_id)
+    assert loaded is not None
+    assert loaded.schema_version == STATE_SCHEMA_VERSION
+```
+
+> `getattr(..., "min_cuda", None)` keeps this test valid both now (the field doesn't exist yet) and after Task 2 (field present, defaults `None`), so it never needs editing.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_state_compat.py -q`
+Expected: FAIL — `ImportError: cannot import name 'STATE_SCHEMA_VERSION'`.
+
+- [ ] **Step 3: Implement the stamp**
+
+In `src/omnirun/models.py`, add to `JobRecord`:
+
+```python
+    schema_version: int = 0  # 0 = written before state versioning; JobStore.save stamps the current version
+```
+
+In `src/omnirun/store.py`, add near the top (after imports):
+
+```python
+STATE_SCHEMA_VERSION = 1
+```
+
+and stamp it in `JobStore.save` (first line of the method body):
+
+```python
+    def save(self, record: JobRecord) -> None:
+        record.schema_version = STATE_SCHEMA_VERSION
+        p = self._meta(record.spec.job_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(record.model_dump_json(indent=2))
+        tmp.replace(p)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_state_compat.py -q`
+Expected: PASS (2 passed).
+
+- [ ] **Step 5: Run the full gate**
+
+Run: `uv run pytest -q && ruff check src tests && basedpyright`
+Expected: PASS (existing store tests still green).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/omnirun/models.py src/omnirun/store.py tests/test_state_compat.py
+git commit -m "feat: stamp JobRecord.schema_version + golden-state regression test"
+```
 
 ---
 
@@ -765,6 +869,23 @@ def test_offer_marked_unfit_when_cuda_too_low(env):  # noqa: F811
     result = runner.invoke(app, ["offers", "--gpus", "1", "--min-cuda", "12.4"])
     assert result.exit_code == 0, result.output
     assert "CUDA 12.0 < required 12.4" in result.output
+
+
+def test_stale_facts_do_not_block(env):  # noqa: F811
+    from datetime import datetime, timedelta, timezone
+
+    FactStore().save(
+        ProviderFacts(
+            backend="stub",
+            discovered_at=datetime.now(timezone.utc) - timedelta(hours=10),
+            ttl_s=3600,  # facts are 10h old with a 1h TTL -> stale
+            capabilities=Capabilities(max_walltime=timedelta(hours=1)),
+            health=Health.OK,
+        )
+    )
+    result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
+    assert result.exit_code == 0, result.output
+    assert "exceeds max walltime" not in result.output  # stale facts must not block
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -774,16 +895,18 @@ Expected: FAIL — `--min-cuda` unknown option (exit 2), and no admission filter
 
 - [ ] **Step 3: Implement admission + the flag**
 
-In `src/omnirun/cli.py`, add the helper and wire it into `_probe`:
+In `src/omnirun/cli.py`, ensure `from datetime import datetime, timezone` is imported, then add the helper and wire it into `_probe`:
 
 ```python
 def _apply_admission(offers: list[Offer], res: ResourceSpec, store: FactStore) -> list[Offer]:
-    """Mark fitting offers unfit when cached facts prove the job can't run there."""
+    """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
+    Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
+    now = datetime.now(timezone.utc)
     for o in offers:
         if not o.fits:
             continue
         facts = store.load(o.backend)
-        if facts is None:
+        if facts is None or not facts.is_fresh(now):
             continue
         reasons = facts.capabilities.satisfies(res)
         if reasons:
@@ -814,7 +937,7 @@ and in the resource-building call add `min_cuda=min_cuda`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_cli_admission.py -q`
-Expected: PASS (2 passed).
+Expected: PASS (3 passed).
 
 - [ ] **Step 5: Run the full gate**
 
@@ -1330,6 +1453,7 @@ git commit -m "fix: colab — retry status beacon before reporting LOST (issue #
 - Admission rejects doomed jobs up front → Task 6. ✓
 - Colab #13 detection (no false LOST) → Task 10. ✓
 - Health / circuit-break signal (`Health` on facts) → Tasks 2,4,7,8 (surfaced by Task 5). ✓
+- Backward-compat with existing local job state (additive `min_cuda`, new `facts/` dir, `schema_version` stamp; stale facts never block a submit) → Task 0 + Task 6. ✓
 - Marketplace/colab **CUDA-on-provisioned-host** and slurm node CUDA discovery are intentionally out of Phase 1 (need a provisioned node); tracked as future refinement — noted, not a gap.
 
 **Placeholder scan:** No "TBD"/"implement later"/"add error handling". Two explicit "confirm this accessor name" notes (Task 5 fixture import, Task 7 `_connect`, Task 10 heartbeat format) are verification instructions with a concrete fallback, not placeholders.
