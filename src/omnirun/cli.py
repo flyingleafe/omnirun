@@ -25,7 +25,7 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
-from omnirun.control import Control
+from omnirun.control import Control, resolve_meta_cap
 from omnirun.models import (
     Deadline,
     EnvSpec,
@@ -304,6 +304,28 @@ def _backend_for(cfg: Config, name: str) -> Backend:
             f"backend {name!r} is not in the config anymore; cannot reach the job"
         )
     return make_backend(name, bcfg)
+
+
+def _effective_handle(rec: JobRecord) -> JobHandle | None:
+    """The backend handle the daemonless lifecycle commands should act on.
+
+    A daemonless ``submit`` mirrors a placement onto the legacy ``rec.handle`` via
+    ``_bridge_placement``. A DAEMON-placed job, however, only ever gets a
+    scheduler ``Placement`` written to its record (``handle`` stays ``None``) — so
+    ``logs``/``cancel``/``pull``/``status``/``gc`` must reconstruct the handle from
+    the placement to reach a job the daemon launched. Prefer the already-mirrored
+    ``rec.handle`` when present; otherwise derive it from the live ``placement``
+    exactly as ``BackendProvider.place`` built the handle it submitted with
+    (``backend`` = the placement's provider, ``data`` = the placement's handle
+    blob). Returns ``None`` only when the job was never placed anywhere (no handle,
+    no placement), which the callers treat as "never submitted".
+    """
+    if rec.handle is not None:
+        return rec.handle
+    p = rec.placement
+    if p is not None:
+        return JobHandle(backend=p.provider_name, job_id=p.job_id, data=p.handle)
+    return None
 
 
 def _bridge_placement(store: Store, rec: JobRecord) -> None:
@@ -591,7 +613,11 @@ def _submit_via_control(
         name: BackendProvider(be, store) for name, be in backends.items()
     }
     control = Control(
-        store, providers, budget_window="day", budget_cap=cfg.budget.daily
+        store,
+        providers,
+        budget_window="day",
+        budget_cap=cfg.budget.daily,
+        week_cap=cfg.budget.weekly,
     )
     now = datetime.now(timezone.utc)
     job_id = control.submit(spec, now=now)
@@ -885,17 +911,18 @@ def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
+    handle = _effective_handle(rec)
     st = rec.last_status
-    if rec.handle is not None and (st is None or not st.status.terminal):
-        be = _backend_for(cfg, rec.handle.backend)
-        st = be.status(rec.handle)
+    if handle is not None and (st is None or not st.status.terminal):
+        be = _backend_for(cfg, handle.backend)
+        st = be.status(handle)
         store.update_job_status(rec.spec.job_id, st)
 
     rows: list[tuple[str, str]] = [
         ("job", rec.spec.job_id),
         ("name", rec.spec.name),
         ("command", rec.spec.command),
-        ("backend", rec.handle.backend if rec.handle else "-"),
+        ("backend", handle.backend if handle else "-"),
         ("offer", rec.offer.label if rec.offer else "-"),
         (
             "repo",
@@ -930,10 +957,11 @@ def logs(
 ) -> None:
     cfg = _load_cfg()
     rec = open_store(cfg.state.resolved_url()).resolve_job(job)
-    if rec.handle is None:
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
-    be = _backend_for(cfg, rec.handle.backend)
-    for line in be.logs(rec.handle, follow=follow):
+    be = _backend_for(cfg, handle.backend)
+    for line in be.logs(handle, follow=follow):
         typer.echo(line.rstrip("\n"))
 
 
@@ -943,12 +971,13 @@ def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
-    if rec.handle is None:
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
-    be = _backend_for(cfg, rec.handle.backend)
-    be.cancel(rec.handle)
+    be = _backend_for(cfg, handle.backend)
+    be.cancel(handle)
     store.update_job_status(
         rec.spec.job_id,
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
@@ -1038,12 +1067,17 @@ def budget(
         if changed:
             console.print("[green]budget updated[/green]")
         now = datetime.now(timezone.utc)
+        # Both windows are GENUINELY enforced by every ``Control`` (the tick's day
+        # gate + ``_enact_place``'s weekly gate), so this shows the same
+        # spend-vs-cap the scheduler acts on — neither row is informational-only.
+        # ``resolve_meta_cap`` is the SAME resolver ``Control`` uses, so the display
+        # can never drift from enforcement on how a stored cap is read.
         table = Table("window", "spent", "cap")
         for window, cfg_default in (
             ("day", cfg.budget.daily),
             ("week", cfg.budget.weekly),
         ):
-            cap = _resolve_budget_cap(store, window, cfg_default)
+            cap = resolve_meta_cap(store, window, cfg_default)
             spent = store.load_ledger(window, cap, now).in_window_total(now)
             table.add_row(
                 window,
@@ -1053,22 +1087,6 @@ def budget(
         console.print(table)
     finally:
         store.close()
-
-
-def _resolve_budget_cap(
-    store: Store, window: str, cfg_default: float | None
-) -> float | None:
-    """The live cap for *window*: the meta override if set, else the config default."""
-    raw = store.get_meta(f"budget.{window}")
-    if raw is not None:
-        raw = raw.strip()
-        if raw == "":
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            pass
-    return cfg_default
 
 
 @app.command(help="Pull a job's collected outputs to a local directory.")
@@ -1082,11 +1100,12 @@ def pull(
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
-    if rec.handle is None:
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
     dest = dest or Path("omnirun-outputs") / rec.spec.job_id
-    be = _backend_for(cfg, rec.handle.backend)
-    paths = be.pull_outputs(rec.handle, dest)
+    be = _backend_for(cfg, handle.backend)
+    paths = be.pull_outputs(handle, dest)
     rec.outputs_pulled_to = str(dest)
     store.save_job(rec)
     console.print(f"pulled {len(paths)} path(s) to {dest}")
@@ -1105,19 +1124,20 @@ def gc(
     for rec in store.list_jobs():
         st = rec.last_status
         terminal = st is not None and st.status.terminal
-        if rec.handle is None:
+        handle = _effective_handle(rec)
+        if handle is None:
             continue
         if not terminal and not all_:
             skipped += 1
             continue
         try:
-            be = _backend_for(cfg, rec.handle.backend)
+            be = _backend_for(cfg, handle.backend)
             if not terminal:
                 try:  # best-effort: stop a still-live job before reaping it
-                    be.cancel(rec.handle)
+                    be.cancel(handle)
                 except Exception:
                     pass
-            be.gc(rec.handle)
+            be.gc(handle)
         except Exception as e:
             failed += 1
             console.print(f"[yellow]warn:[/yellow] gc of {rec.spec.job_id} failed: {e}")

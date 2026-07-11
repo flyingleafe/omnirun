@@ -58,6 +58,32 @@ _STATUS_TO_STATE: dict[JobStatus, JobState] = {
 }
 
 
+def resolve_meta_cap(store: Store, window: str, default: float | None) -> float | None:
+    """The live spend cap for *window*, resolved fresh from the ``meta`` table.
+
+    ``omnirun budget`` (and the daemon) write the current cap into ``meta`` under
+    ``budget.<window>`` — an empty string means "no cap" (unbounded). A parseable
+    float there wins; an unparseable value is logged and IGNORED (falling back to
+    *default*, the config-derived construction default). This single resolver is
+    shared by ``Control`` (the tick's day/week gates) and the ``omnirun budget``
+    display so the two can never drift on how a stored cap is interpreted.
+    """
+    raw = store.get_meta(f"budget.{window}")
+    if raw is not None:
+        raw = raw.strip()
+        if raw == "":
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            _log.warning(
+                "unparseable budget cap %r for window %s; using config default",
+                raw,
+                window,
+            )
+    return default
+
+
 class Control:
     """Drive one client's scheduling loop over a shared ``Store`` and providers.
 
@@ -65,9 +91,18 @@ class Control:
         store: The persistent state repository (job records + budget ledger).
         providers: Runtime execution targets keyed by ``Provider.name``.
         policy: Tick-level policy (only ``allow_paid``); defaults to permissive.
-        budget_window: Ledger window (``"day"`` / ``"week"``) the driver
+        budget_window: PRIMARY ledger window (``"day"`` / ``"week"``) the tick
             commits and realizes against.
-        budget_cap: Spend ceiling for that window (``None`` = unbounded).
+        budget_cap: Spend ceiling for the primary window (``None`` = unbounded).
+        week_cap: SECONDARY weekly ceiling enforced ALONGSIDE the primary cap
+            (``None`` = the weekly window is not gated). It is ONE logical wallet:
+            the day cap gates via the tick's ledger, the week cap via
+            ``_enact_place``. Because the store partitions the ledger table by its
+            ``window`` column (a ``"day"`` row is invisible to
+            ``load_ledger("week", …)``), the same paid amount is materialized as a
+            per-window row and realized/voided in lockstep (see
+            ``_paid_ledger_windows``) — no window ever double-counts. Ignored when
+            ``budget_window == "week"`` (that window is already the primary cap).
     """
 
     def __init__(
@@ -78,12 +113,14 @@ class Control:
         policy: SchedPolicy | None = None,
         budget_window: str = "day",
         budget_cap: float | None = None,
+        week_cap: float | None = None,
     ) -> None:
         self._store = store
         self._providers = providers
         self._policy = policy
         self._budget_window = budget_window
         self._budget_cap = budget_cap
+        self._week_cap = week_cap
 
     # ------------------------------------------------------------------
     # Submission
@@ -221,29 +258,36 @@ class Control:
     # ------------------------------------------------------------------
 
     def _resolve_cap(self) -> float | None:
-        """The live spend cap for this driver's window, resolved fresh each tick.
+        """The live spend cap for this driver's PRIMARY window, fresh each tick."""
+        return resolve_meta_cap(self._store, self._budget_window, self._budget_cap)
 
-        ``omnirun budget`` (and the daemon) write the current cap into the
-        ``meta`` table under ``budget.<window>`` — an empty string means "no
-        cap". A parseable float there wins; otherwise we fall back to the
-        ``budget_cap`` passed at construction (the config-derived default). This
-        is what lets a running daemon or a fresh CLI process see a cap change
-        without a restart.
+    def _resolve_week_cap(self) -> float | None:
+        """The live WEEKLY cap, resolved the same way as the primary cap.
+
+        ``omnirun budget --weekly`` writes ``budget.week`` into ``meta``; a
+        parseable float there wins, else the ``week_cap`` construction default.
+        Enforced by ``_enact_place`` in ADDITION to the primary (day) cap.
         """
-        raw = self._store.get_meta(f"budget.{self._budget_window}")
-        if raw is not None:
-            raw = raw.strip()
-            if raw == "":
-                return None
-            try:
-                return float(raw)
-            except ValueError:
-                _log.warning(
-                    "unparseable budget cap %r for window %s; using config default",
-                    raw,
-                    self._budget_window,
-                )
-        return self._budget_cap
+        return resolve_meta_cap(self._store, "week", self._week_cap)
+
+    def _paid_ledger_windows(self) -> list[str]:
+        """Windows a paid placement's ledger row must be maintained under.
+
+        Always the primary window (``self._budget_window`` — the tick reads it
+        for day affordability). PLUS ``"week"`` when a weekly cap is active AND
+        the primary window is not already ``"week"``, because the store partitions
+        the ledger by its ``window`` column: a row written under ``"day"`` is
+        invisible to ``load_ledger("week", …)``. So the ONE wallet is materialized
+        as one row per enforced window (the day row for the tick, the week row for
+        ``_enact_place``'s weekly gate), each realized/voided in lockstep so no
+        window over-counts. When no weekly cap is set the list is exactly
+        ``[self._budget_window]`` and every paid path behaves as before (the
+        invariant suite + e2e run with ``week_cap`` unset, so they are unchanged).
+        """
+        windows = [self._budget_window]
+        if self._resolve_week_cap() is not None and self._budget_window != "week":
+            windows.append("week")
+        return windows
 
     def run_tick(
         self,
@@ -390,15 +434,18 @@ class Control:
             self._store.save_job(
                 rec.model_copy(update={"state": new_state, "placement": updated})
             )
-            # Realize a committed (paid) placement into a spend. Free jobs carry
-            # cost_actual None and never touch the ledger.
+            # Realize a committed (paid) placement into a spend, in every enforced
+            # window the commit was written to (day always; week when weekly
+            # enforcement is active). Free jobs carry cost_actual None and never
+            # touch the ledger.
             if placement.cost_actual is not None:
-                self._store.ledger_realize(
-                    self._budget_window,
-                    rec.spec.job_id,
-                    placement.cost_actual,
-                    now,
-                )
+                for window in self._paid_ledger_windows():
+                    self._store.ledger_realize(
+                        window,
+                        rec.spec.job_id,
+                        placement.cost_actual,
+                        now,
+                    )
             return
 
         # Still active: keep RUNNING, refresh the backend-level placement state.
@@ -423,7 +470,11 @@ class Control:
         placement carries ``cost_actual is None`` and the same guard skips it.
         """
         if rec.placement is not None and rec.placement.cost_actual is not None:
-            self._store.ledger_realize(self._budget_window, rec.spec.job_id, 0.0, now)
+            # Void the commitment to $0 in every window it was written to (day
+            # always; week when weekly enforcement is active), so no window keeps
+            # counting an abandoned attempt.
+            for window in self._paid_ledger_windows():
+                self._store.ledger_realize(window, rec.spec.job_id, 0.0, now)
         self._store.save_job(
             rec.model_copy(
                 update={
@@ -516,6 +567,20 @@ class Control:
         # would get a ``place`` decision every tick yet never reserve/transition).
         if rec is None or rec.state not in (JobState.QUEUED, JobState.HELD):
             return
+        # Weekly budget gate (enforced ALONGSIDE the day cap the tick already
+        # applied). For a PAID slot with a knowable cost, if a weekly cap is set
+        # and this week's ledger cannot afford the estimate, SKIP the place BEFORE
+        # reserving — the job stays QUEUED and retries a later tick / next window
+        # (liveness: a job is delayed, never permanently failed, when over budget).
+        # The day window is already guaranteed affordable by the tick's own ledger,
+        # so only the orthogonal weekly ceiling is checked here.
+        week_cap = self._resolve_week_cap()
+        if slot.cost.per_hour is not None and week_cap is not None:
+            week_cost = slot.cost.total(rec.spec.resources.time)
+            if week_cost is not None and not self._store.load_ledger(
+                "week", week_cap, now
+            ).can_afford(week_cost, now):
+                return
         # Atomic reserve (#12): flips the row (QUEUED/HELD) to PLACING + stub
         # placement. A lost race / gone capacity returns False; the job keeps its
         # current state, retries next tick.
@@ -541,21 +606,25 @@ class Control:
             return
 
         # Commit the budget for a PAID placement with a knowable cost. Free slots
-        # (per_hour None) and unknowable costs never touch the ledger.
+        # (per_hour None) and unknowable costs never touch the ledger. The commit
+        # lands in every enforced window (day always; week too when a weekly cap is
+        # active — the store partitions the ledger by window, so each cap needs its
+        # own row of the same wallet; see ``_paid_ledger_windows``).
         if slot.cost.per_hour is not None:
             amount = slot.cost.total(rec.spec.resources.time)
             if amount is not None:
                 placement = placement.model_copy(update={"cost_actual": amount})
-                self._store.ledger_add(
-                    self._budget_window,
-                    LedgerEntry(
-                        job_id=decision.job_id,
-                        provider=slot.provider_name,
-                        amount=amount,
-                        kind="committed",
-                        at=now,
-                    ),
-                )
+                for window in self._paid_ledger_windows():
+                    self._store.ledger_add(
+                        window,
+                        LedgerEntry(
+                            job_id=decision.job_id,
+                            provider=slot.provider_name,
+                            amount=amount,
+                            kind="committed",
+                            at=now,
+                        ),
+                    )
         # Persist the placed record (re-load to keep any concurrent field the
         # reserve wrote, then overlay the real placement + RUNNING state).
         current = self._store.load_job(decision.job_id) or rec

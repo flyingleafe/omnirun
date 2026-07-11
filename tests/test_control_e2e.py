@@ -393,3 +393,78 @@ def test_m1_resubmit_same_job_id_raises_and_preserves_record(tmp_path: Path) -> 
         assert after.placement.provider_name == "free"
     finally:
         store.close()
+
+
+def _week_committed(store: Store) -> list[float]:
+    """Amounts of the still-``committed`` rows in the WEEK window at T4."""
+    led = store.load_ledger("week", cap=None, now=T4)
+    return [e.amount for e in led.entries if e.kind == "committed"]
+
+
+def test_weekly_cap_gates_paid_place_and_wallet_spans_both_windows(
+    tmp_path: Path,
+) -> None:
+    """The weekly cap blocks a paid place that would exceed it (job stays QUEUED,
+    provider.place never called), lifts to place it, and the ONE paid wallet is
+    materialized in BOTH the day and week windows and realized in lockstep.
+
+    This exercises the correctness the store's per-window partitioning forces: a
+    committed row written only under ``day`` is invisible to ``load_ledger("week")``,
+    so ``Control`` maintains a parallel ``week`` row (kept in step on realize) when
+    a weekly cap is active — enforcing the same wallet against both ceilings.
+    """
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        spec = _paid_spec()  # 1h job ⇒ $2 on the paid slot
+        # First reconcile poll after placement returns SUCCEEDED (the job is
+        # placed a tick late due to the initial weekly block, so a single-element
+        # script keeps the terminal reconcile at T2).
+        provider = FakeProvider(
+            "paid",
+            slots=[_paid_slot()],
+            poll_script={spec.job_id: [JobStatus.SUCCEEDED]},
+        )
+        # Day cap generous ($100); weekly cap TIGHT ($1) ⇒ the $2 job cannot fit
+        # the week window and must NOT place.
+        control = Control(store, {"paid": provider}, budget_cap=100.0, week_cap=1.0)
+        control.submit(spec, now=T0)
+
+        # --- T0: weekly gate blocks the paid place; job stays QUEUED ----------
+        control.run_tick(T0)
+        blocked = store.load_job(spec.job_id)
+        assert blocked is not None
+        assert blocked.state is JobState.QUEUED  # not placed: over the weekly cap
+        assert blocked.placement is None
+        assert provider.place_calls == []  # provider.place never called
+        assert _week_committed(store) == []  # nothing committed anywhere
+        assert _committed_rows(store) == []
+
+        # --- lift the weekly cap live (meta wins over the ctor default) -------
+        control.budget("week", 100.0)
+
+        # --- T1: now affordable ⇒ placed; wallet lands in BOTH windows --------
+        control.run_tick(T1)
+        placed = store.load_job(spec.job_id)
+        assert placed is not None
+        assert placed.state is JobState.RUNNING
+        assert placed.placement is not None
+        assert placed.placement.cost_actual == 2.0
+        assert provider.place_calls == [spec.job_id]
+        # ONE wallet, one committed row per enforced window (day for the tick,
+        # week for the gate) — same $2 in each, never double-counted within a
+        # window.
+        assert _committed_rows(store) == [2.0]
+        assert _week_committed(store) == [2.0]
+
+        # --- T2: terminal ⇒ realize in lockstep; no committed row lingers -----
+        control.run_tick(T2)
+        done = store.load_job(spec.job_id)
+        assert done is not None
+        assert done.state is JobState.SUCCEEDED
+        assert _committed_rows(store) == []  # day realized
+        assert _week_committed(store) == []  # week realized in lockstep
+        # Net charge is a single $2 in each window (no over-count).
+        assert store.load_ledger("day", cap=None, now=T4).in_window_total(T4) == 2.0
+        assert store.load_ledger("week", cap=None, now=T4).in_window_total(T4) == 2.0
+    finally:
+        store.close()

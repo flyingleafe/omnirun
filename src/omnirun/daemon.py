@@ -196,6 +196,7 @@ class Daemon:
                     self._get_providers(),
                     budget_window="day",
                     budget_cap=self.cfg.budget.daily,
+                    week_cap=self.cfg.budget.weekly,
                 )
             return self._control
 

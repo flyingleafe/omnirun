@@ -23,10 +23,12 @@ from omnirun.models import (
     Capabilities as _Capabilities,
     Health as _Health,
     JobHandle,
+    JobRecord,
     JobSpec,
     JobState,
     JobStatus,
     Offer,
+    Placement,
     ProviderFacts as _ProviderFacts,
     RepoRef,
     ResourceSpec,
@@ -600,6 +602,44 @@ def test_budget_set_daily_then_show_roundtrips(env):
     assert "$0" in result.output  # spent nothing this window
 
 
+def test_daemonless_submit_control_built_with_config_budget_caps(env, monkeypatch):
+    """A ``[budget]`` config with daily+weekly is threaded into the daemonless
+    ``submit`` path's ``Control`` as the day cap AND the weekly cap."""
+    from omnirun.control import Control
+    from omnirun.providers import Provider
+
+    env.config_file.write_text(BASE_CONFIG + "\n[budget]\ndaily = 7.0\nweekly = 40.0\n")
+    built: list[Control] = []
+
+    class RecordingControl(Control):
+        def __init__(
+            self,
+            store: Store,
+            providers: dict[str, Provider],
+            *,
+            policy: object = None,
+            budget_window: str = "day",
+            budget_cap: float | None = None,
+            week_cap: float | None = None,
+        ) -> None:
+            super().__init__(
+                store,
+                providers,
+                budget_window=budget_window,
+                budget_cap=budget_cap,
+                week_cap=week_cap,
+            )
+            built.append(self)
+
+    monkeypatch.setattr("omnirun.cli.Control", RecordingControl)
+    result = runner.invoke(app, ["submit", "--yes", "--", "python", "train.py"])
+    assert result.exit_code == 0, result.output
+    [control] = built
+    assert control._budget_cap == 7.0
+    assert control._week_cap == 40.0
+    assert control._budget_window == "day"
+
+
 def test_budget_show_reads_ledger_spend(env):
     from datetime import datetime as _dt
 
@@ -712,6 +752,93 @@ def test_pull_outputs(env, tmp_path):
     assert (dest / "result.txt").read_text() == "42"
     rec = _store().load_job(job_id)
     assert rec is not None and rec.outputs_pulled_to == str(dest)
+
+
+# ------------------------------------- daemon-placed jobs (placement, handle=None)
+
+
+def _seed_daemon_placed_job(job_id: str = "daemon-placed-01") -> JobRecord:
+    """Persist a RUNNING job the way the DAEMON leaves it: a scheduler
+    ``Placement`` set (on the ``stub`` provider) but the legacy ``handle`` NEVER
+    populated (``_bridge_placement`` only runs on the daemonless submit path)."""
+    rec = JobRecord(
+        spec=JobSpec(
+            job_id=job_id,
+            name="daemon",
+            command="python train.py",
+            resources=ResourceSpec(),
+            repo=RepoRef(
+                remote_url="git@example.com:me/proj.git",
+                sha="b" * 40,
+                branch="main",
+                slug="proj",
+            ),
+        ),
+        state=JobState.RUNNING,
+        submitted_at=datetime.now(timezone.utc),
+        handle=None,  # the regression: daemon never mirrors placement -> handle
+        placement=Placement(
+            provider_name="stub",
+            job_id=job_id,
+            handle={"token": f"t-{job_id}"},
+            state=JobStatus.RUNNING,
+        ),
+    )
+    _store().save_job(rec)
+    return rec
+
+
+def test_effective_handle_reconstructs_from_placement(env):
+    """The read-side bridge derives the backend handle from a placement when the
+    legacy ``handle`` is None (a daemon-placed job) and returns None only for a
+    truly never-placed job."""
+    from omnirun.cli import _effective_handle
+
+    rec = _seed_daemon_placed_job()
+    handle = _effective_handle(rec)
+    assert handle is not None
+    assert handle.backend == "stub"
+    assert handle.job_id == rec.spec.job_id
+    assert handle.data == {"token": f"t-{rec.spec.job_id}"}
+
+    # A record with neither handle nor placement stays unreachable (None).
+    bare = rec.model_copy(update={"placement": None, "handle": None})
+    assert _effective_handle(bare) is None
+
+    # An already-mirrored handle wins verbatim over the placement.
+    mirrored = rec.model_copy(
+        update={"handle": JobHandle(backend="other", job_id="x", data={"k": "v"})}
+    )
+    got = _effective_handle(mirrored)
+    assert got is not None and got.backend == "other" and got.data == {"k": "v"}
+
+
+def test_daemon_placed_job_reachable_by_lifecycle_commands(env):
+    """Regression: ``logs``/``cancel``/``status`` on a daemon-placed job (placement
+    set, handle None) must reach the backend, NOT raise 'never submitted'."""
+    rec = _seed_daemon_placed_job()
+    job_id = rec.spec.job_id
+
+    # logs: streams from the reconstructed handle instead of erroring.
+    result = runner.invoke(app, ["logs", job_id])
+    assert result.exit_code == 0, result.output
+    assert "hello from stub" in result.output
+    assert "never submitted" not in result.output
+
+    # status: refreshes live via the backend and shows the provider.
+    result = runner.invoke(app, ["status", job_id])
+    assert result.exit_code == 0, result.output
+    assert "running" in result.output
+    assert "stub" in result.output
+    assert "never submitted" not in result.output
+
+    # cancel: reaches the backend cancel through the reconstructed handle.
+    result = runner.invoke(app, ["cancel", job_id])
+    assert result.exit_code == 0, result.output
+    assert StubBackend.cancelled == [job_id]
+    rec2 = _store().load_job(job_id)
+    assert rec2 is not None and rec2.last_status is not None
+    assert rec2.last_status.status is JobStatus.CANCELLED
 
 
 # ------------------------------------------------------------------ gc / backends / config-path
