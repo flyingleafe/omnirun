@@ -1,0 +1,88 @@
+@startuml domain
+title omnirun — domain model
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+
+class Job {
+  id : str
+  name : str
+  project : str
+  revision : RepoRef
+  command : str
+  deadline : Deadline?
+  max_cost : Money?
+  priority : int
+  state : JobState
+  resume_from : CheckpointRef?  <<future hook>>
+}
+
+class Requirements {
+  gpu_type : str?
+  gpu_count : int
+  min_vram_gb : float?
+  min_cuda : str?
+  min_driver : str?
+  cpus : int?
+  mem_gb : float?
+  disk_gb : float?
+  est_runtime : timedelta
+}
+
+class Capabilities {
+  .. same vocabulary as Requirements ..
+  satisfies(req : Requirements) : bool
+}
+
+class Slot {
+  provider_name : str  <<display>>
+  cost : CostModel
+  availability : Availability
+  capacity : int
+  provider_ref : dict  <<opaque>>
+}
+
+class Placement {
+  provider_name : str
+  job_id : str
+  handle : dict  <<opaque>>
+  links : Link[]  <<display>>
+  cost_actual : Money?
+  state : JobState
+}
+
+class Link {
+  label : str
+  url : str
+}
+
+class ProviderFacts {
+  provider_name : str
+  discovered_at : datetime
+  ttl : timedelta
+  limits : Limits
+  budget_state : dict?
+  health : OK | DEGRADED | UNREACHABLE
+}
+
+class BudgetLedger {
+  window : day | week
+  cap : Money
+}
+
+class LedgerEntry {
+  job_id : str
+  provider : str
+  amount : Money
+  kind : committed | spent
+  at : datetime
+}
+
+Job *-- Requirements
+Job "1" o-- "*" Placement : attempts
+Slot *-- Capabilities
+Placement "1" o-- "*" Link
+ProviderFacts *-- Capabilities
+ProviderFacts *-- "*" Slot : offer()
+BudgetLedger "1" o-- "*" LedgerEntry
+Requirements ..> Capabilities : matched by\ncapabilities superset of requirements
+@enduml

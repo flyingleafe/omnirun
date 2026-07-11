@@ -1,0 +1,35 @@
+@startuml seq_recovery
+title Ghost session -> LOST -> re-queue -> re-place (recovery, #13)
+skinparam shadowing false
+participant Control
+participant Scheduler
+database Store
+participant "Provider A\n(colab, flaky)" as A
+participant "Provider B\n(slurm)" as B
+
+Control -> A : place(Job, Slot_A)
+A --> Control : Placement_A (RUNNING)
+Control -> Store : Job -> RUNNING
+
+... rapid session churn ...
+
+Control -> A : poll(Placement_A)
+A --> Control : LOST (session dropped)
+note over Control, Store
+  reconcile: RUNNING -> QUEUED,
+  attempts++, release Slot_A capacity.
+  A misbehaving poll that RAISES is
+  caught at the seam -> DEGRADED, tick still completes.
+end note
+Control -> Store : Job -> QUEUED
+
+== next tick(now) ==
+Control -> B : offer(requirements)
+B --> Control : [ Slot_B (queued, wait 5m) ]
+Control -> Scheduler : tick(...)
+Scheduler --> Control : deadline slack ok -> place Job -> Slot_B
+Control -> Store : reserve() atomic (Job -> PLACING)
+Control -> B : place(Job, Slot_B)
+B --> Control : Placement_B (RUNNING)
+note over Control : invariant: a non-cancelled job\nis never silently lost
+@enduml
