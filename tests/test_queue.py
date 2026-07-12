@@ -13,6 +13,7 @@ from omnirun.budget import LedgerEntry
 from omnirun.config import BackendConfig, BudgetConfig, Config, DaemonConfig
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -93,7 +94,7 @@ class FakeBackend(Backend):
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         yield "fake"
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         self.cancelled.append(handle.job_id)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:

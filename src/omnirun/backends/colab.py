@@ -42,6 +42,7 @@ from omnirun.bootstrap import (
     notebook_env_spec,
 )
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -655,7 +656,7 @@ class ColabBackend(Backend):
                 shutil.copytree(outputs, dest, dirs_exist_ok=True)
         return sorted(p for p in dest.rglob("*") if p.is_file())
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         session = handle.data["session"]
         pid = handle.data.get("pid")
         if pid:

@@ -68,7 +68,7 @@ class StubBackend(Backend):
         self.probed: list[ResourceSpec] = []
         self.submitted: list[tuple[JobSpec, Offer]] = []
         self.status_calls: list[JobHandle] = []
-        self.cancelled: list[JobHandle] = []
+        self.cancelled: list[tuple[JobHandle, CancelMode]] = []
         self.logged: list[tuple[JobHandle, bool]] = []
         self.pulled: list[tuple[JobHandle, Path]] = []
 
@@ -94,8 +94,8 @@ class StubBackend(Backend):
         yield "line-1"
         yield "line-2"
 
-    def cancel(self, handle: JobHandle) -> None:
-        self.cancelled.append(handle)
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        self.cancelled.append((handle, mode))
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         self.pulled.append((handle, dest))
@@ -333,9 +333,23 @@ def test_cancel_delegates_with_placement_handle(store: Store) -> None:
     provider.cancel(p, CancelMode.FORCE)
 
     assert len(backend.cancelled) == 1
-    assert backend.cancelled[0].data == {"host": "h"}
-    assert backend.cancelled[0].job_id == "j1"
-    assert backend.cancelled[0].backend == "stub"
+    handle, mode = backend.cancelled[0]
+    assert handle.data == {"host": "h"}
+    assert handle.job_id == "j1"
+    assert handle.backend == "stub"
+    assert mode is CancelMode.FORCE
+
+
+def test_cancel_forwards_mode_to_backend(store: Store) -> None:
+    provider, backend = _provider(store)
+    p = Placement(provider_name="stub", job_id="j1", handle={"host": "h"})
+
+    provider.cancel(p, CancelMode.GRACEFUL)
+
+    assert len(backend.cancelled) == 1
+    handle, mode = backend.cancelled[0]
+    assert handle.data == {"host": "h"}
+    assert mode is CancelMode.GRACEFUL
 
 
 def test_stream_logs_delegates_and_follows(store: Store) -> None:

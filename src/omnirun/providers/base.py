@@ -15,11 +15,11 @@ backend.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
 from omnirun.models import (
+    CancelMode,
     JobRecord,
     Placement,
     ProviderFacts,
@@ -27,19 +27,6 @@ from omnirun.models import (
     Slot,
     Status,
 )
-
-
-class CancelMode(str, Enum):
-    """How firmly to cancel a placement.
-
-    ``GRACEFUL`` asks the job to stop and lets it clean up; ``FORCE`` tears the
-    resource down immediately. Phase 3's ``BackendProvider`` treats both as a
-    best-effort delegate to ``Backend.cancel``; the graceful→force reaping
-    distinction is deepened in Phase 4.
-    """
-
-    GRACEFUL = "graceful"
-    FORCE = "force"
 
 
 class Provider(Protocol):

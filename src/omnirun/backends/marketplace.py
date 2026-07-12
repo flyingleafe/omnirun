@@ -64,6 +64,7 @@ from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.repo import local_root_of
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -486,7 +487,7 @@ class MarketplaceBackend(Backend, ABC):
                 ) from e
         return paths
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         if handle.data.get("job_dir"):  # a provisioning stub has nothing to kill
             try:  # best-effort remote kill; instance dies right after anyway
                 ex = self._exec_from_handle(handle)

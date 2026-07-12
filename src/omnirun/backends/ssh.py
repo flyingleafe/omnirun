@@ -18,6 +18,7 @@ from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.repo import local_root_of
 from omnirun.models import (
     KNOWN_GPU_VRAM_GB,
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -293,7 +294,7 @@ class SshBackend(Backend):
             self.exec_, job_dir, follow=follow, is_terminal=is_terminal
         )
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         job_dir = handle.data["job_dir"]
         q = shell_quote(f"{job_dir}/pid")
         # setsid made the pid its own process-group leader: TERM the whole

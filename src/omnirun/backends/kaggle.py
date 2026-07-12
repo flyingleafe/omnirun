@@ -42,6 +42,7 @@ from omnirun.bootstrap import (
     notebook_env_spec,
 )
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -712,7 +713,7 @@ class KaggleBackend(Backend):
                 shutil.copytree(outputs, dest, dirs_exist_ok=True)
         return sorted(p for p in dest.rglob("*") if p.is_file())
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         api = self._api()
         ref = handle.data["kernel_ref"]
         # the kaggle package historically has no kernel-cancel endpoint; use one

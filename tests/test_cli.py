@@ -20,6 +20,7 @@ from omnirun.backends.base import (
 from omnirun.budget import LedgerEntry as _LedgerEntry
 from omnirun.cli import app
 from omnirun.models import (
+    CancelMode,
     Capabilities as _Capabilities,
     Health as _Health,
     JobHandle,
@@ -85,7 +86,7 @@ class StubBackend(Backend):
         yield "hello from stub"
         yield f"following={follow}"
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         type(self).cancelled.append(handle.job_id)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
@@ -135,7 +136,9 @@ class UnreachableBackend(Backend):
     ) -> Iterator[str]:  # pragma: no cover
         yield ""
 
-    def cancel(self, handle: JobHandle) -> None:  # pragma: no cover
+    def cancel(
+        self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+    ) -> None:  # pragma: no cover
         pass
 
     def pull_outputs(
@@ -176,7 +179,9 @@ class ProvisionThenFailBackend(Backend):
     ) -> Iterator[str]:  # pragma: no cover
         yield ""
 
-    def cancel(self, handle: JobHandle) -> None:  # pragma: no cover
+    def cancel(
+        self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+    ) -> None:  # pragma: no cover
         pass
 
     def pull_outputs(

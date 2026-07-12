@@ -138,14 +138,14 @@ class BackendProvider:
         return Status(state=r.status, exit_code=r.exit_code, detail=r.detail)
 
     def cancel(self, p: Placement, mode: CancelMode) -> None:
-        """Cancel the placed job.
+        """Cancel the placed job, forwarding *mode* to the backend.
 
-        *mode* is accepted for the seam but, in Phase 3, both ``GRACEFUL`` and
-        ``FORCE`` are a best-effort delegate to ``Backend.cancel``; the
-        graceful→force reaping distinction is deepened in Phase 4.
+        Task 5 wraps this in the graceful→force→reap sequence; here the adapter
+        simply threads the caller's mode into ``Backend.cancel`` (which Tasks 4/7
+        teach to honor GRACEFUL vs FORCE).
         """
         self._backend.cancel(
-            JobHandle(backend=self.name, job_id=p.job_id, data=p.handle)
+            JobHandle(backend=self.name, job_id=p.job_id, data=p.handle), mode
         )
 
     def stream_logs(self, p: Placement) -> Iterator[str]:

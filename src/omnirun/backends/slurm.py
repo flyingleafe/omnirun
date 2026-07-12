@@ -24,6 +24,7 @@ from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -587,7 +588,7 @@ class SlurmBackend(Backend):
 
         return gen()
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sid = handle.data["slurm_job_id"]
         r = self.exec_.run(f"scancel {sid}")
         if not r.ok:
