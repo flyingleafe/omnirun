@@ -595,3 +595,71 @@ def test_control_cancel_unknown_and_terminal_are_noops(tmp_path: Path) -> None:
     control.cancel("nope", T1)  # unknown → no-op
     assert provider.cancel_calls == []
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# I1 concurrent-tick lease: reserved_at gates the empty-handle revert
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_keeps_fresh_empty_handle_placing(tmp_path: Path) -> None:
+    """A FRESH empty-handle PLACING is an in-flight place from an overlapping
+    tick — the reserved_at lease must keep it PLACING (not revert+relaunch),
+    closing the concurrent-tick double-launch race (I1)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    provider = FakeProvider("mkt", slots=[_free_slot()])
+    control = Control(store, {"mkt": provider})
+    rec = JobRecord(
+        spec=_spec("lease-1"),
+        state=JobState.PLACING,
+        submitted_at=T0,
+        placement=Placement(
+            provider_name="mkt",
+            job_id="lease-1",
+            state=JobStatus.QUEUED,
+            reserved_at=T1,  # reserved "just now" (same instant the tick runs)
+        ),
+    )
+    store.save_job(rec)
+
+    control.run_tick(T1)  # reconcile at the SAME instant as the reservation
+
+    after = store.load_job("lease-1")
+    assert after is not None
+    assert after.state is JobState.PLACING  # lease not aged out → left alone
+    assert after.placement is not None
+    assert provider.poll_calls == []  # empty handle → not polled either
+    store.close()
+
+
+def test_reconcile_reverts_stale_empty_handle_placing(tmp_path: Path) -> None:
+    """A STALE empty-handle PLACING (reserved long ago, no handle ever written)
+    is a genuine crash between reserve() and place() — revert to QUEUED once the
+    lease has aged out."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    # No slots: prevents the tick from re-placing after the revert so attempts
+    # stays at exactly 1 (the reconcile revert), isolating the reconcile path.
+    provider = FakeProvider("mkt", slots=[])
+    control = Control(store, {"mkt": provider})
+    old = T1 - timedelta(seconds=120)  # well past RESERVE_LEASE_S
+    rec = JobRecord(
+        spec=_spec("stale-1"),
+        state=JobState.PLACING,
+        submitted_at=T0,
+        placement=Placement(
+            provider_name="mkt",
+            job_id="stale-1",
+            state=JobStatus.QUEUED,
+            reserved_at=old,
+        ),
+    )
+    store.save_job(rec)
+
+    control.run_tick(T1)
+
+    after = store.load_job("stale-1")
+    assert after is not None
+    assert after.state is JobState.QUEUED
+    assert after.attempts == 1
+    assert after.placement is None
+    store.close()

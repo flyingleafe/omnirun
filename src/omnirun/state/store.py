@@ -356,7 +356,9 @@ class Store:
         with self._engine.connect() as conn:
             return self._count_active_jobs(conn, provider)
 
-    def reserve(self, slot: Slot, rec: JobRecord) -> bool:
+    def reserve(
+        self, slot: Slot, rec: JobRecord, *, now: datetime | None = None
+    ) -> bool:
         """Atomically reserve job *rec* onto *slot* if the provider is under cap.
 
         The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly
@@ -385,6 +387,7 @@ class Store:
         """
         job_id = rec.spec.job_id
         provider = slot.provider_name
+        reserved_at = now or datetime.now(timezone.utc)
         with self.transaction() as conn:
             if conn.dialect.name == "postgresql":
                 # Postgres runs READ COMMITTED and the FOR UPDATE below locks only
@@ -417,6 +420,7 @@ class Store:
                 provider_name=provider,
                 job_id=job_id,
                 state=_JobStatus.QUEUED,
+                reserved_at=reserved_at,
             )
             current.schema_version = STATE_SCHEMA_VERSION
             # UPDATE directly on this connection — NOT save_job(), which would

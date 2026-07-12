@@ -47,6 +47,13 @@ _log = logging.getLogger("omnirun.control")
 
 # Backend JobStatus -> scheduler JobState. LOST is handled specially by the
 # reconciler (requeue), so it is intentionally absent here.
+# How long a fresh empty-handle PLACING reservation is protected from the
+# crash-recovery revert. An in-flight place() from an overlapping tick holds an
+# empty-handle PLACING briefly; reverting it before this lease ages out would
+# double-launch (tick B relaunches while tick A's place is mid-flight). Past the
+# lease, an empty handle IS a genuine reserve→place crash and is reclaimed. (I1)
+RESERVE_LEASE_S: float = 60.0
+
 _STATUS_TO_STATE: dict[JobStatus, JobState] = {
     JobStatus.QUEUED: JobState.RUNNING,
     JobStatus.PROVISIONING: JobState.RUNNING,
@@ -377,18 +384,27 @@ class Control:
             #
             #   * EMPTY handle  -> the process died between reserve() and place();
             #     no backend resource exists. Revert to QUEUED (attempts+1) so a
-            #     later tick relaunches — never stranded.
+            #     later tick relaunches — never stranded. The concurrent-tick
+            #     double-launch race is closed by the RESERVE_LEASE_S gate below.
             #   * PARTIAL handle carrying a "provisioning" marker -> place() got far
             #     enough to rent a billable resource and persist it via
             #     on_provisioning (I2 orphan-recovery), but the RUNNING save may not
             #     have landed. ADOPT it: fall through to poll() below and let the
             #     normal transition run. Reverting here would orphan the billed
             #     instance and double-launch.
-            #
-            # (The concurrent-tick lease that would also make the EMPTY-handle
-            # revert safe under overlapping ticks is Phase 5; see the note there.)
             handle = placement.handle
             if rec.state is JobState.PLACING and not handle:
+                # I1 lease: only reclaim an empty-handle PLACING once its
+                # reservation has aged past RESERVE_LEASE_S. A FRESH one is an
+                # in-flight place() from an overlapping tick — leave it PLACING
+                # so we never revert+relaunch a reservation another tick is
+                # actively placing (concurrent-tick double-launch, spec inv. 3).
+                reserved_at = placement.reserved_at
+                lease_ok = reserved_at is not None and (
+                    (now - reserved_at).total_seconds() < RESERVE_LEASE_S
+                )
+                if lease_ok:
+                    continue  # fresh reservation held by an in-flight place
                 self._store.save_job(
                     rec.model_copy(
                         update={
@@ -596,7 +612,7 @@ class Control:
         # Atomic reserve (#12): flips the row (QUEUED/HELD) to PLACING + stub
         # placement. A lost race / gone capacity returns False; the job keeps its
         # current state, retries next tick.
-        if not self._store.reserve(slot, rec):
+        if not self._store.reserve(slot, rec, now=now):
             return
         provider = self._providers.get(slot.provider_name)
         if provider is None:

@@ -326,6 +326,7 @@ class Placement(BaseModel):
     links: list[Link] = Field(default_factory=list)
     cost_actual: float | None = None
     state: JobStatus = JobStatus.QUEUED
+    reserved_at: datetime | None = None  # set by Store.reserve; feeds the I1 lease
     placed_at: datetime | None = None
     ended_at: datetime | None = None
 
