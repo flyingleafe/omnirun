@@ -16,6 +16,9 @@ follow logs with: omnirun logs -f train-a3f9c1
 $ omnirun logs -f train-a3f9c1
 epoch 1/50 loss=2.31 ...
 
+$ omnirun cancel train-a3f9c1          # graceful stop; add --force to hard-kill
+cancelled train-a3f9c1
+
 $ omnirun pull train-a3f9c1
 pulled 3 path(s) to omnirun-outputs/train-a3f9c1
 ```

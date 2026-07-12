@@ -40,13 +40,11 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
     8. tick_convergence — a second identical tick makes no new placements.
     **VERIFIED** on the current HEAD with no live backends (pure in-process, SQLite only).
     *Honesty note (I2):* the suite asserts store-level properties only. It does NOT
-    assert "exactly one live backend instance per job" — that is knowingly false across
-    a `place`-failure boundary: if the process dies between `provider.place` succeeding
-    and the `RUNNING save_job`, the first launch becomes an orphan and a later tick
-    relaunches. Closing this to exactly-once (the `on_provisioning` stub for orphan-
-    recovery) is **deferred to Phase 4**. A client crash mid-place may therefore leak a
-    marketplace instance; the common daemonless path and `submit`'s own-failure handling
-    are unaffected.
+    assert "exactly one live backend instance per job" across a `place`-failure boundary.
+    Phase 4 closed the marketplace orphan window: `BackendProvider.place` persists a
+    partial handle via `on_provisioning` before returning, and `Control._reconcile`
+    ADOPTS a partial-handle PLACING (re-polls) instead of reverting and relaunching.
+    The remaining concurrent-tick lease (two overlapping ticks) is Phase 5.
   - **Real e2e without network**: the `local` backend runs actual jobs —
     submit → bare-repo push → worktree → bootstrap → detached run → status →
     logs → cancel → pull, against real git and real processes
@@ -100,6 +98,23 @@ omnirun pull <job-id> && omnirun gc
 ```
 
 Expected: job SUCCEEDED, logs show the print, worktree under `~/.omnirun/jobs/`.
+
+### Phase 4 — uniform lifecycle (local, real)
+
+```bash
+# graceful cancel reaps the process; --force hard-kills; logs -f is uniform
+omnirun submit --yes -- python -c 'import time; [time.sleep(1) for _ in range(60)]'
+omnirun logs -f <job-id> &     # follows the canonical bootstrap.log
+omnirun cancel <job-id>        # SIGTERM the run pgid, then SIGKILL after the grace window
+omnirun status <job-id>        # CANCELLED; no leftover process
+```
+
+- [x] `cancel` (graceful) and `cancel --force` stop the process group; the shared
+      `.trees/<sha>` worktree and `.venv` survive (verified: not deleted).
+- [x] `logs -f` tails `bootstrap.log` with no duplicated command lines.
+- [ ] Marketplace reap-on-cancel — creds-gated (RunPod/Vast/Thunder); the DELETE
+      path is unit-tested against respx, live run still pending.
+- [ ] Kaggle `logs -f` honesty note — verified in unit tests; live run pending.
 
 ### Personal SSH box — UNVERIFIED (no box available)
 

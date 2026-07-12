@@ -389,7 +389,7 @@ queue:        qid TEXT PK, state TEXT, created_at TEXT, only_backend TEXT,
 
 Timestamps are stored as ISO-8601 TEXT (portable and sortable).
 
-### Atomic `reserve_entry` — the §12 double-book guard
+### Atomic `reserve_entry` — the #12 double-book guard
 
 `Store.reserve_entry(qid, backend, cap)` is the only concurrency-critical operation.
 It must guarantee that no two callers can both pass the `count_active(backend) < cap`
@@ -458,10 +458,34 @@ class Provider(Protocol):
     def gc(self) -> None: ...
 ```
 
-`CancelMode` has two values: `GRACEFUL` (ask the job to stop cleanly) and `FORCE`
-(tear it down immediately). Phase 3's `BackendProvider` treats both as a
-best-effort delegate to `Backend.cancel`; the graceful→force distinction is
-deepened in Phase 4.
+`CancelMode` has two values: `GRACEFUL` (ask the job to stop cleanly, then
+hard-kill after a `cancel_grace_s` window) and `FORCE` (tear it down
+immediately). The `BackendProvider` adapter drives the uniform sequence:
+GRACEFUL → poll the backend until terminal or `cancel_grace_s` elapses →
+FORCE (SIGKILL) → **reap** the billable/worker resource (terminate the
+marketplace instance / `scancel` / stop the kernel-session) via `Backend.gc`.
+Cancel is idempotent and complete: after it returns there is no live placement
+or billing instance (invariant 5), even for a job that already looked terminal.
+`omnirun cancel --force` skips the grace window. The per-backend grace duration
+defaults to 30 s and is overridable via `cancel_grace_s` in the backend's
+config block.
+
+SSH-family backends (`signal_job` in `backends/jobdir.py`) signal the whole
+process group (the bootstrap records its `pgid` in `$JOB_DIR/pgid`): TERM on
+graceful, KILL on force; Slurm uses `scancel` / `scancel -s KILL`. The shared
+`.trees/<sha>` worktree and `.venv` are **never touched** — a job never owns
+them. Marketplace/notebook backends reap the billing instance / kernel-session
+as an idempotent side-effect of cancel, even when the job already looks
+terminal. Kaggle has no cancel API; the adapter caches `CANCELLED` and logs a
+note rather than raising.
+
+**Streaming logs.** `stream_logs` tails the worker's canonical
+`logs/bootstrap.log` (the one ordered merged stream that the bootstrap tees all
+stdout/stderr through) on every backend, so `omnirun logs -f` is uniform.
+Kaggle's batch API exposes a run log only once the kernel completes, so its
+follow mode emits a one-line honesty note (`LIVE_TAIL_NOTE`) and then yields
+the final dump — there is no live mid-run tail. A daemon-side ring buffer that
+fans one stream to many remote followers is Phase 5.
 
 `BackendProvider` (`providers/adapter.py`) is the **one bridge** from this seam to
 today's eight `Backend` implementations — it wraps a single `Backend` + a shared
@@ -469,12 +493,13 @@ today's eight `Backend` implementations — it wraps a single `Backend` + a shar
 `place`. No backend rewrite was needed; `BackendProvider` is the tractability
 hinge.
 
-**At-least-once seam.** The `place`/persist boundary is at-least-once: if the
-process dies between a successful `provider.place` and the `RUNNING` `save_job`,
-the first launch becomes an orphan and a later tick relaunches. Closing this
-to exactly-once (the `on_provisioning` stub for orphan-recovery) is deferred to
-**Phase 4**. A client crash mid-place may therefore leak a marketplace instance.
-`submit`'s own-failure path and the common daemonless case are unaffected.
+**At-least-once seam.** The `place`/persist boundary is at-least-once. Phase 4
+closes the marketplace orphan window: `BackendProvider.place` threads
+`on_provisioning` so a billable handle is persisted onto the PLACING placement
+before `place` returns, and `Control._reconcile` ADOPTS (re-polls) a
+partial-handle PLACING instead of reverting and relaunching. The remaining
+concurrent-tick lease (two overlapping ticks reverting each other's fresh
+reservation) is Phase 5.
 
 ### Pure tick: `(jobs, slots, ledger, now) -> decisions`
 
@@ -725,4 +750,4 @@ spot-preemption recovery, image building, a web UI. Cross-backend queueing is **
 a non-goal — the scheduler daemon (§11) provides it, running the same `Control.run_tick`.
 Placement fairness (least-loaded/assignment rather than greedy) and warm-worker reuse
 are *planned but not yet built*, not non-goals. Exact-once marketplace orphan-recovery
-(the `on_provisioning` stub) is Phase 4.
+(`on_provisioning` + reconcile ADOPT) landed in Phase 4.
