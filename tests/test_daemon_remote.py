@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -20,6 +22,23 @@ from omnirun.models import (
     StatusReport,
 )
 from omnirun.staging import stage_dir
+
+
+def stream_request(host: str, port: int, req: dict) -> list[dict]:
+    with socket.create_connection((host, port), timeout=10.0) as conn:
+        conn.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        out: list[dict] = []
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    out.append(json.loads(line.decode()))
+    return out
 
 
 def _serve(daemon: Daemon, tmp_path: Path) -> tuple[str, int, threading.Thread]:
@@ -120,12 +139,14 @@ class FakeBackend(Backend):
         fail_submit: bool = False,
         submitted: list[str] | None = None,
         cost_per_hour: float | None = None,
+        log_lines: list[str] | None = None,
     ) -> None:
         super().__init__(name, config)
         self.runs_before_done = runs_before_done
         self.fail_submit = fail_submit
         self.submitted = submitted if submitted is not None else []
         self.cost_per_hour = cost_per_hour
+        self.log_lines: list[str] = log_lines if log_lines is not None else ["fake"]
         self.cancelled: list[str] = []
         self._polls: dict[str, int] = {}
 
@@ -158,7 +179,7 @@ class FakeBackend(Backend):
         return StatusReport(status=JobStatus.SUCCEEDED, exit_code=0)
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
-        yield "fake"
+        yield from self.log_lines
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         self.cancelled.append(handle.job_id)
@@ -175,6 +196,7 @@ def make_remote_daemon(
     fail_submit: bool = False,
     submitted: list[str] | None = None,
     cost_per_hour: float | None = None,
+    log_lines: list[str] | None = None,
 ) -> Daemon:
     cfg = Config(
         daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
@@ -192,6 +214,7 @@ def make_remote_daemon(
             fail_submit=fail_submit,
             submitted=submitted,
             cost_per_hour=cost_per_hour,
+            log_lines=log_lines,
         )
 
     return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
@@ -272,6 +295,37 @@ def test_reprioritize_and_budget(tmp_path: Path) -> None:
         assert b["ok"] is True
         day = next(w for w in b["windows"] if w["window"] == "day")
         assert day["cap"] == 12.5
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_logs_streams_lines_for_placed_job(tmp_path: Path) -> None:
+    daemon = make_remote_daemon(tmp_path, {"a": 1}, log_lines=["one", "two", "three"])
+    host, port, thread = _serve(daemon, tmp_path)
+    try:
+        spec = make_spec("logjob")
+        send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        msgs = stream_request(
+            host, port, {"cmd": "logs", "job_id": spec.job_id, "follow": False}
+        )
+        lines = [m["line"] for m in msgs if "line" in m]
+        assert lines == ["one", "two", "three"]
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_logs_unknown_job_errors(tmp_path: Path) -> None:
+    daemon = make_remote_daemon(tmp_path, {"a": 1})
+    host, port, thread = _serve(daemon, tmp_path)
+    try:
+        msgs = stream_request(
+            host, port, {"cmd": "logs", "job_id": "nope", "follow": False}
+        )
+        assert msgs and msgs[-1].get("ok") is False
     finally:
         send_request(host, port, {"cmd": "shutdown"})
         thread.join(timeout=5.0)

@@ -34,6 +34,7 @@ from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
 from omnirun.staging import StageRef, write_stage
 from omnirun.control import Control, resolve_meta_cap
+from omnirun.logstream import LogMux
 from omnirun.models import (
     Deadline,
     JobRecord,
@@ -177,6 +178,7 @@ class Daemon:
         )
         self._store: Store = open_store(db_url)
         self._lock = threading.RLock()
+        self._log_mux = LogMux()
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._scheduler_thread: threading.Thread | None = None
@@ -305,6 +307,9 @@ class Daemon:
                 if not line:
                     return
                 req = json.loads(line.decode())
+                if req.get("cmd") == "logs":
+                    self._stream_logs_conn(conn, req)
+                    return
                 resp = self._dispatch(req)
             except Exception as e:  # never let a bad request kill the handler
                 resp = {"ok": False, "error": str(e)}
@@ -312,6 +317,17 @@ class Daemon:
                 conn.sendall((json.dumps(resp) + "\n").encode())
             except OSError:
                 pass
+
+    def _stream_logs_conn(self, conn: socket.socket, req: dict[str, Any]) -> None:
+        """Serve a streaming ``logs`` response: one JSON line per log line, until
+        the stream ends or the client disconnects (a write error drops this
+        follower via the LogMux generator's finally — peers/producer survive)."""
+        conn.settimeout(None)  # a follow stream may idle between lines
+        try:
+            for msg in self._cmd_logs(req):
+                conn.sendall((json.dumps(msg) + "\n").encode())
+        except OSError:
+            return  # client went away; the follower generator is closed on GC
 
     def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         cmd = req.get("cmd")
@@ -501,6 +517,40 @@ class Daemon:
                 spent = self._store.load_ledger(w, resolved, now).in_window_total(now)
                 windows.append({"window": w, "spent": spent, "cap": resolved})
         return {"ok": True, "windows": windows}
+
+    def _provider_stream_for(self, job_id: str) -> Callable[[], Iterator[str]] | str:
+        """A zero-arg producer that streams *job_id*'s logs from its placement's
+        provider, or an error string when the job is unknown/never placed."""
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            return f"unknown job {job_id!r}"
+        placement = rec.placement
+        if placement is None:
+            return f"job {job_id!r} has no live placement to stream"
+        provider = self._get_providers().get(placement.provider_name)
+        if provider is None:
+            return f"no provider {placement.provider_name!r} for job {job_id!r}"
+
+        def producer() -> Iterator[str]:
+            yield from provider.stream_logs(placement)
+
+        return producer
+
+    def _cmd_logs(self, req: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Stream a job's logs as one ``{"line": ...}`` message per log line.
+
+        Multiplexed through ``LogMux`` so several ``logs -f`` followers share ONE
+        provider stream and a late joiner replays the recent ring. On follow=False
+        the generator ends when the current stream is drained. On an unknown job it
+        yields a single error message."""
+        job_id = str(req.get("job_id", ""))
+        with self._lock:
+            producer = self._provider_stream_for(job_id)
+        if isinstance(producer, str):
+            yield {"ok": False, "error": producer}
+            return
+        for line in self._log_mux.follow(job_id, producer):
+            yield {"line": line}
 
     # --- scheduler --------------------------------------------------------
 
