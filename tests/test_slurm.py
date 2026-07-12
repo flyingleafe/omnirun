@@ -13,7 +13,14 @@ from omnirun.backends.base import BackendError
 from omnirun.backends.slurm import SlurmBackend, render_sbatch
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, ExecResult
-from omnirun.models import JobHandle, JobSpec, JobStatus, RepoRef, ResourceSpec
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+)
 from omnirun.state import default_db_url, open_store
 
 
@@ -619,6 +626,18 @@ def test_cancel_failure_raises():
     fake.add(r"scancel", returncode=1, stderr="scancel: error: kill_job error")
     with pytest.raises(BackendError, match="scancel"):
         make_backend(fake).cancel(HANDLE)
+
+
+def test_cancel_graceful_scancels():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.GRACEFUL)
+    assert any(c.startswith("scancel ") and "-s KILL" not in c for c in fake.commands)
+
+
+def test_cancel_force_scancels_with_kill():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.FORCE)
+    assert any("scancel -s KILL" in c for c in fake.commands)
 
 
 def test_pull_outputs_via_jobdir(tmp_path):

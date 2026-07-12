@@ -590,9 +590,10 @@ class SlurmBackend(Backend):
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sid = handle.data["slurm_job_id"]
-        r = self.exec_.run(f"scancel {sid}")
+        cmd = f"scancel -s KILL {sid}" if mode is CancelMode.FORCE else f"scancel {sid}"
+        r = self.exec_.run(cmd)
         if not r.ok:
-            raise BackendError(f"scancel {sid} failed: {r.stderr.strip()}")
+            raise BackendError(f"{cmd} failed: {r.stderr.strip()}")
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)

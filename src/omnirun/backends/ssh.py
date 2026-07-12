@@ -295,15 +295,8 @@ class SshBackend(Backend):
         )
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
-        job_dir = handle.data["job_dir"]
-        q = shell_quote(f"{job_dir}/pid")
-        # setsid made the pid its own process-group leader: TERM the whole
-        # group first (children incl. the user command), then the pid itself.
-        self.exec_.run(
-            f"p=$(cat {q} 2>/dev/null); "
-            f'if [ -n "$p" ]; then pkill -TERM -g "$p" 2>/dev/null; '
-            f'kill -TERM "$p" 2>/dev/null; fi; true'
-        )
+        sig = "KILL" if mode is CancelMode.FORCE else "TERM"
+        jobdir.signal_job(self.exec_, handle.data["job_dir"], sig)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)

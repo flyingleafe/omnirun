@@ -13,7 +13,14 @@ from omnirun.backends.base import BackendError
 from omnirun.backends.ssh import SshBackend
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, ExecResult
-from omnirun.models import JobHandle, JobSpec, JobStatus, RepoRef, ResourceSpec
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+)
 
 
 class FakeExec(Exec):
@@ -375,12 +382,19 @@ def test_signal_job_kills_pgid_group():
     assert "kill -KILL -" in cmd
 
 
-def test_cancel_terms_process_group():
+def test_cancel_graceful_terms_pgid():
     fake = FakeExec()
-    make_backend(fake).cancel(HANDLE)
+    make_backend(fake).cancel(HANDLE, CancelMode.GRACEFUL)
     cmd = fake.commands[-1]
-    assert "pkill -TERM -g" in cmd
-    assert "kill -TERM" in cmd
+    assert "kill -TERM -" in cmd
+    assert "/pgid" in cmd
+
+
+def test_cancel_force_kills_pgid():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.FORCE)
+    cmd = fake.commands[-1]
+    assert "kill -KILL -" in cmd
 
 
 def test_logs_reads_job_dir_files():
