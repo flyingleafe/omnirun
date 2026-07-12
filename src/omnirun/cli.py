@@ -27,6 +27,7 @@ from omnirun.config import (
 )
 from omnirun.control import Control, resolve_meta_cap
 from omnirun.models import (
+    CancelMode,
     Deadline,
     EnvSpec,
     Health,
@@ -965,9 +966,14 @@ def logs(
         typer.echo(line.rstrip("\n"))
 
 
-@app.command(help="Cancel a running job.")
+@app.command(help="Cancel a running job (graceful by default; --force = hard kill).")
 @friendly_errors
-def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+def cancel(
+    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Skip the graceful window; hard-kill immediately."
+    ),
+) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
@@ -977,7 +983,7 @@ def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
     be = _backend_for(cfg, handle.backend)
-    be.cancel(handle)
+    be.cancel(handle, CancelMode.FORCE if force else CancelMode.GRACEFUL)
     store.update_job_status(
         rec.spec.job_id,
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),

@@ -749,6 +749,32 @@ def test_cancel_updates_store(env):
     assert rec.last_status.status is JobStatus.CANCELLED
 
 
+def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
+    modes: list[CancelMode] = []
+    monkeypatch.setattr(
+        StubBackend,
+        "cancel",
+        lambda self, handle, mode=CancelMode.GRACEFUL: modes.append(mode),
+    )
+    job_id = submit_one()
+    result = runner.invoke(app, ["cancel", "--force", job_id])
+    assert result.exit_code == 0, result.output
+    assert modes == [CancelMode.FORCE]
+
+
+def test_cli_cancel_default_is_graceful(env, monkeypatch):
+    modes: list[CancelMode] = []
+    monkeypatch.setattr(
+        StubBackend,
+        "cancel",
+        lambda self, handle, mode=CancelMode.GRACEFUL: modes.append(mode),
+    )
+    job_id = submit_one()
+    result = runner.invoke(app, ["cancel", job_id])
+    assert result.exit_code == 0, result.output
+    assert modes == [CancelMode.GRACEFUL]
+
+
 def test_pull_outputs(env, tmp_path):
     job_id = submit_one()
     dest = tmp_path / "downloads"
