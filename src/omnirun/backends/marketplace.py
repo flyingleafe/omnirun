@@ -489,17 +489,16 @@ class MarketplaceBackend(Backend, ABC):
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         if handle.data.get("job_dir"):  # a provisioning stub has nothing to kill
-            try:  # best-effort remote kill; instance dies right after anyway
-                ex = self._exec_from_handle(handle)
-                q = shell_quote(handle.data["job_dir"])
-                ex.run(
-                    f"if [ -f {q}/pid ]; then p=$(cat {q}/pid); "
-                    f'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; fi; true',
-                    timeout=30,
+            sig = "KILL" if mode is CancelMode.FORCE else "TERM"
+            try:  # best-effort remote signal; the instance dies right after anyway
+                jobdir.signal_job(
+                    self._exec_from_handle(handle), handle.data["job_dir"], sig
                 )
             except Exception:
                 pass
         instance_id = handle.data["instance_id"]
+        # Idempotent reap: terminate the billing instance if it still exists,
+        # REGARDLESS of the job's own state — a finished job can still be billing.
         if self._get_instance(instance_id) is not None:
             self._terminate(instance_id)
 

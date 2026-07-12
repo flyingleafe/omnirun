@@ -568,9 +568,10 @@ def _big_bundle(dest: Path) -> Path:
     return dest
 
 
-def test_cancel_without_api_support_points_at_website(fake_api, backend):
-    with pytest.raises(BackendError, match="kaggle.com"):
-        backend.cancel(make_handle())
+def test_cancel_without_api_support_is_idempotent_noop(fake_api, backend):
+    handle = make_handle()
+    backend.cancel(handle)  # no cancel endpoint in FakeKaggleApi — must NOT raise
+    assert backend.status(handle).status is JobStatus.CANCELLED
 
 
 def test_cancel_uses_api_when_available(fake_api, backend):

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import shutil
 import tarfile
 import tempfile
@@ -54,6 +55,8 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
+
+_log = logging.getLogger("omnirun.backends.kaggle")
 
 # normalized GPU name -> kernel-metadata machine_shape
 KAGGLE_SHAPES: dict[str, str] = {
@@ -729,9 +732,17 @@ class KaggleBackend(Backend):
                     status=JobStatus.CANCELLED, detail="cancelled via API"
                 )
                 return
-        raise BackendError(
-            "the installed kaggle client has no kernel-cancel endpoint; "
-            f"stop the session manually at https://www.kaggle.com/code/{ref}"
+        # No cancel endpoint in the installed client. Do NOT raise — that would
+        # abort a Control.cancel reap sweep and surprise the CLI. Mark cancelled
+        # locally and log where to stop it by hand (idempotent, complete-enough:
+        # a Kaggle batch kernel self-terminates at its session cap anyway).
+        _log.warning(
+            "kaggle client has no kernel-cancel endpoint; stop it at "
+            "https://www.kaggle.com/code/%s",
+            ref,
+        )
+        self._terminal[handle.job_id] = StatusReport(
+            status=JobStatus.CANCELLED, detail="cancel requested (no API endpoint)"
         )
 
     def gc(self, handle: JobHandle) -> None:
