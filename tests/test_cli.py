@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import types
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -19,6 +21,8 @@ from omnirun.backends.base import (
 )
 from omnirun.budget import LedgerEntry as _LedgerEntry
 from omnirun.cli import app
+from omnirun.config import BackendConfig, Config, DaemonConfig
+from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.models import (
     CancelMode,
     Capabilities as _Capabilities,
@@ -1034,3 +1038,296 @@ def test_logs_follow_uses_effective_handle_for_placement_only_record(env, job_sp
     assert (
         "following=True" in result.output
     )  # follow flag threaded through the rebuilt handle
+
+
+# ------------------------------------------------- remote routing (thin client)
+#
+# When ``[daemon] remote = true`` the lifecycle commands must talk to the daemon
+# over the Control socket, NOT the local Store. We stand up a REAL loopback
+# ``Daemon`` over ``FakeBackend``s (its state dir separate from the CLI's empty
+# ``$OMNIRUN_STATE_DIR``), point a temp config's ``[daemon]`` at it, and assert
+# the effect provably came from the remote daemon (the local store is empty).
+#
+# The daemon/backend harness below is copied from ``tests/test_daemon_remote.py``
+# per this codebase's per-module test-helper convention (no cross-test imports).
+
+
+def _serve(daemon: Daemon, tmp_path: Path) -> tuple[str, int, threading.Thread]:
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    addr = None
+    for _ in range(200):
+        addr = daemon_address(tmp_path)
+        if addr is not None:
+            break
+        time.sleep(0.01)
+    assert addr is not None
+    return addr[0], addr[1], thread
+
+
+def make_spec(name: str = "train") -> JobSpec:
+    return JobSpec(
+        job_id=JobSpec.make_job_id(name),
+        name=name,
+        command="python3 train.py",
+        repo=RepoRef(remote_url="", sha="a" * 40, branch="main", slug="proj"),
+    )
+
+
+class FakeBackend(Backend):
+    """In-process backend: fitting probe, recorded submit, counter-driven status.
+
+    Not registered — passed to the daemon via ``backend_factory``. One instance
+    per backend name (the daemon caches it), so per-job status state persists.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: BackendConfig,
+        *,
+        runs_before_done: int = 1,
+        fail_submit: bool = False,
+        submitted: list[str] | None = None,
+        cost_per_hour: float | None = None,
+        log_lines: list[str] | None = None,
+    ) -> None:
+        super().__init__(name, config)
+        self.runs_before_done = runs_before_done
+        self.fail_submit = fail_submit
+        self.submitted = submitted if submitted is not None else []
+        self.cost_per_hour = cost_per_hour
+        self.log_lines: list[str] = log_lines if log_lines is not None else ["fake"]
+        self.cancelled: list[str] = []
+        self._polls: dict[str, int] = {}
+
+    def probe(self, res: ResourceSpec) -> list[Offer]:
+        return [
+            Offer(
+                backend=self.name,
+                label=f"{self.name}: fake box",
+                fits=True,
+                cost_per_hour=self.cost_per_hour,
+                wait_estimate_s=0.0,
+            )
+        ]
+
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
+        if self.fail_submit:
+            raise RuntimeError("submit boom")
+        self.submitted.append(spec.job_id)
+        return JobHandle(backend=self.name, job_id=spec.job_id, data={})
+
+    def status(self, handle: JobHandle) -> StatusReport:
+        self._polls[handle.job_id] = self._polls.get(handle.job_id, 0) + 1
+        if self._polls[handle.job_id] <= self.runs_before_done:
+            return StatusReport(status=JobStatus.RUNNING)
+        return StatusReport(status=JobStatus.SUCCEEDED, exit_code=0)
+
+    def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
+        yield from self.log_lines
+
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        self.cancelled.append(handle.job_id)
+
+    def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
+        return []
+
+
+def make_remote_daemon(
+    tmp_path: Path,
+    backends: dict[str, int],
+    *,
+    runs_before_done: int = 1,
+    fail_submit: bool = False,
+    submitted: list[str] | None = None,
+    cost_per_hour: float | None = None,
+    log_lines: list[str] | None = None,
+) -> Daemon:
+    cfg = Config(
+        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
+        backends={
+            name: BackendConfig(type="fake", max_parallel=cap)
+            for name, cap in backends.items()
+        },
+    )
+
+    def factory(name: str, bcfg: BackendConfig) -> FakeBackend:
+        return FakeBackend(
+            name,
+            bcfg,
+            runs_before_done=runs_before_done,
+            fail_submit=fail_submit,
+            submitted=submitted,
+            cost_per_hour=cost_per_hour,
+            log_lines=log_lines,
+        )
+
+    return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
+
+
+def _write_remote_config(tmp_path: Path, host: str, port: int) -> Path:
+    p = tmp_path / "remote.toml"
+    p.write_text(f'[daemon]\nremote = true\nhost = "{host}"\nport = {port}\n')
+    return p
+
+
+def test_ps_routes_to_remote_daemon(env, tmp_path):
+    """`ps` with [daemon] remote = true lists the REMOTE daemon's jobs. The local
+    store ($OMNIRUN_STATE_DIR) is empty, so a job id in the output can only have
+    come over the socket."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    spec = make_spec("remote-ps")
+    daemon._store.save_job(
+        JobRecord(
+            spec=spec, state=JobState.RUNNING, submitted_at=datetime.now(timezone.utc)
+        )
+    )
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        # sanity: the LOCAL store this CLI would otherwise read is empty
+        assert _store().list_job_ids() == []
+        result = runner.invoke(app, ["--config", str(cfg_path), "ps"])
+        assert result.exit_code == 0, result.output
+        assert spec.job_id in result.output  # came from the REMOTE daemon
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_cancel_routes_to_remote_daemon(env, tmp_path):
+    """`cancel <job_id>` with remote routing cancels the job ON the remote daemon
+    (its status flips to cancelled), not against the empty local store."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    submitted: list[str] = []
+    daemon = make_remote_daemon(daemon_home, {"a": 1}, submitted=submitted)
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        spec = make_spec("remote-cxl")
+        r = send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        assert r["ok"] is True
+
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(app, ["--config", str(cfg_path), "cancel", spec.job_id])
+        assert result.exit_code == 0, result.output
+        assert f"cancelled {spec.job_id}" in result.output
+
+        st = send_request(host, port, {"cmd": "status", "job_id": spec.job_id})
+        assert st["ok"] is True
+        assert st["job"]["state"] == "cancelled"  # the remote daemon cancelled it
+        # the local store never learned of this job
+        assert _store().list_job_ids() == []
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_reprioritize_routes_to_remote_daemon(env, tmp_path):
+    """`reprioritize <job_id> --priority N --free-only` routes to the daemon and
+    renders the returned policy (priority + free-only)."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        spec = make_spec("remote-rp")
+        send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(
+            app,
+            [
+                "--config",
+                str(cfg_path),
+                "reprioritize",
+                spec.job_id,
+                "--priority",
+                "5",
+                "--free-only",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert f"reprioritized {spec.job_id}" in result.output
+        assert "priority:" in result.output and "5" in result.output
+        assert "free-only" in result.output
+
+        st = send_request(host, port, {"cmd": "status", "job_id": spec.job_id})
+        assert st["job"]["spec"]["policy"]["priority"] == 5
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_budget_routes_to_remote_daemon(env, tmp_path):
+    """`budget --daily N` routes to the daemon; the returned windows render the
+    set cap."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(
+            app, ["--config", str(cfg_path), "budget", "--daily", "12.5"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "budget updated" in result.output
+        assert "$12.5" in result.output
+        # persisted on the REMOTE daemon's store, not the empty local one
+        b = send_request(host, port, {"cmd": "budget"})
+        day = next(w for w in b["windows"] if w["window"] == "day")
+        assert day["cap"] == 12.5
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_status_routes_to_remote_daemon(env, tmp_path):
+    """`status <job_id>` routes to the daemon and renders the returned record."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        spec = make_spec("remote-status")
+        send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(app, ["--config", str(cfg_path), "status", spec.job_id])
+        assert result.exit_code == 0, result.output
+        assert spec.job_id in result.output
+        assert "python3 train.py" in result.output
+        assert _store().list_job_ids() == []  # not from the local store
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_status_unknown_job_on_remote_errors(env, tmp_path):
+    """A missing job id on the remote daemon surfaces as a friendly error (exit 1),
+    since the daemon has no prefix resolution — an exact id is required."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(app, ["--config", str(cfg_path), "status", "nope"])
+        assert result.exit_code == 1
+        assert "error:" in result.output
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)

@@ -827,6 +827,29 @@ def _require_daemon() -> tuple[str, int]:
     return addr
 
 
+def _remote(cfg: Config) -> tuple[str, int] | None:
+    """The remote daemon address to route lifecycle commands to, or None.
+
+    When ``[daemon] remote = true`` this machine is a THIN CLIENT (spec §10 Tier-2):
+    ``submit``/``ps``/``status``/``logs``/``cancel``/``pull``/``reprioritize``/
+    ``budget`` talk to the daemon at ``host:port`` over the Control socket instead
+    of a local ``Store``. When false the CLI is daemonless (Tier-0) / a local daemon
+    is reached via ``daemon_address`` as before (Tier-1). One switch, read here.
+    """
+    if cfg.daemon.remote:
+        return cfg.daemon.host, cfg.daemon.port
+    return None
+
+
+def _client_request(cfg: Config, req: dict[str, Any]) -> dict[str, Any]:
+    """Send *req* to the configured remote daemon; raise on a not-ok response."""
+    host, port = cfg.daemon.host, cfg.daemon.port
+    resp = send_request(host, port, req)
+    if not resp.get("ok", False):
+        raise BackendError(str(resp.get("error", "remote daemon request failed")))
+    return resp
+
+
 def _queue_table(entries: list[dict[str, Any]]) -> Table:
     table = Table()
     for col in ("qid", "state", "backend", "job", "name", "command"):
@@ -869,26 +892,16 @@ def _queue_wait(host: str, port: int) -> None:
 # --------------------------------------------------------------------------- ps & co
 
 
-@app.command(help="List all known jobs with refreshed statuses.")
-@friendly_errors
-def ps() -> None:
-    cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    records = store.list_jobs()
-    if not records:
-        console.print("no jobs yet — try: omnirun submit -- <command>")
-        return
-    cache: dict[str, Backend] = {}
-    now = datetime.now(timezone.utc)
-
+def _render_ps_table(
+    rows: list[tuple[JobRecord, StatusReport | None]], now: datetime
+) -> None:
+    """Render the ``ps`` table. Each row carries its own status source so the
+    local path can feed a live-refreshed report and the remote path the daemon's
+    persisted ``last_status``, byte-identical columns either way."""
     table = Table()
-    table.add_column("job")
-    table.add_column("backend")
-    table.add_column("status")
-    table.add_column("submitted")
-    table.add_column("command")
-    for rec in records:
-        st = _refresh_status(store, cfg, rec, cache)
+    for col in ("job", "backend", "status", "submitted", "command"):
+        table.add_column(col)
+    for rec, st in rows:
         if st is None:
             status_txt = "?"
         else:
@@ -906,19 +919,34 @@ def ps() -> None:
     console.print(table)
 
 
-@app.command(help="Refresh and show one job's details (accepts a unique id prefix).")
+@app.command(help="List all known jobs with refreshed statuses.")
 @friendly_errors
-def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+def ps() -> None:
     cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        resp = _client_request(cfg, {"cmd": "ps"})
+        records = [JobRecord.model_validate(j) for j in resp.get("jobs", [])]
+        if not records:
+            console.print("no jobs yet — try: omnirun submit -- <command>")
+            return
+        now = datetime.now(timezone.utc)
+        _render_ps_table([(rec, rec.last_status) for rec in records], now)
+        return
     store = open_store(cfg.state.resolved_url())
-    rec = store.resolve_job(job)
-    handle = _effective_handle(rec)
-    st = rec.last_status
-    if handle is not None and (st is None or not st.status.terminal):
-        be = _backend_for(cfg, handle.backend)
-        st = be.status(handle)
-        store.update_job_status(rec.spec.job_id, st)
+    records = store.list_jobs()
+    if not records:
+        console.print("no jobs yet — try: omnirun submit -- <command>")
+        return
+    cache: dict[str, Backend] = {}
+    now = datetime.now(timezone.utc)
+    rows = [(rec, _refresh_status(store, cfg, rec, cache)) for rec in records]
+    _render_ps_table(rows, now)
 
+
+def _render_status(rec: JobRecord, st: StatusReport | None) -> None:
+    """Print one job's detail rows. Backend is ``_effective_handle(rec)`` (a
+    daemon-placed job's handle is reconstructed from its placement)."""
+    handle = _effective_handle(rec)
     rows: list[tuple[str, str]] = [
         ("job", rec.spec.job_id),
         ("name", rec.spec.name),
@@ -948,6 +976,28 @@ def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
         console.print(f"[bold]{key}:[/bold] {value}")
 
 
+@app.command(help="Refresh and show one job's details (accepts a unique id prefix).")
+@friendly_errors
+def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+    cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        # The daemon resolves by EXACT job_id (no prefix matching — that needs the
+        # local store); pass the ref as-is and render the returned record.
+        resp = _client_request(cfg, {"cmd": "status", "job_id": job})
+        rec = JobRecord.model_validate(resp["job"])
+        _render_status(rec, rec.last_status)
+        return
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
+    handle = _effective_handle(rec)
+    st = rec.last_status
+    if handle is not None and (st is None or not st.status.terminal):
+        be = _backend_for(cfg, handle.backend)
+        st = be.status(handle)
+        store.update_job_status(rec.spec.job_id, st)
+    _render_status(rec, st)
+
+
 @app.command(help="Stream a job's logs (stdout+stderr merged).")
 @friendly_errors
 def logs(
@@ -975,6 +1025,11 @@ def cancel(
     ),
 ) -> None:
     cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        # Exact job_id only (the daemon has no prefix resolution).
+        _client_request(cfg, {"cmd": "cancel_job", "job_id": job, "force": force})
+        console.print(f"cancelled {job}")
+        return
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
     handle = _effective_handle(rec)
@@ -989,6 +1044,21 @@ def cancel(
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
     )
     console.print(f"cancelled {rec.spec.job_id}")
+
+
+def _render_policy(job_id: str, new_policy: JobPolicy) -> None:
+    """Print a reprioritized job's new scheduling policy."""
+    console.print(f"reprioritized {job_id}:")
+    console.print(f"[bold]priority:[/bold] {new_policy.priority}")
+    pay = "free-only" if new_policy.max_cost == 0.0 else "paid allowed"
+    if new_policy.max_cost not in (None, 0.0):
+        pay = f"<= ${new_policy.max_cost:g}"
+    console.print(f"[bold]pay:[/bold] {pay}")
+    if new_policy.deadline is not None:
+        d = new_policy.deadline
+        console.print(
+            f"[bold]deadline:[/bold] start_by={d.start_by} finish_by={d.finish_by}"
+        )
 
 
 @app.command(help="Change a queued/running job's scheduling policy.")
@@ -1011,6 +1081,28 @@ def reprioritize(
     ),
 ) -> None:
     cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        # Deadlines are parsed CLIENT-side to ISO (the daemon only decodes ISO);
+        # the daemon resolves by EXACT job_id (no prefix resolution).
+        start_iso = (
+            _parse_deadline(start_by).isoformat() if start_by is not None else None
+        )
+        finish_iso = (
+            _parse_deadline(finish_by).isoformat() if finish_by is not None else None
+        )
+        resp = _client_request(
+            cfg,
+            {
+                "cmd": "reprioritize",
+                "job_id": job,
+                "priority": priority,
+                "start_by": start_iso,
+                "finish_by": finish_iso,
+                "allow_paid": allow_paid,
+            },
+        )
+        _render_policy(job, JobPolicy.model_validate(resp["policy"]))
+        return
     store = open_store(cfg.state.resolved_url())
     try:
         rec = store.resolve_job(job)
@@ -1036,17 +1128,19 @@ def reprioritize(
         _die(str(e))
     finally:
         store.close()
-    console.print(f"reprioritized {rec.spec.job_id}:")
-    console.print(f"[bold]priority:[/bold] {new_policy.priority}")
-    pay = "free-only" if new_policy.max_cost == 0.0 else "paid allowed"
-    if new_policy.max_cost not in (None, 0.0):
-        pay = f"<= ${new_policy.max_cost:g}"
-    console.print(f"[bold]pay:[/bold] {pay}")
-    if new_policy.deadline is not None:
-        d = new_policy.deadline
-        console.print(
-            f"[bold]deadline:[/bold] start_by={d.start_by} finish_by={d.finish_by}"
+    _render_policy(rec.spec.job_id, new_policy)
+
+
+def _render_budget_table(rows: list[tuple[str, float, float | None]]) -> None:
+    """Render the spend-vs-cap table from ``(window, spent, cap)`` rows."""
+    table = Table("window", "spent", "cap")
+    for window, spent, cap in rows:
+        table.add_row(
+            window,
+            f"${spent:g}",
+            "unbounded" if cap is None else f"${cap:g}",
         )
+    console.print(table)
 
 
 @app.command(help="Show or set the global spend budget (per day/week).")
@@ -1060,6 +1154,22 @@ def budget(
     ),
 ) -> None:
     cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        changed = False
+        last: dict[str, Any] | None = None
+        for window, val in (("day", daily), ("week", weekly)):
+            if val is not None:
+                last = _client_request(
+                    cfg, {"cmd": "budget", "window": window, "cap": val}
+                )
+                changed = True
+        if last is None:
+            last = _client_request(cfg, {"cmd": "budget"})  # show-only
+        if changed:
+            console.print("[green]budget updated[/green]")
+        rows = [(w["window"], w["spent"], w["cap"]) for w in last["windows"]]
+        _render_budget_table(rows)
+        return
     store = open_store(cfg.state.resolved_url())
     try:
         control = Control(store, {})
@@ -1078,19 +1188,15 @@ def budget(
         # spend-vs-cap the scheduler acts on — neither row is informational-only.
         # ``resolve_meta_cap`` is the SAME resolver ``Control`` uses, so the display
         # can never drift from enforcement on how a stored cap is read.
-        table = Table("window", "spent", "cap")
+        rows: list[tuple[str, float, float | None]] = []
         for window, cfg_default in (
             ("day", cfg.budget.daily),
             ("week", cfg.budget.weekly),
         ):
             cap = resolve_meta_cap(store, window, cfg_default)
             spent = store.load_ledger(window, cap, now).in_window_total(now)
-            table.add_row(
-                window,
-                f"${spent:g}",
-                "unbounded" if cap is None else f"${cap:g}",
-            )
-        console.print(table)
+            rows.append((window, spent, cap))
+        _render_budget_table(rows)
     finally:
         store.close()
 
