@@ -585,3 +585,25 @@ def test_cancel_uses_api_when_available(fake_api, backend):
 
 def test_check_reports_username(fake_api, backend):
     assert "testuser" in backend.check()
+
+
+# ---- logs -------------------------------------------------------------------
+
+
+def test_logs_follow_emits_honesty_note_before_complete(fake_api, backend, monkeypatch):
+    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
+    monkeypatch.setattr(
+        backend,
+        "status",
+        lambda h: StatusReport(status=next(statuses, JobStatus.SUCCEEDED)),
+    )
+    texts = iter([None, "final log line\n"])
+    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: next(texts, None))
+    monkeypatch.setattr("omnirun.backends.kaggle.time.sleep", lambda _s: None)
+    handle = make_handle()
+    lines = list(backend.logs(handle, follow=True))
+    assert any("live tail unavailable mid-run" in ln for ln in lines)
+    assert "final log line" in lines
+    assert (
+        sum("live tail unavailable" in ln for ln in lines) == 1
+    )  # note appears at most once

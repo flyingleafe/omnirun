@@ -93,6 +93,10 @@ RESULT_TAR = "omnirun-job.tar.gz"
 # is unaffected by this cap. Override per backend with `max_source_bytes`.
 KAGGLE_MAX_SOURCE_BYTES = 1024 * 1024
 LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
+LIVE_TAIL_NOTE = (
+    "OMNIRUN: kaggle exposes run logs only after the kernel completes; "
+    "live tail unavailable mid-run"
+)
 
 
 def _create_bundle(root: Path, sha: str, dest: Path) -> Path:
@@ -678,6 +682,7 @@ class KaggleBackend(Backend):
         api = self._api()
         ref = handle.data["kernel_ref"]
         offset = self._log_offsets.get(handle.job_id, 0)
+        noted = False
         while True:
             report = self.status(handle)
             text = self._fetch_log_text(api, ref)
@@ -686,6 +691,10 @@ class KaggleBackend(Backend):
                 offset = len(text)
                 self._log_offsets[handle.job_id] = offset
                 yield from new.splitlines()
+            elif follow and not noted and not report.status.terminal:
+                # Batch API: no mid-run log. Say so once, honestly (issue #4).
+                noted = True
+                yield LIVE_TAIL_NOTE
             if not follow or report.status.terminal:
                 return
             time.sleep(LOG_POLL_INTERVAL_S)

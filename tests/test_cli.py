@@ -984,3 +984,27 @@ def test_stale_facts_do_not_block(env):
     result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
     assert result.exit_code == 0, result.output
     assert "exceeds max walltime" not in result.output  # stale facts must not block
+
+
+# ------------------------------------------------------------------ logs
+
+
+def test_logs_follow_uses_effective_handle_for_placement_only_record(env, job_spec):
+    store = _store()
+    rec = JobRecord(
+        spec=job_spec.model_copy(update={"job_id": "logs-1"}),
+        state=JobState.RUNNING,
+        placement=Placement(
+            provider_name="stub",
+            job_id="logs-1",
+            handle={"token": "t-logs-1"},
+            state=JobStatus.RUNNING,
+        ),
+    )
+    store.save_job(rec)
+    result = runner.invoke(app, ["logs", "-f", "logs-1"])
+    assert result.exit_code == 0, result.output
+    assert "hello from stub" in result.output
+    assert (
+        "following=True" in result.output
+    )  # follow flag threaded through the rebuilt handle
