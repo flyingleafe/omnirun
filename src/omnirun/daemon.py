@@ -33,8 +33,9 @@ from typing import Any, Callable
 from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
 from omnirun.staging import StageRef, write_stage
-from omnirun.control import Control
+from omnirun.control import Control, resolve_meta_cap
 from omnirun.models import (
+    Deadline,
     JobRecord,
     JobSpec,
     JobState,
@@ -54,6 +55,21 @@ _log = logging.getLogger("omnirun.daemon")
 
 _MAX_ATTEMPTS = 3
 _ACCEPT_TIMEOUT_S = 0.5
+
+
+def _deadline_from_req(req: dict[str, Any]) -> Deadline | None:
+    """Build a ``Deadline`` from ISO ``start_by``/``finish_by`` strings in *req*,
+    or ``None`` when neither is present. The client sends already-resolved ISO
+    timestamps (it parses ``+<N>[dhm]`` locally), so the daemon only decodes."""
+    start_by = req.get("start_by")
+    finish_by = req.get("finish_by")
+    if start_by is None and finish_by is None:
+        return None
+    return Deadline(
+        start_by=datetime.fromisoformat(start_by) if start_by else None,
+        finish_by=datetime.fromisoformat(finish_by) if finish_by else None,
+    )
+
 
 # Scheduler JobState -> client-facing QueueState projection. PLACING/HELD both
 # read as PENDING to the queue view (a slot is being taken / the job is waiting).
@@ -306,6 +322,12 @@ class Daemon:
             "cancel": self._cmd_cancel,
             "shutdown": self._cmd_shutdown,
             "stage": self._cmd_stage,
+            "submit": self._cmd_submit,
+            "ps": self._cmd_ps,
+            "status": self._cmd_status,
+            "cancel_job": self._cmd_cancel_job,
+            "reprioritize": self._cmd_reprioritize,
+            "budget": self._cmd_budget,
         }.get(cmd or "")
         if handler is None:
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
@@ -408,6 +430,77 @@ class Daemon:
                 clone_url=clone_url if isinstance(clone_url, str) else None,
             )
         return {"ok": True, "stage": ref.model_dump(mode="json")}
+
+    def _cmd_submit(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Persist a spec QUEUED and run one tick — the remote counterpart of the
+        daemonless ``_submit_via_control``. Returns the resulting JobRecord so the
+        client reports placed/held/queued exactly as the local path does."""
+        spec = JobSpec.model_validate(req["spec"])
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            control = self._get_control()
+            job_id = control.submit(spec, now=now)
+            control.run_tick(now)
+            rec = self._store.load_job(job_id)
+        if rec is None:
+            return {"ok": False, "error": f"job {job_id} vanished after submit"}
+        return {"ok": True, "job": rec.model_dump(mode="json")}
+
+    def _cmd_ps(self, _req: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            jobs = self._store.list_jobs()
+        return {"ok": True, "jobs": [j.model_dump(mode="json") for j in jobs]}
+
+    def _cmd_status(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        with self._lock:
+            rec = self._store.load_job(job_id)
+        if rec is None:
+            return {"ok": False, "error": f"unknown job {job_id!r}"}
+        return {"ok": True, "job": rec.model_dump(mode="json")}
+
+    def _cmd_cancel_job(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        force = bool(req.get("force", False))
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._get_control().cancel(job_id, now, force=force)
+        return {"ok": True}
+
+    def _cmd_reprioritize(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        deadline = _deadline_from_req(req)
+        allow_paid = req.get("allow_paid")
+        priority = req.get("priority")
+        with self._lock:
+            try:
+                policy = self._get_control().reprioritize(
+                    job_id,
+                    priority=int(priority) if priority is not None else None,
+                    deadline=deadline,
+                    allow_paid=allow_paid if isinstance(allow_paid, bool) else None,
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+        return {"ok": True, "policy": policy.model_dump(mode="json")}
+
+    def _cmd_budget(self, req: dict[str, Any]) -> dict[str, Any]:
+        window = str(req.get("window", "day"))
+        cap = req.get("cap")
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            control = self._get_control()
+            if cap is not None:
+                control.budget(window, float(cap))
+            windows: list[dict[str, Any]] = []
+            for w, cfg_default in (
+                ("day", self.cfg.budget.daily),
+                ("week", self.cfg.budget.weekly),
+            ):
+                resolved = resolve_meta_cap(self._store, w, cfg_default)
+                spent = self._store.load_ledger(w, resolved, now).in_window_total(now)
+                windows.append({"window": w, "spent": spent, "cap": resolved})
+        return {"ok": True, "windows": windows}
 
     # --- scheduler --------------------------------------------------------
 
