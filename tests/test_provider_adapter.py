@@ -515,6 +515,27 @@ def test_cancel_force_mode_skips_grace_and_reaps(store: Store) -> None:
     assert len(backend.gc_calls) == 1
 
 
+def test_cancel_reaps_even_when_backend_cancel_raises(store: Store) -> None:
+    """Invariant 5 (crash-isolation half): a raising ``Backend.cancel`` must not
+    skip the reap — ``gc`` still runs so no instance/session is left billing."""
+
+    class RaisingCancelBackend(ReapStubBackend):
+        def cancel(
+            self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+        ) -> None:
+            raise RuntimeError("cancel boom")
+
+    backend = RaisingCancelBackend(
+        "stub", BackendConfig(type="local", max_parallel=1), flip_after=999
+    )
+    provider = BackendProvider(backend, store)
+    p = Placement(provider_name="stub", job_id="j1", handle={"job_dir": "/d"})
+
+    provider.cancel(p, CancelMode.FORCE)  # FORCE skips the grace poll
+
+    assert len(backend.gc_calls) == 1  # reap ran despite cancel raising
+
+
 def test_place_persists_partial_handle_before_returning(store: Store) -> None:
     backend = ProvisioningStubBackend(
         name="stub", config=BackendConfig(type="local", max_parallel=2)
