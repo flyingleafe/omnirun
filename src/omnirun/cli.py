@@ -589,6 +589,14 @@ def submit(
         _render_payload(backends[picked.offer.backend], spec, picked.offer)
         return
 
+    if _remote(cfg) is not None:
+        _stage_to_daemon(cfg, spec)
+        resp = _client_request(
+            cfg, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        _report_submitted(JobRecord.model_validate(resp["job"]))
+        return
+
     # Real placement now runs through the scheduler: the pure ``tick`` inside
     # ``Control`` reconciles, reserves atomically, and places on the cheapest
     # offer that fits the deadline/budget — the same tick the daemon runs. The
@@ -628,7 +636,12 @@ def _submit_via_control(
     if rec is None:  # pragma: no cover — we just wrote it
         _die(f"job {job_id} vanished after submit")
     _bridge_placement(store, rec)
+    _report_submitted(rec)
 
+
+def _report_submitted(rec: JobRecord) -> None:
+    """Report a submitted job's outcome (placed → follow hint; HELD/unplaced → _die)."""
+    job_id = rec.spec.job_id
     if rec.placement is not None and rec.placement.handle:
         label = (
             rec.offer.label if rec.offer is not None else rec.placement.provider_name
@@ -639,12 +652,31 @@ def _submit_via_control(
     if rec.state is JobState.HELD:
         reason = rec.last_status.detail if rec.last_status else "no slot can satisfy it"
         _die(f"job {job_id} cannot be placed: {reason}")
-    # QUEUED but unplaced: admissible yet no fitting/affordable offer right now.
-    # The record persists; a running `omnirun serve` (or a later manual submit)
-    # can still place it, but a daemonless submit has no auto-wakeup.
     _die(
         f"job {job_id} could not be placed now: no fitting/affordable offer "
         "(raise --max-cost / budget, relax the deadline, or run `omnirun serve`)"
+    )
+
+
+def _stage_to_daemon(cfg: Config, spec: JobSpec) -> None:
+    """Stage *spec*'s revision + gitignored .env into the remote daemon host.
+
+    The Tier-2 trust boundary (spec §10): a private/unpushed sha travels as a
+    base64 git bundle and a gitignored .env as its own blob, both entrusted to the
+    daemon host over the Control socket; a PUBLIC sha sends only its clone URL
+    (nothing lands on the VPS). Origin git credentials never leave the laptop."""
+    from omnirun import repo as repo_mod
+
+    root = repo_mod.local_root_of(spec.repo)
+    _client_request(
+        cfg,
+        {
+            "cmd": "stage",
+            "sha": spec.repo.sha,
+            "bundle_b64": repo_mod.bundle_blob(spec.repo, root),
+            "env_b64": repo_mod.env_blob(root),
+            "clone_url": repo_mod.remote_clone_plan(spec.repo, root),
+        },
     )
 
 
@@ -778,6 +810,21 @@ def enqueue(
         priority=priority,
         max_cost=max_cost,
     )
+    cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        _stage_to_daemon(cfg, spec)
+        resp = _client_request(
+            cfg,
+            {
+                "cmd": "enqueue",
+                "spec": spec.model_dump(mode="json"),
+                "count": count,
+                "backend": backend,
+            },
+        )
+        qids = resp.get("qids", [])
+        console.print(f"[green]enqueued[/green] {len(qids)} job(s): {', '.join(qids)}")
+        return
     host, port = _require_daemon()
     resp = send_request(
         host,

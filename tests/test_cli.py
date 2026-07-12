@@ -1121,7 +1121,9 @@ class FakeBackend(Backend):
         if self.fail_submit:
             raise RuntimeError("submit boom")
         self.submitted.append(spec.job_id)
-        return JobHandle(backend=self.name, job_id=spec.job_id, data={})
+        return JobHandle(
+            backend=self.name, job_id=spec.job_id, data={"id": spec.job_id}
+        )
 
     def status(self, handle: JobHandle) -> StatusReport:
         self._polls[handle.job_id] = self._polls.get(handle.job_id, 0) + 1
@@ -1328,6 +1330,32 @@ def test_status_unknown_job_on_remote_errors(env, tmp_path):
         result = runner.invoke(app, ["--config", str(cfg_path), "status", "nope"])
         assert result.exit_code == 1
         assert "error:" in result.output
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
+def test_submit_stages_then_submits_to_remote(env, tmp_path, monkeypatch):
+    """`submit` with [daemon] remote = true stages the revision then submits to
+    the REMOTE daemon; a job appears in the remote store, not the local one."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    daemon = make_remote_daemon(daemon_home, {"a": 1})
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        # Force the public path (URL only, no bundle) so no real remote is needed.
+        monkeypatch.setattr(
+            "omnirun.repo.remote_clone_plan", lambda ref, root: "https://x/y.git"
+        )
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(
+            app, ["--config", str(cfg_path), "submit", "--", "python", "train.py"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "submitted" in result.output
+        # The job landed on the REMOTE daemon (public stage records URL only).
+        ps = send_request(host, port, {"cmd": "ps"})
+        assert len(ps["jobs"]) == 1
     finally:
         send_request(host, port, {"cmd": "shutdown"})
         thread.join(timeout=5.0)
