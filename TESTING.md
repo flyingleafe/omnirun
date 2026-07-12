@@ -139,6 +139,21 @@ Known code gap — NOT built (remaining Tier-2 wiring, not merely un-live-tested
       prefer `staging/<sha12>/bundle.git` when `local_root_of` isn't a valid checkout.
       Follow-up PR, live-tested.
 
+Known Tier-2 limitations (built, but partial — remote path, un-live-tested; follow-ups):
+- [ ] **Remote `logs` without `-f` blocks until the job finishes** instead of returning a
+      snapshot and exiting (Tier-0 `logs` returns a snapshot). The daemon always
+      multiplexes a *following* stream — `Provider.stream_logs` is following-only by design
+      — so the `follow` flag is ignored on the remote path. Fix: add a snapshot
+      (`follow=False`) read to the Provider seam. Workaround today: use `-f`, or Ctrl-C.
+- [ ] **A disconnected `logs -f` follower on a silent (no new output) running job** is not
+      reaped until the next log line or job end — bounded and self-healing (no leak, no
+      effect on other followers or the producer), but there is no idle keepalive. Fix: a
+      periodic keepalive/heartbeat on the follower channel.
+- [ ] **`RESERVE_LEASE_S` is a fixed 60s.** A hypothetical backend whose `submit` blocks
+      >60s without reporting provisioning progress could have its PLACING reverted and
+      relaunched by an overlapping tick. Not reachable by any current backend. Fix: make
+      the lease adaptive, or have long provisioners heartbeat.
+
 Live, infra-gated (needs real VPS + Postgres — not yet run):
 - [ ] Real VPS + Postgres end-to-end: `omnirun serve` on the VPS, thin clients from two
       laptops, a **public**-repo `submit` placed VPS→backend, global budget enforced
