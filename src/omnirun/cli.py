@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import shlex
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -897,6 +898,38 @@ def _client_request(cfg: Config, req: dict[str, Any]) -> dict[str, Any]:
     return resp
 
 
+def _stream_logs_client(cfg: Config, job: str, follow: bool) -> Iterator[str]:
+    """Yield a remote daemon's streamed log lines for *job* (Tier-2).
+
+    Opens one socket, sends a ``logs`` request, and reads newline-JSON messages
+    until the daemon closes the stream (job terminal / follow ended). Raises
+    ``BackendError`` if the daemon reports the job unknown/unplaceable."""
+    import json as _json
+    import socket as _socket
+
+    with _socket.create_connection((cfg.daemon.host, cfg.daemon.port)) as conn:
+        conn.sendall(
+            (
+                _json.dumps({"cmd": "logs", "job_id": job, "follow": follow}) + "\n"
+            ).encode()
+        )
+        buf = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                if not raw.strip():
+                    continue
+                msg = _json.loads(raw.decode())
+                if msg.get("ok") is False:
+                    raise BackendError(str(msg.get("error", "remote logs failed")))
+                if "line" in msg:
+                    yield str(msg["line"])
+
+
 def _queue_table(entries: list[dict[str, Any]]) -> Table:
     table = Table()
     for col in ("qid", "state", "backend", "job", "name", "command"):
@@ -1054,6 +1087,10 @@ def logs(
     ),
 ) -> None:
     cfg = _load_cfg()
+    if _remote(cfg) is not None:
+        for line in _stream_logs_client(cfg, job, follow):
+            typer.echo(line.rstrip("\n"))
+        return
     rec = open_store(cfg.state.resolved_url()).resolve_job(job)
     handle = _effective_handle(rec)
     if handle is None:

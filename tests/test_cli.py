@@ -1359,3 +1359,20 @@ def test_submit_stages_then_submits_to_remote(env, tmp_path, monkeypatch):
     finally:
         send_request(host, port, {"cmd": "shutdown"})
         thread.join(timeout=5.0)
+
+
+def test_logs_follow_streams_from_remote_daemon(env, tmp_path):
+    daemon = make_remote_daemon(tmp_path, {"a": 1}, log_lines=["alpha", "beta"])
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        spec = make_spec("logj")
+        send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        result = runner.invoke(app, ["--config", str(cfg_path), "logs", spec.job_id])
+        assert result.exit_code == 0
+        assert "alpha" in result.stdout and "beta" in result.stdout
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
