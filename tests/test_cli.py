@@ -1272,6 +1272,70 @@ def test_reprioritize_routes_to_remote_daemon(env, tmp_path):
         thread.join(timeout=5.0)
 
 
+def test_reprioritize_partial_deadline_preserves_other_field_on_remote(env, tmp_path):
+    """A thin-client `reprioritize --finish-by B2` must NOT drop an existing
+    start_by. The client sends only the provided field; control field-merges the
+    partial deadline over the job's current one. We set BOTH via the remote CLI,
+    then change ONLY finish_by, and assert start_by survived while finish_by moved."""
+    daemon_home = tmp_path / "daemon-home"
+    daemon_home.mkdir()
+    # Keep the placed job RUNNING (non-terminal) across both reprioritize calls so
+    # the ticking daemon can't finish it out from under us mid-test.
+    daemon = make_remote_daemon(daemon_home, {"a": 1}, runs_before_done=10_000)
+    host, port, thread = _serve(daemon, daemon.state_root)
+    try:
+        spec = make_spec("remote-rp-merge")
+        send_request(
+            host, port, {"cmd": "submit", "spec": spec.model_dump(mode="json")}
+        )
+        cfg_path = _write_remote_config(tmp_path, host, port)
+        start_a = "2026-08-01T10:00:00+00:00"
+        finish_b = "2026-08-01T18:00:00+00:00"
+        finish_b2 = "2026-08-01T20:00:00+00:00"
+
+        # 1) set BOTH deadline fields via the remote arm
+        r1 = runner.invoke(
+            app,
+            [
+                "--config",
+                str(cfg_path),
+                "reprioritize",
+                spec.job_id,
+                "--start-by",
+                start_a,
+                "--finish-by",
+                finish_b,
+            ],
+        )
+        assert r1.exit_code == 0, r1.output
+
+        # 2) change ONLY finish_by (client sends start_by=None over the socket)
+        r2 = runner.invoke(
+            app,
+            [
+                "--config",
+                str(cfg_path),
+                "reprioritize",
+                spec.job_id,
+                "--finish-by",
+                finish_b2,
+            ],
+        )
+        assert r2.exit_code == 0, r2.output
+
+        st = send_request(host, port, {"cmd": "status", "job_id": spec.job_id})
+        dl = st["job"]["spec"]["policy"]["deadline"]
+        assert dl is not None
+        # start_by must be PRESERVED (the bug nulled it); finish_by must be UPDATED.
+        assert datetime.fromisoformat(dl["start_by"]) == datetime.fromisoformat(start_a)
+        assert datetime.fromisoformat(dl["finish_by"]) == datetime.fromisoformat(
+            finish_b2
+        )
+    finally:
+        send_request(host, port, {"cmd": "shutdown"})
+        thread.join(timeout=5.0)
+
+
 def test_budget_routes_to_remote_daemon(env, tmp_path):
     """`budget --daily N` routes to the daemon; the returned windows render the
     set cap."""

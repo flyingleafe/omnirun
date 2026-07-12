@@ -65,6 +65,31 @@ _STATUS_TO_STATE: dict[JobStatus, JobState] = {
 }
 
 
+def _merge_deadline(
+    current: Deadline | None, incoming: Deadline | None
+) -> Deadline | None:
+    """Layer a partial ``incoming`` deadline over ``current`` (field-merge).
+
+    A ``None`` *incoming* leaves ``current`` untouched; otherwise each of
+    ``start_by``/``finish_by`` falls back to ``current``'s value when the
+    corresponding *incoming* field is ``None``. This lets a thin client send only
+    the field it wants to change (``reprioritize --finish-by T``) without nulling
+    the complementary one — honoring ``reprioritize``'s "layered" contract.
+    """
+    if incoming is None:
+        return current
+    if current is None:
+        return incoming
+    return Deadline(
+        start_by=incoming.start_by
+        if incoming.start_by is not None
+        else current.start_by,
+        finish_by=(
+            incoming.finish_by if incoming.finish_by is not None else current.finish_by
+        ),
+    )
+
+
 def resolve_meta_cap(store: Store, window: str, default: float | None) -> float | None:
     """The live spend cap for *window*, resolved fresh from the ``meta`` table.
 
@@ -201,7 +226,7 @@ class Control:
         elif allow_paid is False:
             new_max_cost = 0.0
         new_policy = JobPolicy(
-            deadline=deadline if deadline is not None else current.deadline,
+            deadline=_merge_deadline(current.deadline, deadline),
             max_cost=new_max_cost,
             priority=priority if priority is not None else current.priority,
         )

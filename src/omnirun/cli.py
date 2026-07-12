@@ -1190,16 +1190,13 @@ def reprioritize(
     store = open_store(cfg.state.resolved_url())
     try:
         rec = store.resolve_job(job)
+        # Pass the RAW partial deadline; control.reprioritize field-merges it over
+        # the job's current deadline (one merge site, so local and remote agree).
         deadline: Deadline | None = None
         if start_by is not None or finish_by is not None:
-            existing = rec.spec.policy.deadline or Deadline()
             deadline = Deadline(
-                start_by=_parse_deadline(start_by)
-                if start_by is not None
-                else existing.start_by,
-                finish_by=_parse_deadline(finish_by)
-                if finish_by is not None
-                else existing.finish_by,
+                start_by=_parse_deadline(start_by) if start_by is not None else None,
+                finish_by=_parse_deadline(finish_by) if finish_by is not None else None,
             )
         control = Control(store, {})
         new_policy = control.reprioritize(
