@@ -340,16 +340,28 @@ def test_cancel_delegates_with_placement_handle(store: Store) -> None:
     assert mode is CancelMode.FORCE
 
 
-def test_cancel_forwards_mode_to_backend(store: Store) -> None:
+def test_cancel_forwards_mode_to_backend(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnirun.providers.adapter as adapter_mod
+
+    # StubBackend.status returns RUNNING (never terminal), so GRACEFUL cancel
+    # polls until the grace budget expires and then escalates to FORCE. Inject
+    # fast time seams so the test completes instantly.
+    monkeypatch.setattr(adapter_mod, "_sleep", lambda _s: None)
+    monkeypatch.setattr(adapter_mod, "_now", iter([0.0, 100.0]).__next__)
     provider, backend = _provider(store)
     p = Placement(provider_name="stub", job_id="j1", handle={"host": "h"})
 
     provider.cancel(p, CancelMode.GRACEFUL)
 
-    assert len(backend.cancelled) == 1
-    handle, mode = backend.cancelled[0]
+    # First mode forwarded is GRACEFUL; the job never goes terminal so FORCE
+    # escalation follows — both are delegated with the correct handle.
+    assert backend.cancelled[0][1] is CancelMode.GRACEFUL
+    handle = backend.cancelled[0][0]
     assert handle.data == {"host": "h"}
-    assert mode is CancelMode.GRACEFUL
+    assert handle.job_id == "j1"
+    assert handle.backend == "stub"
 
 
 def test_stream_logs_delegates_and_follows(store: Store) -> None:
@@ -420,6 +432,87 @@ class ProvisioningStubBackend(StubBackend):
             job_id=spec.job_id,
             data={"instance_id": "i-123", "job_dir": "/root/.omnirun/jobs/x"},
         )
+
+
+# ---------------------------------------------------------------------------
+# cancel — graceful→force→reap (Task 5)
+# ---------------------------------------------------------------------------
+
+
+class ReapStubBackend(StubBackend):
+    """Records cancel modes + gc calls; status flips terminal after `flip_after`."""
+
+    def __init__(self, name: str, config: BackendConfig, *, flip_after: int) -> None:
+        super().__init__(name, config)
+        self._flip_after = flip_after
+        self._polls = 0
+        self.gc_calls: list[JobHandle] = []
+
+    def status(self, handle: JobHandle) -> StatusReport:
+        self._polls += 1
+        if self._polls > self._flip_after:
+            return StatusReport(status=JobStatus.CANCELLED, detail="stopped")
+        return StatusReport(status=JobStatus.RUNNING)
+
+    def gc(self, handle: JobHandle) -> None:
+        self.gc_calls.append(handle)
+
+
+def test_cancel_graceful_then_reap_when_job_stops(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnirun.providers.adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "_sleep", lambda _s: None)
+    backend = ReapStubBackend(
+        "stub", BackendConfig(type="local", max_parallel=1), flip_after=1
+    )
+    provider = adapter_mod.BackendProvider(backend, store, cancel_grace_s=30.0)
+    p = Placement(provider_name="stub", job_id="j1", handle={"job_dir": "/d"})
+
+    provider.cancel(p, CancelMode.GRACEFUL)
+
+    # Graceful TERM sent, job went terminal within grace → NO force needed, reaped.
+    modes = [m for _h, m in backend.cancelled]
+    assert modes == [CancelMode.GRACEFUL]
+    assert len(backend.gc_calls) == 1
+
+
+def test_cancel_escalates_to_force_after_grace(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnirun.providers.adapter as adapter_mod
+
+    # Fake monotonic clock that jumps past the grace window after the first poll.
+    ticks = iter([0.0, 0.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(adapter_mod, "_sleep", lambda _s: None)
+    monkeypatch.setattr(adapter_mod, "_now", lambda: next(ticks))
+    backend = ReapStubBackend(
+        "stub", BackendConfig(type="local", max_parallel=1), flip_after=999
+    )
+    provider = adapter_mod.BackendProvider(backend, store, cancel_grace_s=30.0)
+    p = Placement(provider_name="stub", job_id="j1", handle={"job_dir": "/d"})
+
+    provider.cancel(p, CancelMode.GRACEFUL)
+
+    modes = [m for _h, m in backend.cancelled]
+    # Graceful first, then force after the grace window expired without terminal.
+    assert modes == [CancelMode.GRACEFUL, CancelMode.FORCE]
+    assert len(backend.gc_calls) == 1
+
+
+def test_cancel_force_mode_skips_grace_and_reaps(store: Store) -> None:
+    backend = ReapStubBackend(
+        "stub", BackendConfig(type="local", max_parallel=1), flip_after=999
+    )
+    provider = BackendProvider(backend, store)
+    p = Placement(provider_name="stub", job_id="j1", handle={"job_dir": "/d"})
+
+    provider.cancel(p, CancelMode.FORCE)
+
+    modes = [m for _h, m in backend.cancelled]
+    assert modes == [CancelMode.FORCE]  # no graceful pre-step
+    assert len(backend.gc_calls) == 1
 
 
 def test_place_persists_partial_handle_before_returning(store: Store) -> None:

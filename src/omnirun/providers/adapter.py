@@ -23,7 +23,9 @@ this also removes the Phase-2 per-probe-engine construction blip.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import logging
+import time
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +48,12 @@ from omnirun.models import (
 from omnirun.providers.base import CancelMode
 from omnirun.state.store import Store
 
+_sleep = time.sleep  # test seam
+_now = time.monotonic  # test seam
+_POLL_S = 2.0  # backend re-poll cadence while waiting for a graceful stop
+_DEFAULT_CANCEL_GRACE_S = 30.0
+_log = logging.getLogger("omnirun.providers.adapter")
+
 # JobHandle.data keys whose (case-insensitive) name contains any of these are
 # surfaced as display Links on a Placement (notebook/kernel/dashboard URLs).
 _LINK_KEY_HINTS = ("url", "notebook", "kernel", "dashboard")
@@ -54,10 +62,20 @@ _LINK_KEY_HINTS = ("url", "notebook", "kernel", "dashboard")
 class BackendProvider:
     """Adapt one ``Backend`` + one shared ``Store`` to the ``Provider`` seam."""
 
-    def __init__(self, backend: Backend, store: Store) -> None:
+    def __init__(
+        self,
+        backend: Backend,
+        store: Store,
+        *,
+        cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S,
+    ) -> None:
         self.name = backend.name
         self._backend = backend
         self._store = store
+        # Per-backend override wins over the constructor default when configured.
+        self._cancel_grace_s = float(
+            backend.config.extra("cancel_grace_s", cancel_grace_s)
+        )
 
     def discover(self) -> ProviderFacts:
         return self._backend.discover()
@@ -159,15 +177,57 @@ class BackendProvider:
         return Status(state=r.status, exit_code=r.exit_code, detail=r.detail)
 
     def cancel(self, p: Placement, mode: CancelMode) -> None:
-        """Cancel the placed job, forwarding *mode* to the backend.
+        """Cancel the placed job and reap its billable/worker resource.
 
-        Task 5 wraps this in the graceful→force→reap sequence; here the adapter
-        simply threads the caller's mode into ``Backend.cancel`` (which Tasks 4/7
-        teach to honor GRACEFUL vs FORCE).
+        Uniform across every backend (spec §8, invariant 5):
+
+        * ``GRACEFUL`` — ask the job to stop (``Backend.cancel`` GRACEFUL = SIGTERM
+          to the run pgid / ``scancel`` / stop the kernel), then poll the backend
+          until it reports terminal OR ``cancel_grace_s`` elapses, then hard-kill
+          (``Backend.cancel`` FORCE = SIGKILL).
+        * ``FORCE`` — skip the grace window; hard-kill immediately.
+
+        Finally REAP: ``Backend.gc`` terminates the marketplace instance / removes
+        the job dir so no instance or session keeps billing. Every stage is
+        best-effort (a raising backend is swallowed) but the reap always runs, so
+        after ``cancel`` returns there is no live placement/instance. Idempotent:
+        on an already-terminal job the first poll is terminal, so it goes straight
+        to the reap.
         """
-        self._backend.cancel(
-            JobHandle(backend=self.name, job_id=p.job_id, data=p.handle), mode
-        )
+        handle = JobHandle(backend=self.name, job_id=p.job_id, data=p.handle)
+        if mode is CancelMode.GRACEFUL:
+            self._try(lambda: self._backend.cancel(handle, CancelMode.GRACEFUL))
+            if not self._await_terminal(handle):
+                self._try(lambda: self._backend.cancel(handle, CancelMode.FORCE))
+        else:
+            self._try(lambda: self._backend.cancel(handle, CancelMode.FORCE))
+        self._try(lambda: self._backend.gc(handle))
+
+    def _await_terminal(self, handle: JobHandle) -> bool:
+        """Poll until the job is terminal or the grace budget elapses.
+
+        Returns True if it reached a terminal status within ``cancel_grace_s``.
+        A poll that raises is treated as 'not yet terminal' (we then escalate to
+        FORCE), never crashing cancel.
+        """
+        deadline = _now() + self._cancel_grace_s
+        while True:
+            try:
+                if self._backend.status(handle).status.terminal:
+                    return True
+            except Exception:
+                return False
+            if _now() >= deadline:
+                return False
+            _sleep(_POLL_S)
+
+    @staticmethod
+    def _try(fn: Callable[[], None]) -> None:
+        """Run *fn*, swallowing exceptions (best-effort cancel/reap stages)."""
+        try:
+            fn()
+        except Exception:
+            _log.warning("cancel/reap stage raised; continuing", exc_info=True)
 
     def stream_logs(self, p: Placement) -> Iterator[str]:
         yield from self._backend.logs(
