@@ -379,8 +379,16 @@ class SchedulerInvariants(RuleBasedStateMachine):
             if r.placement is not None and r.placement.provider_name == "free"
         }
         for entry in led.entries:
+            # A voided (spent-$0) relic of a prior PAID attempt that was lost and
+            # then re-placed free is harmless: free costs nothing, and the C1
+            # requeue-void zeroed the amount (the row keeps its paid provider, so
+            # line 360 still holds). Only a NONZERO row for a currently-free job
+            # would mean a free placement was actually charged.
+            if entry.amount == 0.0:
+                continue
             assert entry.job_id not in free_job_ids, (
-                f"job {entry.job_id} placed on free has a ledger entry"
+                f"job {entry.job_id} placed on free has a nonzero ledger entry "
+                f"{entry.amount}"
             )
 
     @invariant()
