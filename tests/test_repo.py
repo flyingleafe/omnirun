@@ -220,3 +220,33 @@ def test_remote_clone_plan_unreachable_sha_ships_bundle(
     unpushed = _commit(sample_repo, "unpushed.txt")
     ref = ref.model_copy(update={"sha": unpushed})
     assert remote_clone_plan(ref, sample_repo) is None
+
+
+# --- bundle_blob / env_blob -------------------------------------------------------
+
+
+def test_bundle_blob_for_private_repo(sample_repo: Path) -> None:
+    ref = capture_repo_state(sample_repo)  # no origin → not public → bundle
+    blob = repo_mod.bundle_blob(ref, sample_repo)
+    assert blob is not None
+    import base64
+
+    # Decodes to a real git bundle (starts with the bundle signature).
+    decoded = base64.b64decode(blob)
+    assert decoded.startswith(b"# v2 git bundle") or decoded.startswith(
+        b"# v3 git bundle"
+    )
+
+
+def test_env_blob_ships_gitignored_env(sample_repo: Path) -> None:
+    (sample_repo / ".gitignore").write_text(".env\n")
+    (sample_repo / ".env").write_text("TOKEN=abc\n")
+    import base64
+
+    blob = repo_mod.env_blob(sample_repo)
+    assert blob is not None
+    assert base64.b64decode(blob) == b"TOKEN=abc\n"
+
+
+def test_env_blob_none_without_env(sample_repo: Path) -> None:
+    assert repo_mod.env_blob(sample_repo) is None

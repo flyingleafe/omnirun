@@ -7,10 +7,12 @@ gitpython.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from omnirun.models import RepoRef
@@ -246,3 +248,34 @@ def create_bundle(root: Path, sha: str, dest: Path) -> Path:
     finally:
         _git(root, "update-ref", "-d", ref)
     return dest
+
+
+def bundle_blob(ref: RepoRef, root: Path) -> str | None:
+    """Base64 of a ``git bundle`` carrying ``ref.sha``, or ``None`` when the sha
+    is publicly cloneable (the worker clones directly — nothing to stage).
+
+    The client staging artifact for a REMOTE daemon (spec §10): a private/unpushed
+    revision travels to the daemon host as this blob (over the Control socket), the
+    daemon decodes it, and a later place reads it as the local git source — so
+    origin credentials never leave the laptop and the code is entrusted only to the
+    daemon host. A public sha returns ``None`` (its ``remote_clone_plan`` url is
+    sent instead; the worker fetches it and nothing lands on the VPS).
+    """
+    if remote_clone_plan(ref, root) is not None:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        dest = create_bundle(root, ref.sha, Path(td) / "bundle.git")
+        return base64.b64encode(dest.read_bytes()).decode()
+
+
+def env_blob(root: Path) -> str | None:
+    """Base64 of a gitignored ``<root>/.env`` (via ``env_file``), or ``None``.
+
+    The secrets staging artifact: a gitignored ``.env`` rides to the daemon host as
+    its own out-of-band blob (never through git), matching the laptop's
+    ``jobdir.stage_env_file`` behaviour but landing on the daemon for it to inject.
+    """
+    envf = env_file(root)
+    if envf is None:
+        return None
+    return base64.b64encode(envf.read_bytes()).decode()
