@@ -13,11 +13,12 @@ import os
 import tomllib
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from omnirun.models import normalize_gpu_type
+from omnirun.state import default_db_url
 
 
 class PolicyConfig(BaseModel):
@@ -86,15 +87,59 @@ class BackendConfig(BaseModel, extra="allow"):
         return pr
 
 
+class BudgetConfig(BaseModel):
+    """Global spend envelope (DESIGN §7): one wallet per user, per rolling window.
+
+    A ``None`` cap means that window is unbounded. The daemonless ``submit`` and
+    the daemon both feed ``daily`` into the ``Control`` day-window ledger; the
+    ``omnirun budget`` command can override either at runtime (stored in ``meta``).
+    """
+
+    daily: float | None = None
+    weekly: float | None = None
+
+
 class DaemonConfig(BaseModel):
-    host: str = "127.0.0.1"  # localhost socket; bind 0.0.0.0 + auth to go remote
+    host: str = "127.0.0.1"  # bind host for `serve`; dial host for a thin client
     port: int = 8787
-    poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
+    poll_interval_s: float = 10.0  # scheduler tick cadence
+    # Tier-2: when true, this machine is a THIN CLIENT — lifecycle commands
+    # (submit/ps/status/logs/cancel/pull/reprioritize/budget) route to the daemon
+    # at host:port over the Control socket instead of the local SQL Store. When
+    # false (default) the CLI is daemonless (Tier-0) / a local daemon is reached
+    # via daemon.json as today (Tier-1). Set on the laptops, not the VPS.
+    remote: bool = False
+    # Cap on a single staged git-bundle blob (bytes, decoded). Bounds a `stage`
+    # socket message so a client cannot push an unbounded artifact; code-sized
+    # repos fit easily (data is never staged — jobs fetch their own).
+    staging_max_bytes: int = 20 * 1024 * 1024
+
+
+class StateConfig(BaseModel):
+    """Where the SQL state store lives (DESIGN §9).
+
+    ``backend`` selects the engine; ``url`` is an explicit SQLAlchemy URL that
+    wins outright; otherwise a ``path`` becomes a SQLite file URL, and with
+    neither set the default ``$OMNIRUN_STATE_DIR/omnirun.db`` is used.
+    """
+
+    backend: Literal["sqlite", "postgres"] = "sqlite"
+    path: str | None = None
+    url: str | None = None
+
+    def resolved_url(self) -> str:
+        if self.url:
+            return self.url
+        if self.path:
+            return f"sqlite:///{self.path}"
+        return default_db_url()
 
 
 class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    state: StateConfig = Field(default_factory=StateConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
 

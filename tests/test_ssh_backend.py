@@ -13,7 +13,14 @@ from omnirun.backends.base import BackendError
 from omnirun.backends.ssh import SshBackend
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, ExecResult
-from omnirun.models import JobHandle, JobSpec, JobStatus, RepoRef, ResourceSpec
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+)
 
 
 class FakeExec(Exec):
@@ -359,12 +366,35 @@ def test_status_dead_socket_reports_lost_with_hint():
 # --- cancel / logs / outputs / gc / check ------------------------------------------------
 
 
-def test_cancel_terms_process_group():
+def test_signal_job_terms_pgid_group():
     fake = FakeExec()
-    make_backend(fake).cancel(HANDLE)
+    jobdir.signal_job(fake, "/root/.omnirun/jobs/train-abc123", "TERM")
     cmd = fake.commands[-1]
-    assert "pkill -TERM -g" in cmd
-    assert "kill -TERM" in cmd
+    # Reads the recorded pgid and signals the whole group, falling back to pid.
+    assert "/pgid" in cmd
+    assert "kill -TERM -" in cmd
+
+
+def test_signal_job_kills_pgid_group():
+    fake = FakeExec()
+    jobdir.signal_job(fake, "/root/.omnirun/jobs/train-abc123", "KILL")
+    cmd = fake.commands[-1]
+    assert "kill -KILL -" in cmd
+
+
+def test_cancel_graceful_terms_pgid():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.GRACEFUL)
+    cmd = fake.commands[-1]
+    assert "kill -TERM -" in cmd
+    assert "/pgid" in cmd
+
+
+def test_cancel_force_kills_pgid():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.FORCE)
+    cmd = fake.commands[-1]
+    assert "kill -KILL -" in cmd
 
 
 def test_logs_reads_job_dir_files():

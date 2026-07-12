@@ -5,12 +5,15 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from omnirun.backends.base import Backend, ProvisioningSink
-from omnirun.config import BackendConfig, Config, DaemonConfig
+from omnirun.budget import LedgerEntry
+from omnirun.config import BackendConfig, BudgetConfig, Config, DaemonConfig
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -19,7 +22,8 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
-from omnirun.queue import QueueEntry, QueueState, QueueStore
+from omnirun.queue import QueueEntry, QueueState
+from omnirun.state import open_store
 
 
 # --------------------------------------------------------------------- fixtures
@@ -49,11 +53,13 @@ class FakeBackend(Backend):
         runs_before_done: int = 1,
         fail_submit: bool = False,
         submitted: list[str] | None = None,
+        cost_per_hour: float | None = None,
     ) -> None:
         super().__init__(name, config)
         self.runs_before_done = runs_before_done
         self.fail_submit = fail_submit
         self.submitted = submitted if submitted is not None else []
+        self.cost_per_hour = cost_per_hour
         self.cancelled: list[str] = []
         self._polls: dict[str, int] = {}
 
@@ -63,7 +69,7 @@ class FakeBackend(Backend):
                 backend=self.name,
                 label=f"{self.name}: fake box",
                 fits=True,
-                cost_per_hour=None,
+                cost_per_hour=self.cost_per_hour,
                 wait_estimate_s=0.0,
             )
         ]
@@ -88,7 +94,7 @@ class FakeBackend(Backend):
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         yield "fake"
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         self.cancelled.append(handle.job_id)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
@@ -102,6 +108,7 @@ def make_daemon(
     runs_before_done: int = 1,
     fail_submit: bool = False,
     submitted: list[str] | None = None,
+    cost_per_hour: float | None = None,
 ) -> Daemon:
     cfg = Config(
         daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
@@ -118,55 +125,27 @@ def make_daemon(
             runs_before_done=runs_before_done,
             fail_submit=fail_submit,
             submitted=submitted,
+            cost_per_hour=cost_per_hour,
         )
 
     return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
 
 
 def _drain(daemon: Daemon, timeout: float = 5.0) -> None:
-    """Block until every in-flight submit worker has left the PLACING state."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not any(e.state == QueueState.PLACING for e in daemon._store.load_all()):
-            return
-        time.sleep(0.005)
-    raise AssertionError("submits did not drain out of PLACING")
+    """No-op: placement is now synchronous inside ``_tick`` (the scheduler
+    reconciles, reserves, and places inline), so nothing lingers in PLACING
+    after a tick returns. Kept so the existing test bodies read unchanged."""
+    del timeout
+    assert not any(
+        e.state == QueueState.PLACING for e in daemon._store.load_entries()
+    ), "a synchronous tick must not leave an entry PLACING"
 
 
 def _states(daemon: Daemon) -> list[QueueState]:
-    return [e.state for e in daemon._store.load_all()]
+    return [e.state for e in daemon._store.load_entries()]
 
 
-# ------------------------------------------------------------------ QueueStore
-
-
-def test_queue_store_roundtrip(tmp_path: Path) -> None:
-    store = QueueStore(tmp_path)
-    entry = QueueEntry.new(make_spec("a"))
-    store.save(entry)
-
-    loaded = store.get(entry.qid)
-    assert loaded is not None
-    assert loaded.qid == entry.qid
-    assert loaded.spec.name == "a"
-    assert loaded.state is QueueState.PENDING
-
-    assert store.get("q-missing") is None
-    assert [e.qid for e in store.load_all()] == [entry.qid]
-
-    store.delete(entry.qid)
-    assert store.get(entry.qid) is None
-    assert store.load_all() == []
-
-
-def test_queue_store_sorted_by_created_at(tmp_path: Path) -> None:
-    store = QueueStore(tmp_path)
-    first = QueueEntry.new(make_spec("first"))
-    time.sleep(0.002)
-    second = QueueEntry.new(make_spec("second"))
-    store.save(second)
-    store.save(first)
-    assert [e.spec.name for e in store.load_all()] == ["first", "second"]
+# ------------------------------------------------------------------ queue state
 
 
 def test_queue_state_terminal() -> None:
@@ -184,89 +163,200 @@ def test_queue_state_terminal() -> None:
 def test_respects_cap_and_backfills(tmp_path: Path) -> None:
     submitted: list[str] = []
     daemon = make_daemon(tmp_path, {"a": 2}, submitted=submitted)
-    try:
-        for _ in range(5):
-            daemon._store.save(QueueEntry.new(make_spec()))
+    for _ in range(5):
+        daemon._store.save_entry(QueueEntry.new(make_spec()))
 
-        peak = 0
-        for _ in range(40):
-            daemon._tick()
-            _drain(daemon)
-            running = sum(s == QueueState.RUNNING for s in _states(daemon))
-            peak = max(peak, running)
-            if all(s.terminal for s in _states(daemon)):
-                break
+    peak = 0
+    for _ in range(40):
+        daemon._tick()
+        _drain(daemon)
+        running = sum(s == QueueState.RUNNING for s in _states(daemon))
+        peak = max(peak, running)
+        if all(s.terminal for s in _states(daemon)):
+            break
 
-        assert all(s is QueueState.SUCCEEDED for s in _states(daemon))
-        assert peak == 2  # never exceeded the per-backend cap, and did reach it
-        assert len(submitted) == 5  # every job ran exactly once
-    finally:
-        daemon._executor.shutdown(wait=True)
+    assert all(s is QueueState.SUCCEEDED for s in _states(daemon))
+    assert peak == 2  # never exceeded the per-backend cap, and did reach it
+    assert len(submitted) == 5  # every job ran exactly once
 
 
 def test_spreads_across_two_backends(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    try:
-        daemon._store.save(QueueEntry.new(make_spec("j1")))
-        daemon._store.save(QueueEntry.new(make_spec("j2")))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j1")))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j2")))
 
-        daemon._tick()
-        _drain(daemon)
+    daemon._tick()
+    _drain(daemon)
 
-        entries = daemon._store.load_all()
-        assert all(e.state is QueueState.RUNNING for e in entries)
-        assert {e.backend for e in entries} == {"a", "b"}  # one on each
-    finally:
-        daemon._executor.shutdown(wait=True)
+    entries = daemon._store.load_entries()
+    assert all(e.state is QueueState.RUNNING for e in entries)
+    assert {e.backend for e in entries} == {"a", "b"}  # one on each
 
 
 def test_only_backend_restriction(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    try:
-        daemon._store.save(QueueEntry.new(make_spec("j"), only_backend="b"))
+    daemon._store.save_entry(QueueEntry.new(make_spec("j"), only_backend="b"))
+    daemon._tick()
+    _drain(daemon)
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.RUNNING
+    assert entry.backend == "b"
+
+
+def test_budget_cap_blocks_paid_escalation(tmp_path: Path) -> None:
+    """A paid-only backend at a zero daily cap: the tick's escalation to the paid
+    slot is unaffordable, so the job stays PENDING (unplaced) and is never
+    submitted. The cap is set live via meta (dynamic-cap path)."""
+    submitted: list[str] = []
+    daemon = make_daemon(tmp_path, {"paid": 1}, submitted=submitted, cost_per_hour=2.0)
+    daemon._store.set_meta("budget.day", "0.0")  # no room for any paid job today
+    spec = make_spec("pricey").model_copy(
+        update={"resources": ResourceSpec(time=timedelta(hours=1))}
+    )
+    daemon._store.save_entry(QueueEntry.new(spec))
+
+    for _ in range(5):
         daemon._tick()
-        _drain(daemon)
-        [entry] = daemon._store.load_all()
-        assert entry.state is QueueState.RUNNING
-        assert entry.backend == "b"
-    finally:
-        daemon._executor.shutdown(wait=True)
+
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.PENDING  # never placed: over budget
+    assert submitted == []  # backend.submit was never called
+
+    # Lifting the cap lets the very next tick place it (proving it was the cap,
+    # not an unfit job, that blocked placement).
+    daemon._store.set_meta("budget.day", "100.0")
+    daemon._tick()
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.RUNNING
+    assert submitted == [spec.job_id]
+
+
+def _paid_free_daemon(tmp_path: Path, submitted: list[str]) -> Daemon:
+    """A daemon with a PAID backend ($2/h) and a FREE backend, sharing one
+    ``submitted`` recorder so a test can assert which (if any) actually ran."""
+    cfg = Config(
+        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
+        backends={
+            "paid": BackendConfig(type="fake", max_parallel=1),
+            "free": BackendConfig(type="fake", max_parallel=1),
+        },
+    )
+
+    def factory(name: str, bcfg: BackendConfig) -> FakeBackend:
+        return FakeBackend(
+            name,
+            bcfg,
+            runs_before_done=3,
+            submitted=submitted,
+            cost_per_hour=2.0 if name == "paid" else None,
+        )
+
+    return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
+
+
+def test_weekly_budget_cap_blocks_paid_while_free_proceeds(tmp_path: Path) -> None:
+    """The WEEKLY cap is genuinely enforced (not just settable/displayed).
+
+    With NO day cap but a low weekly cap already near its limit (seeded via a
+    committed ``week`` ledger row), a paid placement is BLOCKED (job stays
+    PENDING, backend.submit never called) while a free placement proceeds. Lifting
+    the weekly cap lets the very next tick place the paid job — proving it was the
+    weekly ceiling, not an unfit job, that held it back.
+    """
+    submitted: list[str] = []
+    daemon = _paid_free_daemon(tmp_path, submitted)
+
+    # Weekly cap $3, already $2 committed this ISO week → only $1 of headroom.
+    # (No day cap set: the day window stays unbounded, so ONLY the week gate can
+    # block the $2/h paid job.)
+    now = datetime.now(timezone.utc)
+    daemon._store.set_meta("budget.week", "3.0")
+    daemon._store.ledger_add(
+        "week",
+        LedgerEntry(
+            job_id="prior", provider="paid", amount=2.0, kind="committed", at=now
+        ),
+    )
+
+    # A 1h paid job ($2) does NOT fit the $1 weekly headroom → must be pinned to
+    # the paid backend so it cannot silently fall back to free.
+    paid_spec = make_spec("pricey").model_copy(
+        update={"resources": ResourceSpec(time=timedelta(hours=1))}
+    )
+    daemon._store.save_entry(QueueEntry.new(paid_spec, only_backend="paid"))
+    # A free job pinned to the free backend must still place (free never touches
+    # the ledger, so the week cap is irrelevant to it).
+    free_spec = make_spec("gratis")
+    daemon._store.save_entry(QueueEntry.new(free_spec, only_backend="free"))
+
+    for _ in range(5):
+        daemon._tick()
+
+    entries = {e.spec.job_id: e for e in daemon._store.load_entries()}
+    assert entries[paid_spec.job_id].state is QueueState.PENDING  # blocked: over week
+    # The free job placed (and, given runs_before_done=3 over 5 ticks, ran to
+    # completion) — either way it left PENDING and its backend.submit was called.
+    assert entries[free_spec.job_id].state is not QueueState.PENDING
+    assert submitted == [free_spec.job_id]  # only free ran; paid.submit never called
+
+    # Lift the weekly cap: the paid job now places on the very next tick.
+    daemon._store.set_meta("budget.week", "100.0")
+    daemon._tick()
+    entries = {e.spec.job_id: e for e in daemon._store.load_entries()}
+    assert entries[paid_spec.job_id].state is QueueState.RUNNING
+    assert paid_spec.job_id in submitted
+
+
+def test_daemon_control_built_with_config_budget_caps(tmp_path: Path) -> None:
+    """A ``[budget]`` config with daily+weekly flows into the daemon's ``Control``
+    as the day cap AND the weekly cap (both windows are enforced from config)."""
+    cfg = Config(
+        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
+        budget=BudgetConfig(daily=25.0, weekly=100.0),
+        backends={"a": BackendConfig(type="fake", max_parallel=1)},
+    )
+    daemon = Daemon(
+        cfg,
+        state_dir=tmp_path,
+        backend_factory=lambda name, bcfg: FakeBackend(name, bcfg),
+    )
+    control = daemon._get_control()
+    assert control._budget_cap == 25.0
+    assert control._week_cap == 100.0
+    assert control._budget_window == "day"
 
 
 def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1}, fail_submit=True)
-    try:
-        daemon._store.save(QueueEntry.new(make_spec()))
+    daemon._store.save_entry(QueueEntry.new(make_spec()))
 
-        for _ in range(10):
-            daemon._tick()
-            _drain(daemon)
-            if all(s.terminal for s in _states(daemon)):
-                break
+    for _ in range(10):
+        daemon._tick()
+        _drain(daemon)
+        if all(s.terminal for s in _states(daemon)):
+            break
 
-        [entry] = daemon._store.load_all()
-        assert entry.state is QueueState.FAILED
-        assert entry.attempts == 3
-        assert entry.error is not None and "boom" in entry.error
-    finally:
-        daemon._executor.shutdown(wait=True)
+    [entry] = daemon._store.load_entries()
+    assert entry.state is QueueState.FAILED
+    assert entry.attempts == 3
+    assert entry.error is not None and "boom" in entry.error
 
 
 def test_recover_resets_placing_to_pending(tmp_path: Path) -> None:
-    store = QueueStore(tmp_path)
+    # Seed a mid-place entry directly in the daemon's DB (same sqlite file the
+    # daemon opens for state_dir=tmp_path), then verify recovery resets it.
+    store = open_store(f"sqlite:///{tmp_path / 'omnirun.db'}")
     entry = QueueEntry.new(make_spec())
     entry.state = QueueState.PLACING
     entry.backend = "a"
-    store.save(entry)
+    store.save_entry(entry)
+    store.close()
 
     daemon = make_daemon(tmp_path, {"a": 1})
-    try:
-        daemon._recover_placing()
-        [reloaded] = daemon._store.load_all()
-        assert reloaded.state is QueueState.PENDING
-        assert reloaded.backend is None
-    finally:
-        daemon._executor.shutdown(wait=True)
+    daemon._recover_placing()
+    [reloaded] = daemon._store.load_entries()
+    assert reloaded.state is QueueState.PENDING
+    assert reloaded.backend is None
 
 
 # ------------------------------------------------------------------ protocol

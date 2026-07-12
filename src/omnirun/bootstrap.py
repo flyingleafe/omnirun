@@ -285,6 +285,9 @@ export OMNIRUN_OUTPUT="$JOB_DIR/outputs"
 
 mkdir -p "$JOB_DIR/logs" "$JOB_DIR/outputs" "$PROJECT_ROOT/.trees" "$PROJECT_ROOT/.locks" "$OMNIRUN_ROOT/cache"
 exec >> "$JOB_DIR/logs/bootstrap.log" 2>&1
+# Record our process-group id so cancel can TERM (then KILL) the whole group.
+# We run under setsid, so the pgid is our own pid; write it explicitly anyway.
+ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' > "$JOB_DIR/pgid" || echo "$$" > "$JOB_DIR/pgid"
 
 now() {{ date -u +%Y-%m-%dT%H:%M:%SZ; }}
 status() {{ echo "$1" > "$JOB_DIR/phase"; echo "OMNIRUN: [$(now)] $1 ${{2:-}}"; }}

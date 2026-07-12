@@ -42,6 +42,12 @@ def run_bootstrap(script: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_bootstrap_records_pgid(job_spec: JobSpec) -> None:
+    script = generate_bootstrap(job_spec)
+    assert 'ps -o pgid= -p "$$"' in script or "/pgid" in script
+    assert "$JOB_DIR/pgid" in script
+
+
 def test_script_passes_bash_syntax_check(job_spec: JobSpec, tmp_path: Path) -> None:
     script = tmp_path / "bootstrap.sh"
     script.write_text(generate_bootstrap(job_spec))

@@ -7,17 +7,44 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
 
 ## 1. Current state
 
-- All backends, the chooser, bootstrap codegen, repo handling, store, the
-  optional queue daemon, and the full CLI are implemented. `uv run pytest -q`
-  → **287 passed in ~7s**.
+- All backends, the chooser, bootstrap codegen, repo handling, the SQL state
+  layer, the scheduler (pure tick + Control driver + Provider seam), the optional
+  queue daemon, and the full CLI are implemented.
+  `uv run pytest -q` → **561 passed, 6 skipped in ~25s** (the 6 skips are the
+  `@pytest.mark.integration` Postgres tests, omitted unless `OMNIRUN_TEST_POSTGRES_URL`
+  is set).
 - **basedpyright** runs in **standard** mode with **0 errors / 0 warnings**.
 - **CI** (GitHub Actions) runs on every push/PR: ruff + ruff-format (via
   `nix flake check`), basedpyright, and pytest. **v0.1.0 is published to PyPI**
   via a tag-triggered trusted-publish (OIDC) workflow.
 - Coverage by tier:
   - **Unit**: bootstrap codegen, sbatch rendering, chooser ranking/auto-pick,
-    repo state capture + bundles, store, GPU-name normalization, CLI flows
-    (typer runner).
+    repo state capture + bundles, SQL state layer (jobs/facts/queue CRUD,
+    wait-history, atomic `reserve_entry` race test), GPU-name normalization, CLI
+    flows (typer runner), scheduler tick (pure function over synthetic jobs/slots/
+    ledger), budget ledger (committed/spent, day/week windows, can_afford),
+    Control driver (reconcile, enact_place, week-cap gate), reprioritize/budget
+    commands.
+  - **Hypothesis stateful invariant suite** (`tests/test_scheduler_invariants.py`):
+    a `RuleBasedStateMachine` drives the REAL `Control` + SQLite `Store` +
+    `FlakyProvider` / `FakeProvider` doubles through random interleavings of
+    `submit / run_tick / provider_responds / provider_fails / cancel / advance_time`,
+    asserting all 8 invariants after EVERY step:
+    1. budget_safety — committed+spent ≤ cap; per-job ≤ `max_cost`; free costs 0.
+    2. admission_soundness — every live placement's provider can satisfy the req.
+    3. concurrency_safety — non-terminal placements per provider ≤ `max_parallel`.
+    4. liveness_no_silent_loss — no non-cancelled job silently disappears.
+    5. cancellation_completeness — cancelled job has zero live placements; stays cancelled.
+    6. deadline_defense — no paid placement while a free slot met the deadline.
+    7. crash_isolation — a failing provider never crashes the tick nor blocks others.
+    8. tick_convergence — a second identical tick makes no new placements.
+    **VERIFIED** on the current HEAD with no live backends (pure in-process, SQLite only).
+    *Honesty note (I2):* the suite asserts store-level properties only. It does NOT
+    assert "exactly one live backend instance per job" across a `place`-failure boundary.
+    Phase 4 closed the marketplace orphan window: `BackendProvider.place` persists a
+    partial handle via `on_provisioning` before returning, and `Control._reconcile`
+    ADOPTS a partial-handle PLACING (re-polls) instead of reverting and relaunching.
+    The remaining concurrent-tick lease (two overlapping ticks) is Phase 5.
   - **Real e2e without network**: the `local` backend runs actual jobs —
     submit → bare-repo push → worktree → bootstrap → detached run → status →
     logs → cancel → pull, against real git and real processes
@@ -25,6 +52,21 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   - **Mocked integration**: SSH exec (fake ssh binary), Slurm (canned
     sbatch/squeue/sacct output), Kaggle (fake `KaggleApi`), Colab (fake `colab`
     subprocess), marketplaces (respx HTTP mocks).
+  - **Dialect-compile (Postgres, serverless)**: `tests/test_state_postgres.py`
+    compiles representative Store SQL against `sqlalchemy.dialects.postgresql`
+    and asserts `ON CONFLICT`, `FOR UPDATE`, and the advisory-lock form are
+    correct — runs in CI without any server.
+- **SQL state layer — VERIFIED**:
+  - **SQLite**: unit tests + a real-threads race test (`test_reserve_entry_race_single_winner`
+    in `tests/test_state_store.py`) confirm BEGIN IMMEDIATE serialization prevents
+    over-booking with concurrent `reserve_entry` calls. Passes with 0 flakes.
+  - **Postgres**: dialect-compile tests run in CI (no server). The over-book
+    regression (`test_pg_reserve_no_overbook` in `tests/test_state_postgres.py`,
+    K=8 threads × 10 rounds) is opt-in via `OMNIRUN_TEST_POSTGRES_URL`. The
+    `pg_advisory_xact_lock` guard was **live-verified** during code review on
+    PG 18.1: the raw-psycopg reproduction (`pg_overbook_raw.py`) showed 25/25
+    over-books without the guard → 0/15 after adding it. Full CI-integrated
+    Postgres is deferred to Phase 5 / VPS provisioning.
 - **LIVE-VERIFIED this session** (real jobs, real outputs pulled back):
   - **local** — the no-network e2e above, run for real.
   - **uni Slurm** — on QMUL's Apocrita cluster (account `acw592`, partition
@@ -56,6 +98,68 @@ omnirun pull <job-id> && omnirun gc
 ```
 
 Expected: job SUCCEEDED, logs show the print, worktree under `~/.omnirun/jobs/`.
+
+### Phase 4 — uniform lifecycle (local, real)
+
+```bash
+# graceful cancel reaps the process; --force hard-kills; logs -f is uniform
+omnirun submit --yes -- python -c 'import time; [time.sleep(1) for _ in range(60)]'
+omnirun logs -f <job-id> &     # follows the canonical bootstrap.log
+omnirun cancel <job-id>        # SIGTERM the run pgid, then SIGKILL after the grace window
+omnirun status <job-id>        # CANCELLED; no leftover process
+```
+
+- [x] `cancel` (graceful) and `cancel --force` stop the process group; the shared
+      `.trees/<sha>` worktree and `.venv` survive (verified: not deleted).
+- [x] `logs -f` tails `bootstrap.log` with no duplicated command lines.
+- [ ] Marketplace reap-on-cancel — creds-gated (RunPod/Vast/Thunder); the DELETE
+      path is unit-tested against respx, live run still pending.
+- [ ] Kaggle `logs -f` honesty note — verified in unit tests; live run pending.
+
+### Phase 5 — central daemon + thin clients + VPS staging
+
+Unit/fake-verified (no network, in CI):
+- [x] Remote lifecycle commands (`submit`/`ps`/`status`/`cancel_job`/`reprioritize`/
+      `budget`/`stage`/streaming `logs`) over a real `Daemon` on a loopback port.
+- [x] VPS staging **receive**: `repo.bundle_blob`/`env_blob` + `staging.write_stage` +
+      the `stage` command round-trip (bundle+`.env` decoded under `staging/<sha12>/` on
+      the daemon; a public sha records URL only); the `staging_max_bytes` guard rejects
+      an oversized bundle.
+- [x] `LogMux` ring replay + bounding; daemon `logs` fan-out to multiple followers.
+- [x] I1 `reserved_at` lease: a fresh empty-handle PLACING is kept, a stale one reverts.
+- [x] CLI `[daemon] remote = true` routes ps/status/cancel/reprioritize/budget/logs and
+      stages on submit/enqueue; `remote = false` is byte-for-byte the Tier-0 path.
+
+Known code gap — NOT built (remaining Tier-2 wiring, not merely un-live-tested):
+- [ ] **Daemon place-path consumption of the staged bundle.** The `stage` command stores
+      the bundle + `.env` under `staging/<sha12>/`, but the daemon's place path
+      (`jobdir.stage_job` → `repo.local_root_of`) does not read it back, so a remote
+      **private/unpushed** `submit` stages code the backend never receives. Public-repo
+      remote submit is unaffected (the worker clones directly). Fix: make the place path
+      prefer `staging/<sha12>/bundle.git` when `local_root_of` isn't a valid checkout.
+      Follow-up PR, live-tested.
+
+Known Tier-2 limitations (built, but partial — remote path, un-live-tested; follow-ups):
+- [ ] **Remote `logs` without `-f` blocks until the job finishes** instead of returning a
+      snapshot and exiting (Tier-0 `logs` returns a snapshot). The daemon always
+      multiplexes a *following* stream — `Provider.stream_logs` is following-only by design
+      — so the `follow` flag is ignored on the remote path. Fix: add a snapshot
+      (`follow=False`) read to the Provider seam. Workaround today: use `-f`, or Ctrl-C.
+- [ ] **A disconnected `logs -f` follower on a silent (no new output) running job** is not
+      reaped until the next log line or job end — bounded and self-healing (no leak, no
+      effect on other followers or the producer), but there is no idle keepalive. Fix: a
+      periodic keepalive/heartbeat on the follower channel.
+- [ ] **`RESERVE_LEASE_S` is a fixed 60s.** A hypothetical backend whose `submit` blocks
+      >60s without reporting provisioning progress could have its PLACING reverted and
+      relaunched by an overlapping tick. Not reachable by any current backend. Fix: make
+      the lease adaptive, or have long provisioners heartbeat.
+
+Live, infra-gated (needs real VPS + Postgres — not yet run):
+- [ ] Real VPS + Postgres end-to-end: `omnirun serve` on the VPS, thin clients from two
+      laptops, a **public**-repo `submit` placed VPS→backend, global budget enforced
+      across clients, `logs -f` fanned to two followers. The **private**-repo VPS→backend
+      case is additionally blocked on the consumption gap above. Needs a VPS and a Postgres
+      instance — not yet run.
 
 ### Personal SSH box — UNVERIFIED (no box available)
 

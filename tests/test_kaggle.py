@@ -30,7 +30,7 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
-from omnirun.store import JobStore
+from omnirun.state import default_db_url, open_store
 
 JOB_ID = "train-abc123"
 SHA = "a" * 40
@@ -280,7 +280,7 @@ def _store_gpu_job(hours: float) -> None:
             finished_at=now,
         ),
     )
-    JobStore().save(rec)
+    open_store(default_db_url()).save_job(rec)
 
 
 def test_probe_quota_exhausted_makes_gpu_offers_unfit(backend):
@@ -568,9 +568,10 @@ def _big_bundle(dest: Path) -> Path:
     return dest
 
 
-def test_cancel_without_api_support_points_at_website(fake_api, backend):
-    with pytest.raises(BackendError, match="kaggle.com"):
-        backend.cancel(make_handle())
+def test_cancel_without_api_support_is_idempotent_noop(fake_api, backend):
+    handle = make_handle()
+    backend.cancel(handle)  # no cancel endpoint in FakeKaggleApi — must NOT raise
+    assert backend.status(handle).status is JobStatus.CANCELLED
 
 
 def test_cancel_uses_api_when_available(fake_api, backend):
@@ -584,3 +585,25 @@ def test_cancel_uses_api_when_available(fake_api, backend):
 
 def test_check_reports_username(fake_api, backend):
     assert "testuser" in backend.check()
+
+
+# ---- logs -------------------------------------------------------------------
+
+
+def test_logs_follow_emits_honesty_note_before_complete(fake_api, backend, monkeypatch):
+    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
+    monkeypatch.setattr(
+        backend,
+        "status",
+        lambda h: StatusReport(status=next(statuses, JobStatus.SUCCEEDED)),
+    )
+    texts = iter([None, "final log line\n"])
+    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: next(texts, None))
+    monkeypatch.setattr("omnirun.backends.kaggle.time.sleep", lambda _s: None)
+    handle = make_handle()
+    lines = list(backend.logs(handle, follow=True))
+    assert any("live tail unavailable mid-run" in ln for ln in lines)
+    assert "final log line" in lines
+    assert (
+        sum("live tail unavailable" in ln for ln in lines) == 1
+    )  # note appears at most once

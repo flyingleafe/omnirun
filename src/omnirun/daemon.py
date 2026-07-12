@@ -1,47 +1,88 @@
 """Long-lived localhost scheduler daemon.
 
-Owns the durable queue (QueueStore) and spreads its jobs across the configured
-backends, honoring each backend's ``max_parallel`` cap and backfilling as jobs
-finish. Clients talk to it over a tiny line-oriented JSON protocol: one JSON
-object per line each way.
+Owns the durable queue (the SQL ``Store``) and spreads its jobs across the
+configured backends, honoring each backend's ``max_parallel`` cap and
+backfilling as jobs finish. Clients talk to it over a tiny line-oriented JSON
+protocol: one JSON object per line each way.
 
-No warm-worker reuse yet — every placement is a plain one-shot ``backend.submit``
-dispatched on a thread pool so a slow submit never stalls the scheduler tick.
+Placement is the SAME pure scheduler ``tick`` the daemonless ``submit`` runs,
+driven here through :class:`~omnirun.control.Control` over the daemon's shared
+``Store``. The ``queue`` table stays the client-facing view (``enqueue`` /
+``list`` / ``cancel`` speak ``QueueEntry``/``QueueState``); each non-terminal
+entry is mirrored to a scheduler ``JobRecord`` that the tick actually places,
+and every ``JobRecord`` transition is projected back onto its entry after the
+tick. The per-backend concurrency cap is now enforced by ``Store.reserve``
+(#12), not a manual count; the daemon's single-threaded tick serializes rounds
+so the pure driver's concurrent-tick caveats never bite.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import os
 import signal
 import socket
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from omnirun import chooser
 from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
+from omnirun.staging import StageRef, write_stage
+from omnirun.control import Control, resolve_meta_cap
+from omnirun.logstream import LogMux
 from omnirun.models import (
-    JobHandle,
+    Deadline,
     JobRecord,
     JobSpec,
-    JobStatus,
-    Offer,
+    JobState,
+    Placement,
+    ProviderFacts,
     ResourceSpec,
-    StatusReport,
+    Slot,
+    Status,
 )
-from omnirun.queue import QueueEntry, QueueState, QueueStore
-from omnirun.store import JobStore, default_store_dir
+from omnirun.providers import BackendProvider, CancelMode, Provider
+from omnirun.queue import QueueEntry, QueueState
+from omnirun.state import Store, default_store_dir, open_store
 
 BackendFactory = Callable[[str, Any], Backend]
 
+_log = logging.getLogger("omnirun.daemon")
+
 _MAX_ATTEMPTS = 3
 _ACCEPT_TIMEOUT_S = 0.5
-_OFFER_CACHE_TTL_S = 5.0
+
+
+def _deadline_from_req(req: dict[str, Any]) -> Deadline | None:
+    """Build a ``Deadline`` from ISO ``start_by``/``finish_by`` strings in *req*,
+    or ``None`` when neither is present. The client sends already-resolved ISO
+    timestamps (it parses ``+<N>[dhm]`` locally), so the daemon only decodes."""
+    start_by = req.get("start_by")
+    finish_by = req.get("finish_by")
+    if start_by is None and finish_by is None:
+        return None
+    return Deadline(
+        start_by=datetime.fromisoformat(start_by) if start_by else None,
+        finish_by=datetime.fromisoformat(finish_by) if finish_by else None,
+    )
+
+
+# Scheduler JobState -> client-facing QueueState projection. PLACING/HELD both
+# read as PENDING to the queue view (a slot is being taken / the job is waiting).
+_STATE_TO_QUEUE: dict[JobState, QueueState] = {
+    JobState.QUEUED: QueueState.PENDING,
+    JobState.HELD: QueueState.PENDING,
+    JobState.PLACING: QueueState.PLACING,
+    JobState.RUNNING: QueueState.RUNNING,
+    JobState.SUCCEEDED: QueueState.SUCCEEDED,
+    JobState.FAILED: QueueState.FAILED,
+    JobState.CANCELLED: QueueState.CANCELLED,
+}
 
 
 def _state_root(state_dir: Path | None) -> Path:
@@ -115,23 +156,34 @@ class Daemon:
         self.host = cfg.daemon.host
         self.port = cfg.daemon.port
         self.poll_interval = cfg.daemon.poll_interval_s
-        self.offer_cache_ttl_s = _OFFER_CACHE_TTL_S
 
         self._backend_factory = backend_factory
         self._backend_cache: dict[str, Backend] | None = None
-        self._offer_cache: dict[tuple[str, str], tuple[float, list[Offer]]] = {}
+        self._provider_cache: dict[str, Provider] | None = None
+        self._control: Control | None = None
+        # job_id -> last place() error, recorded by the provider wrapper so the
+        # queue view can surface a failing job's reason (the pure Control loop
+        # otherwise only logs the swallowed exception).
+        self._place_errors: dict[str, str] = {}
 
-        self._store = QueueStore(self.state_root)
-        self._jobstore = JobStore(self.state_root)
-        self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix="omnirun-submit"
+        # One Store for the whole daemon (queue + job persistence). An explicit
+        # state_dir (tests, or a caller relocating the daemon's state home) puts
+        # the SQLite DB there; otherwise honor the configured state URL (which
+        # may be Postgres). daemon.json still tracks the liveness address under
+        # state_root regardless.
+        db_url = (
+            f"sqlite:///{self.state_root / 'omnirun.db'}"
+            if state_dir is not None
+            else cfg.state.resolved_url()
         )
+        self._store: Store = open_store(db_url)
+        self._lock = threading.RLock()
+        self._log_mux = LogMux()
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._scheduler_thread: threading.Thread | None = None
 
-    # --- backends ---------------------------------------------------------
+    # --- backends / providers / control -----------------------------------
 
     def _get_backends(self) -> dict[str, Backend]:
         with self._lock:
@@ -142,6 +194,31 @@ class Daemon:
                     if bcfg.enabled
                 }
             return self._backend_cache
+
+    def _get_providers(self) -> dict[str, Provider]:
+        """Enabled backends wrapped as scheduler ``Provider``s over the shared
+        ``Store``, each recording its ``place`` errors for the queue view."""
+        with self._lock:
+            if self._provider_cache is None:
+                self._provider_cache = {
+                    name: _RecordingProvider(
+                        BackendProvider(be, self._store), self._place_errors
+                    )
+                    for name, be in self._get_backends().items()
+                }
+            return self._provider_cache
+
+    def _get_control(self) -> Control:
+        with self._lock:
+            if self._control is None:
+                self._control = Control(
+                    self._store,
+                    self._get_providers(),
+                    budget_window="day",
+                    budget_cap=self.cfg.budget.daily,
+                    week_cap=self.cfg.budget.weekly,
+                )
+            return self._control
 
     # --- lifecycle --------------------------------------------------------
 
@@ -169,17 +246,23 @@ class Daemon:
             self._stop.set()
             if self._scheduler_thread is not None:
                 self._scheduler_thread.join(timeout=5.0)
-            self._executor.shutdown(wait=False, cancel_futures=True)
             self._remove_daemon_json()
 
     def _recover_placing(self) -> None:
-        """A crash mid-place leaves PLACING entries; re-place them."""
+        """Reset any PLACING left by a crash mid-place back to a re-placeable state.
+
+        Placement is synchronous inside a tick, so a PLACING row only survives a
+        crash. The queue view's PLACING entries revert to PENDING; the scheduler
+        ``JobRecord`` side is recovered independently by ``Control``'s reconcile
+        (a PLACING job with an empty-handle stub placement reverts to QUEUED),
+        so the very next tick re-places it.
+        """
         with self._lock:
-            for entry in self._store.load_all():
+            for entry in self._store.load_entries():
                 if entry.state == QueueState.PLACING:
                     entry.state = QueueState.PENDING
                     entry.backend = None
-                    self._store.save(entry)
+                    self._store.save_entry(entry)
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -224,6 +307,9 @@ class Daemon:
                 if not line:
                     return
                 req = json.loads(line.decode())
+                if req.get("cmd") == "logs":
+                    self._stream_logs_conn(conn, req)
+                    return
                 resp = self._dispatch(req)
             except Exception as e:  # never let a bad request kill the handler
                 resp = {"ok": False, "error": str(e)}
@@ -231,6 +317,17 @@ class Daemon:
                 conn.sendall((json.dumps(resp) + "\n").encode())
             except OSError:
                 pass
+
+    def _stream_logs_conn(self, conn: socket.socket, req: dict[str, Any]) -> None:
+        """Serve a streaming ``logs`` response: one JSON line per log line, until
+        the stream ends or the client disconnects (a write error drops this
+        follower via the LogMux generator's finally — peers/producer survive)."""
+        conn.settimeout(None)  # a follow stream may idle between lines
+        try:
+            for msg in self._cmd_logs(req):
+                conn.sendall((json.dumps(msg) + "\n").encode())
+        except OSError:
+            return  # client went away; the follower generator is closed on GC
 
     def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         cmd = req.get("cmd")
@@ -240,6 +337,13 @@ class Daemon:
             "list": self._cmd_list,
             "cancel": self._cmd_cancel,
             "shutdown": self._cmd_shutdown,
+            "stage": self._cmd_stage,
+            "submit": self._cmd_submit,
+            "ps": self._cmd_ps,
+            "status": self._cmd_status,
+            "cancel_job": self._cmd_cancel_job,
+            "reprioritize": self._cmd_reprioritize,
+            "budget": self._cmd_budget,
         }.get(cmd or "")
         if handler is None:
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
@@ -249,7 +353,7 @@ class Daemon:
 
     def _cmd_ping(self, _req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
         pending = sum(
             e.state in (QueueState.PENDING, QueueState.PLACING) for e in entries
         )
@@ -274,48 +378,179 @@ class Daemon:
                     update={"job_id": JobSpec.make_job_id(spec.name)}
                 )
                 entry = QueueEntry.new(job_spec, only_backend=only_backend)
-                self._store.save(entry)
+                self._store.save_entry(entry)
                 qids.append(entry.qid)
         return {"ok": True, "qids": qids}
 
     def _cmd_list(self, _req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
         return {"ok": True, "entries": [e.model_dump(mode="json") for e in entries]}
 
     def _cmd_cancel(self, req: dict[str, Any]) -> dict[str, Any]:
         qid = req.get("qid")
+        now = datetime.now(timezone.utc)
         with self._lock:
-            entries = self._store.load_all()
+            entries = self._store.load_entries()
             targets = entries if qid == "all" else [e for e in entries if e.qid == qid]
-            backends = self._get_backends()
+            control = self._get_control()
             cancelled = 0
             for entry in targets:
                 if entry.state.terminal:
                     continue
-                if entry.state == QueueState.RUNNING and entry.job_id and entry.backend:
-                    rec = self._jobstore.load(entry.job_id)
-                    be = backends.get(entry.backend)
-                    if rec is not None and rec.handle is not None and be is not None:
-                        try:
-                            be.cancel(rec.handle)
-                        except Exception:
-                            pass
-                        self._jobstore.update_status(
-                            entry.job_id,
-                            StatusReport(
-                                status=JobStatus.CANCELLED,
-                                detail="cancelled via queue",
-                            ),
-                        )
+                # Cancel the scheduler job through Control (reaps any live
+                # placement + marks the JobRecord CANCELLED, so no later tick
+                # re-places it), then terminalize the queue entry.
+                control.cancel(entry.spec.job_id, now)
                 entry.state = QueueState.CANCELLED
-                self._store.save(entry)
+                self._store.save_entry(entry)
                 cancelled += 1
         return {"ok": True, "cancelled": cancelled}
 
     def _cmd_shutdown(self, _req: dict[str, Any]) -> dict[str, Any]:
         self._stop.set()
         return {"ok": True}
+
+    def _cmd_stage(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Receive a client's staged code+secrets (spec §10 trust boundary).
+
+        Decodes the base64 ``git bundle`` (private/unpushed sha) and ``.env`` blob
+        into the daemon's per-sha staging dir; a public sha carries only a
+        ``clone_url`` (nothing lands on disk). Size-guarded so one socket message
+        cannot push an unbounded artifact. Idempotent by sha.
+        """
+        sha = req.get("sha")
+        if not isinstance(sha, str) or not sha:
+            return {"ok": False, "error": "stage requires a non-empty sha"}
+        bundle_b64 = req.get("bundle_b64")
+        env_b64 = req.get("env_b64")
+        clone_url = req.get("clone_url")
+        cap = self.cfg.daemon.staging_max_bytes
+        if isinstance(bundle_b64, str):
+            size = len(base64.b64decode(bundle_b64))
+            if size > cap:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"staged bundle is {size} bytes, over staging_max_bytes "
+                        f"({cap}) — push the sha to a public remote so the worker "
+                        "clones it, or raise [daemon] staging_max_bytes"
+                    ),
+                }
+        with self._lock:
+            ref: StageRef = write_stage(
+                self.state_root,
+                sha,
+                bundle_b64=bundle_b64 if isinstance(bundle_b64, str) else None,
+                env_b64=env_b64 if isinstance(env_b64, str) else None,
+                clone_url=clone_url if isinstance(clone_url, str) else None,
+            )
+        return {"ok": True, "stage": ref.model_dump(mode="json")}
+
+    def _cmd_submit(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Persist a spec QUEUED and run one tick — the remote counterpart of the
+        daemonless ``_submit_via_control``. Returns the resulting JobRecord so the
+        client reports placed/held/queued exactly as the local path does."""
+        spec = JobSpec.model_validate(req["spec"])
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            control = self._get_control()
+            job_id = control.submit(spec, now=now)
+            control.run_tick(now)
+            rec = self._store.load_job(job_id)
+        if rec is None:
+            return {"ok": False, "error": f"job {job_id} vanished after submit"}
+        return {"ok": True, "job": rec.model_dump(mode="json")}
+
+    def _cmd_ps(self, _req: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            jobs = self._store.list_jobs()
+        return {"ok": True, "jobs": [j.model_dump(mode="json") for j in jobs]}
+
+    def _cmd_status(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        with self._lock:
+            rec = self._store.load_job(job_id)
+        if rec is None:
+            return {"ok": False, "error": f"unknown job {job_id!r}"}
+        return {"ok": True, "job": rec.model_dump(mode="json")}
+
+    def _cmd_cancel_job(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        force = bool(req.get("force", False))
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._get_control().cancel(job_id, now, force=force)
+        return {"ok": True}
+
+    def _cmd_reprioritize(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        deadline = _deadline_from_req(req)
+        allow_paid = req.get("allow_paid")
+        priority = req.get("priority")
+        with self._lock:
+            try:
+                policy = self._get_control().reprioritize(
+                    job_id,
+                    priority=int(priority) if priority is not None else None,
+                    deadline=deadline,
+                    allow_paid=allow_paid if isinstance(allow_paid, bool) else None,
+                )
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+        return {"ok": True, "policy": policy.model_dump(mode="json")}
+
+    def _cmd_budget(self, req: dict[str, Any]) -> dict[str, Any]:
+        window = str(req.get("window", "day"))
+        cap = req.get("cap")
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            control = self._get_control()
+            if cap is not None:
+                control.budget(window, float(cap))
+            windows: list[dict[str, Any]] = []
+            for w, cfg_default in (
+                ("day", self.cfg.budget.daily),
+                ("week", self.cfg.budget.weekly),
+            ):
+                resolved = resolve_meta_cap(self._store, w, cfg_default)
+                spent = self._store.load_ledger(w, resolved, now).in_window_total(now)
+                windows.append({"window": w, "spent": spent, "cap": resolved})
+        return {"ok": True, "windows": windows}
+
+    def _provider_stream_for(self, job_id: str) -> Callable[[], Iterator[str]] | str:
+        """A zero-arg producer that streams *job_id*'s logs from its placement's
+        provider, or an error string when the job is unknown/never placed."""
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            return f"unknown job {job_id!r}"
+        placement = rec.placement
+        if placement is None:
+            return f"job {job_id!r} has no live placement to stream"
+        provider = self._get_providers().get(placement.provider_name)
+        if provider is None:
+            return f"no provider {placement.provider_name!r} for job {job_id!r}"
+
+        def producer() -> Iterator[str]:
+            yield from provider.stream_logs(placement)
+
+        return producer
+
+    def _cmd_logs(self, req: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Stream a job's logs as one ``{"line": ...}`` message per log line.
+
+        Multiplexed through ``LogMux`` so several ``logs -f`` followers share ONE
+        provider stream and a late joiner replays the recent ring. On follow=False
+        the generator ends when the current stream is drained. On an unknown job it
+        yields a single error message."""
+        job_id = str(req.get("job_id", ""))
+        with self._lock:
+            producer = self._provider_stream_for(job_id)
+        if isinstance(producer, str):
+            yield {"ok": False, "error": producer}
+            return
+        for line in self._log_mux.follow(job_id, producer):
+            yield {"line": line}
 
     # --- scheduler --------------------------------------------------------
 
@@ -324,170 +559,184 @@ class Daemon:
             try:
                 self._tick()
             except Exception:  # a tick failure must never kill the scheduler
-                pass
+                _log.warning("scheduler tick raised; continuing", exc_info=True)
             self._stop.wait(self.poll_interval)
 
     def _tick(self) -> None:
+        """One scheduling round: mirror queue → jobs, run the tick, project back.
+
+        Everything runs under ``self._lock`` (serializing ticks against socket
+        handlers), so the pure driver's at-least-once/concurrent-tick caveats do
+        not apply here — reconcile, reserve and place happen without an
+        overlapping round.
+        """
         with self._lock:
-            self._refresh_running()
-            self._place_pending()
+            now = datetime.now(timezone.utc)
+            self._sync_jobs()
+            self._run_scheduler(now)
+            self._project(now)
 
-    def _refresh_running(self) -> None:
-        backends = self._get_backends()
-        for entry in self._store.load_all():
-            if entry.state != QueueState.RUNNING:
+    def _sync_jobs(self) -> None:
+        """Ensure every non-terminal queue entry has a scheduler ``JobRecord``.
+
+        The ``queue`` table is the client-facing view; the scheduler places over
+        the ``jobs`` table. A newly enqueued entry gets a matching QUEUED job
+        record (keyed by its ``spec.job_id``) whose ``submitted_at`` is the
+        enqueue time, so the tick's priority/urgency ranking honors queue order.
+        Idempotent — an entry whose job already exists is left untouched.
+        """
+        for entry in self._store.load_entries():
+            if entry.state.terminal:
                 continue
-            if not entry.job_id or not entry.backend:
-                continue
-            rec = self._jobstore.load(entry.job_id)
-            be = backends.get(entry.backend)
-            if rec is None or rec.handle is None or be is None:
-                continue
-            try:
-                report = be.status(rec.handle)
-            except Exception:
-                continue  # tolerate transient backend errors; retry next tick
-            self._jobstore.update_status(entry.job_id, report)
-            if report.status.terminal:
-                if report.status == JobStatus.SUCCEEDED:
-                    entry.state = QueueState.SUCCEEDED
-                else:
-                    entry.state = QueueState.FAILED
-                    entry.error = report.detail or report.status.value
-                self._store.save(entry)
-
-    def _running_counts(self, entries: list[QueueEntry]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for e in entries:
-            if e.backend and e.state in (QueueState.PLACING, QueueState.RUNNING):
-                counts[e.backend] = counts.get(e.backend, 0) + 1
-        return counts
-
-    def _place_pending(self) -> None:
-        backends = self._get_backends()
-        entries = self._store.load_all()  # sorted oldest-first
-        pending = [e for e in entries if e.state == QueueState.PENDING]
-        for entry in pending:
-            counts = self._running_counts(entries)
-            candidates = {
-                name: be
-                for name, be in backends.items()
-                if counts.get(name, 0) < self.cfg.backends[name].max_parallel
-                and (entry.only_backend is None or name == entry.only_backend)
-            }
-            if not candidates:
-                continue
-            res = entry.spec.resources
-            offers = self._offers_for(candidates, res)
-            ranked = [
-                r
-                for r in chooser.rank(offers, res, self.cfg.policy)
-                if r.offer.backend in candidates
-            ]
-            if not ranked:
-                continue
-            picked = ranked[0].offer
-            # Reserve the slot synchronously so the next entry in this tick (and
-            # concurrent ticks) sees it taken and can't double-book the backend.
-            entry.state = QueueState.PLACING
-            entry.backend = picked.backend
-            self._store.save(entry)
-            self._executor.submit(self._run_submit, entry.qid, picked)
-
-    def _offers_for(
-        self, candidates: dict[str, Backend], res: ResourceSpec
-    ) -> list[Offer]:
-        """Probe candidate backends for ``res``, caching per (backend, res) so a
-        batch of identical jobs doesn't re-probe on every tick."""
-        sig = res.model_dump_json()
-        now = time.monotonic()
-        offers: list[Offer] = []
-        missing: dict[str, Backend] = {}
-        for name, be in candidates.items():
-            cached = self._offer_cache.get((name, sig))
-            if cached is not None and now - cached[0] < self.offer_cache_ttl_s:
-                offers.extend(cached[1])
-            else:
-                missing[name] = be
-        if missing:
-            fresh = chooser.gather_offers(
-                missing, res, timeout_s=self.cfg.policy.probe_timeout_s
-            )
-            by_backend: dict[str, list[Offer]] = {}
-            for o in fresh:
-                by_backend.setdefault(o.backend, []).append(o)
-            for name in missing:
-                got = by_backend.get(name, [])
-                self._offer_cache[(name, sig)] = (now, got)
-                offers.extend(got)
-        return offers
-
-    def _run_submit(self, qid: str, offer: Offer) -> None:
-        """Blocking one-shot submit, dispatched off the scheduler thread."""
-        with self._lock:
-            entry = self._store.get(qid)
-            if entry is None or entry.state != QueueState.PLACING:
-                return  # cancelled or already handled
-            spec = entry.spec
-            backend_name = entry.backend
-        be = self._get_backends().get(backend_name or "")
-        if be is None:
-            self._fail_submit(qid, f"backend {backend_name!r} unavailable")
-            return
-
-        def _persist(h: JobHandle) -> None:
-            # Persist a stub the instant a billable resource is created, then
-            # the final handle — an interrupted submit stays reclaimable (#7).
-            self._jobstore.save(
-                JobRecord(
-                    spec=spec,
-                    handle=h,
-                    offer=offer,
-                    submitted_at=datetime.now(timezone.utc),
+            job_id = entry.spec.job_id
+            if self._store.load_job(job_id) is None:
+                self._store.save_job(
+                    JobRecord(
+                        spec=entry.spec,
+                        state=JobState.QUEUED,
+                        submitted_at=entry.created_at,
+                    )
                 )
+            if entry.job_id != job_id:
+                entry.job_id = job_id
+                self._store.save_entry(entry)
+
+    def _run_scheduler(self, now: datetime) -> None:
+        """Drive the pure ``tick`` through ``Control``, honoring ``only_backend``.
+
+        The pure tick is slot-blind, so a job pinned to one backend cannot be
+        expressed as a capability. Instead we run one scoped ``run_tick`` per
+        restriction group over the ONE shared ``Store`` (so ``Store.reserve``
+        still enforces every backend's cap globally and atomically): the
+        unrestricted jobs may place on any provider; each ``only_backend`` group
+        may place only on its provider. Reconcile is global and runs on the FIRST
+        call only, so an in-flight placement is polled exactly once per tick.
+        """
+        control = self._get_control()
+        groups = self._restriction_groups()
+        if not groups:
+            control.run_tick(now)  # nothing pending; still reconcile in-flight jobs
+            return
+        for i, (providers, job_ids) in enumerate(groups):
+            control.run_tick(
+                now,
+                only_providers=providers,
+                only_job_ids=job_ids,
+                reconcile=(i == 0),
             )
 
-        try:
-            handle = be.submit(spec, offer, on_provisioning=_persist)
-        except Exception as e:
-            self._retry_or_fail(qid, str(e))
-            return
-        _persist(handle)
-        with self._lock:
-            entry = self._store.get(qid)
-            if entry is None:
-                return
-            if entry.state == QueueState.CANCELLED:
-                try:  # cancelled while the submit was in flight
-                    be.cancel(handle)
-                except Exception:
-                    pass
-                return
-            entry.state = QueueState.RUNNING
-            entry.job_id = spec.job_id
-            entry.offer_label = offer.label
-            entry.error = None
-            self._store.save(entry)
+    def _restriction_groups(
+        self,
+    ) -> list[tuple[set[str] | None, set[str] | None]]:
+        """Partition pending queue entries into ``(only_providers, only_job_ids)``.
 
-    def _retry_or_fail(self, qid: str, error: str) -> None:
-        with self._lock:
-            entry = self._store.get(qid)
-            if entry is None or entry.state != QueueState.PLACING:
-                return
-            entry.attempts += 1
-            entry.error = error
-            if entry.attempts >= _MAX_ATTEMPTS:
+        The unrestricted group (all providers, ``None`` job filter) comes first so
+        it carries the single global reconcile; then one group per distinct
+        ``only_backend`` value, each scoped to that provider and its job ids.
+        Returns an empty list when nothing is pending.
+        """
+        pending = [
+            e
+            for e in self._store.load_entries()
+            if e.state in (QueueState.PENDING, QueueState.PLACING)
+        ]
+        unrestricted = [e for e in pending if e.only_backend is None]
+        by_backend: dict[str, set[str]] = {}
+        for e in pending:
+            if e.only_backend is not None:
+                by_backend.setdefault(e.only_backend, set()).add(e.spec.job_id)
+
+        groups: list[tuple[set[str] | None, set[str] | None]] = []
+        if unrestricted:
+            groups.append((None, {e.spec.job_id for e in unrestricted}))
+        for backend, job_ids in by_backend.items():
+            groups.append(({backend}, job_ids))
+        return groups
+
+    def _project(self, now: datetime) -> None:
+        """Mirror each job's scheduler state back onto its queue entry.
+
+        Maps ``JobState`` → ``QueueState`` (PLACING/HELD read as PENDING), copies
+        the placement's provider onto ``entry.backend`` and label, and enforces
+        the 3-attempt cap the queue view promises: a job the tick keeps failing to
+        place (back to QUEUED with ``attempts >= _MAX_ATTEMPTS``) is terminalized
+        FAILED on BOTH the job record (so no later tick re-places it) and the
+        entry, carrying the last recorded place error. Already-terminal entries
+        are left as-is (never resurrected).
+        """
+        for entry in self._store.load_entries():
+            if entry.state.terminal:
+                continue
+            rec = self._store.load_job(entry.spec.job_id)
+            if rec is None:
+                continue
+            if (
+                rec.state is JobState.QUEUED
+                and rec.attempts >= _MAX_ATTEMPTS
+                and self._place_errors.get(entry.spec.job_id)
+            ):
+                self._store.save_job(rec.model_copy(update={"state": JobState.FAILED}))
                 entry.state = QueueState.FAILED
-            else:
-                entry.state = QueueState.PENDING  # release the slot, retry later
-                entry.backend = None
-            self._store.save(entry)
+                entry.attempts = rec.attempts
+                entry.error = self._place_errors.pop(entry.spec.job_id)
+                self._store.save_entry(entry)
+                continue
 
-    def _fail_submit(self, qid: str, error: str) -> None:
-        with self._lock:
-            entry = self._store.get(qid)
-            if entry is None:
-                return
-            entry.state = QueueState.FAILED
-            entry.error = error
-            self._store.save(entry)
+            entry.state = _STATE_TO_QUEUE[rec.state]
+            entry.attempts = rec.attempts
+            if rec.placement is not None:
+                entry.backend = rec.placement.provider_name
+                entry.offer_label = rec.placement.provider_name
+            elif rec.state in (JobState.QUEUED, JobState.HELD):
+                entry.backend = None
+            if rec.state is JobState.FAILED:
+                entry.error = self._place_errors.pop(
+                    entry.spec.job_id, entry.error or rec.state.value
+                )
+            self._store.save_entry(entry)
+
+
+class _RecordingProvider:
+    """Wrap a ``Provider`` to record ``place`` failures for the queue view.
+
+    ``Control`` swallows a ``place`` exception (releasing the reservation and
+    logging) so the pure loop never crashes on a misbehaving backend. The daemon
+    still wants the failure REASON to surface on the queue entry, so this thin
+    delegate captures the exception text (keyed by job id) and re-raises,
+    letting ``Control``'s normal release/retry path run unchanged.
+    """
+
+    def __init__(self, inner: Provider, errors: dict[str, str]) -> None:
+        self.name = inner.name
+        self._inner = inner
+        self._errors = errors
+
+    def discover(self) -> ProviderFacts:
+        return self._inner.discover()
+
+    def offer(self, req: ResourceSpec) -> list[Slot]:
+        return self._inner.offer(req)
+
+    def place(self, rec: JobRecord, slot: Slot) -> Placement:
+        try:
+            placement = self._inner.place(rec, slot)
+        except Exception as e:
+            self._errors[rec.spec.job_id] = str(e)
+            raise
+        self._errors.pop(rec.spec.job_id, None)  # a good place clears any prior error
+        return placement
+
+    def poll(self, p: Placement) -> Status:
+        return self._inner.poll(p)
+
+    def cancel(self, p: Placement, mode: CancelMode) -> None:
+        self._inner.cancel(p, mode)
+
+    def stream_logs(self, p: Placement) -> Iterator[str]:
+        yield from self._inner.stream_logs(p)
+
+    def collect_outputs(self, p: Placement, dest: Path) -> None:
+        self._inner.collect_outputs(p, dest)
+
+    def gc(self) -> None:
+        self._inner.gc()
