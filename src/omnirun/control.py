@@ -114,6 +114,7 @@ class Control:
         budget_window: str = "day",
         budget_cap: float | None = None,
         week_cap: float | None = None,
+        cancel_grace_s: float = 30.0,
     ) -> None:
         self._store = store
         self._providers = providers
@@ -121,6 +122,10 @@ class Control:
         self._budget_window = budget_window
         self._budget_cap = budget_cap
         self._week_cap = week_cap
+        # The graceful→force grace budget. The BackendProvider adapter owns the
+        # actual poll-and-escalate loop; Control carries this so a driver that
+        # constructs its own providers can pass a matching value.
+        self._cancel_grace_s = cancel_grace_s
 
     # ------------------------------------------------------------------
     # Submission
@@ -215,29 +220,31 @@ class Control:
     # deepens this to graceful→force→reap with confirmation.
     # ------------------------------------------------------------------
 
-    def cancel(self, job_id: str, now: datetime) -> None:
-        """Cancel *job_id* — reap any live placement, then mark it CANCELLED.
+    def cancel(self, job_id: str, now: datetime, *, force: bool = False) -> None:
+        """Cancel *job_id*, then mark it CANCELLED — idempotent and complete.
 
-        Idempotent and best-effort: an unknown or already-terminal job is a
-        no-op. If the job has a live placement (a real ``handle``), its provider
-        is asked to ``cancel`` it (FORCE) so no backend instance/session is left
-        running; a provider that raises is swallowed (crash isolation — the job
-        is still marked cancelled). Because the tick only ever considers
-        QUEUED/HELD jobs and reconcile only folds PLACING/RUNNING ones, a job in
-        CANCELLED is never re-placed or resurrected by a later tick — the "even
+        Delegates to the placement provider's ``cancel``: with ``force=False`` (the
+        default) a ``GRACEFUL`` cancel, which the adapter drives as
+        SIGTERM→poll-until-terminal-or-``cancel_grace_s``→SIGKILL→reap; with
+        ``force=True`` a ``FORCE`` cancel (immediate hard kill + reap). Either way
+        no backend instance/session is left running (invariant 5).
+
+        Idempotent and best-effort: an unknown or already-terminal job is a no-op;
+        a provider that raises is swallowed (crash isolation — the job is still
+        marked cancelled). Because the pure tick only ever considers QUEUED/HELD
+        jobs, a job in CANCELLED is never re-placed by a later tick — the "even
         racing a placement" half of the cancellation-completeness invariant.
         """
         rec = self._store.load_job(job_id)
         if rec is None or rec.state.terminal:
             return
-        # Reap any live placement best-effort, so no instance/session leaks.
+        mode = CancelMode.FORCE if force else CancelMode.GRACEFUL
         if rec.placement is not None and rec.placement.handle:
             provider = self._providers.get(rec.placement.provider_name)
             if provider is not None:
                 try:
-                    provider.cancel(rec.placement, CancelMode.FORCE)
+                    provider.cancel(rec.placement, mode)
                 except Exception:
-                    # Best-effort; still mark cancelled (crash isolation).
                     _log.warning(
                         "cancel raised for job %s on %s; marking cancelled anyway",
                         job_id,

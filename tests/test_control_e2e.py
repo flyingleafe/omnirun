@@ -24,6 +24,7 @@ import pytest
 from omnirun.control import Control
 from omnirun.models import (
     Capabilities,
+    CancelMode,
     Cost,
     JobRecord,
     JobSpec,
@@ -547,4 +548,50 @@ def test_reconcile_reverts_empty_handle_placing(tmp_path: Path) -> None:
     assert after.attempts == 1
     assert after.placement is None
     assert provider.poll_calls == []  # never polled — reverted
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Task-6: Control.cancel graceful-by-default with --force override
+# ---------------------------------------------------------------------------
+
+
+def test_control_cancel_graceful_by_default(tmp_path: Path) -> None:
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    provider = FakeProvider("free", slots=[_free_slot()])
+    control = Control(store, {"free": provider})
+    control.submit(_spec("cxl-1"), now=T0)
+    control.run_tick(T0)  # place it (RUNNING)
+
+    control.cancel("cxl-1", T1)
+
+    assert provider.cancel_calls == [("cxl-1", CancelMode.GRACEFUL)]
+    after = store.load_job("cxl-1")
+    assert after is not None and after.state is JobState.CANCELLED
+    assert after.placement is not None
+    assert after.placement.state is JobStatus.CANCELLED
+    store.close()
+
+
+def test_control_cancel_force_uses_force_mode(tmp_path: Path) -> None:
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    provider = FakeProvider("free", slots=[_free_slot()])
+    control = Control(store, {"free": provider})
+    control.submit(_spec("cxl-2"), now=T0)
+    control.run_tick(T0)
+
+    control.cancel("cxl-2", T1, force=True)
+
+    assert provider.cancel_calls == [("cxl-2", CancelMode.FORCE)]
+    after = store.load_job("cxl-2")
+    assert after is not None and after.state is JobState.CANCELLED
+    store.close()
+
+
+def test_control_cancel_unknown_and_terminal_are_noops(tmp_path: Path) -> None:
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    provider = FakeProvider("free", slots=[_free_slot()])
+    control = Control(store, {"free": provider})
+    control.cancel("nope", T1)  # unknown → no-op
+    assert provider.cancel_calls == []
     store.close()
