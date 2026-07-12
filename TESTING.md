@@ -8,8 +8,9 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
 ## 1. Current state
 
 - All backends, the chooser, bootstrap codegen, repo handling, the SQL state
-  layer, the optional queue daemon, and the full CLI are implemented.
-  `uv run pytest -q` → **388 passed, 6 skipped in ~14s** (the 6 skips are the
+  layer, the scheduler (pure tick + Control driver + Provider seam), the optional
+  queue daemon, and the full CLI are implemented.
+  `uv run pytest -q` → **561 passed, 6 skipped in ~25s** (the 6 skips are the
   `@pytest.mark.integration` Postgres tests, omitted unless `OMNIRUN_TEST_POSTGRES_URL`
   is set).
 - **basedpyright** runs in **standard** mode with **0 errors / 0 warnings**.
@@ -20,7 +21,32 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   - **Unit**: bootstrap codegen, sbatch rendering, chooser ranking/auto-pick,
     repo state capture + bundles, SQL state layer (jobs/facts/queue CRUD,
     wait-history, atomic `reserve_entry` race test), GPU-name normalization, CLI
-    flows (typer runner).
+    flows (typer runner), scheduler tick (pure function over synthetic jobs/slots/
+    ledger), budget ledger (committed/spent, day/week windows, can_afford),
+    Control driver (reconcile, enact_place, week-cap gate), reprioritize/budget
+    commands.
+  - **Hypothesis stateful invariant suite** (`tests/test_scheduler_invariants.py`):
+    a `RuleBasedStateMachine` drives the REAL `Control` + SQLite `Store` +
+    `FlakyProvider` / `FakeProvider` doubles through random interleavings of
+    `submit / run_tick / provider_responds / provider_fails / cancel / advance_time`,
+    asserting all 8 invariants after EVERY step:
+    1. budget_safety — committed+spent ≤ cap; per-job ≤ `max_cost`; free costs 0.
+    2. admission_soundness — every live placement's provider can satisfy the req.
+    3. concurrency_safety — non-terminal placements per provider ≤ `max_parallel`.
+    4. liveness_no_silent_loss — no non-cancelled job silently disappears.
+    5. cancellation_completeness — cancelled job has zero live placements; stays cancelled.
+    6. deadline_defense — no paid placement while a free slot met the deadline.
+    7. crash_isolation — a failing provider never crashes the tick nor blocks others.
+    8. tick_convergence — a second identical tick makes no new placements.
+    **VERIFIED** on the current HEAD with no live backends (pure in-process, SQLite only).
+    *Honesty note (I2):* the suite asserts store-level properties only. It does NOT
+    assert "exactly one live backend instance per job" — that is knowingly false across
+    a `place`-failure boundary: if the process dies between `provider.place` succeeding
+    and the `RUNNING save_job`, the first launch becomes an orphan and a later tick
+    relaunches. Closing this to exactly-once (the `on_provisioning` stub for orphan-
+    recovery) is **deferred to Phase 4**. A client crash mid-place may therefore leak a
+    marketplace instance; the common daemonless path and `submit`'s own-failure handling
+    are unaffected.
   - **Real e2e without network**: the `local` backend runs actual jobs —
     submit → bare-repo push → worktree → bootstrap → detached run → status →
     logs → cancel → pull, against real git and real processes

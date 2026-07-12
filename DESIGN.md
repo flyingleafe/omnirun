@@ -164,15 +164,17 @@ break sibling jobs at the same sha).
 
 ## 4. Chooser
 
+`omnirun offers` probes and ranks — display only, no submission.  Actual
+placement is done by the scheduler tick inside `Control` (§10).
+
 1. Probe all enabled backends in parallel (timeout 10s each).
 2. Partition offers: fit / unfit.
 3. Score fitting offers. Default policy (configurable weights):
    - `total_cost = hourly × est_time` (0 for free backends)
    - `time_to_result = wait_estimate + est_time`
-   - **Auto-pick** iff a free offer has `wait < auto_wait_threshold` (default 15m),
-     or exactly one offer fits, or `--yes` with a `--max-cost`.
-   - Otherwise render the table (rich): backend, GPU, $/hr, est. total $, est. wait,
-     time-to-result, notes — user picks by number. `--yes` picks the top-ranked.
+   - The old interactive offer-pick UI (`--yes` required) is gone; `submit` now
+     always routes through the scheduler and auto-places. `omnirun offers` still
+     prints the table so you can inspect options before committing.
 
 Wait estimation is honest about uncertainty. Slurm: `sinfo` idle-node check
 ("likely immediate") → `sbatch --test-only` pre-submit estimate + script validation
@@ -436,49 +438,229 @@ the legacy `$OMNIRUN_STATE_DIR/jobs/*/meta.json`, `facts/*.json`, `queue/*.json`
 `wait_history.json` files, tolerating `schema_version` 0 and 1, and upserts them into
 the SQL store. `omnirun state path` prints the active database URL.
 
-## 10. Queue & scheduler daemon (optional)
+## 10. Scheduler — Provider seam, pure tick, budget/deadline
 
-Direct `submit` stays daemonless. For fan-out — many jobs, or spreading a batch across
-backends with per-backend concurrency caps — an *optional* long-lived scheduler is
-available (`daemon.py`, `queue.py`). It changes nothing about how a job runs; it just
-decides *when* and *where*, then calls the same `Backend.submit`.
+### Provider seam
 
-- **`omnirun serve`** runs the daemon in the foreground: a localhost TCP socket (default
-  `127.0.0.1:8787`), newline-delimited JSON request/response, plus a scheduler thread
-  ticking every `poll_interval_s` (default 10s). It owns a durable queue persisted via
-  the SQL `Store`; a restart re-reads and resumes.
-- **Scheduler tick** (under a lock): refresh RUNNING entries against their backend, then
-  place PENDING ones. Placement reserves a backend slot *synchronously*
-  (`reserve_entry` in one atomic transaction, state → PLACING, so concurrent placements
-  can't double-book — see §9) before dispatching the blocking `submit` on a thread pool;
-  it backfills as jobs complete, and retries a failed submit up to 3 attempts before
-  marking it FAILED. Each backend's `max_parallel` caps its concurrent non-terminal
-  jobs — per-partition Slurm limits = one backend section per partition, each capped.
-- **Entry lifecycle**: PENDING → PLACING → RUNNING → SUCCEEDED / FAILED / CANCELLED.
-- **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...` (same resource flags as
-  `submit`), `queue` (show the table), `queue --wait` (poll until all terminal),
-  `queue --cancel <qid|all>`; the socket also speaks `ping` / `list` / `shutdown`.
-- **Placement is greedy** — it favors the fastest-freeing backend via the same
-  `chooser.rank`, with a short offer cache so a batch of identical jobs doesn't re-probe
-  every tick. Assignment/least-loaded fairness and warm-worker reuse (every placement is
-  today a cold one-shot `submit`) are deferred refinements, not yet built.
+Between the pure `tick` and the eight concrete `Backend` implementations sits a
+thin protocol layer (`providers/`):
 
-## 11. CLI
+```python
+class Provider(Protocol):
+    name: str
+    def discover(self) -> ProviderFacts: ...
+    def offer(self, req: ResourceSpec) -> list[Slot]: ...
+    def place(self, rec: JobRecord, slot: Slot) -> Placement: ...
+    def poll(self, p: Placement) -> Status: ...
+    def cancel(self, p: Placement, mode: CancelMode) -> None: ...
+    def stream_logs(self, p: Placement) -> Iterator[str]: ...
+    def collect_outputs(self, p: Placement, dest: Path) -> None: ...
+    def gc(self) -> None: ...
+```
+
+`CancelMode` has two values: `GRACEFUL` (ask the job to stop cleanly) and `FORCE`
+(tear it down immediately). Phase 3's `BackendProvider` treats both as a
+best-effort delegate to `Backend.cancel`; the graceful→force distinction is
+deepened in Phase 4.
+
+`BackendProvider` (`providers/adapter.py`) is the **one bridge** from this seam to
+today's eight `Backend` implementations — it wraps a single `Backend` + a shared
+`Store` and adapts `Backend.probe` into `Slot`s and `Backend.submit` into
+`place`. No backend rewrite was needed; `BackendProvider` is the tractability
+hinge.
+
+**At-least-once seam.** The `place`/persist boundary is at-least-once: if the
+process dies between a successful `provider.place` and the `RUNNING` `save_job`,
+the first launch becomes an orphan and a later tick relaunches. Closing this
+to exactly-once (the `on_provisioning` stub for orphan-recovery) is deferred to
+**Phase 4**. A client crash mid-place may therefore leak a marketplace instance.
+`submit`'s own-failure path and the common daemonless case are unaffected.
+
+### Pure tick: `(jobs, slots, ledger, now) -> decisions`
+
+`scheduler.tick` is a **pure function** — no I/O, `now` is a parameter (making
+it deterministic and testable), no wall-clock, no backend names, imports only
+`models` and `budget`. Fit is decided solely by
+`slot.capabilities.satisfies(req)`.
+
+```python
+def tick(
+    jobs: list[JobRecord],
+    slots: list[Slot],
+    ledger: BudgetLedger,
+    now: datetime,
+    *,
+    policy: SchedPolicy | None = None,
+) -> list[Decision]:
+```
+
+**Per-tick match order (for each pending job, priority+urgency ranked):**
+
+1. *Admit/HELD* — if slots exist and none of their capabilities can ever
+   satisfy the resource request, the job is HELD (not queued) so the tick
+   reports the reason. With no slots we can't prove impossibility, so the
+   job stays QUEUED.
+2. *4a: free-first* — best free slot (smallest `wait_s`) that meets the
+   `finish_by` deadline.
+3. *4b: last-responsible-moment paid escalation* — if no free slot met the
+   deadline, pick the cheapest affordable paid slot that does, checked
+   against a LOCAL working ledger (this tick's prior paid commitments
+   count, so the total paid in one tick never exceeds the cap).
+4. *4c: run-late liveness* — if neither 4a nor 4b worked (no slot can meet
+   the deadline), place on the best FREE slot IGNORING the deadline.
+   **A job is never refused for cost** — it waits for free capacity.
+
+`SchedPolicy.allow_paid = False` skips step 4b; the job runs free or waits.
+
+### Budget ledger and per-job policy
+
+`JobPolicy` (carried in `JobSpec.policy`) holds:
+- `deadline: Deadline | None` — optional `start_by` and/or `finish_by` (UTC).
+- `max_cost: float | None` — **per-job USD ceiling** for a single placement.
+  **Breaking change from the old chooser flag:** `--max-cost` is now a
+  per-job total cost ceiling (works best with `--time` to bound the estimate),
+  NOT a filter that drops offers above a cost threshold. Existing uses of
+  `--max-cost` as a coarse filter should be migrated to per-backend
+  `max_hourly` in the config.
+- `priority: int` — higher = scheduled sooner; reprioritizable live via
+  `omnirun reprioritize`.
+
+**Budget ledger** (`budget.py`, `BudgetLedger`): pure, immutable, two kinds of
+entries — `committed` (at placement) and `spent` (at completion). Two calendar-
+aligned windows:
+- `"day"` — entries where `entry.at.date() == now.date()` (UTC).
+- `"week"` — entries in the same ISO year+week.
+
+**BOTH windows are enforced simultaneously** (one wallet, two gates):
+
+- The **daily cap** is the tick's primary window: `ledger.can_afford(cost, now)`
+  gates paid escalation in step 4b.
+- The **weekly cap** is enforced alongside by `Control._enact_place`: before
+  reserving, if the weekly ledger cannot afford the estimate, the place is
+  skipped (job stays QUEUED, retries a later tick / next week).
+
+A paid job is blocked if it cannot afford EITHER window; it runs free/late
+instead (liveness: a job is delayed, never permanently failed). `omnirun budget
+--daily $D --weekly $W` sets both caps; `omnirun budget` (no flags) shows
+`spent` and `cap` for each window.
+
+### The impure `Control` driver
+
+`Control` (`control.py`) is `tick`'s impure counterpart — it does all the I/O
+that `tick` cannot:
+
+```
+run_tick(now):
+  1. reconcile: poll each PLACING/RUNNING job's provider → update job state
+     (terminal → realize budget; LOST → requeue with attempts+1)
+  2. gather slots: ask each provider.offer() for every distinct pending req
+  3. load ledger: Store.load_ledger(window, cap, now)
+  4. tick: pure function → decisions
+  5. enact: for each decision:
+       hold  → save HELD
+       place → Store.reserve (atomic, #12 guard) → PLACING stub →
+               provider.place → commit budget → save RUNNING
+```
+
+`Store.reserve` (the §9 `reserve_entry` guard) flips QUEUED/HELD → PLACING
+and writes a stub `Placement` in ONE transaction — only one concurrent tick
+can win the race; the other sees the state already PLACING and skips it.
+
+**Daemonless vs daemon — one tick everywhere.** Direct `omnirun submit` stores
+the spec QUEUED and runs exactly ONE synchronous tick; no background process is
+required (a placed job then runs on the backend while the laptop is off).
+`omnirun serve` runs the same `Control.run_tick` on a background thread every
+`poll_interval_s` (default 10 s). The tick logic is identical; only the cadence
+differs.
+
+### The 8 correctness invariants (`tests/test_scheduler_invariants.py`)
+
+A Hypothesis `RuleBasedStateMachine` drives the real `Control` + SQLite `Store`
++ deterministic `FlakyProvider` doubles through random interleavings of
+`submit / run_tick / provider_responds / provider_fails / cancel / advance_time`,
+asserting all eight invariants after EVERY step:
+
+1. **budget_safety** — committed+spent ≤ cap; per-job ≤ `max_cost`; free
+   slots cost 0.
+2. **admission_soundness** — every live placement's provider can satisfy the
+   resource request (§8 hit-guard).
+3. **concurrency_safety** — non-terminal placements per provider ≤ its
+   `max_parallel` cap (the §9 `Store.reserve` atomic guard).
+4. **liveness_no_silent_loss** — a non-cancelled job is always in a live or
+   terminal state (reconcile requeues LOST, no silent drops).
+5. **cancellation_completeness** — a cancelled job has zero live placements
+   and is never re-placed by a later tick (§7).
+6. **deadline_defense** — no paid placement while a fitting free slot met the
+   deadline (4a takes priority over 4b).
+7. **crash_isolation** — a failing provider never crashes the tick nor blocks
+   healthy providers.
+8. **tick_convergence** — a second identical tick creates no new placements
+   (idempotency).
+
+**At-least-once caveat (I2 note):** assertions are store-level only (job states,
+ledger totals, `count_active_jobs ≤ cap`). The fakes do not model backend
+instances, so "exactly one live backend instance per job" is NOT asserted —
+that property is knowingly false across a `place`-failure boundary until
+Phase 4's orphan-recovery lands.
+
+## 11. Queue & scheduler daemon (optional)
+
+Direct `submit` stays daemonless (§10). For fan-out — many jobs, or spreading a
+batch across backends with per-backend concurrency caps — an *optional*
+long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
+`Control.run_tick` as the daemonless path.
+
+- **`omnirun serve`** runs the daemon in the foreground: a localhost TCP socket
+  (default `127.0.0.1:8787`), newline-delimited JSON request/response, plus a
+  scheduler thread ticking every `poll_interval_s` (default 10s). It owns a
+  durable queue persisted via the SQL `Store`; a restart re-reads and resumes.
+- **Scheduler tick** (§10): reconcile → gather slots → load ledger → pure tick
+  → enact. Placement reserves a backend slot atomically (§9 guard, state →
+  PLACING) before dispatching `provider.place` on a thread pool; it backfills
+  as jobs complete. Each backend's `max_parallel` caps its concurrent
+  non-terminal jobs.
+- **Job lifecycle**: QUEUED → (HELD) → PLACING → RUNNING → SUCCEEDED / FAILED /
+  CANCELLED.
+- **Commands**: `enqueue [--count N] [--backend NAME] [--finish-by T] [--start-by T]
+  [--priority N] [--max-cost $] -- CMD...`, `queue` (show the table),
+  `queue --wait` (poll until all terminal), `queue --cancel <qid|all>`; the
+  socket also speaks `ping` / `list` / `shutdown`.
+- **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
+  Assignment/least-loaded fairness and warm-worker reuse (every placement is
+  still a cold one-shot `provider.place`) are deferred refinements.
+
+## 12. CLI
 
 ```
 omnirun submit [--name N] [--gpus 1] [--gpu-type H100 | --vram 40] [--time 15h]
-               [--backend uni] [--yes] [--max-cost 30] [--push] -- python train.py ...
+               [--backend uni] [--yes] [--max-cost 30] [--priority 1]
+               [--finish-by 2026-07-12T18:00 | +8h] [--start-by +2h]
+               [--push] -- python train.py ...
 omnirun offers [same resource flags]      # probe & table, no submit
 omnirun ps                                # all known jobs, refreshed statuses
 omnirun status <job> | logs [-f] <job> | cancel <job> | pull <job> [dest]
+omnirun reprioritize <job> [--priority N] [--finish-by T] [--start-by T]
+                           [--allow-paid | --free-only]
+omnirun budget [--daily $D] [--weekly $W]  # set caps; bare 'budget' shows spend
 omnirun backends check                    # config + connectivity sanity per backend
+omnirun backends discover                 # probe live capability/health; cache facts
 omnirun gc                                # reap finished job dirs, leaked instances
-omnirun serve [--host H] [--port P]       # run the scheduler daemon (optional, §9)
-omnirun enqueue [resource flags] [--count N] [--backend NAME] -- CMD...  # queue a job
+omnirun serve [--host H] [--port P]       # run the scheduler daemon (optional, §11)
+omnirun enqueue [resource+policy flags] [--count N] [--backend NAME] -- CMD...
 omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemon queue
 ```
 
-## 12. Implementation notes
+`--yes` is accepted for backward compatibility but has no effect: `submit` now always
+routes through the scheduler and auto-places.
+
+**`--max-cost` meaning change.** `--max-cost` is now the **per-job USD ceiling**
+for the scheduler's paid escalation (§10). With `--time` it bounds the estimated
+total; without it the ceiling applies to runs with unknown cost. This is NOT the
+old chooser cost-filter that dropped offers above a $/hr threshold — existing
+scripts that used `--max-cost` as a filter should move to per-backend `max_hourly`
+in the config.
+
+## 13. Implementation notes
 
 - Python ≥3.12, deps: `typer`, `rich`, `httpx`, `pydantic`, `kaggle` (thin API
   client), `google-colab-cli` (optional extra). Marketplaces via plain REST
@@ -506,16 +688,23 @@ omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemo
   ```
   src/omnirun/
     models.py      # JobSpec, ResourceSpec, EnvSpec/EnvKind (auto|uv|pip|conda|system|none),
-                   # Offer, JobStatus, JobHandle
+                   # Offer, JobStatus, JobHandle, JobState, Placement, Slot,
+                   # Cost, Availability, Deadline, JobPolicy, Decision
     config.py      # TOML load, backend registry (project_root, gpu_map, max_parallel),
-                   # PolicyConfig, DaemonConfig
+                   # PolicyConfig, DaemonConfig, BudgetConfig
     repo.py        # git state, clean/pushed checks, RepoRef, env_file, bundle creation,
                    # remote_clone_plan/worker_clone_url/remote_is_public (public-repo direct clone)
     bootstrap.py   # bootstrap.sh generation (shared payload), notebook_env_spec
-    store.py       # $OMNIRUN_STATE_DIR/jobs/<id>/meta.json
-    queue.py       # durable QueueStore/QueueEntry backing the scheduler
+    budget.py      # pure BudgetLedger (committed/spent, day/week windows, can_afford)
+    scheduler.py   # pure tick(jobs, slots, ledger, now) -> decisions; SchedPolicy
+    control.py     # impure Control driver: reconcile → gather → tick → enact; reprioritize; budget
+    providers/     # base.py (Provider protocol, CancelMode),
+                   # adapter.py (BackendProvider: Backend+Store → Provider seam)
+    state/         # store.py (Store, open_store, reserve, ledger_add/realize),
+                   # schema.py, migrate.py
+    queue.py       # durable QueueStore/QueueEntry backing the daemon
     daemon.py      # optional localhost scheduler daemon (serve/enqueue/queue)
-    chooser.py     # parallel probing, ranking, offer table
+    chooser.py     # parallel probing, ranking, offer table (display; tick does placement)
     execlayer/     # base.py (Exec protocol), local.py, ssh.py (ControlMaster, login_shell)
     backends/      # base.py, jobdir.py (shared job-dir/project-root/push/.env/status
                    # helpers), local.py, ssh.py, slurm.py, kaggle.py, colab.py,
@@ -523,14 +712,17 @@ omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemo
                    # vast.py, thunder.py
     cli.py         # typer app
   ```
-- Testing tiers: (1) pure unit (codegen, ranking, repo state); (2) e2e through
-  `local` backend — full submit→run→pull without network; (3) dockerized sshd and
-  slurm cluster integration tests, opt-in; (4) live backends — needs user creds.
+- Testing tiers: (1) pure unit (codegen, ranking, repo state, scheduler tick,
+  budget ledger); (2) Hypothesis stateful invariant suite (`tests/test_scheduler_invariants.py`,
+  8 invariants over real Control + SQLite Store + Fake/Flaky providers); (3) e2e through
+  `local` backend — full submit→run→pull without network; (4) dockerized sshd and
+  slurm cluster integration tests, opt-in; (5) live backends — needs user creds.
 
-## 13. Non-goals
+## 14. Non-goals
 
 Still out of scope: data syncing, artifact versioning, DAGs/pipelines, multi-node jobs,
 spot-preemption recovery, image building, a web UI. Cross-backend queueing is **no longer**
-a non-goal — the optional scheduler daemon (§9) provides it. Placement fairness
-(least-loaded/assignment rather than greedy) and warm-worker reuse are *planned but not yet
-built*, not non-goals.
+a non-goal — the scheduler daemon (§11) provides it, running the same `Control.run_tick`.
+Placement fairness (least-loaded/assignment rather than greedy) and warm-worker reuse
+are *planned but not yet built*, not non-goals. Exact-once marketplace orphan-recovery
+(the `on_provisioning` stub) is Phase 4.

@@ -5,20 +5,11 @@ university Slurm cluster over SSH, any box you can ssh into, Kaggle, Colab, or a
 auto-provisioned marketplace GPU (RunPod / Vast.ai / Thunder Compute). One
 `submit` pins the exact commit, ships it to the worker, builds the Python env
 from your lockfiles (uv / micromamba), runs the command, and collects outputs —
-after showing you a cost-vs-wait offer table so you can pick "free but queued"
-over "$2.79/hr right now" (or let it auto-pick).
+the scheduler automatically picks the cheapest/fastest option that fits your
+deadline and budget.
 
 ```console
 $ omnirun submit --gpus 1 --gpu-type A100 --time 4h -- python train.py --epochs 50
-
-  #  offer                                    $/hr    est. total  wait          notes
-  1  uni: gpu partition (1x A100)             free    -           idle nodes available
-  2  thunder: a100xl $1.09/hr                 1.09    $4.36       ~2-3 min      virtualized GPU-over-TCP…
-  3  vast: A100_SXM4 x1 $1.21/hr (Iceland)    1.21    $4.84       ~2-3 min      offers churn…
-  4  runpod: NVIDIA A100 80GB PCIe (SECURE)   1.64    $6.56       ~2-3 min
-  (kaggle: unfit — A100 requires Colab-Pro-linked account)
-
-pick an offer # 1
 submitted train-a3f9c1 -> uni: gpu partition (1x A100)
 follow logs with: omnirun logs -f train-a3f9c1
 
@@ -27,6 +18,19 @@ epoch 1/50 loss=2.31 ...
 
 $ omnirun pull train-a3f9c1
 pulled 3 path(s) to omnirun-outputs/train-a3f9c1
+```
+
+`omnirun offers` shows the full ranked table without submitting — useful before
+you commit:
+
+```console
+$ omnirun offers --gpus 1 --gpu-type A100 --time 4h
+  #  offer                                    $/hr    est. total  wait          notes
+  1  uni: gpu partition (1x A100)             free    -           idle nodes available
+  2  thunder: a100xl $1.09/hr                 1.09    $4.36       ~2-3 min      virtualized GPU-over-TCP…
+  3  vast: A100_SXM4 x1 $1.21/hr (Iceland)    1.21    $4.84       ~2-3 min      offers churn…
+  4  runpod: NVIDIA A100 80GB PCIe (SECURE)   1.64    $6.56       ~2-3 min
+  (kaggle: unfit — A100 requires Colab-Pro-linked account)
 ```
 
 ## How it works
@@ -57,6 +61,12 @@ on the worker:
    on exit;
 5. collect your `outputs` globs into the per-job dir (`jobs/<job_id>/`, which
    holds only logs, outputs, and `result.json`) for `omnirun pull`.
+
+**Placement is automatic.** `submit` runs a synchronous scheduler tick that
+probes backends, picks the cheapest/fastest fitting option (free first; paid only
+if the deadline requires it and your budget allows), and places the job — all in
+one command. No manual offer-picking. `omnirun offers` remains the way to inspect
+the option table before committing.
 
 The direct `omnirun submit` path is **daemonless and has no control plane**.
 Client state lives in a SQLite database at
@@ -264,7 +274,7 @@ Global: `omnirun --config PATH <command>` (default config: `$OMNIRUN_CONFIG` or
 `~/.config/omnirun/config.toml`). Every command that takes a job accepts a
 unique id prefix.
 
-**`omnirun submit [OPTIONS] -- COMMAND...`** — probe, pick an offer, run.
+**`omnirun submit [OPTIONS] -- COMMAND...`** — let the scheduler pick and place.
 
 | option | meaning |
 |---|---|
@@ -277,22 +287,52 @@ unique id prefix.
 | `--outputs GLOB` | output glob relative to repo root (repeatable) |
 | `--env K=V` | env var forwarded to the job (repeatable) |
 | `--backend NAME` | restrict to one configured backend |
-| `--yes`, `-y` | don't ask; take the top-ranked offer |
-| `--max-cost $` | drop offers whose estimated total cost exceeds this |
+| `--priority N` | higher = scheduled sooner (default 0); reprioritizable later |
+| `--finish-by T` | deadline: ISO-8601 (`2026-07-12T18:00`) or relative (`+8h`, `+2d`) |
+| `--start-by T` | latest acceptable start time (same format as `--finish-by`) |
+| `--max-cost $` | **per-job USD ceiling** — the scheduler won't spend more than this on a single paid placement (works best with `--time`; see note below) |
 | `--push` | auto-push an unpushed HEAD to origin |
+| `--yes`, `-y` | accepted for backward compatibility; placement is now always automatic |
 | `--dry-run` | print the rendered payload (Slurm: full sbatch script) and exit |
 
+> **`--max-cost` change from earlier versions.** This flag is now a per-job
+> total-USD ceiling for paid placement — the scheduler won't escalate to a paid
+> slot whose estimated cost exceeds this value. It is NOT the old chooser
+> cost-filter that dropped offers above a $/hr threshold. To cap by hourly rate,
+> use per-backend `max_hourly` in `config.toml` instead.
+
 **`omnirun offers [resource flags] [--backend NAME]`** — probe and print the
-offer table without submitting (same resource flags as `submit`).
+offer table without submitting (same resource flags as `submit`, minus policy
+flags). Use this to inspect options before committing.
+
+**`omnirun reprioritize <job> [OPTIONS]`** — change a queued or running job's
+scheduling policy without resubmitting.
+
+| option | meaning |
+|---|---|
+| `--priority N` | new priority tier (higher = scheduled sooner) |
+| `--finish-by T` | new finish-by deadline |
+| `--start-by T` | new start-by deadline |
+| `--allow-paid` / `--free-only` | allow paid placement (within budget) or restrict to free offers only |
+
+**`omnirun budget [--daily $D] [--weekly $W]`** — set or view the global spend
+caps. Passing flags sets the cap(s); bare `omnirun budget` shows current spend
+vs cap for both windows.
+
+Both the daily cap and the weekly cap are **actively enforced** — the scheduler
+gates paid escalation against BOTH windows on every tick, not just the primary
+one. A job whose paid cost would exceed either window's remaining budget runs
+free (or waits for free capacity) instead.
 
 **`omnirun serve [--host H] [--port P]`** — run the optional scheduler daemon in
 the foreground (background it yourself). Listens on a localhost TCP socket
 (default `127.0.0.1:8787`, overridable in config or with these flags).
 
-**`omnirun enqueue [OPTIONS] --count N -- COMMAND...`** — hand a job to the
-running daemon's queue. Takes all of `submit`'s resource flags (`--gpus`,
-`--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`, `--outputs`,
-`--env`, `--push`) plus `--count N` (enqueue N copies) and
+**`omnirun enqueue [OPTIONS] [--count N] -- COMMAND...`** — hand a job to the
+running daemon's queue. Takes all of `submit`'s resource and policy flags
+(`--gpus`, `--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`,
+`--outputs`, `--env`, `--push`, `--priority`, `--finish-by`, `--start-by`,
+`--max-cost`) plus `--count N` (enqueue N copies) and
 `--backend NAME` (restrict placement to one backend).
 
 **`omnirun queue [--wait] [--cancel QID|all]`** — show the daemon's queue;
@@ -321,6 +361,10 @@ them LOST.
 **`omnirun backends check [NAME]`** — config + connectivity sanity check per
 backend. For SSH/Slurm this establishes the ControlMaster session
 interactively, so 2FA prompts happen here, once.
+
+**`omnirun backends discover [NAME]`** — probe each backend's live capabilities
+and health facts and cache them in the store (TTL-based; used by the scheduler
+for admission).
 
 **`omnirun config-path`** — print the resolved config path and whether it exists.
 
