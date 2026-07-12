@@ -116,6 +116,36 @@ omnirun status <job-id>        # CANCELLED; no leftover process
       path is unit-tested against respx, live run still pending.
 - [ ] Kaggle `logs -f` honesty note — verified in unit tests; live run pending.
 
+### Phase 5 — central daemon + thin clients + VPS staging
+
+Unit/fake-verified (no network, in CI):
+- [x] Remote lifecycle commands (`submit`/`ps`/`status`/`cancel_job`/`reprioritize`/
+      `budget`/`stage`/streaming `logs`) over a real `Daemon` on a loopback port.
+- [x] VPS staging **receive**: `repo.bundle_blob`/`env_blob` + `staging.write_stage` +
+      the `stage` command round-trip (bundle+`.env` decoded under `staging/<sha12>/` on
+      the daemon; a public sha records URL only); the `staging_max_bytes` guard rejects
+      an oversized bundle.
+- [x] `LogMux` ring replay + bounding; daemon `logs` fan-out to multiple followers.
+- [x] I1 `reserved_at` lease: a fresh empty-handle PLACING is kept, a stale one reverts.
+- [x] CLI `[daemon] remote = true` routes ps/status/cancel/reprioritize/budget/logs and
+      stages on submit/enqueue; `remote = false` is byte-for-byte the Tier-0 path.
+
+Known code gap — NOT built (remaining Tier-2 wiring, not merely un-live-tested):
+- [ ] **Daemon place-path consumption of the staged bundle.** The `stage` command stores
+      the bundle + `.env` under `staging/<sha12>/`, but the daemon's place path
+      (`jobdir.stage_job` → `repo.local_root_of`) does not read it back, so a remote
+      **private/unpushed** `submit` stages code the backend never receives. Public-repo
+      remote submit is unaffected (the worker clones directly). Fix: make the place path
+      prefer `staging/<sha12>/bundle.git` when `local_root_of` isn't a valid checkout.
+      Follow-up PR, live-tested.
+
+Live, infra-gated (needs real VPS + Postgres — not yet run):
+- [ ] Real VPS + Postgres end-to-end: `omnirun serve` on the VPS, thin clients from two
+      laptops, a **public**-repo `submit` placed VPS→backend, global budget enforced
+      across clients, `logs -f` fanned to two followers. The **private**-repo VPS→backend
+      case is additionally blocked on the consumption gap above. Needs a VPS and a Postgres
+      instance — not yet run.
+
 ### Personal SSH box — UNVERIFIED (no box available)
 
 Not run live — the user has no personal SSH box. Kept as an example; the ssh

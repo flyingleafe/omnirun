@@ -129,6 +129,42 @@ failed placement (up to 3 attempts) on another backend before giving up.
 Minimizing provisioning cost by reusing warm workers is a planned next phase,
 not yet implemented — every placement is still a plain one-shot `submit`.
 
+### Central daemon (Tier-2, optional)
+
+Run one daemon on a box you control (a VPS, Postgres-backed) and point laptops at it
+as thin clients:
+
+```toml
+# on the VPS: run `omnirun serve` with a Postgres state url
+[state]
+url = "postgresql+psycopg://user:pw@localhost/omnirun"
+[daemon]
+host = "0.0.0.0"   # bind (put real auth / a tunnel in front of it)
+port = 8787
+
+# on each laptop:
+[daemon]
+remote = true
+host = "your.vps.example"
+port = 8787
+```
+
+Now `omnirun submit`/`ps`/`status`/`logs -f`/`cancel`/`reprioritize`/`budget` route to
+the shared daemon — one global queue, one budget, backend knowledge in one place,
+reprioritize from anywhere.
+
+**Trust boundary.** Origin git credentials never leave your laptop. A **public** repo
+stages nothing — the worker clones it directly. For a **private/unpushed** commit the
+client stages a `git bundle` of the exact sha plus any gitignored `.env` into the daemon
+host over the socket, so code + secrets are entrusted to the daemon host you run — run it
+somewhere you trust.
+
+**Status.** Remote lifecycle commands (`ps`/`status`/`logs -f`/`cancel`/`reprioritize`/
+`budget`) and remote **public**-repo `submit` work today. Remote **private/unpushed**
+`submit` is not yet complete: the client stages the code to the daemon, but the daemon's
+placement path does not yet read that staged bundle back — so the backend never receives
+the private code. That last wiring is a tracked follow-up.
+
 ## Install
 
 On [PyPI](https://pypi.org/project/omnirun/):

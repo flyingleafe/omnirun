@@ -298,6 +298,10 @@ Worker access to private repos — **no git credentials ever leave the laptop**:
   still never touch origin from the worker. What changed is that public-repo workers now
   *do* reach the (anonymous) origin directly, by design.
 
+> Tier-2 (Phase 5, §11) softens this: origin git credentials still never leave the
+> laptop, but a remote daemon is entrusted with the code (a `git bundle`) and the
+> gitignored `.env`, staged to the daemon host over the Control socket. See §11.
+
 **Uncommitted secrets** (`.env`): if `<repo-root>/.env` exists *and is gitignored*, it is
 shipped out-of-band to the worker's job dir and sourced/exported into the job environment
 before the command runs — never written into the shared tree, never committed into the
@@ -653,6 +657,47 @@ long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
 - **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
   Assignment/least-loaded fairness and warm-worker reuse (every placement is
   still a cold one-shot `provider.place`) are deferred refinements.
+
+**Tier-2 realized (Phase 5).** A thin client sets `[daemon] remote = true` (+ `host`/
+`port`); its lifecycle commands (`submit`/`ps`/`status`/`logs`/`cancel`/`reprioritize`/
+`budget`) route to the daemon over the SAME newline-JSON/TCP Control socket the Tier-1
+daemon already speaks (transport reused, not HTTP). New socket commands mirror
+`Control`: `submit`, `ps`, `status`, `cancel_job` (job id + `force`), `reprioritize`,
+`budget`, `stage`, and a STREAMING `logs` (one JSON message per line). The daemon runs
+on Postgres; the client holds no state.
+
+**Trust boundary (softened, spec §10).** With deferred placement the laptop may be
+offline when the daemon places a job, so at enqueue time the client STAGES into the
+daemon host: a private/unpushed sha travels as a base64 `git bundle` and the gitignored
+`.env` as its own base64 blob, sent over the Control socket (`stage`) and decoded into
+`$state_root/staging/<sha12>/` on the daemon; a PUBLIC repo stages nothing — only its
+clone URL is sent and the worker clones directly. A `staging_max_bytes` guard bounds the
+bundle (code-sized repos only; data is never staged). The invariant softens from
+*"secrets never leave the laptop"* to **"origin git credentials never leave the laptop;
+code + secrets are entrusted only to the daemon host you run."**
+
+**Status — staging RECEIVE is built; place-path CONSUME is not (known gap).** The
+client→daemon half above (compute blobs, `stage`, decode under `staging/<sha12>/`) is
+implemented and unit/fake-tested. The daemon's *place* path, however, does NOT yet read
+the staged bundle back: `jobdir.stage_job` resolves the repo via `repo.local_root_of`,
+which points at the client's captured path / the daemon's cwd — not
+`staging/<sha12>/bundle.git`. So a remote **public**-repo submit works end-to-end (direct
+clone), but a remote **private/unpushed** submit stages code the backend never receives.
+Remote lifecycle/monitoring (`ps`/`status`/`logs -f`/`cancel`/`reprioritize`/`budget`)
+of already-placed jobs is unaffected. Wiring the place path to prefer
+`staging/<sha12>/bundle.git` when `local_root_of` isn't a valid checkout is the remaining
+Tier-2 task — a follow-up PR, live-tested.
+
+**Concurrency (I1 lease).** `Store.reserve` stamps `reserved_at` on the stub placement;
+`Control._reconcile` reclaims an empty-handle PLACING only once that reservation ages past
+`RESERVE_LEASE_S`, so an in-flight `place` from an overlapping tick (two machines, or a
+daemon tick racing a manual submit) is never reverted and relaunched — closing the
+concurrent-tick double-launch race.
+
+**Log multiplexing.** The daemon owns a `LogMux`: one provider `stream_logs` per job
+feeds a bounded ring; each `logs -f` follower replays the ring on join then receives live
+lines, and a follower's disconnect drops it without disturbing the producer or peers.
+Tier-0 `logs -f` still tails the provider stream directly (no mux).
 
 ## 12. CLI
 
