@@ -100,9 +100,19 @@ class BudgetConfig(BaseModel):
 
 
 class DaemonConfig(BaseModel):
-    host: str = "127.0.0.1"  # localhost socket; bind 0.0.0.0 + auth to go remote
+    host: str = "127.0.0.1"  # bind host for `serve`; dial host for a thin client
     port: int = 8787
-    poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
+    poll_interval_s: float = 10.0  # scheduler tick cadence
+    # Tier-2: when true, this machine is a THIN CLIENT — lifecycle commands
+    # (submit/ps/status/logs/cancel/pull/reprioritize/budget) route to the daemon
+    # at host:port over the Control socket instead of the local SQL Store. When
+    # false (default) the CLI is daemonless (Tier-0) / a local daemon is reached
+    # via daemon.json as today (Tier-1). Set on the laptops, not the VPS.
+    remote: bool = False
+    # Cap on a single staged git-bundle blob (bytes, decoded). Bounds a `stage`
+    # socket message so a client cannot push an unbounded artifact; code-sized
+    # repos fit easily (data is never staged — jobs fetch their own).
+    staging_max_bytes: int = 20 * 1024 * 1024
 
 
 class StateConfig(BaseModel):

@@ -18,6 +18,7 @@ so the pure driver's concurrent-tick caveats never bite.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from typing import Any, Callable
 
 from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
+from omnirun.staging import StageRef, write_stage
 from omnirun.control import Control
 from omnirun.models import (
     JobRecord,
@@ -303,6 +305,7 @@ class Daemon:
             "list": self._cmd_list,
             "cancel": self._cmd_cancel,
             "shutdown": self._cmd_shutdown,
+            "stage": self._cmd_stage,
         }.get(cmd or "")
         if handler is None:
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
@@ -369,6 +372,42 @@ class Daemon:
     def _cmd_shutdown(self, _req: dict[str, Any]) -> dict[str, Any]:
         self._stop.set()
         return {"ok": True}
+
+    def _cmd_stage(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Receive a client's staged code+secrets (spec §10 trust boundary).
+
+        Decodes the base64 ``git bundle`` (private/unpushed sha) and ``.env`` blob
+        into the daemon's per-sha staging dir; a public sha carries only a
+        ``clone_url`` (nothing lands on disk). Size-guarded so one socket message
+        cannot push an unbounded artifact. Idempotent by sha.
+        """
+        sha = req.get("sha")
+        if not isinstance(sha, str) or not sha:
+            return {"ok": False, "error": "stage requires a non-empty sha"}
+        bundle_b64 = req.get("bundle_b64")
+        env_b64 = req.get("env_b64")
+        clone_url = req.get("clone_url")
+        cap = self.cfg.daemon.staging_max_bytes
+        if isinstance(bundle_b64, str):
+            size = len(base64.b64decode(bundle_b64))
+            if size > cap:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"staged bundle is {size} bytes, over staging_max_bytes "
+                        f"({cap}) — push the sha to a public remote so the worker "
+                        "clones it, or raise [daemon] staging_max_bytes"
+                    ),
+                }
+        with self._lock:
+            ref: StageRef = write_stage(
+                self.state_root,
+                sha,
+                bundle_b64=bundle_b64 if isinstance(bundle_b64, str) else None,
+                env_b64=env_b64 if isinstance(env_b64, str) else None,
+                clone_url=clone_url if isinstance(clone_url, str) else None,
+            )
+        return {"ok": True, "stage": ref.model_dump(mode="json")}
 
     # --- scheduler --------------------------------------------------------
 
