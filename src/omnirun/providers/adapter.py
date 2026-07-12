@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from omnirun.backends.base import Backend
+from omnirun.backends.base import Backend, ProvisioningSink
 from omnirun.models import (
     Availability,
     Capabilities,
@@ -103,6 +103,25 @@ class BackendProvider:
             )
         return slots
 
+    def _persist_partial(self, rec: JobRecord) -> ProvisioningSink:
+        """A sink that records a partial (provisioning) handle onto *rec*'s live
+        PLACING placement and persists it BEFORE submit returns.
+
+        Closes the at-least-once orphan window (I2): if the process dies between a
+        successful ``Backend.submit`` internal rent and the RUNNING save, the job's
+        placement already carries the billable handle, so ``Control._reconcile``
+        adopts (re-polls) it instead of reverting to QUEUED and relaunching.
+        """
+
+        def sink(partial: JobHandle) -> None:
+            current = self._store.load_job(rec.spec.job_id)
+            if current is None or current.placement is None:
+                return
+            updated = current.placement.model_copy(update={"handle": partial.data})
+            self._store.save_job(current.model_copy(update={"placement": updated}))
+
+        return sink
+
     def place(self, rec: JobRecord, slot: Slot) -> Placement:
         """Submit *rec* onto *slot* and return the resulting ``Placement``.
 
@@ -116,7 +135,9 @@ class BackendProvider:
         reconcile poll.  STARTING never triggers a requeue.
         """
         offer = Offer.model_validate(slot.provider_ref["offer"])
-        handle = self._backend.submit(rec.spec, offer)
+        handle = self._backend.submit(
+            rec.spec, offer, on_provisioning=self._persist_partial(rec)
+        )
         links: list[Link] = []
         for key, value in handle.data.items():
             if isinstance(value, str) and any(

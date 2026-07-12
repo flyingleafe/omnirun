@@ -365,18 +365,23 @@ class Control:
             placement = rec.placement
             if placement is None:
                 continue
-            # Crash isolation: reserve wrote a stub placement (empty handle) but
-            # place never completed. Release the reservation back to QUEUED.
+            # Crash isolation: reserve wrote a stub placement but place never
+            # completed. Distinguish two shapes of a PLACING placement:
             #
-            # This revert ASSUMES a single live tick source (direct submit, or one
-            # daemon event loop). With two overlapping ticks on one Store, tick B's
-            # reconcile could revert a stub that tick A is mid-``place`` on — the
-            # empty handle is indistinguishable from a real crash — and double-
-            # launch the job. Making concurrent ticks safe needs a lease /
-            # ``reserved_at`` min-age gate so a fresh reservation is not reverted
-            # out from under an in-flight place (Phase 5), which is out of scope
-            # here.
-            if rec.state is JobState.PLACING and not placement.handle:
+            #   * EMPTY handle  -> the process died between reserve() and place();
+            #     no backend resource exists. Revert to QUEUED (attempts+1) so a
+            #     later tick relaunches — never stranded.
+            #   * PARTIAL handle carrying a "provisioning" marker -> place() got far
+            #     enough to rent a billable resource and persist it via
+            #     on_provisioning (I2 orphan-recovery), but the RUNNING save may not
+            #     have landed. ADOPT it: fall through to poll() below and let the
+            #     normal transition run. Reverting here would orphan the billed
+            #     instance and double-launch.
+            #
+            # (The concurrent-tick lease that would also make the EMPTY-handle
+            # revert safe under overlapping ticks is Phase 5; see the note there.)
+            handle = placement.handle
+            if rec.state is JobState.PLACING and not handle:
                 self._store.save_job(
                     rec.model_copy(
                         update={

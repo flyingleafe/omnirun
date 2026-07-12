@@ -390,3 +390,61 @@ def test_discover_delegates(store: Store) -> None:
     # Default Backend.discover derives capabilities from config gpus (none here).
     assert facts.backend == "stub"
     assert isinstance(facts, ProviderFacts)
+
+
+# ---------------------------------------------------------------------------
+# on_provisioning — orphan-recovery (I2)
+# ---------------------------------------------------------------------------
+
+
+class ProvisioningStubBackend(StubBackend):
+    """Emits an on_provisioning partial handle before returning the full one."""
+
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
+        self.submitted.append((spec, offer))
+        if on_provisioning is not None:
+            on_provisioning(
+                JobHandle(
+                    backend=self.name,
+                    job_id=spec.job_id,
+                    data={"instance_id": "i-123", "provisioning": True},
+                )
+            )
+        return JobHandle(
+            backend=self.name,
+            job_id=spec.job_id,
+            data={"instance_id": "i-123", "job_dir": "/root/.omnirun/jobs/x"},
+        )
+
+
+def test_place_persists_partial_handle_before_returning(store: Store) -> None:
+    backend = ProvisioningStubBackend(
+        name="stub", config=BackendConfig(type="local", max_parallel=2)
+    )
+    provider = BackendProvider(backend, store)
+    slot = provider.offer(ResourceSpec())[0]
+    rec = _record("prov-1")
+    rec.state = JobState.PLACING
+    rec.placement = Placement(
+        provider_name="stub", job_id="prov-1", state=JobStatus.QUEUED
+    )
+    store.save_job(rec)
+
+    placement = provider.place(rec, slot)
+
+    # The partial handle was persisted onto the job's PLACING placement DURING
+    # place (so a crash before the RUNNING save still leaves a reclaimable record).
+    persisted = store.load_job("prov-1")
+    assert persisted is not None
+    assert persisted.placement is not None
+    assert persisted.placement.handle == {"instance_id": "i-123", "provisioning": True}
+    # And place still returns the full handle for the caller to persist as RUNNING.
+    assert placement.handle == {
+        "instance_id": "i-123",
+        "job_dir": "/root/.omnirun/jobs/x",
+    }

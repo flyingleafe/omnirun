@@ -29,6 +29,7 @@ from omnirun.models import (
     JobSpec,
     JobState,
     JobStatus,
+    Placement,
     RepoRef,
     ResourceSpec,
     Slot,
@@ -468,3 +469,82 @@ def test_weekly_cap_gates_paid_place_and_wallet_spans_both_windows(
         assert store.load_ledger("week", cap=None, now=T4).in_window_total(T4) == 2.0
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# I2 orphan-recovery: PLACING placement with partial vs. empty handle
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_adopts_partial_handle_placing(tmp_path: Path) -> None:
+    """A PLACING job whose placement carries a partial (provisioning) handle is a
+    live rented resource — reconcile must POLL it (adopt), never revert to QUEUED
+    and relaunch (which would orphan the billed instance). Contrast the
+    empty-handle PLACING, which is a genuine pre-place crash and IS reverted."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    provider = FakeProvider(
+        "mkt",
+        slots=[_free_slot()],
+        poll_script={"orphan-1": [JobStatus.RUNNING, JobStatus.SUCCEEDED]},
+    )
+    control = Control(store, {"mkt": provider})
+    rec = JobRecord(
+        spec=_spec("orphan-1"),
+        state=JobState.PLACING,
+        submitted_at=T0,
+        placement=Placement(
+            provider_name="mkt",
+            job_id="orphan-1",
+            handle={"instance_id": "i-9", "provisioning": True},
+            state=JobStatus.PROVISIONING,
+        ),
+    )
+    store.save_job(rec)
+
+    control.run_tick(T1)
+
+    after = store.load_job("orphan-1")
+    assert after is not None
+    # Adopted: polled and advanced to RUNNING — NOT reverted to QUEUED.
+    assert after.state is JobState.RUNNING
+    assert provider.poll_calls == ["orphan-1"]
+    store.close()
+
+
+def _mkt_slot() -> Slot:
+    """A FREE, capacity-1 slot on the 'mkt' provider that satisfies the empty req."""
+    return Slot(
+        provider_name="mkt",
+        capabilities=Capabilities(),
+        cost=Cost(),  # per_hour None → free
+        capacity=1,
+    )
+
+
+def test_reconcile_reverts_empty_handle_placing(tmp_path: Path) -> None:
+    """An EMPTY-handle PLACING is a pre-place crash (reserve wrote the stub, place
+    never ran) — reconcile reverts it to QUEUED (attempts+1), never polls."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    # No slots offered so the tick cannot re-place after the revert; this isolates
+    # the reconcile path and keeps attempts at exactly 1.
+    provider = FakeProvider("mkt", slots=[])
+    control = Control(store, {"mkt": provider})
+    rec = JobRecord(
+        spec=_spec("stub-1"),
+        state=JobState.PLACING,
+        submitted_at=T0,
+        placement=Placement(
+            provider_name="mkt", job_id="stub-1", state=JobStatus.QUEUED
+        ),
+    )
+    store.save_job(rec)
+
+    control.run_tick(T1)
+
+    after = store.load_job("stub-1")
+    assert after is not None
+    assert after.state is JobState.QUEUED
+    assert after.attempts == 1
+    assert after.placement is None
+    assert provider.poll_calls == []  # never polled — reverted
+    store.close()
