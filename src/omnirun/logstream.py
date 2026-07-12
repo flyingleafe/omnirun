@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 
 _LOG_RING_LINES = 1000  # per-job replay ring capacity
 
@@ -27,15 +27,16 @@ class _JobStream:
     further behind than the ring holds skips the rotated-out lines (bounded catch-up)
     and never blocks or re-reads.
 
-    Lifecycle is guarded entirely by ``_cond``. The producer runs until the job is
-    terminal (iterator ends) OR the last follower leaves (``_stop``). Two reconnect
-    races are closed here: (a) ``register`` clears a pending ``_stop`` and relaunches a
-    dead producer, so a follower reconnecting in the last-follower-left window REVIVES
-    the stream instead of attaching to a producer about to quit; (b) the producer sets
-    ``_done`` in the SAME critical section in which it observes ``_stop``, so ``register``
-    (also under ``_cond``) always sees a settled done/stop state — never a half-stopped
-    stream. A terminal stream is never revived (``register`` returns ``None`` so the
-    owning ``LogMux`` builds a fresh one).
+    Lifecycle is guarded entirely by ``_cond``, and EVERY follower side effect happens
+    lazily inside ``follow`` on first iteration — never in a constructor or a separate
+    ``register`` step — so a follow iterator that is created but never consumed leaks
+    nothing (no follower counted, no producer started). The producer runs until the job
+    is terminal (iterator ends) OR the last follower leaves (``_stop``). A follower that
+    arrives after the last one left REVIVES the stream: on enrollment it clears ``_stop``
+    and relaunches a dead producer, and the producer sets ``_done`` in the SAME ``_cond``
+    section in which it observes ``_stop`` so a rejoin never sees a half-stopped stream.
+    A stream whose producer has finished is not reused — ``is_live`` returns False and the
+    owning ``LogMux`` builds a fresh one.
     """
 
     def __init__(self, producer: Callable[[], Iterator[str]]) -> None:
@@ -54,7 +55,7 @@ class _JobStream:
                 with self._cond:
                     if self._stop:
                         # Observed the last-follower-left signal: become terminal in the
-                        # SAME critical section, so a concurrent `register` sees a settled
+                        # SAME critical section, so a concurrent enrollment sees a settled
                         # done/stop state and never revives a producer that has quit.
                         self._done = True
                         self._cond.notify_all()
@@ -91,33 +92,36 @@ class _JobStream:
         n = min(behind, len(self._ring))
         return list(self._ring)[len(self._ring) - n :]
 
-    def register(self) -> tuple[list[str], int] | None:
-        """Atomically add a follower and snapshot its replay, or return ``None`` if this
-        stream is already terminal (the caller must build a fresh one).
-
-        Clears a pending ``_stop`` and (re)starts a dead producer, so a follower
-        reconnecting in the last-follower-left window revives the stream. Runs entirely
-        under ``_cond`` so it cannot interleave with the producer's stop-observation.
-        Pairs with ``follow`` (which does the matching follower decrement); the returned
-        iterator MUST be consumed or closed or the follower count leaks.
-        """
+    def is_live(self) -> bool:
+        """True while this stream can still enroll a follower (producer not terminal).
+        Read under ``_cond`` so the owning ``LogMux`` never decides reuse by racing the
+        producer's completion (no cross-lock read of ``_done``)."""
         with self._cond:
-            if self._done:
-                return None
-            self._stop = False
-            self._followers += 1
-            self._ensure_running()
-            my_count = self._total - len(
-                self._ring
-            )  # replay from the ring's oldest line
-            return self._tail_since(my_count), self._total
+            return not self._done
 
-    def follow(self, replay: list[str], my_count: int) -> Iterator[str]:
-        """Yield *replay* then live lines until the producer finishes. Seeded by
-        ``register`` (which did the follower accounting); the matching decrement runs in
-        this generator's ``finally`` when the consumer stops iterating or disconnects."""
+    def follow(self) -> Generator[str, None, None]:
+        """Enroll a follower and yield the ring replay, then live lines until the producer
+        finishes. ALL side effects — follower count, ``_stop`` clear, producer launch —
+        happen HERE on the first iteration under ``_cond``, never in a bare constructor,
+        so a follow iterator created but never consumed leaks nothing; the matching
+        follower decrement runs in this generator's ``finally``. A follower arriving after
+        the last one left revives the stream (clears ``_stop``, relaunches a dead
+        producer). If the stream went terminal in the tiny window before this first
+        iteration, the follower simply replays the ring and stops (``LogMux`` rebuilds on
+        the next follow)."""
+        with self._cond:
+            my_count = self._total - len(self._ring)
+            replay = self._tail_since(my_count)
+            my_count = self._total
+            enrolled = not self._done
+            if enrolled:
+                self._stop = False
+                self._followers += 1
+                self._ensure_running()
         try:
             yield from replay
+            if not enrolled:
+                return
             while True:
                 with self._cond:
                     while self._total <= my_count and not self._done:
@@ -129,11 +133,12 @@ class _JobStream:
                 if done and not new:
                     return
         finally:
-            with self._cond:
-                self._followers -= 1
-                if self._followers <= 0:
-                    self._stop = True
-                    self._cond.notify_all()
+            if enrolled:
+                with self._cond:
+                    self._followers -= 1
+                    if self._followers <= 0:
+                        self._stop = True
+                        self._cond.notify_all()
 
     def is_evictable(self) -> bool:
         """True once the producer is terminal and no follower remains — safe for the
@@ -157,20 +162,16 @@ class LogMux:
         stream or its stream is terminal. Sweeps terminal, follower-less streams so a
         long-lived daemon does not retain a ring per job ever followed.
 
-        The returned iterator MUST be consumed or closed — the follower is registered
-        eagerly and its deregistration runs when the iterator is exhausted or closed.
-        """
+        Follower accounting is lazy (see ``_JobStream.follow``): the returned iterator may
+        be dropped un-consumed with no leak, and its deregistration runs when it is
+        exhausted or closed."""
         with self._lock:
             self._evict_dead(keep=job_id)
             stream = self._streams.get(job_id)
-            seed = stream.register() if stream is not None else None
-            if stream is None or seed is None:  # absent or terminal → fresh stream
+            if stream is None or not stream.is_live():  # absent or terminal → fresh
                 stream = _JobStream(producer)
                 self._streams[job_id] = stream
-                seed = stream.register()
-                if seed is None:  # unreachable: a fresh stream is never terminal
-                    raise RuntimeError("new log stream reported terminal on creation")
-        return stream.follow(*seed)
+        return stream.follow()
 
     def _evict_dead(self, *, keep: str) -> None:
         """Drop terminal, follower-less streams (except *keep*). Called under ``_lock``;
