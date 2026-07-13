@@ -28,6 +28,7 @@ from omnirun.backends.vast import VastBackend, normalize_vast_gpu
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecResult
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -550,6 +551,23 @@ def test_runpod_gc_terminates_leaked_instance(fake_ssh):
     )
     runpod_backend().gc(make_handle())
     assert delete.called
+
+
+@respx.mock
+def test_cancel_terminates_instance_even_when_job_terminal(fake_ssh):
+    # Instance still exists (GET returns it with a terminal state); DELETE must
+    # fire on cancel regardless of the job's own state — a finished job can
+    # still be billing.
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "EXITED"})
+    )
+    deleted = respx.delete(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    runpod_backend().cancel(make_handle(), CancelMode.GRACEFUL)
+    assert deleted.called
+    (ex,) = fake_ssh.instances
+    assert any("kill -TERM -" in c for c in ex.commands)
 
 
 # -------------------------------------------------------------------- vast ---

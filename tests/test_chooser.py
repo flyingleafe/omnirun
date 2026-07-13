@@ -9,7 +9,6 @@ from datetime import timedelta
 from rich.console import Console
 
 from omnirun.chooser import (
-    apply_max_cost,
     auto_pick,
     gather_offers,
     humanize_duration,
@@ -130,29 +129,6 @@ def test_value_of_hour_comes_from_policy_max_hourly_default():
     policy = PolicyConfig(max_hourly_default=10.0)
     ranked = rank([offer("f", cph=None, wait=3600.0)], RES_1H, policy)
     assert ranked[0].score == 10.0
-
-
-def test_apply_max_cost_keeps_free_and_cheap():
-    ranked = rank(
-        [offer("pricey", cph=5.0, wait=0.0), offer("free", cph=None, wait=0.0)],
-        RES_1H,
-        POLICY,
-    )
-    kept = apply_max_cost(ranked, 3.0)
-    assert [r.offer.backend for r in kept] == ["free"]
-    assert apply_max_cost(ranked, None) == ranked
-
-
-def test_max_cost_filter_can_leave_single_offer_to_auto_pick():
-    ranked = rank(
-        [offer("pricey", cph=5.0, wait=0.0), offer("cheap", cph=1.0, wait=0.0)],
-        RES_1H,
-        POLICY,
-    )
-    assert auto_pick(ranked, POLICY) is None  # genuine tradeoff, two paid offers
-    kept = apply_max_cost(ranked, 2.0)
-    picked = auto_pick(kept, POLICY)
-    assert picked is not None and picked.offer.backend == "cheap"
 
 
 # ------------------------------------------------------------------ gather_offers

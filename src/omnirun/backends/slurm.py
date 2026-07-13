@@ -24,6 +24,7 @@ from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -36,7 +37,7 @@ from omnirun.models import (
     normalize_gpu_type,
 )
 from omnirun.repo import local_root_of
-from omnirun.store import JobStore
+from omnirun.state import default_db_url, open_store
 
 # Slurm states that mean "not started yet" / "still occupying a slot".
 QUEUED_STATES = {
@@ -326,7 +327,11 @@ class SlurmBackend(Backend):
         except Exception:
             pass
         try:
-            median = JobStore().median_wait_s(self.name, self._wait_key(res.gpu_type))
+            store = open_store(default_db_url())
+            try:
+                median = store.median_wait_s(self.name, self._wait_key(res.gpu_type))
+            finally:
+                store.close()
         except Exception:
             median = None
         if median is not None:
@@ -554,7 +559,11 @@ class SlurmBackend(Backend):
             if wait_s < 0:
                 return
             key = handle.data.get("wait_key") or self._wait_key(None)
-            JobStore().record_wait(self.name, key, wait_s)
+            store = open_store(default_db_url())
+            try:
+                store.record_wait(self.name, key, wait_s)
+            finally:
+                store.close()
         except Exception:
             pass
 
@@ -579,11 +588,12 @@ class SlurmBackend(Backend):
 
         return gen()
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sid = handle.data["slurm_job_id"]
-        r = self.exec_.run(f"scancel {sid}")
+        cmd = f"scancel -s KILL {sid}" if mode is CancelMode.FORCE else f"scancel {sid}"
+        r = self.exec_.run(cmd)
         if not r.ok:
-            raise BackendError(f"scancel {sid} failed: {r.stderr.strip()}")
+            raise BackendError(f"{cmd} failed: {r.stderr.strip()}")
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)

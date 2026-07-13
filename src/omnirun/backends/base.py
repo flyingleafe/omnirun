@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -85,7 +86,9 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    def cancel(self, handle: JobHandle) -> None: ...
+    def cancel(
+        self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+    ) -> None: ...
 
     @abstractmethod
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
