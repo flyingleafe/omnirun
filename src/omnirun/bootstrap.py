@@ -126,7 +126,6 @@ HostKey /etc/ssh/ssh_host_rsa_key
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 AuthenticationMethods publickey
-UsePrivilegeSeparation no
 UsePAM no
 PrintMotd no
 SSHD_EOF

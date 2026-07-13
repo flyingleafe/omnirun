@@ -33,7 +33,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, SSHEndpoint, register
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    ProvisioningSink,
+    SSHEndpoint,
+    register,
+)
 from omnirun.backends import jobdir, tarsafe
 from omnirun.bootstrap import (
     BootstrapParams,
@@ -795,12 +801,14 @@ class KaggleBackend(Backend):
                 try:
                     fn(ref)
                 except Exception as e:
+                    _release_port(handle.job_id)
                     raise BackendError(f"kernel cancel failed: {e}") from e
                 _release_port(handle.job_id)
                 self._terminal[handle.job_id] = StatusReport(
                     status=JobStatus.CANCELLED, detail="cancelled via API"
                 )
                 return
+        _release_port(handle.job_id)
         raise BackendError(
             "the installed kaggle client has no kernel-cancel endpoint; "
             f"stop the session manually at https://www.kaggle.com/code/{ref}"

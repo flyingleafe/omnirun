@@ -158,6 +158,7 @@ def fake_bundle(monkeypatch):
     monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: None)
     # default: bore disabled — keeps harness byte-identical to non-bore baseline.
     from omnirun.config import BoreConfig
+
     monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: BoreConfig())
 
 
@@ -576,6 +577,19 @@ def test_cancel_without_api_support_points_at_website(fake_api, backend):
         backend.cancel(make_handle())
 
 
+def test_cancel_releases_tunnel_port_even_when_it_raises(fake_api, backend):
+    # Bug 1 (T4 live): cancel must free the deterministic tunnel port on its
+    # error-exit paths, not only on the success path — else ports leak until gc.
+    from omnirun import transport
+
+    handle = make_handle()
+    transport.allocate(None, handle.job_id, 20000, 20099)
+    assert transport.port_for(None, handle.job_id) is not None
+    with pytest.raises(BackendError, match="kaggle.com"):
+        backend.cancel(handle)
+    assert transport.port_for(None, handle.job_id) is None
+
+
 def test_cancel_uses_api_when_available(fake_api, backend):
     cancelled: list[str] = []
     fake_api.kernels_cancel = cancelled.append
@@ -630,7 +644,7 @@ def test_submit_with_bore_injects_env_vars_into_harness(
         "OMNIRUN_SSH_PUBKEY",
         "OMNIRUN_BORE_PORT",
     ):
-        assert f'os.environ[{var!r}]' in run_py, f"{var!r} not found in run_py"
+        assert f"os.environ[{var!r}]" in run_py, f"{var!r} not found in run_py"
 
     assert "bore.example.com" in run_py
     assert "s3cr3t" in run_py

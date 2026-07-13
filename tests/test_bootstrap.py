@@ -278,7 +278,9 @@ def test_bore_snippet_present_in_generated_script(job_spec: JobSpec) -> None:
     assert "PasswordAuthentication no" in script
     assert "PermitRootLogin prohibit-password" in script
     assert "AuthenticationMethods publickey" in script
-    assert "UsePrivilegeSeparation no" in script
+    # UsePrivilegeSeparation is deprecated/removed in modern OpenSSH (privsep is
+    # mandatory) — it must NOT be emitted or sshd warns on every worker.
+    assert "UsePrivilegeSeparation" not in script
     # Kaggle-proven quirks + safety net
     assert "mkdir -p /run/sshd" in script
     assert "/usr/sbin/sshd" in script
@@ -371,11 +373,14 @@ def test_bore_snippet_has_ssh_keygen_A_before_sshd(job_spec: JobSpec) -> None:
     created before sshd starts."""
     script = generate_bootstrap(job_spec)
     lines = script.splitlines()
-    keygen_idx = next(
-        (i for i, ln in enumerate(lines) if "ssh-keygen -A" in ln), None
-    )
+    keygen_idx = next((i for i, ln in enumerate(lines) if "ssh-keygen -A" in ln), None)
     sshd_idx = next(
-        (i for i, ln in enumerate(lines) if "/usr/sbin/sshd" in ln and "ssh-keygen" not in ln), None
+        (
+            i
+            for i, ln in enumerate(lines)
+            if "/usr/sbin/sshd" in ln and "ssh-keygen" not in ln
+        ),
+        None,
     )
     assert keygen_idx is not None, "ssh-keygen -A not found in script"
     assert sshd_idx is not None, "/usr/sbin/sshd not found in script"
