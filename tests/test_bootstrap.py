@@ -219,6 +219,20 @@ def test_generated_script_uses_mkdir_lock_not_flock(job_spec: JobSpec) -> None:
         assert 'flock "' not in script, f"flock file-arg found in {kind} script"
 
 
+def test_lock_refreshes_heartbeat_and_unlock_kills_refresher(
+    job_spec: JobSpec,
+) -> None:
+    """A held lock must keep its heartbeat fresh so a long `uv sync` (slower than
+    the stale-lock timeout) is not stolen mid-build (the residual #12 race), and
+    omnirun_unlock must stop that background refresher."""
+    script = generate_bootstrap(_make_spec(job_spec, EnvKind.UV))
+    # a background refresher rewrites the lock heartbeat on an interval
+    assert 'echo $! > "$d/hb.pid"' in script
+    assert "while :; do sleep 60;" in script
+    # unlock kills the refresher before removing the lock dir
+    assert 'kill "$(cat "$1/hb.pid")"' in script
+
+
 def test_generated_script_venv_lock_uses_dot_d_directory(job_spec: JobSpec) -> None:
     """The venv lock must be a directory (.locks/venv.d) not a plain file, so that
     the mkdir-based protocol works (mkdir on a file path would fail with EEXIST but

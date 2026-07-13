@@ -330,8 +330,19 @@ omnirun_lock() {{
     sleep 1
   done
   echo "$HOSTNAME:$$ $(date +%s)" > "$d/heartbeat"
+  # Keep the lock heartbeat fresh for the whole critical section so a holder
+  # slower than $to (e.g. a cold `uv sync` reinstalling torch over GPFS) is
+  # never mistaken for dead and its lock stolen mid-build — the residual #12
+  # race the stamp-skip alone cannot close. The refresher dies with the process
+  # group on crash/cancel (like the job heartbeat) and is killed explicitly by
+  # omnirun_unlock on every exit path.
+  ( while :; do sleep 60; echo "$HOSTNAME:$$ $(date +%s)" > "$d/heartbeat" 2>/dev/null || exit 0; done ) &
+  echo $! > "$d/hb.pid"
 }}
-omnirun_unlock() {{ rm -rf "$1"; }}
+omnirun_unlock() {{
+  [ -f "$1/hb.pid" ] && kill "$(cat "$1/hb.pid")" 2>/dev/null
+  rm -rf "$1"
+}}
 
 status preparing
 # ---- code (shared worktree per revision, created once under a per-sha lock) -----
