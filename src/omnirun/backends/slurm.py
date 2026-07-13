@@ -24,7 +24,6 @@ from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
-from omnirun.factstore import FactStore
 from omnirun.models import (
     CancelMode,
     Capabilities,
@@ -328,9 +327,7 @@ class SlurmBackend(Backend):
             health_detail = "ok"
             account = self.config.account
             if account and part:
-                assoc_detail = _check_assoc(
-                    self.exec_, account, part, qos
-                )
+                assoc_detail = _check_assoc(self.exec_, account, part, qos)
                 if assoc_detail is not None:
                     health = Health.DEGRADED
                     health_detail = assoc_detail
@@ -524,8 +521,18 @@ class SlurmBackend(Backend):
         warn when --time is omitted so the user isn't silently on the cluster default.
 
         Best-effort: uses cached ProviderFacts if available; skips check when not.
+        Intentionally kept even though the unified capabilities gate also rejects
+        an over-cap job: this fires on the explicit ``--backend slurm`` path (which
+        never consults the offer table) and gives a wall-time-specific message.
         """
-        facts = FactStore().load(self.name)
+        try:
+            store = open_store(default_db_url())
+            try:
+                facts = store.load_facts(self.name)
+            finally:
+                store.close()
+        except Exception:
+            facts = None
         max_walltime = facts.capabilities.max_walltime if facts else None
         requested = spec.resources.time
         qos_tag = f" (qos {self.config.qos!r})" if self.config.qos else ""

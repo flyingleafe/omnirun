@@ -11,8 +11,18 @@ from omnirun.backends.slurm import (
 )
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecResult
-from omnirun.factstore import FactStore
 from omnirun.models import Capabilities, Health, ProviderFacts
+from omnirun.state import default_db_url, open_store
+
+
+def _seed_facts(facts: ProviderFacts) -> None:
+    """Persist cached ProviderFacts into the state store the backend reads
+    (``OMNIRUN_STATE_DIR`` is redirected by the ``state_dir`` fixture)."""
+    store = open_store(default_db_url())
+    try:
+        store.save_facts(facts)
+    finally:
+        store.close()
 
 
 class FakeExec(Exec):
@@ -227,9 +237,7 @@ def test_discover_valid_account_partition_stays_healthy() -> None:
 
 def test_discover_assoc_sacctmgr_unavailable_leaves_health_ok() -> None:
     """If sacctmgr show assoc fails, health is left as-is (best-effort)."""
-    cfg = BackendConfig(
-        type="slurm", host="login", partition="gpu", account="proj42"
-    )
+    cfg = BackendConfig(type="slurm", host="login", partition="gpu", account="proj42")
     be = SlurmBackend("uni", cfg)
     be._exec = FakeExec(
         {
@@ -253,21 +261,6 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "state"
 
 
-def _make_backend_with_cap(cap: timedelta, state_root: Path) -> SlurmBackend:
-    """Return a SlurmBackend with cached facts declaring the given max_walltime."""
-    cfg = BackendConfig(type="slurm", host="login", partition="gpu", qos="gpu-8h")
-    be = SlurmBackend("uni", cfg)
-    facts = ProviderFacts(
-        backend="uni",
-        discovered_at=__import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        ),
-        capabilities=Capabilities(max_walltime=cap),
-    )
-    FactStore(state_root / "state").save(facts)
-    return be
-
-
 def test_submit_refuses_walltime_exceeding_cap(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,7 +278,7 @@ def test_submit_refuses_walltime_exceeding_cap(
         ),
         capabilities=Capabilities(max_walltime=timedelta(hours=8)),
     )
-    FactStore().save(facts)
+    _seed_facts(facts)
 
     spec = JobSpec(
         job_id="train-abc123",
@@ -317,7 +310,7 @@ def test_submit_accepts_walltime_within_cap(state_dir: Path) -> None:
         ),
         capabilities=Capabilities(max_walltime=timedelta(hours=8)),
     )
-    FactStore().save(facts)
+    _seed_facts(facts)
 
     spec = JobSpec(
         job_id="train-abc123",
@@ -352,7 +345,7 @@ def test_submit_no_time_logs_warning(
         ),
         capabilities=Capabilities(max_walltime=timedelta(hours=8)),
     )
-    FactStore().save(facts)
+    _seed_facts(facts)
 
     spec = JobSpec(
         job_id="train-abc123",
