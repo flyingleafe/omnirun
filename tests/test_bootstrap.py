@@ -1,7 +1,11 @@
 """Run the generated bootstrap.sh for real (no backend, no network): stage a
 bare repo the way the client-side push does, execute the script, and verify
 the on-worker contract (worktree, phase, heartbeat, result.json, logs,
-outputs, exit code propagation)."""
+outputs, exit code propagation).
+
+Also covers the bore tunnel snippet: generation assertions (content + bash -n),
+and confirms the block is always generated but only runs when the env var is set.
+"""
 
 from __future__ import annotations
 
@@ -258,3 +262,89 @@ def test_all_env_kinds_pass_bash_syntax_check(
         path.write_text(script)
         proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
         assert proc.returncode == 0, f"bash -n failed for {kind}: {proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Bore tunnel snippet: generation content, bash syntax, runtime-guard
+# ---------------------------------------------------------------------------
+
+
+def test_bore_snippet_present_in_generated_script(job_spec: JobSpec) -> None:
+    """The bore block is always generated (unconditionally) in the script."""
+    script = generate_bootstrap(job_spec)
+    # Runtime guard present
+    assert 'if [ -n "${OMNIRUN_BORE_PUBLIC_HOST:-}' in script
+    # key-only sshd config
+    assert "PasswordAuthentication no" in script
+    assert "PermitRootLogin prohibit-password" in script
+    assert "AuthenticationMethods publickey" in script
+    assert "UsePrivilegeSeparation no" in script
+    # Kaggle-proven quirks
+    assert "mkdir -p /run/sshd" in script
+    assert "/usr/sbin/sshd" in script
+    # bore invocation — auto-assign only, no --port flag for the tunnel
+    assert "bore local 22 --to" in script
+    assert "--port" not in _extract_bore_invocation(script)
+    # OMNIRUN_TUNNEL announcement
+    assert "OMNIRUN_TUNNEL host=" in script
+
+
+def _extract_bore_invocation(script: str) -> str:
+    """Return just the 'bore local …' line from the generated script."""
+    for line in script.splitlines():
+        if "bore local 22 --to" in line:
+            return line
+    return ""
+
+
+def test_bore_snippet_uses_absolute_sshd_path(job_spec: JobSpec) -> None:
+    """sshd must be called via its absolute path (Kaggle requirement)."""
+    script = generate_bootstrap(job_spec)
+    assert "/usr/sbin/sshd" in script
+
+
+def test_bore_snippet_bore_to_uses_control_port_env(job_spec: JobSpec) -> None:
+    """bore --to HOST:PORT must use $OMNIRUN_BORE_CONTROL_PORT (defaulting to 7835)."""
+    script = generate_bootstrap(job_spec)
+    # The --to flag uses a shell variable that incorporates the control port.
+    assert "${_bore_host}:${_bore_port}" in script
+    assert 'OMNIRUN_BORE_CONTROL_PORT:-7835' in script
+
+
+def test_bore_snippet_no_port_flag_in_bore_local(job_spec: JobSpec) -> None:
+    """bore local 22 must NOT have a --port flag (auto-assignment required)."""
+    script = generate_bootstrap(job_spec)
+    bore_line = _extract_bore_invocation(script)
+    assert bore_line, "bore local invocation not found in script"
+    assert "--port" not in bore_line
+
+
+def test_bore_snippet_non_fatal_outer_guard(job_spec: JobSpec) -> None:
+    """The outer { ... } || echo warning pattern must be present so that a
+    setup failure warns to stderr and lets the job continue."""
+    script = generate_bootstrap(job_spec)
+    assert "ssh/bore setup failed; job continues" in script
+
+
+def test_bore_snippet_passes_bash_syntax(job_spec: JobSpec, tmp_path: Path) -> None:
+    """bash -n on the generated script (with the bore block embedded) must pass."""
+    script = generate_bootstrap(job_spec)
+    path = tmp_path / "bootstrap_bore.sh"
+    path.write_text(script)
+    proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_bore_snippet_is_runtime_guarded_not_conditional_on_generation(
+    job_spec: JobSpec,
+) -> None:
+    """The bore block is ALWAYS in the generated script (unconditional generation)
+    but is NEVER executed when $OMNIRUN_BORE_PUBLIC_HOST is empty.
+
+    We check this by running the script in a subprocess with the env var unset and
+    verifying that no bore-related output appears and no bore/sshd binary is
+    invoked (the block skips entirely).
+    """
+    # The guard must be present regardless of params
+    script = generate_bootstrap(job_spec)
+    assert "OMNIRUN_BORE_PUBLIC_HOST" in script

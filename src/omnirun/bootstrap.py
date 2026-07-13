@@ -56,6 +56,81 @@ MICROMAMBA_INSTALL = (
     ' | tar -xj -C "$OMNIRUN_ROOT/bin" --strip-components=1 bin/micromamba'
 )
 
+# bore v0.5.1 static musl binary — proven in the spike on Colab and Kaggle.
+_BORE_RELEASE_URL = (
+    "https://github.com/ekzhang/bore/releases/download/v0.5.1"
+    "/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz"
+)
+
+
+def _bore_tunnel_block() -> str:
+    """Shell snippet that starts a key-only sshd + bore tunnel in the background.
+
+    Runtime-guarded: the block runs only when $OMNIRUN_BORE_PUBLIC_HOST is set.
+    A non-bore job's script is byte-unaffected (the env var is empty → entire
+    block skips).
+
+    Non-fatal: any failure inside the outer { ... } warns to stderr and lets
+    the job continue.  An ssh/bore failure must never fail the job.
+
+    Bakes in the three Kaggle-proven quirks (harmless on Colab):
+      - mkdir -p /run/sshd   (privsep dir absent on Kaggle by default)
+      - /usr/sbin/sshd        (absolute path — Kaggle requirement)
+      - UsePrivilegeSeparation no   (Kaggle kernel user-namespace restriction)
+
+    Env vars consumed (T2 will inject these; here they may be empty → no-op):
+      OMNIRUN_BORE_PUBLIC_HOST, OMNIRUN_BORE_SECRET, OMNIRUN_BORE_CONTROL_PORT,
+      OMNIRUN_SSH_PUBKEY.
+
+    The snippet emits one line to the job log on success:
+      OMNIRUN_TUNNEL host=<host> port=<port>
+    The client (T4) scans for this line to obtain the tunnel address.
+    """
+    return f"""\
+# ---- bore tunnel (ssh-everywhere) — runtime-guarded, non-fatal ---------------
+if [ -n "${{OMNIRUN_BORE_PUBLIC_HOST:-}}" ]; then
+  {{
+    # --- install openssh-server if missing ---
+    command -v sshd >/dev/null 2>&1 || \\
+      (apt-get update -qq && apt-get install -y -qq openssh-server) >/dev/null 2>&1
+    # --- key-only sshd (Kaggle quirks: mkdir /run/sshd, UsePrivilegeSeparation no) ---
+    mkdir -p /run/sshd ~/.ssh
+    printf '%s\\n' "${{OMNIRUN_SSH_PUBKEY:-}}" > ~/.ssh/authorized_keys
+    chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys
+    cat > /etc/ssh/sshd_config.d/omnirun.conf <<'SSHD_EOF'
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+AuthenticationMethods publickey
+UsePrivilegeSeparation no
+SSHD_EOF
+    /usr/sbin/sshd
+    # --- install bore (static musl binary) if not already present ---
+    command -v bore >/dev/null 2>&1 || {{
+      curl -fsSL {_BORE_RELEASE_URL} | tar xz -C /usr/local/bin bore
+    }}
+    # --- open tunnel; NO --port (server auto-assigns to avoid collisions) ---
+    _bore_host="${{OMNIRUN_BORE_PUBLIC_HOST}}"
+    _bore_port="${{OMNIRUN_BORE_CONTROL_PORT:-7835}}"
+    bore local 22 --to "${{_bore_host}}:${{_bore_port}}" \\
+      ${{OMNIRUN_BORE_SECRET:+--secret "${{OMNIRUN_BORE_SECRET}}"}} \\
+      > /tmp/omnirun-bore.log 2>&1 &
+    # --- wait up to 30s for bore to announce the assigned port ---
+    _bore_line=""
+    for _i in $(seq 1 30); do
+      _bore_line=$(grep -m1 'listening at' /tmp/omnirun-bore.log 2>/dev/null) && \\
+        [ -n "$_bore_line" ] && break
+      sleep 1
+    done
+    if [ -n "$_bore_line" ]; then
+      _bore_addr=$(printf '%s' "$_bore_line" | sed -n 's/.*listening at //p')
+      echo "OMNIRUN_TUNNEL host=${{_bore_addr%:*}} port=${{_bore_addr##*:}}"
+    else
+      echo "OMNIRUN_TUNNEL: warning — tunnel did not come up within 30s; falling back to legacy monitoring" >&2
+    fi
+  }} || echo "OMNIRUN_TUNNEL: warning — ssh/bore setup failed; job continues" >&2
+fi
+"""
+
 
 @dataclass
 class CodeSource:
@@ -362,6 +437,7 @@ set +a
 {exports}
 {pre_run}
 
+{_bore_tunnel_block()}\
 # ---- heartbeat ----------------------------------------------------------------
 ( while true; do now > "$JOB_DIR/heartbeat"; sleep {HEARTBEAT_INTERVAL_S}; done ) &
 HB_PID=$!
