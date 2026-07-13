@@ -41,9 +41,17 @@ packages = ["src/omnirun"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Live tests hit real backends and are OFF by default (so `pytest` and CI stay
+# green with no credentials). Run them explicitly: `pytest -m live`, or per
+# backend `pytest -m "live and kaggle"`. When selected they FAIL (never skip) if
+# the required creds/config are absent — missing coverage must be loud.
+addopts = "-m 'not live'"
 markers = [
     "integration: needs docker or network (deselect with '-m \"not integration\"')",
-    "live: needs real backend credentials",
+    "live: hits a real backend; off by default, fails (not skips) without creds",
+    "slurm: live test against a Slurm cluster (set OMNIRUN_TEST_SLURM_BACKEND)",
+    "colab: live test against Colab (needs google-colab-cli auth)",
+    "kaggle: live test against Kaggle (needs kaggle credentials)",
 ]
 
 [tool.pyright]

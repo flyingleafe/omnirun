@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import shutil
 import tarfile
 import tempfile
@@ -178,6 +179,51 @@ def _release_port(job_id: str) -> None:
     release(None, job_id)
 
 
+def _kaggle_config_dir() -> Path:
+    """The directory the kaggle client reads credentials from (``KAGGLE_CONFIG_DIR``
+    if set, else ~/.kaggle)."""
+    override = os.environ.get("KAGGLE_CONFIG_DIR")
+    return Path(override) if override else Path.home() / ".kaggle"
+
+
+def _username_from_config_dir(config_dir: str | None) -> str | None:
+    """Read the kaggle username out of the standard credential files under
+    ``config_dir`` (defaults to KAGGLE_CONFIG_DIR / ~/.kaggle). Covers both the
+    OAuth ``credentials.json`` and the legacy ``kaggle.json`` shapes; returns
+    None if neither yields a username."""
+    base = Path(config_dir) if config_dir else _kaggle_config_dir()
+    for fname in ("credentials.json", "kaggle.json"):
+        try:
+            data = json.loads((base / fname).read_text())
+        except Exception:
+            continue
+        user = data.get("username") if isinstance(data, dict) else None
+        if user:
+            return str(user)
+    return None
+
+
+def _oauth_token_expired(buffer_s: float = 120.0) -> bool:
+    """True when the OAuth access token in ``credentials.json`` has expired or
+    is within ``buffer_s`` of expiring — the signal to re-authenticate (which
+    refreshes it). Legacy API-key auth (``kaggle.json`` with a ``key``) has no
+    expiry, so this returns False and the cached client is kept."""
+    try:
+        data = json.loads((_kaggle_config_dir() / "credentials.json").read_text())
+    except Exception:
+        return False
+    exp = data.get("access_token_expiration") if isinstance(data, dict) else None
+    if not exp:
+        return False
+    try:
+        deadline = datetime.fromisoformat(str(exp))
+    except ValueError:
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) >= deadline - timedelta(seconds=buffer_s)
+
+
 def _remaining_from_quota(q: object) -> tuple[float | None, str | None]:
     """Parse ``KaggleApi.quota_view()`` into (remaining_gpu_hours, refresh_iso).
 
@@ -305,7 +351,14 @@ class KaggleBackend(Backend):
     # ---- api plumbing --------------------------------------------------------
 
     def _api(self) -> Any:
-        if self._api_obj is None:
+        # Re-authenticate when the cached client is absent OR its OAuth access
+        # token has (nearly) expired. OAuth tokens from `kaggle` CLI login last
+        # only ~1h; the cached client does NOT refresh mid-flight, so a job that
+        # outlives its token would 401 on the next push/poll. Re-authenticating
+        # rewrites credentials.json with a fresh token. (Legacy API-key auth
+        # never expires, so _oauth_token_expired() is False and we keep the
+        # cached client.)
+        if self._api_obj is None or _oauth_token_expired():
             api = _load_kaggle_api_class()()
             try:
                 api.authenticate()
@@ -319,6 +372,10 @@ class KaggleBackend(Backend):
 
     @staticmethod
     def _username(api: Any) -> str:
+        # The legacy kaggle.json / KAGGLE_USERNAME path populates config_values,
+        # but the newer OAuth credential format (~/.kaggle/credentials.json)
+        # authenticates via a token and leaves config_values EMPTY — so we must
+        # also read the username straight out of the standard credential files.
         user = None
         try:
             user = api.get_config_value("username")
@@ -326,6 +383,10 @@ class KaggleBackend(Backend):
             pass
         if not user:
             user = getattr(api, "config_values", {}).get("username")
+        if not user:
+            user = os.environ.get("KAGGLE_USERNAME")
+        if not user:
+            user = _username_from_config_dir(getattr(api, "config_dir", None))
         if not user:
             raise BackendError("could not determine kaggle username from credentials")
         return str(user)
