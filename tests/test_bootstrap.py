@@ -279,10 +279,11 @@ def test_bore_snippet_present_in_generated_script(job_spec: JobSpec) -> None:
     assert "PermitRootLogin prohibit-password" in script
     assert "AuthenticationMethods publickey" in script
     assert "UsePrivilegeSeparation no" in script
-    # Kaggle-proven quirks
+    # Kaggle-proven quirks + safety net
     assert "mkdir -p /run/sshd" in script
     assert "/usr/sbin/sshd" in script
-    # bore invocation — auto-assign only, no --port flag for the tunnel
+    assert "ssh-keygen -A" in script  # host-key safety net (T2 fix)
+    # bore invocation — bare host, auto-assign only, no --port flag
     assert "bore local 22 --to" in script
     assert "--port" not in _extract_bore_invocation(script)
     # OMNIRUN_TUNNEL announcement
@@ -303,12 +304,17 @@ def test_bore_snippet_uses_absolute_sshd_path(job_spec: JobSpec) -> None:
     assert "/usr/sbin/sshd" in script
 
 
-def test_bore_snippet_bore_to_uses_control_port_env(job_spec: JobSpec) -> None:
-    """bore --to HOST:PORT must use $OMNIRUN_BORE_CONTROL_PORT (defaulting to 7835)."""
+def test_bore_snippet_bore_to_uses_bare_host(job_spec: JobSpec) -> None:
+    """bore --to must take a BARE HOST (bore 0.6.0: control port is fixed at 7835,
+    there is no client flag for it).  The old HOST:PORT form is a bug."""
     script = generate_bootstrap(job_spec)
-    # The --to flag uses a shell variable that incorporates the control port.
-    assert "${_bore_host}:${_bore_port}" in script
-    assert 'OMNIRUN_BORE_CONTROL_PORT:-7835' in script
+    bore_line = _extract_bore_invocation(script)
+    assert bore_line, "bore local invocation not found in script"
+    # --to "$_bore_host" — no colon, no port suffix
+    assert "--to" in bore_line
+    # The invocation must NOT contain a HOST:PORT pattern (e.g. "$_bore_host:$_bore_port")
+    assert ":${_bore_port}" not in bore_line
+    assert ":${OMNIRUN_BORE_CONTROL_PORT" not in bore_line
 
 
 def test_bore_snippet_no_port_flag_in_bore_local(job_spec: JobSpec) -> None:
@@ -348,3 +354,29 @@ def test_bore_snippet_is_runtime_guarded_not_conditional_on_generation(
     # The guard must be present regardless of params
     script = generate_bootstrap(job_spec)
     assert "OMNIRUN_BORE_PUBLIC_HOST" in script
+
+
+def test_bore_snippet_pins_version_0_6_0(job_spec: JobSpec) -> None:
+    """The bore download URL must reference v0.6.0 (protocol-matched to the server
+    used in the spike; v0.5.1 has an incompatible protocol and would silently fail
+    to connect to a v0.6.0 server)."""
+    script = generate_bootstrap(job_spec)
+    assert "v0.6.0" in script
+    assert "v0.5.1" not in script
+
+
+def test_bore_snippet_has_ssh_keygen_A_before_sshd(job_spec: JobSpec) -> None:
+    """ssh-keygen -A must appear before /usr/sbin/sshd so that a missing host
+    key (Kaggle safety net: the openssh-server postinstall may not have run) is
+    created before sshd starts."""
+    script = generate_bootstrap(job_spec)
+    lines = script.splitlines()
+    keygen_idx = next(
+        (i for i, ln in enumerate(lines) if "ssh-keygen -A" in ln), None
+    )
+    sshd_idx = next(
+        (i for i, ln in enumerate(lines) if "/usr/sbin/sshd" in ln and "ssh-keygen" not in ln), None
+    )
+    assert keygen_idx is not None, "ssh-keygen -A not found in script"
+    assert sshd_idx is not None, "/usr/sbin/sshd not found in script"
+    assert keygen_idx < sshd_idx, "ssh-keygen -A must appear before /usr/sbin/sshd"

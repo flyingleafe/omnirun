@@ -156,6 +156,9 @@ def fake_bundle(monkeypatch):
     # (no gh/curl/ls-remote to the network). Tests override these per-case.
     monkeypatch.setattr(kaggle_mod, "_remote_clone_plan", lambda ref, root: None)
     monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: None)
+    # default: bore disabled — keeps harness byte-identical to non-bore baseline.
+    from omnirun.config import BoreConfig
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: BoreConfig())
 
 
 @pytest.fixture
@@ -584,3 +587,72 @@ def test_cancel_uses_api_when_available(fake_api, backend):
 
 def test_check_reports_username(fake_api, backend):
     assert "testuser" in backend.check()
+
+
+# ---- bore env injection (ssh-everywhere T2) ------------------------------------
+
+
+def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
+    from omnirun.config import BoreConfig
+
+    return BoreConfig(public_host=host, secret=secret, control_port=7835)
+
+
+def test_submit_with_bore_injects_env_vars_into_harness(
+    fake_api, backend, monkeypatch
+) -> None:
+    """When bore is enabled, the four OMNIRUN_BORE_*/OMNIRUN_SSH_PUBKEY vars must
+    appear as os.environ assignments in the generated run.py harness.  The vars
+    must be present before the subprocess.Popen call that runs bootstrap.sh, and
+    they must never appear in the git bundle or bootstrap.sh blob."""
+    bore = _make_bore_cfg()
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
+    monkeypatch.setattr(
+        kaggle_mod, "_ensure_keypair", lambda job_id: "ssh-ed25519 AAAA test-pubkey"
+    )
+
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    for var in (
+        "OMNIRUN_BORE_PUBLIC_HOST",
+        "OMNIRUN_BORE_SECRET",
+        "OMNIRUN_BORE_CONTROL_PORT",
+        "OMNIRUN_SSH_PUBKEY",
+    ):
+        assert f'os.environ[{var!r}]' in run_py, f"{var!r} not found in run_py"
+
+    assert "bore.example.com" in run_py
+    assert "s3cr3t" in run_py
+    assert "7835" in run_py
+    assert "test-pubkey" in run_py
+
+    # The bore vars must NOT appear in the embedded bootstrap.sh
+    m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
+    assert m
+    bootstrap = base64.b64decode(m.group(1)).decode()
+    assert "s3cr3t" not in bootstrap, "bore secret must not be in bootstrap.sh"
+    assert "test-pubkey" not in bootstrap, "pubkey literal must not be in bootstrap.sh"
+
+
+def test_submit_without_bore_harness_has_no_bore_vars(
+    fake_api, backend, monkeypatch
+) -> None:
+    """When bore is disabled, the harness must be byte-identical to the pre-bore
+    baseline — no OMNIRUN_BORE_* or OMNIRUN_SSH_PUBKEY assignments."""
+    from omnirun.config import BoreConfig
+
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: BoreConfig())
+
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    assert "OMNIRUN_BORE_PUBLIC_HOST" not in run_py
+    assert "OMNIRUN_BORE_SECRET" not in run_py
+    assert "OMNIRUN_SSH_PUBKEY" not in run_py

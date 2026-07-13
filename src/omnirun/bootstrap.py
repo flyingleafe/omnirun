@@ -56,10 +56,12 @@ MICROMAMBA_INSTALL = (
     ' | tar -xj -C "$OMNIRUN_ROOT/bin" --strip-components=1 bin/micromamba'
 )
 
-# bore v0.5.1 static musl binary — proven in the spike on Colab and Kaggle.
+# bore v0.6.0 static musl binary — protocol-matched to the server/client on this
+# machine (verified in the spike); v0.5.1 uses a different protocol and would
+# silently fail to connect to a v0.6.0 server.
 _BORE_RELEASE_URL = (
-    "https://github.com/ekzhang/bore/releases/download/v0.5.1"
-    "/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz"
+    "https://github.com/ekzhang/bore/releases/download/v0.6.0"
+    "/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
 )
 
 
@@ -77,14 +79,21 @@ def _bore_tunnel_block() -> str:
       - mkdir -p /run/sshd   (privsep dir absent on Kaggle by default)
       - /usr/sbin/sshd        (absolute path — Kaggle requirement)
       - UsePrivilegeSeparation no   (Kaggle kernel user-namespace restriction)
+      - ssh-keygen -A before sshd   (safety net if postinstall didn't create host keys)
 
-    Env vars consumed (T2 will inject these; here they may be empty → no-op):
+    Bore invocation: `bore local 22 --to "$OMNIRUN_BORE_PUBLIC_HOST" ...`
+      - `--to` takes a BARE HOST only (bore 0.6.0 — control port is fixed at 7835,
+        there is no client flag for it).
+      - NO `--port` → server auto-assigns tunnel port to avoid collisions.
+
+    Env vars consumed (injected by the notebook backends when bore is enabled;
+    when unset the block skips entirely — non-bore jobs are byte-unaffected):
       OMNIRUN_BORE_PUBLIC_HOST, OMNIRUN_BORE_SECRET, OMNIRUN_BORE_CONTROL_PORT,
       OMNIRUN_SSH_PUBKEY.
 
     The snippet emits one line to the job log on success:
       OMNIRUN_TUNNEL host=<host> port=<port>
-    The client (T4) scans for this line to obtain the tunnel address.
+    The client (T3+) scans for this line to obtain the tunnel address.
     """
     return f"""\
 # ---- bore tunnel (ssh-everywhere) — runtime-guarded, non-fatal ---------------
@@ -103,15 +112,16 @@ PermitRootLogin prohibit-password
 AuthenticationMethods publickey
 UsePrivilegeSeparation no
 SSHD_EOF
+    # generate host keys if the openssh-server postinstall didn't (Kaggle safety net)
+    ssh-keygen -A >/dev/null 2>&1 || true
     /usr/sbin/sshd
-    # --- install bore (static musl binary) if not already present ---
+    # --- install bore (static musl binary, v0.6.0) if not already present ---
     command -v bore >/dev/null 2>&1 || {{
       curl -fsSL {_BORE_RELEASE_URL} | tar xz -C /usr/local/bin bore
     }}
-    # --- open tunnel; NO --port (server auto-assigns to avoid collisions) ---
+    # --- open tunnel; --to takes a bare host (bore 0.6.0); NO --port (auto-assign) ---
     _bore_host="${{OMNIRUN_BORE_PUBLIC_HOST}}"
-    _bore_port="${{OMNIRUN_BORE_CONTROL_PORT:-7835}}"
-    bore local 22 --to "${{_bore_host}}:${{_bore_port}}" \\
+    bore local 22 --to "${{_bore_host}}" \\
       ${{OMNIRUN_BORE_SECRET:+--secret "${{OMNIRUN_BORE_SECRET}}"}} \\
       > /tmp/omnirun-bore.log 2>&1 &
     # --- wait up to 30s for bore to announce the assigned port ---

@@ -41,6 +41,7 @@ from omnirun.bootstrap import (
     generate_bootstrap,
     notebook_env_spec,
 )
+from omnirun.config import BoreConfig
 from omnirun.models import (
     JobHandle,
     JobSpec,
@@ -125,6 +126,25 @@ def _remote_clone_plan(spec: JobSpec) -> str | None:
     return repo.remote_clone_plan(spec.repo, _local_root(spec))
 
 
+def _bore_cfg() -> BoreConfig:
+    """Load the global bore config (lazy, monkeypatched in tests).
+
+    Kept as a module-level function so tests can replace it with a fake that
+    returns a specific BoreConfig without touching the filesystem.
+    """
+    from omnirun.config import load_config
+
+    return load_config().bore
+
+
+def _ensure_keypair(job_id: str) -> str:
+    """Generate (or reuse) the per-job throwaway SSH keypair (monkeypatched
+    in tests).  Returns the public key string."""
+    from omnirun.transport import ensure_keypair
+
+    return ensure_keypair(job_id)
+
+
 def _ts(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -137,12 +157,21 @@ def _ts(s: str | None) -> datetime | None:
 # ---- exec snippets (python sent to the session kernel over `colab exec`) -------
 
 
-def _launcher_snippet(root: str, job_dir: str) -> str:
+def _launcher_snippet(root: str, job_dir: str, extra_env: dict[str, str] | None = None) -> str:
+    """Python cell that starts bootstrap.sh detached.
+
+    ``extra_env`` is injected into the subprocess environment at launch time
+    (infra vars like bore credentials and the SSH pubkey).  These never touch
+    git — they ride the ``colab exec`` channel directly.
+    """
+    extra = dict(extra_env or {})
+    extra["OMNIRUN_ROOT"] = root
+    env_repr = repr(extra)
     return f"""\
 import os, subprocess
 job_dir = {job_dir!r}
 os.makedirs(job_dir, exist_ok=True)
-env = dict(os.environ, OMNIRUN_ROOT={root!r})
+env = dict(os.environ, **{env_repr})
 log = open(job_dir + "/launcher.log", "ab")
 proc = subprocess.Popen(
     ["bash", job_dir + "/bootstrap.sh"],
@@ -373,6 +402,19 @@ class ColabBackend(Backend):
             new_args += ["--gpu", gpu_flag]
         self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
 
+        # bore env — generated at submit time; empty when bore is disabled so
+        # the launcher never touches it and the script is byte-unchanged.
+        bore = _bore_cfg()
+        bore_env: dict[str, str] = {}
+        if bore.enabled:
+            pubkey = _ensure_keypair(spec.job_id)
+            bore_env = {
+                "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
+                "OMNIRUN_BORE_SECRET": bore.secret or "",
+                "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
+                "OMNIRUN_SSH_PUBKEY": pubkey,
+            }
+
         # a public repo is cloned by the worker directly (bootstrap does the git
         # clone over the VM's internet); only a private/unpushed sha is uploaded
         # as a bundle. Decided once here and reused by render_payload (dry-run).
@@ -448,7 +490,7 @@ class ColabBackend(Backend):
                 "exec",
                 "-s",
                 session,
-                stdin=_launcher_snippet(COLAB_ROOT, job_dir),
+                stdin=_launcher_snippet(COLAB_ROOT, job_dir, extra_env=bore_env or None),
                 timeout=EXEC_TIMEOUT_S,
             )
             pid_str = _marker_line(out, "LAUNCHED ")

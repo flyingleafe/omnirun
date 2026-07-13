@@ -41,6 +41,7 @@ from omnirun.bootstrap import (
     generate_bootstrap,
     notebook_env_spec,
 )
+from omnirun.config import BoreConfig
 from omnirun.models import (
     Capabilities,
     Health,
@@ -121,6 +122,25 @@ def _env_file(spec: JobSpec):
     return repo.env_file(_local_root(spec))
 
 
+def _bore_cfg() -> BoreConfig:
+    """Load the global bore config (lazy, monkeypatched in tests).
+
+    Kept as a module-level function so tests can replace it with a fake that
+    returns a specific BoreConfig without touching the filesystem.
+    """
+    from omnirun.config import load_config
+
+    return load_config().bore
+
+
+def _ensure_keypair(job_id: str) -> str:
+    """Generate (or reuse) the per-job throwaway SSH keypair (monkeypatched
+    in tests).  Returns the public key string."""
+    from omnirun.transport import ensure_keypair
+
+    return ensure_keypair(job_id)
+
+
 def _load_kaggle_api_class() -> Any:
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
@@ -141,12 +161,29 @@ def _ts(s: str | None) -> datetime | None:
 
 
 def _render_harness(
-    job_id: str, bootstrap_b64: str, bundle_b64: str, env_b64: str
+    job_id: str,
+    bootstrap_b64: str,
+    bundle_b64: str,
+    env_b64: str,
+    infra_env: dict[str, str] | None = None,
 ) -> str:
     """The script-kernel payload: decode the embedded bootstrap.sh (+ the git
     bundle, unless the repo is public and bootstrap clones it directly, + any
     out-of-band .env), run bootstrap under /kaggle/tmp, stream its log to kernel
-    stdout, then persist results to /kaggle/working."""
+    stdout, then persist results to /kaggle/working.
+
+    ``infra_env`` is a dict of extra env vars to inject before running bootstrap
+    (bore credentials, SSH pubkey).  These are written as literal ``os.environ``
+    assignments inside the generated Python — they never touch git or the bundle.
+    When ``infra_env`` is None or empty, the harness is byte-identical to before.
+    """
+    infra_env_lines = ""
+    if infra_env:
+        infra_env_lines = "\n".join(
+            f"os.environ[{k!r}] = {v!r}" for k, v in sorted(infra_env.items())
+        )
+        infra_env_lines = infra_env_lines + "\n"
+
     return f'''\
 """omnirun harness for job {job_id} — generated, do not edit."""
 import base64, os, subprocess, sys, tarfile, time
@@ -160,7 +197,7 @@ ENV_B64 = "{env_b64}"
 
 os.makedirs(JOB_DIR, exist_ok=True)
 os.environ["OMNIRUN_ROOT"] = ROOT
-with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
+{infra_env_lines}with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
     f.write(base64.b64decode(BOOTSTRAP_B64))
 if BUNDLE_B64:  # empty when the repo is public (bootstrap clones it directly)
     with open(JOB_DIR + "/bundle.git", "wb") as f:
@@ -482,6 +519,20 @@ class KaggleBackend(Backend):
                 base64.b64encode(envf.read_text().encode()).decode() if envf else ""
             )
 
+            # bore infra env — injected as os.environ assignments inside run.py;
+            # never touches git or the bundle.  Empty when bore is disabled so the
+            # harness is byte-identical to a non-bore submission.
+            bore = _bore_cfg()
+            infra_env: dict[str, str] | None = None
+            if bore.enabled:
+                pubkey = _ensure_keypair(job_id)
+                infra_env = {
+                    "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
+                    "OMNIRUN_BORE_SECRET": bore.secret or "",
+                    "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
+                    "OMNIRUN_SSH_PUBKEY": pubkey,
+                }
+
             script = generate_bootstrap(
                 notebook_env_spec(spec),
                 BootstrapParams(
@@ -496,7 +547,7 @@ class KaggleBackend(Backend):
             )
             boot_b64 = base64.b64encode(script.encode()).decode()
 
-            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64)
+            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64, infra_env)
             self._guard_source_size(harness, shipped_bundle=bool(bundle_b64))
 
             k_dir = stage / "kernel"

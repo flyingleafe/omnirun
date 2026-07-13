@@ -107,6 +107,12 @@ def fake_bundle(monkeypatch):
     # default: private repo (upload a bundle) — keeps submit hermetic (no
     # gh/curl/ls-remote to the network). The public-repo test overrides this.
     monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
+    # default: no .env file — prevents picking up a real repo .env on the
+    # developer's machine (env_file calls git ls-files on the cwd).
+    monkeypatch.setattr(colab_mod, "_env_file", lambda spec: None)
+    # default: bore disabled — keeps submit byte-identical to non-bore baseline.
+    from omnirun.config import BoreConfig
+    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())
 
 
 # ---- probe -----------------------------------------------------------------
@@ -457,3 +463,62 @@ def test_check(cli, backend):
     out = backend.check()
     assert out.startswith("ok:")
     assert "colab 0.6.0" in out
+
+
+# ---- bore env injection (ssh-everywhere T2) ------------------------------------
+
+
+def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
+    from omnirun.config import BoreConfig
+
+    return BoreConfig(public_host=host, secret=secret, control_port=7835)
+
+
+def test_submit_with_bore_injects_env_vars_into_launcher(cli, backend, monkeypatch):
+    """When bore is enabled, the four OMNIRUN_BORE_*/OMNIRUN_SSH_PUBKEY vars
+    must appear in the launcher snippet's env dict (sent via `colab exec`)."""
+    bore = _make_bore_cfg()
+    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
+    monkeypatch.setattr(
+        colab_mod, "_ensure_keypair", lambda job_id: "ssh-ed25519 AAAA test-pubkey"
+    )
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    cli.calls.clear()
+    backend.submit(spec, offer)
+
+    # Find the launcher exec call (last exec)
+    exec_calls = [c for c in cli.calls if c["argv"][1] == "exec"]
+    launcher = exec_calls[-1]["stdin"]
+
+    assert "OMNIRUN_BORE_PUBLIC_HOST" in launcher
+    assert "bore.example.com" in launcher
+    assert "OMNIRUN_BORE_SECRET" in launcher
+    assert "s3cr3t" in launcher
+    assert "OMNIRUN_BORE_CONTROL_PORT" in launcher
+    assert "7835" in launcher
+    assert "OMNIRUN_SSH_PUBKEY" in launcher
+    assert "test-pubkey" in launcher
+
+
+def test_submit_without_bore_launcher_is_byte_unchanged(cli, backend, monkeypatch):
+    """When bore is disabled, the launcher snippet must be byte-identical to the
+    pre-bore baseline — no bore vars, no extra lines."""
+    from omnirun.config import BoreConfig
+
+    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())  # no public_host
+
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    cli.calls.clear()
+    backend.submit(spec, offer)
+
+    exec_calls = [c for c in cli.calls if c["argv"][1] == "exec"]
+    launcher = exec_calls[-1]["stdin"]
+
+    assert "OMNIRUN_BORE_PUBLIC_HOST" not in launcher
+    assert "OMNIRUN_BORE_SECRET" not in launcher
+    assert "OMNIRUN_SSH_PUBKEY" not in launcher
