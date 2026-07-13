@@ -23,12 +23,15 @@ On-worker layout (the contract all backends and status logic rely on):
       repo.git/  (or .git/)            object store — bare repo, or the existing clone's
       .venv/                           ONE env shared by every worktree of the project
       .trees/<sha12>/                  worktree at a revision, shared by all jobs at it
-      .locks/                          flock files (per-project venv, per-sha tree)
+      .locks/                          lock directories (per-project venv, per-sha tree)
+                                       Uses atomic mkdir (not flock) — safe on network
+                                       filesystems (NFS, GPFS) where flock is unreliable.
 
 Reuse model: worktrees are deduped by revision and the venv is shared across all
 of them (UV_PROJECT_ENVIRONMENT=$PROJECT_ROOT/.venv), so jobs at the same sha pay
 nothing to check out or build the env, and a new commit with unchanged deps is a
-fast `uv sync` no-op. Concurrent env/tree creation is serialized by flock.
+fast no-op when the uv.lock+python stamp is unchanged. Concurrent env/tree creation
+is serialized by atomic mkdir locks with heartbeat-based stale-lock stealing.
 
 Status derivation (used by all ssh-family backends):
   result.json exists      -> SUCCEEDED / FAILED by exit_code
@@ -84,8 +87,12 @@ class BootstrapParams:
 
 def _env_block(kind: EnvKind) -> str:
     """Shell that prepares the shared env at $PROJECT_ROOT/.venv (serialized by a
-    per-project flock) and defines ACTIVATE. SYSTEM installs into the ambient
-    interpreter instead (notebooks keep their preinstalled, GPU-matched stack)."""
+    per-project atomic mkdir lock) and defines ACTIVATE. SYSTEM installs into the
+    ambient interpreter instead (notebooks keep their preinstalled, GPU-matched stack).
+
+    Lock dirs under .locks/ are acquired with omnirun_lock (defined in the preamble)
+    which uses atomic mkdir — safe on network filesystems (NFS, GPFS) unlike flock.
+    """
     ensure_uv = f"""\
 if ! command -v uv >/dev/null 2>&1; then
   status env "installing uv"
@@ -95,20 +102,32 @@ fi
 export UV_CACHE_DIR="$OMNIRUN_ROOT/cache/uv"
 export UV_PROJECT_ENVIRONMENT="$PROJECT_ROOT/.venv"
 """
-    # venv ops share one env per project -> serialize on fd 9 (per-project lock)
+    # stamp-guarded idempotent uv sync: skip entirely when uv.lock+python unchanged.
+    # Double-check under the lock (check-lock-recheck) so only the first concurrent
+    # job pays the sync cost; subsequent jobs at the same stamp are a no-op.
     uv_sync = """\
-(
-  flock 9
-  if [ -f uv.lock ]; then uv sync --frozen || uv sync; else uv sync; fi
-) 9>"$PROJECT_ROOT/.locks/venv" || fail "uv sync failed"
+OMNIRUN_VENV_STAMP="$PROJECT_ROOT/.venv/.omnirun-env-stamp"
+OMNIRUN_VENV_WANT=$( { cat uv.lock 2>/dev/null; python3 -V 2>/dev/null; } | sha256sum | cut -d' ' -f1 )
+if [ -f "$OMNIRUN_VENV_STAMP" ] && [ "$(cat "$OMNIRUN_VENV_STAMP")" = "$OMNIRUN_VENV_WANT" ]; then
+  : # env already matches lock+python — skip uv sync
+else
+  omnirun_lock "$PROJECT_ROOT/.locks/venv.d" || fail "uv sync failed"
+  # re-check under the lock (another job may have just built it)
+  if [ ! -f "$OMNIRUN_VENV_STAMP" ] || [ "$(cat "$OMNIRUN_VENV_STAMP")" != "$OMNIRUN_VENV_WANT" ]; then
+    if [ -f uv.lock ]; then uv sync --frozen || uv sync; else uv sync; fi \
+      && echo "$OMNIRUN_VENV_WANT" > "$OMNIRUN_VENV_STAMP" \
+      || { omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "uv sync failed"; }
+  fi
+  omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"
+fi
 ACTIVATE="$PROJECT_ROOT/.venv/bin/activate"
 """
     pip_install = """\
-(
-  flock 9
-  [ -d "$PROJECT_ROOT/.venv" ] || uv venv "$PROJECT_ROOT/.venv"
-  VIRTUAL_ENV="$PROJECT_ROOT/.venv" uv pip install -r requirements.txt
-) 9>"$PROJECT_ROOT/.locks/venv" || fail "pip install failed"
+omnirun_lock "$PROJECT_ROOT/.locks/venv.d" || fail "pip install failed"
+{ [ -d "$PROJECT_ROOT/.venv" ] || uv venv "$PROJECT_ROOT/.venv"; } \
+  && VIRTUAL_ENV="$PROJECT_ROOT/.venv" uv pip install -r requirements.txt \
+  || { omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "pip install failed"; }
+omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"
 ACTIVATE="$PROJECT_ROOT/.venv/bin/activate"
 """
     conda_install = f"""\
@@ -119,14 +138,15 @@ if ! command -v micromamba >/dev/null 2>&1; then
   export PATH="$OMNIRUN_ROOT/bin:$PATH"
 fi
 export MAMBA_ROOT_PREFIX="$OMNIRUN_ROOT/mamba"
-(
-  flock 9
-  if [ -d "$PROJECT_ROOT/.venv" ]; then
-    micromamba install -y -p "$PROJECT_ROOT/.venv" -f environment.yml
-  else
-    micromamba create -y -p "$PROJECT_ROOT/.venv" -f environment.yml
-  fi
-) 9>"$PROJECT_ROOT/.locks/venv" || fail "micromamba failed"
+omnirun_lock "$PROJECT_ROOT/.locks/venv.d" || fail "micromamba failed"
+if [ -d "$PROJECT_ROOT/.venv" ]; then
+  micromamba install -y -p "$PROJECT_ROOT/.venv" -f environment.yml \
+    || {{ omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "micromamba install failed"; }}
+else
+  micromamba create -y -p "$PROJECT_ROOT/.venv" -f environment.yml \
+    || {{ omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "micromamba create failed"; }}
+fi
+omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"
 eval "$(micromamba shell hook --shell bash)"
 ACTIVATE=""
 micromamba activate "$PROJECT_ROOT/.venv"
@@ -134,14 +154,15 @@ micromamba activate "$PROJECT_ROOT/.venv"
     # notebooks: install into the VM's Python so its CUDA-matched torch is kept.
     system_install = """\
 status env "installing into system python"
-(
-  flock 9
-  if [ -f pyproject.toml ] || [ -f setup.py ]; then
-    python -m pip install -e . -q
-  elif [ -f requirements.txt ]; then
-    python -m pip install -r requirements.txt -q
-  fi
-) 9>"$PROJECT_ROOT/.locks/venv" || fail "system pip install failed"
+omnirun_lock "$PROJECT_ROOT/.locks/venv.d" || fail "system pip install failed"
+if [ -f pyproject.toml ] || [ -f setup.py ]; then
+  python -m pip install -e . -q \
+    || { omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "system pip install failed"; }
+elif [ -f requirements.txt ]; then
+  python -m pip install -r requirements.txt -q \
+    || { omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"; fail "system pip install failed"; }
+fi
+omnirun_unlock "$PROJECT_ROOT/.locks/venv.d"
 ACTIVATE=""
 """
     match kind:
@@ -295,16 +316,33 @@ write_result() {{
 }}
 fail() {{ echo "OMNIRUN: FATAL: $1"; write_result 1 "$1"; exit 1; }}
 
+# atomic lock using mkdir — works on NFS/GPFS unlike flock.
+# Spins until acquired; steals stale locks whose heartbeat is older than timeout.
+omnirun_lock() {{
+  local d="$1" to="${{2:-900}}" start now
+  start=$(date +%s)
+  while ! mkdir "$d" 2>/dev/null; do
+    now=$(date +%s)
+    if [ -f "$d/heartbeat" ] && [ $(( now - $(stat -c %Y "$d/heartbeat" 2>/dev/null || echo "$now") )) -gt "$to" ]; then
+      rm -rf "$d"; continue
+    fi
+    [ $(( now - start )) -gt "$to" ] && {{ rm -rf "$d"; continue; }}
+    sleep 1
+  done
+  echo "$HOSTNAME:$$ $(date +%s)" > "$d/heartbeat"
+}}
+omnirun_unlock() {{ rm -rf "$1"; }}
+
 status preparing
 # ---- code (shared worktree per revision, created once under a per-sha lock) -----
 command -v git >/dev/null 2>&1 || fail "git not available on worker"
 {code_block}\
 git --git-dir="$GIT_DIR" cat-file -e "$SHA^{{commit}}" 2>/dev/null || fail "commit $SHA not in object store"
-(
-  flock 9
-  git --git-dir="$GIT_DIR" worktree prune >/dev/null 2>&1 || true
-  [ -d "$TREE_DIR" ] || git --git-dir="$GIT_DIR" worktree add --detach "$TREE_DIR" "$SHA"
-) 9>"$PROJECT_ROOT/.locks/tree-$SHORT" || fail "worktree add failed"
+omnirun_lock "$PROJECT_ROOT/.locks/tree-$SHORT.d"
+git --git-dir="$GIT_DIR" worktree prune >/dev/null 2>&1 || true
+{{ [ -d "$TREE_DIR" ] || git --git-dir="$GIT_DIR" worktree add --detach "$TREE_DIR" "$SHA"; }} \
+  || {{ omnirun_unlock "$PROJECT_ROOT/.locks/tree-$SHORT.d"; fail "worktree add failed"; }}
+omnirun_unlock "$PROJECT_ROOT/.locks/tree-$SHORT.d"
 
 # ---- site setup (backend config + job spec) ---------------------------------
 {setup}
