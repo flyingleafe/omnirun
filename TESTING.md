@@ -192,6 +192,18 @@ and `proof.txt` was pulled back. So a **public repo of any size** runs on Kaggle
 unconstrained by the source cap. Kaggle also injects a gitignored `<repo>/.env`
 (base64 `ENV_B64` → 0600 file → sourced) — unit-tested, parity with Colab.
 
+**OAuth credential format — LIVE-VERIFIED (2026-07-13).** The `kaggle` CLI's
+browser login writes `~/.kaggle/credentials.json` (an OAuth `access_token` +
+`refresh_token` + `username`), not the legacy `kaggle.json` (`username`+`key`).
+Two real bugs surfaced and were fixed against a live GPU (T4) job that ran to
+terminal SUCCEEDED: (1) `_username` only read the legacy `config_values`, which
+the OAuth flow leaves **empty** — it now also reads the username straight from
+`credentials.json`/`kaggle.json` under `KAGGLE_CONFIG_DIR`; (2) OAuth access
+tokens expire (~1h) and the cached `KaggleApi` client does **not** refresh
+mid-flight, so a job outliving its token 401s on the next push/poll — `_api()`
+now re-authenticates when the token in `credentials.json` is within 120s of its
+`access_token_expiration` (legacy key auth never expires, so it is untouched).
+
 **Kernel-source cap — MEASURED (this session).** Pushing `run.py` payloads of
 increasing size to the kernels API: `<=1 MiB` (1,048,570 B) **accepted**,
 `>=1.1 MiB` **rejected with HTTP 400** — so Kaggle's limit is **1 MiB**. The

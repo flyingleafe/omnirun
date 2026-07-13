@@ -157,6 +157,9 @@ class FakeKaggleApi:
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIRUN_STATE_DIR", str(tmp_path / "state"))
+    # Point the kaggle credential dir at an empty tmp dir so the OAuth-expiry
+    # check never reads the developer's real ~/.kaggle during unit tests.
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path / "kaggle-cfg"))
 
 
 @pytest.fixture(autouse=True)
@@ -606,6 +609,109 @@ def test_cancel_uses_api_when_available(fake_api, backend):
 
 def test_check_reports_username(fake_api, backend):
     assert "testuser" in backend.check()
+
+
+def test_username_falls_back_to_oauth_credentials_json(tmp_path):
+    """The newer OAuth credential format authenticates via a token and leaves
+    the api's config_values empty, so get_config_value('username') is None. The
+    username must still be recovered from ~/.kaggle/credentials.json."""
+    (tmp_path / "credentials.json").write_text(
+        json.dumps({"username": "oauthuser", "access_token": "tok", "scopes": []})
+    )
+    api = SimpleNamespace(
+        get_config_value=lambda key: None,
+        config_values={},
+        config_dir=str(tmp_path),
+    )
+    assert KaggleBackend._username(api) == "oauthuser"
+
+
+def test_username_from_config_dir_reads_legacy_kaggle_json(tmp_path):
+    (tmp_path / "kaggle.json").write_text(
+        json.dumps({"username": "legacyuser", "key": "k"})
+    )
+    assert kaggle_mod._username_from_config_dir(str(tmp_path)) == "legacyuser"
+
+
+def test_username_raises_when_no_source_has_it(tmp_path, monkeypatch):
+    monkeypatch.delenv("KAGGLE_USERNAME", raising=False)
+    api = SimpleNamespace(
+        get_config_value=lambda key: None,
+        config_values={},
+        config_dir=str(tmp_path),  # empty dir -> no credential files
+    )
+    with pytest.raises(BackendError, match="could not determine kaggle username"):
+        KaggleBackend._username(api)
+
+
+# ---- OAuth token expiry / re-authentication --------------------------------
+
+
+def _write_oauth_creds(dirpath: Path, expiration: str) -> None:
+    dirpath.mkdir(parents=True, exist_ok=True)
+    (dirpath / "credentials.json").write_text(
+        json.dumps(
+            {
+                "username": "u",
+                "access_token": "tok",
+                "access_token_expiration": expiration,
+            }
+        )
+    )
+
+
+def test_oauth_token_expired_true_when_past(tmp_path, monkeypatch):
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path))
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    _write_oauth_creds(tmp_path, past)
+    assert kaggle_mod._oauth_token_expired() is True
+
+
+def test_oauth_token_expired_true_within_buffer(tmp_path, monkeypatch):
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path))
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    _write_oauth_creds(tmp_path, soon)  # inside the 120s refresh buffer
+    assert kaggle_mod._oauth_token_expired() is True
+
+
+def test_oauth_token_not_expired_when_future(tmp_path, monkeypatch):
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path))
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_oauth_creds(tmp_path, future)
+    assert kaggle_mod._oauth_token_expired() is False
+
+
+def test_oauth_token_expired_false_for_legacy_api_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("KAGGLE_CONFIG_DIR", str(tmp_path))
+    # legacy kaggle.json (username+key) has no credentials.json -> never expires
+    (tmp_path / "kaggle.json").write_text(json.dumps({"username": "u", "key": "k"}))
+    assert kaggle_mod._oauth_token_expired() is False
+
+
+def test_api_reauthenticates_when_oauth_token_expired(monkeypatch):
+    """A cached client whose OAuth token expired must be rebuilt (re-authenticated)
+    so a job outliving its ~1h token does not 401 on the next push/poll."""
+    calls = {"auth": 0, "built": 0}
+
+    class CountingApi:
+        def __init__(self) -> None:
+            calls["built"] += 1
+
+        def authenticate(self) -> None:
+            calls["auth"] += 1
+
+    monkeypatch.setattr(kaggle_mod, "_load_kaggle_api_class", lambda: CountingApi)
+    be = KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+
+    monkeypatch.setattr(kaggle_mod, "_oauth_token_expired", lambda: False)
+    first = be._api()
+    assert be._api() is first  # not expired -> cached, reused
+    assert calls == {"auth": 1, "built": 1}
+
+    monkeypatch.setattr(kaggle_mod, "_oauth_token_expired", lambda: True)
+    second = be._api()
+    assert second is not first  # expired -> fresh client, re-authenticated
+    assert calls == {"auth": 2, "built": 2}
 
 
 # ---- bore env injection (ssh-everywhere T2) ------------------------------------
