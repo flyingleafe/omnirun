@@ -78,7 +78,11 @@ def _bore_tunnel_block() -> str:
     Bakes in the three Kaggle-proven quirks (harmless on Colab):
       - mkdir -p /run/sshd   (privsep dir absent on Kaggle by default)
       - /usr/sbin/sshd        (absolute path — Kaggle requirement)
-      - UsePrivilegeSeparation no   (Kaggle kernel user-namespace restriction)
+      - -f /tmp/omnirun-sshd.conf  standalone config — bypass base sshd_config
+        (live-verified: Colab's base sshd_config sets ListenAddress 127.0.0.1
+        and Port 2222; a drop-in under sshd_config.d/ does NOT override those
+        and sshd would listen on loopback:2222 instead of 0.0.0.0:22,
+        making bore local 22 fail with "could not connect to localhost:22")
       - ssh-keygen -A before sshd   (safety net if postinstall didn't create host keys)
 
     Bore invocation: `bore local 22 --to "$OMNIRUN_BORE_PUBLIC_HOST" ...`
@@ -102,19 +106,30 @@ if [ -n "${{OMNIRUN_BORE_PUBLIC_HOST:-}}" ]; then
     # --- install openssh-server if missing ---
     command -v sshd >/dev/null 2>&1 || \\
       (apt-get update -qq && apt-get install -y -qq openssh-server) >/dev/null 2>&1
-    # --- key-only sshd (Kaggle quirks: mkdir /run/sshd, UsePrivilegeSeparation no) ---
+    # --- key-only sshd (Kaggle/Colab quirks) ---
+    # Use -f with a standalone config to bypass the base sshd_config entirely.
+    # Colab's /etc/ssh/sshd_config sets Port 2222 and ListenAddress 127.0.0.1;
+    # a drop-in in sshd_config.d/ does NOT override those directives — sshd
+    # would listen on loopback:2222 and bore local 22 would fail to connect.
     mkdir -p /run/sshd ~/.ssh
     printf '%s\\n' "${{OMNIRUN_SSH_PUBKEY:-}}" > ~/.ssh/authorized_keys
     chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys
-    cat > /etc/ssh/sshd_config.d/omnirun.conf <<'SSHD_EOF'
+    # generate host keys if the openssh-server postinstall didn't (Kaggle safety net)
+    ssh-keygen -A >/dev/null 2>&1 || true
+    cat > /tmp/omnirun-sshd.conf <<'SSHD_EOF'
+# omnirun standalone sshd config — bypasses the base sshd_config entirely
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 AuthenticationMethods publickey
 UsePrivilegeSeparation no
+UsePAM no
+PrintMotd no
 SSHD_EOF
-    # generate host keys if the openssh-server postinstall didn't (Kaggle safety net)
-    ssh-keygen -A >/dev/null 2>&1 || true
-    /usr/sbin/sshd
+    /usr/sbin/sshd -f /tmp/omnirun-sshd.conf
     # --- install bore (static musl binary, v0.6.0) if not already present ---
     command -v bore >/dev/null 2>&1 || {{
       curl -fsSL {_BORE_RELEASE_URL} | tar xz -C /usr/local/bin bore
