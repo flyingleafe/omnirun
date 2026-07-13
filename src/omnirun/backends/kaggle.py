@@ -170,6 +170,23 @@ def _release_port(job_id: str) -> None:
     release(None, job_id)
 
 
+def _remaining_from_quota(q: object) -> tuple[float | None, str | None]:
+    """Parse ``KaggleApi.quota_view()`` into (remaining_gpu_hours, refresh_iso).
+
+    ``remaining_gpu_hours`` is None when the API did not report a GPU quota
+    (older client or a shape we don't recognize) — callers treat None as
+    "quota unknown, do not block".  This is the single source of truth for the
+    real weekly GPU allowance, shared by discover() and probe() so they can
+    never disagree (they did: probe used to guess from local job records)."""
+    gpu = getattr(q, "gpu_quota", None)
+    remaining_h: float | None = None
+    if gpu is not None:
+        remaining = gpu.total_time_allowed - gpu.time_used
+        remaining_h = max(0.0, remaining.total_seconds() / 3600.0)
+    refresh = getattr(q, "quota_refresh_time", None)
+    return remaining_h, (refresh.isoformat() if refresh else None)
+
+
 def _load_kaggle_api_class() -> Any:
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
@@ -311,15 +328,10 @@ class KaggleBackend(Backend):
         now = datetime.now(timezone.utc)
         try:
             q = self._api().quota_view()
-            remaining_h: float | None = None
-            gpu = getattr(q, "gpu_quota", None)
-            if gpu is not None:
-                remaining = gpu.total_time_allowed - gpu.time_used
-                remaining_h = max(0.0, remaining.total_seconds() / 3600.0)
-            refresh = getattr(q, "quota_refresh_time", None)
+            remaining_h, refresh = _remaining_from_quota(q)
             budget = {
                 "gpu_hours_remaining": remaining_h,
-                "refresh": refresh.isoformat() if refresh else None,
+                "refresh": refresh,
             }
             exhausted = remaining_h is not None and remaining_h <= 0.0
             caps = Capabilities(
@@ -345,33 +357,21 @@ class KaggleBackend(Backend):
 
     # ---- probe ---------------------------------------------------------------
 
-    def _weekly_gpu_hours_used(self) -> float:
-        """Best-effort sum of this week's kaggle GPU job durations (no quota API)."""
-        try:
-            from omnirun.store import JobStore
+    def _gpu_quota_reasons(self) -> list[str]:
+        """Return an unfit reason iff the REAL weekly GPU quota is exhausted.
 
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-            used = 0.0
-            for rec in JobStore().list_records():
-                if rec.handle is None or rec.handle.backend != self.name:
-                    continue
-                if not rec.spec.resources.wants_gpu():
-                    continue
-                sub = rec.submitted_at
-                if sub is None:
-                    continue
-                if sub.tzinfo is None:
-                    sub = sub.replace(tzinfo=timezone.utc)
-                if sub < cutoff:
-                    continue
-                st = rec.last_status
-                if st and st.started_at and st.finished_at:
-                    used += (st.finished_at - st.started_at).total_seconds() / 3600
-                elif rec.spec.resources.time:
-                    used += rec.spec.resources.time.total_seconds() / 3600
-            return used
+        Reads the live quota API (same source as discover()) rather than
+        guessing from local job records or a static config budget — so a job is
+        blocked only when Kaggle itself would refuse it (remaining <= 0).  A
+        quota the API can't report (None) never blocks."""
+        try:
+            remaining_h, refresh = _remaining_from_quota(self._api().quota_view())
         except Exception:
-            return 0.0
+            return []  # quota unknown → be optimistic, let the submit try
+        if remaining_h is None or remaining_h > 0:
+            return []
+        when = f" — refreshes {refresh}" if refresh else ""
+        return [f"weekly GPU quota exhausted{when}"]
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
         try:
@@ -416,15 +416,7 @@ class KaggleBackend(Backend):
                 )
             ]
 
-        budget = float(self.config.extra("weekly_gpu_hours", 30))
-        used = self._weekly_gpu_hours_used()
-        quota_reasons = (
-            [
-                f"weekly quota likely exhausted (~{used:.1f}h used of {budget:.0f}h budget)"
-            ]
-            if used >= budget
-            else []
-        )
+        quota_reasons = self._gpu_quota_reasons()
 
         n = res.effective_gpus()
         floor = res.vram_floor_gb()

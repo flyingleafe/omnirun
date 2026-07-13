@@ -229,7 +229,7 @@ gpus = [{ type = "4090", count = 1 }]   # static capability declaration
 
 [backends.kaggle]
 type = "kaggle"                  # creds from ~/.config/kaggle/kaggle.json
-weekly_gpu_hours = 30            # local budget (no quota API)
+                                # weekly GPU quota is read live from the quota API
 
 [backends.colab]
 type = "colab"
@@ -323,8 +323,9 @@ is already in the revision and is left alone. (`repo.env_file` / `jobdir.stage_e
   `logs/ outputs/ result.json phase` into `/kaggle/working/omnirun-job.tar.gz` so results
   persist with the kernel version. Env handling is forced to `system` (§ below) to keep
   Kaggle's preinstalled CUDA-matched torch. Probe constraints: ~12h session cap → unfit if
-  `resources.time` exceeds; ~30 GPU-h/week quota is not queryable → tracked locally in
-  state as a budget (`weekly_gpu_hours`). Poll ≥30s. `gc()` is a no-op (nothing
+  `resources.time` exceeds; the weekly GPU quota is read live from `KaggleApi.quota_view()`
+  (same source as `discover()`) → GPU offers are unfit only when the real remaining allowance
+  is exhausted (0h). Poll ≥30s. `gc()` is a no-op (nothing
   worker-side: the bundle rode inside the kernel).
 - **Colab**: fully automated via the official `google-colab-cli` (v0.6+, June 2026;
   one-time OAuth). Submit = `colab new --gpu <T4|L4|G4|A100|H100>` → `colab upload`

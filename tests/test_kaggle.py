@@ -14,6 +14,7 @@ import sys
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,14 +24,11 @@ from omnirun.backends.kaggle import KaggleBackend
 from omnirun.config import BackendConfig
 from omnirun.models import (
     JobHandle,
-    JobRecord,
     JobSpec,
     JobStatus,
     RepoRef,
     ResourceSpec,
-    StatusReport,
 )
-from omnirun.store import JobStore
 
 JOB_ID = "train-abc123"
 SHA = "a" * 40
@@ -96,6 +94,11 @@ class FakeKaggleApi:
         self.output_files: dict[str, bytes] = {}
         self.dataset_folders: list[dict] = []
         self.kernel_folders: list[dict] = []
+        # weekly GPU quota (real quota_view() shape); default: plenty remaining
+        self.gpu_total_h = 45.0
+        self.gpu_used_h = 0.0
+        self.quota_refresh: object | None = None
+        self.quota_error: Exception | None = None
 
     def authenticate(self) -> None:
         if self.auth_error:
@@ -137,6 +140,17 @@ class FakeKaggleApi:
     def kernels_output(self, kernel, path, **kw) -> None:
         for name, data in self.output_files.items():
             (Path(path) / name).write_bytes(data)
+
+    def quota_view(self):
+        if self.quota_error:
+            raise self.quota_error
+        gpu = SimpleNamespace(
+            time_used=timedelta(hours=self.gpu_used_h),
+            total_time_allowed=timedelta(hours=self.gpu_total_h),
+        )
+        return SimpleNamespace(
+            gpu_quota=gpu, tpu_quota=None, quota_refresh_time=self.quota_refresh
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -271,45 +285,33 @@ def test_probe_cpu_offer_when_no_gpu(backend):
     assert offers[0].details["machine_shape"] is None
 
 
-def _store_gpu_job(hours: float) -> None:
-    now = datetime.now(timezone.utc)
-    rec = JobRecord(
-        spec=make_spec(gpus=1),
-        handle=make_handle(),
-        submitted_at=now - timedelta(hours=hours),
-        last_status=StatusReport(
-            status=JobStatus.SUCCEEDED,
-            exit_code=0,
-            started_at=now - timedelta(hours=hours),
-            finished_at=now,
-        ),
-    )
-    JobStore().save(rec)
-
-
-def test_probe_quota_exhausted_makes_gpu_offers_unfit(backend):
-    _store_gpu_job(hours=31)  # 31 GPU-hours this week > default 30h budget
+def test_probe_quota_exhausted_makes_gpu_offers_unfit(fake_api, backend):
+    # the REAL quota API (quota_view) reports 0 remaining -> block
+    fake_api.gpu_used_h = 45.0  # used == total
+    fake_api.quota_refresh = datetime(2026, 7, 18, tzinfo=timezone.utc)
     offers = backend.probe(ResourceSpec(gpus=1))
     assert offers
     for o in offers:
         assert not o.fits
-        assert any("weekly quota likely exhausted" in r for r in o.unfit_reasons)
+        assert any("weekly GPU quota exhausted" in r for r in o.unfit_reasons)
+        assert any("2026-07-18" in r for r in o.unfit_reasons)
 
 
-def test_probe_quota_within_budget_fits(backend):
-    _store_gpu_job(hours=2)
+def test_probe_quota_within_budget_fits(fake_api, backend):
+    # 16.74h remaining of 45h (the real reported case) -> GPU offers fit
+    fake_api.gpu_total_h = 45.0
+    fake_api.gpu_used_h = 28.26
     offers = backend.probe(ResourceSpec(gpus=1))
+    assert offers
     assert all(o.fits for o in offers)
 
 
-def test_probe_quota_respects_config_override(fake_api):
-    backend = KaggleBackend(
-        "kaggle",
-        BackendConfig.model_validate({"type": "kaggle", "weekly_gpu_hours": 1}),
-    )
-    _store_gpu_job(hours=2)
+def test_probe_quota_unknown_does_not_block(fake_api, backend):
+    # if the quota API errors, be optimistic (never falsely reject a submit)
+    fake_api.quota_error = RuntimeError("quota endpoint down")
     offers = backend.probe(ResourceSpec(gpus=1))
-    assert all(not o.fits for o in offers)
+    assert offers
+    assert all(o.fits for o in offers)
 
 
 # ---- submit ----------------------------------------------------------------
