@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import Any
 
 from omnirun.backends import jobdir, tarsafe
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, SSHEndpoint, register
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    ProvisioningSink,
+    SSHEndpoint,
+    register,
+)
+from omnirun.sshconn import endpoint_reachable, stream_log_file
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
@@ -179,7 +186,9 @@ def _ts(s: str | None) -> datetime | None:
 # ---- exec snippets (python sent to the session kernel over `colab exec`) -------
 
 
-def _launcher_snippet(root: str, job_dir: str, extra_env: dict[str, str] | None = None) -> str:
+def _launcher_snippet(
+    root: str, job_dir: str, extra_env: dict[str, str] | None = None
+) -> str:
     """Python cell that starts bootstrap.sh detached.
 
     ``extra_env`` is injected into the subprocess environment at launch time
@@ -514,7 +523,9 @@ class ColabBackend(Backend):
                 "exec",
                 "-s",
                 session,
-                stdin=_launcher_snippet(COLAB_ROOT, job_dir, extra_env=bore_env or None),
+                stdin=_launcher_snippet(
+                    COLAB_ROOT, job_dir, extra_env=bore_env or None
+                ),
                 timeout=EXEC_TIMEOUT_S,
             )
             pid_str = _marker_line(out, "LAUNCHED ")
@@ -650,6 +661,14 @@ class ColabBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
+        # Prefer the bore tunnel: `tail -F bootstrap.log` over ssh is truly live,
+        # which polling the session exec loop below is not. Fall back to the exec
+        # path only when the endpoint is absent or not (yet) connectable, so a
+        # slow-to-provision worker never duplicates output across both paths.
+        ep = self.ssh_endpoint(handle)
+        if ep is not None and endpoint_reachable(ep):
+            yield from stream_log_file(ep, f"{job_dir}/logs/bootstrap.log", follow)
+            return
         # Read only bootstrap.log — the canonical merged log (diagnostics + the
         # command's stdout+stderr, which the run step tees back through fd 1/2).
         # Also reading stdout/stderr.log would double every command line; they

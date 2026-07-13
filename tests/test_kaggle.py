@@ -660,6 +660,74 @@ def test_submit_with_bore_injects_env_vars_into_harness(
     assert "test-pubkey" not in bootstrap, "pubkey literal must not be in bootstrap.sh"
 
 
+def _enable_bore_endpoint(backend, monkeypatch, handle) -> None:
+    """Wire a live ssh endpoint for ``handle``: bore enabled, key + port present."""
+    from pathlib import Path
+
+    bore = _make_bore_cfg()
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
+    monkeypatch.setattr(
+        kaggle_mod,
+        "_managed_keypair",
+        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test"),
+    )
+    from omnirun import transport
+
+    transport.allocate(None, handle.job_id, bore.port_min, bore.port_max)
+
+
+def test_logs_streams_over_ssh_when_endpoint_reachable(
+    fake_api, backend, monkeypatch
+) -> None:
+    """A running job with a reachable bore endpoint tails bootstrap.log over ssh
+    — never touching the (non-live) kernel-log API."""
+    handle = make_handle()
+    _enable_bore_endpoint(backend, monkeypatch, handle)
+    monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: True)
+
+    seen: dict[str, str] = {}
+
+    def fake_stream(ep, remote_path, follow):
+        seen["remote_path"] = remote_path
+        yield "hello from worker"
+        yield "second line"
+
+    monkeypatch.setattr(kaggle_mod, "stream_log_file", fake_stream)
+
+    def boom(*a, **k):
+        raise AssertionError("kernel-log API must not be used when ssh is reachable")
+
+    monkeypatch.setattr(backend, "_fetch_log_text", boom)
+
+    assert list(backend.logs(handle, follow=False)) == [
+        "hello from worker",
+        "second line",
+    ]
+    assert seen["remote_path"].endswith(f"/jobs/{JOB_ID}/logs/bootstrap.log")
+    assert kaggle_mod.KAGGLE_ROOT in seen["remote_path"]
+
+
+def test_logs_falls_back_to_api_when_endpoint_unreachable(
+    fake_api, backend, monkeypatch
+) -> None:
+    """If the endpoint exists but is not (yet) connectable, logs fall back to the
+    kernel-log API rather than yielding nothing."""
+    handle = make_handle()
+    _enable_bore_endpoint(backend, monkeypatch, handle)
+    monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: False)
+
+    def no_stream(*a, **k):
+        raise AssertionError("must not stream over ssh when unreachable")
+
+    monkeypatch.setattr(kaggle_mod, "stream_log_file", no_stream)
+    fake_api.status_value = "complete"
+    monkeypatch.setattr(
+        backend, "_fetch_log_text", lambda api, ref: "api line 1\napi line 2"
+    )
+
+    assert list(backend.logs(handle, follow=False)) == ["api line 1", "api line 2"]
+
+
 def test_submit_without_bore_harness_has_no_bore_vars(
     fake_api, backend, monkeypatch
 ) -> None:

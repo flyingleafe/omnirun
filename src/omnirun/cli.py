@@ -16,6 +16,7 @@ from rich.table import Table
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
+from omnirun.sshconn import ssh_argv
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.config import (
@@ -1009,22 +1010,10 @@ def ssh(
         _die(reason)
     assert ep is not None
 
-    # Build the ssh argv, reusing the flags SSHExec uses:
-    #   -i <key>  -p <port>  -o StrictHostKeyChecking=accept-new
-    #   -o UserKnownHostsFile=/dev/null  (ephemeral worker hosts)
-    # Route through the user's own `ssh` binary (invariant: never bypass it).
-    target = f"{ep.user}@{ep.host}" if ep.user else ep.host
-    argv = [
-        "ssh",
-        "-i", str(ep.key_path),
-        "-p", str(ep.port),
-        "-oStrictHostKeyChecking=accept-new",
-        "-oUserKnownHostsFile=/dev/null",
-    ]
-    if cmd:
-        argv += ["--", target] + list(cmd)
-    else:
-        argv += ["-tt", "--", target]  # allocate PTY for interactive session
+    # Build the ssh argv via the shared helper (same flags the notebook `logs`
+    # path uses). Route through the user's own `ssh` binary (invariant: never
+    # bypass it). No CMD → interactive PTY; CMD → run it and exit with its code.
+    argv = ssh_argv(ep, remote_cmd=list(cmd) if cmd else None, interactive=not cmd)
 
     # exec replaces the current process — exit code is the ssh exit code.
     os.execvp("ssh", argv)
