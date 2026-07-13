@@ -1,28 +1,30 @@
 """Shared ssh-connection helpers for the ssh-everywhere transport.
 
-`omnirun ssh` and the notebook backends' `logs` path both connect to a worker
-through the same bore tunnel with the same omnirun-managed key.  This module is
-the single place that assembles that ``ssh`` argv and streams a remote log file
-line-by-line, so the two callers can never drift apart.
+`omnirun ssh` and the notebook backends both reach a worker through the same
+bore tunnel with the same omnirun-managed key.  This module is the single place
+that turns an endpoint into either a one-shot ``ssh`` argv (interactive shell,
+reachability probe) or the shared `SSHExec` transport, so notebook and ssh-family
+backends can never drift apart.
 
 Design notes:
 - We shell out to the user's own ``ssh`` binary (invariant: never bypass it),
   reusing the flags `omnirun ssh` established: managed identity, tunnel port,
   and ``accept-new`` host-key policy against a throwaway known-hosts file
   (worker host keys are ephemeral).
-- `stream_log_file` tails ``logs/bootstrap.log`` — the worker's canonical merged
-  log — giving true live output for a running notebook job, which polling the
-  kernel log cannot.  When the job ends the tunnel drops and ``tail -F`` exits,
-  so the stream ends on its own.
+- `exec_for_endpoint` wraps a tunnelled worker in the SAME `SSHExec` transport
+  the ssh-family backends use, so a notebook worker is driven byte-for-byte
+  identically to a plain-ssh box: `logs` (and any other job-dir operation) goes
+  through `jobdir.tail_logs`/`derive_status` over this exec, not a bespoke path.
+  A follow stops when `derive_status` sees the job terminal (or the tunnel
+  drops → LOST), never by relying on the connection closing.
 """
 
 from __future__ import annotations
 
-import shlex
 import subprocess
-from collections.abc import Iterator
 
 from omnirun.backends.base import SSHEndpoint
+from omnirun.execlayer.ssh import SSHExec
 
 
 def ssh_argv(
@@ -80,36 +82,26 @@ def endpoint_reachable(ep: SSHEndpoint, timeout: float = 8.0) -> bool:
     return proc.returncode == 0
 
 
-def log_stream_argv(ep: SSHEndpoint, remote_path: str, follow: bool) -> list[str]:
-    """Build the argv that streams ``remote_path`` from the worker.
+def exec_for_endpoint(ep: SSHEndpoint) -> SSHExec:
+    """Build the SAME `SSHExec` transport the ssh-family backends use, pointed at
+    a worker reached through the bore tunnel.
 
-    ``follow`` uses ``tail -F`` (survives log rotation, ends when the tunnel
-    drops); otherwise a single ``cat`` that never errors on a missing file.
+    Routing a notebook worker's job-dir operations through this — rather than a
+    notebook-specific ssh path — means they run identically to a plain-ssh
+    backend: the one place that turns "a reachable worker" into "an Exec".
+    Uses the managed key and the ephemeral-host-key policy `omnirun ssh`
+    established (accept-new against a throwaway known-hosts file); a
+    ControlMaster keeps the poll loop's many round-trips on one connection.
     """
-    quoted = shlex.quote(remote_path)
-    remote = (
-        f"tail -n +1 -F {quoted}" if follow else f"cat {quoted} 2>/dev/null || true"
+    target = f"{ep.user}@{ep.host}" if ep.user else ep.host
+    return SSHExec(
+        target,
+        port=ep.port,
+        identity=str(ep.key_path),
+        extra_opts=[
+            "-oStrictHostKeyChecking=accept-new",
+            "-oUserKnownHostsFile=/dev/null",
+        ],
+        login_shell=False,
+        batch_mode=True,
     )
-    return ssh_argv(ep, remote_cmd=[remote])
-
-
-def stream_log_file(ep: SSHEndpoint, remote_path: str, follow: bool) -> Iterator[str]:
-    """Yield lines of a remote log file over ssh.
-
-    Streams line-by-line so ``logs -f`` is live.  The iterator ends when the
-    file is exhausted (``follow=False``) or the connection drops because the
-    job ended (``follow=True``).
-    """
-    argv = log_stream_argv(ep, remote_path, follow)
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            yield line.rstrip("\n")
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()

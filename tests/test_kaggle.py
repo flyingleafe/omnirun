@@ -790,20 +790,26 @@ def _enable_bore_endpoint(backend, monkeypatch, handle) -> None:
 def test_logs_streams_over_ssh_when_endpoint_reachable(
     fake_api, backend, monkeypatch
 ) -> None:
-    """A running job with a reachable bore endpoint tails bootstrap.log over ssh
-    — never touching the (non-live) kernel-log API."""
+    """A running job with a reachable bore endpoint tails bootstrap.log through
+    the SAME SSHExec + jobdir.tail_logs the ssh-family backends use — never
+    touching the (non-live) kernel-log API."""
     handle = make_handle()
     _enable_bore_endpoint(backend, monkeypatch, handle)
     monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: True)
 
-    seen: dict[str, str] = {}
+    sentinel_exec = object()
+    monkeypatch.setattr(kaggle_mod, "exec_for_endpoint", lambda ep: sentinel_exec)
 
-    def fake_stream(ep, remote_path, follow):
-        seen["remote_path"] = remote_path
+    seen: dict[str, object] = {}
+
+    def fake_tail(ex, job_dir, *, follow, is_terminal):
+        seen["ex"] = ex
+        seen["job_dir"] = job_dir
+        seen["follow"] = follow
         yield "hello from worker"
         yield "second line"
 
-    monkeypatch.setattr(kaggle_mod, "stream_log_file", fake_stream)
+    monkeypatch.setattr(kaggle_mod.jobdir, "tail_logs", fake_tail)
 
     def boom(*a, **k):
         raise AssertionError("kernel-log API must not be used when ssh is reachable")
@@ -814,8 +820,42 @@ def test_logs_streams_over_ssh_when_endpoint_reachable(
         "hello from worker",
         "second line",
     ]
-    assert seen["remote_path"].endswith(f"/jobs/{JOB_ID}/logs/bootstrap.log")
-    assert kaggle_mod.KAGGLE_ROOT in seen["remote_path"]
+    assert seen["ex"] is sentinel_exec  # driven through the shared transport
+    assert str(seen["job_dir"]).endswith(f"/jobs/{JOB_ID}")
+    assert kaggle_mod.KAGGLE_ROOT in str(seen["job_dir"])
+    assert seen["follow"] is False
+
+
+def test_logs_follow_over_ssh_stops_when_job_terminal(
+    fake_api, backend, monkeypatch
+) -> None:
+    """logs(follow=True) over the tunnel stops as soon as derive_status — read
+    over the SAME exec — reports terminal, rather than relying on the tunnel
+    dropping (the old `tail -F` hung because a notebook session lingers)."""
+    handle = make_handle()
+    _enable_bore_endpoint(backend, monkeypatch, handle)
+    monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: True)
+    monkeypatch.setattr(kaggle_mod, "exec_for_endpoint", lambda ep: object())
+
+    captured: dict[str, object] = {}
+
+    def fake_tail(ex, job_dir, *, follow, is_terminal):
+        captured["is_terminal"] = is_terminal
+        return iter(())
+
+    monkeypatch.setattr(kaggle_mod.jobdir, "tail_logs", fake_tail)
+    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
+    monkeypatch.setattr(
+        kaggle_mod.jobdir,
+        "derive_status",
+        lambda ex, job_dir: StatusReport(status=next(statuses)),
+    )
+
+    list(backend.logs(handle, follow=True))
+    is_terminal = captured["is_terminal"]
+    assert callable(is_terminal)
+    assert is_terminal() is False  # RUNNING
+    assert is_terminal() is True  # SUCCEEDED -> follow loop would return
 
 
 def test_logs_falls_back_to_api_when_endpoint_unreachable(
@@ -827,10 +867,10 @@ def test_logs_falls_back_to_api_when_endpoint_unreachable(
     _enable_bore_endpoint(backend, monkeypatch, handle)
     monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: False)
 
-    def no_stream(*a, **k):
+    def no_ssh(*a, **k):
         raise AssertionError("must not stream over ssh when unreachable")
 
-    monkeypatch.setattr(kaggle_mod, "stream_log_file", no_stream)
+    monkeypatch.setattr(kaggle_mod, "exec_for_endpoint", no_ssh)
     fake_api.status_value = "complete"
     monkeypatch.setattr(
         backend, "_fetch_log_text", lambda api, ref: "api line 1\napi line 2"

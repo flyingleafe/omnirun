@@ -43,7 +43,7 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.backends import jobdir, tarsafe
-from omnirun.sshconn import endpoint_reachable, stream_log_file
+from omnirun.sshconn import endpoint_reachable, exec_for_endpoint
 from omnirun.bootstrap import (
     BootstrapParams,
     CodeSource,
@@ -811,14 +811,25 @@ class KaggleBackend(Backend):
         return raw
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
-        # Prefer the bore tunnel: `tail -F bootstrap.log` over ssh is truly live,
-        # unlike the kernel log (which the API only serves in non-live snapshots).
-        # Fall back to the API path when the endpoint is absent or not (yet)
-        # connectable, so a slow-to-start kernel never duplicates output.
+        # Prefer the bore tunnel: drive the worker through the exact same
+        # `SSHExec` + `jobdir.tail_logs` the ssh-family backends use, so a kernel
+        # job's `logs` behaves identically — a true live tail that stops cleanly
+        # when `derive_status` (read over the same tunnel) sees the job terminal
+        # or the tunnel drops (LOST). Fall back to the kernel-API path (final
+        # snapshot only) when the endpoint is absent or not (yet) connectable, so
+        # a slow-to-start kernel never duplicates output.
         ep = self.ssh_endpoint(handle)
         if ep is not None and endpoint_reachable(ep):
             job_dir = f"{KAGGLE_ROOT}/jobs/{handle.job_id}"
-            yield from stream_log_file(ep, f"{job_dir}/logs/bootstrap.log", follow)
+            ex = exec_for_endpoint(ep)
+            is_terminal = (
+                (lambda: jobdir.derive_status(ex, job_dir).status.terminal)
+                if follow
+                else None
+            )
+            yield from jobdir.tail_logs(
+                ex, job_dir, follow=follow, is_terminal=is_terminal
+            )
             return
         api = self._api()
         ref = handle.data["kernel_ref"]

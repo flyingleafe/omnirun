@@ -413,6 +413,44 @@ def test_logs_incremental_offsets(cli, backend):
     assert sent_offsets[f"{JOB_DIR}/logs/bootstrap.log"] == len("line1\nline2\n")
 
 
+def test_logs_over_ssh_uses_shared_exec_and_stops_on_terminal(backend, monkeypatch):
+    """With a reachable bore endpoint, colab logs go through the exact same
+    SSHExec + jobdir.tail_logs the ssh-family uses, and follow terminates when
+    derive_status (over the same exec) reports terminal — not via a lingering
+    session (the bug that left `logs -f` hanging)."""
+    from omnirun.backends.base import SSHEndpoint
+
+    ep = SSHEndpoint(host="t.example.com", port=20001, user="root", key_path=Path("/k"))
+    monkeypatch.setattr(backend, "ssh_endpoint", lambda h: ep)
+    monkeypatch.setattr(colab_mod, "endpoint_reachable", lambda e, **kw: True)
+    sentinel_exec = object()
+    monkeypatch.setattr(colab_mod, "exec_for_endpoint", lambda e: sentinel_exec)
+
+    seen: dict[str, object] = {}
+
+    def fake_tail(ex, job_dir, *, follow, is_terminal):
+        seen["ex"] = ex
+        seen["job_dir"] = job_dir
+        seen["is_terminal"] = is_terminal
+        yield "worker line"
+
+    monkeypatch.setattr(colab_mod.jobdir, "tail_logs", fake_tail)
+    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
+    monkeypatch.setattr(
+        colab_mod.jobdir,
+        "derive_status",
+        lambda ex, job_dir: StatusReport(status=next(statuses)),
+    )
+
+    assert list(backend.logs(make_handle(), follow=True)) == ["worker line"]
+    assert seen["ex"] is sentinel_exec
+    assert seen["job_dir"] == JOB_DIR
+    is_terminal = seen["is_terminal"]
+    assert callable(is_terminal)
+    assert is_terminal() is False  # RUNNING
+    assert is_terminal() is True  # SUCCEEDED
+
+
 # ---- outputs / cancel / gc / check ---------------------------------------------
 
 

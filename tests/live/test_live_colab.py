@@ -11,6 +11,7 @@ Needs the google-colab-cli authenticated (one-time `colab auth`).
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -65,6 +66,52 @@ def test_session_reclaimed_by_gc(colab_backend: ColabBackend, tmp_path: Path) ->
         colab_backend.gc(handle)
         assert not _session_listed(colab_backend, session), (
             f"colab session {session!r} still active after gc — VM leaked"
+        )
+    finally:
+        try:
+            colab_backend.gc(handle)
+        except Exception:
+            pass
+
+
+def test_logs_follow_exits_when_job_finished(
+    colab_backend: ColabBackend, tmp_path: Path
+) -> None:
+    """`logs -f` must return on its own once the job is terminal — the property
+    that makes `omnirun logs -f <job> && omnirun gc` a valid reap idiom.
+    Regression for the bore-tunnel `tail -F` that hung forever because a Colab
+    session lingers after the job finishes (so the tunnel never dropped)."""
+    spec = make_live_spec(
+        tmp_path / "lf",
+        command="python -c \"print('LOGSF_DONE')\"",
+        name="live-colab-logsf",
+    )
+    handle = submit_live(colab_backend, spec)
+    try:
+        final = wait_terminal(colab_backend, handle, timeout_s=JOB_TIMEOUT_S, poll_s=15)
+        assert final.status.terminal, (
+            f"job did not finish: {final.status} ({final.detail})"
+        )
+        # The session is intentionally NOT reaped yet (that is the lingering-VM
+        # case). follow must still terminate, driven by derive_status over the
+        # tunnel — never by the connection dropping.
+        lines: list[str] = []
+        done = threading.Event()
+
+        def drain() -> None:
+            try:
+                for line in colab_backend.logs(handle, follow=True):
+                    lines.append(line)
+            finally:
+                done.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        assert done.wait(timeout=120), (
+            "logs(follow=True) did not exit within 120s after the job finished — "
+            "it hung (the tail -F regression)"
+        )
+        assert any("LOGSF_DONE" in ln for ln in lines), (
+            f"expected the job's stdout in the followed logs, got tail {lines[-5:]}"
         )
     finally:
         try:

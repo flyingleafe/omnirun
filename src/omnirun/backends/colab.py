@@ -40,7 +40,7 @@ from omnirun.backends.base import (
     SSHEndpoint,
     register,
 )
-from omnirun.sshconn import endpoint_reachable, stream_log_file
+from omnirun.sshconn import endpoint_reachable, exec_for_endpoint
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
@@ -662,13 +662,24 @@ class ColabBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
-        # Prefer the bore tunnel: `tail -F bootstrap.log` over ssh is truly live,
-        # which polling the session exec loop below is not. Fall back to the exec
-        # path only when the endpoint is absent or not (yet) connectable, so a
+        # Prefer the bore tunnel: drive the worker through the exact same
+        # `SSHExec` + `jobdir.tail_logs` the ssh-family backends use, so a
+        # notebook job's `logs` behaves identically — including stopping cleanly
+        # when `derive_status` (read over the same tunnel) sees the job terminal
+        # or the tunnel drops (LOST). Fall back to the session-exec poll below
+        # only when the endpoint is absent or not (yet) connectable, so a
         # slow-to-provision worker never duplicates output across both paths.
         ep = self.ssh_endpoint(handle)
         if ep is not None and endpoint_reachable(ep):
-            yield from stream_log_file(ep, f"{job_dir}/logs/bootstrap.log", follow)
+            ex = exec_for_endpoint(ep)
+            is_terminal = (
+                (lambda: jobdir.derive_status(ex, job_dir).status.terminal)
+                if follow
+                else None
+            )
+            yield from jobdir.tail_logs(
+                ex, job_dir, follow=follow, is_terminal=is_terminal
+            )
             return
         # Read only bootstrap.log — the canonical merged log (diagnostics + the
         # command's stdout+stderr, which the run step tees back through fd 1/2).

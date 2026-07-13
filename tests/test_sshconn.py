@@ -47,26 +47,23 @@ def test_ssh_argv_no_user() -> None:
     assert sshconn.ssh_argv(ep)[-1] == "h"
 
 
-def test_log_stream_argv_follow_uses_tail_F() -> None:
-    argv = sshconn.log_stream_argv(
-        _ep(), "/root/.omnirun/jobs/j1/logs/bootstrap.log", True
-    )
-    remote = argv[-1]
-    assert remote.startswith("tail -n +1 -F ")
-    assert "/root/.omnirun/jobs/j1/logs/bootstrap.log" in remote
+def test_exec_for_endpoint_builds_sshexec_like_the_ssh_family() -> None:
+    from omnirun.execlayer.ssh import SSHExec
+
+    ex = sshconn.exec_for_endpoint(_ep())
+    # Same transport class the ssh/slurm backends drive job dirs through.
+    assert isinstance(ex, SSHExec)
+    assert ex.target == "root@tunnel.example.com"
+    assert ex.port == 20007
+    assert ex.identity == "/k/id_ed25519"
+    assert "-oStrictHostKeyChecking=accept-new" in ex.extra_opts
+    assert "-oUserKnownHostsFile=/dev/null" in ex.extra_opts
+    assert ex.login_shell is False  # workers are plain shells, not HPC login nodes
 
 
-def test_log_stream_argv_no_follow_uses_cat() -> None:
-    argv = sshconn.log_stream_argv(_ep(), "/p/logs/bootstrap.log", False)
-    remote = argv[-1]
-    assert remote.startswith("cat ")
-    assert "|| true" in remote  # never errors on a missing file
-
-
-def test_log_stream_argv_quotes_path() -> None:
-    argv = sshconn.log_stream_argv(_ep(), "/weird path/with;semi", False)
-    # the path must be shell-quoted so the remote shell treats it as one word
-    assert "'/weird path/with;semi'" in argv[-1]
+def test_exec_for_endpoint_no_user_target() -> None:
+    ep = SSHEndpoint(host="h", port=22, user="", key_path=Path("/k"))
+    assert sshconn.exec_for_endpoint(ep).target == "h"
 
 
 def test_endpoint_reachable_true_on_zero_exit(monkeypatch) -> None:
@@ -98,18 +95,3 @@ def test_endpoint_reachable_false_on_timeout(monkeypatch) -> None:
 
     monkeypatch.setattr(sshconn.subprocess, "run", boom)
     assert sshconn.endpoint_reachable(_ep()) is False
-
-
-def test_stream_log_file_yields_lines(monkeypatch) -> None:
-    class FakeProc:
-        def __init__(self) -> None:
-            self.stdout = iter(["line one\n", "line two\n"])
-
-        def poll(self):
-            return 0
-
-    monkeypatch.setattr(sshconn.subprocess, "Popen", lambda *a, **k: FakeProc())
-    assert list(sshconn.stream_log_file(_ep(), "/p/logs/bootstrap.log", False)) == [
-        "line one",
-        "line two",
-    ]
