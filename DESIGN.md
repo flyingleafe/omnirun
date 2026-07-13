@@ -440,6 +440,14 @@ the SQL store. `omnirun state path` prints the active database URL.
 
 ## 10. Scheduler — Provider seam, pure tick, budget/deadline
 
+> **Status (core branch).** What ships today is the **pure cheapest-fitting
+> free→paid tick** plus the atomic reserve and reconcile/orphan-recovery described
+> below. The **budget ledger, per-job deadline (`start_by`/`finish_by`), priority,
+> `omnirun reprioritize`, and `omnirun budget` (daily/weekly caps)** are **deferred
+> to a follow-up branch, pending a real need for spend control** — the `tick`
+> signature below therefore takes no `ledger`, ranks by `submitted_at` only, and
+> invariants **budget_safety** and **deadline_defense** are not active in core.
+
 ### Provider seam
 
 Between the pure `tick` and the eight concrete `Backend` implementations sits a
@@ -646,8 +654,7 @@ long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
   non-terminal jobs.
 - **Job lifecycle**: QUEUED → (HELD) → PLACING → RUNNING → SUCCEEDED / FAILED /
   CANCELLED.
-- **Commands**: `enqueue [--count N] [--backend NAME] [--finish-by T] [--start-by T]
-  [--priority N] [--max-cost $] -- CMD...`, `queue` (show the table),
+- **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...`, `queue` (show the table),
   `queue --wait` (poll until all terminal), `queue --cancel <qid|all>`; the
   socket also speaks `ping` / `list` / `shutdown`.
 - **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
@@ -658,32 +665,17 @@ long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
 
 ```
 omnirun submit [--name N] [--gpus 1] [--gpu-type H100 | --vram 40] [--time 15h]
-               [--backend uni] [--yes] [--max-cost 30] [--priority 1]
-               [--finish-by 2026-07-12T18:00 | +8h] [--start-by +2h]
-               [--push] -- python train.py ...
+               [--backend uni] [--push] -- python train.py ...
 omnirun offers [same resource flags]      # probe & table, no submit
 omnirun ps                                # all known jobs, refreshed statuses
 omnirun status <job> | logs [-f] <job> | cancel <job> | pull <job> [dest]
-omnirun reprioritize <job> [--priority N] [--finish-by T] [--start-by T]
-                           [--allow-paid | --free-only]
-omnirun budget [--daily $D] [--weekly $W]  # set caps; bare 'budget' shows spend
 omnirun backends check                    # config + connectivity sanity per backend
 omnirun backends discover                 # probe live capability/health; cache facts
 omnirun gc                                # reap finished job dirs, leaked instances
 omnirun serve [--host H] [--port P]       # run the scheduler daemon (optional, §11)
-omnirun enqueue [resource+policy flags] [--count N] [--backend NAME] -- CMD...
+omnirun enqueue [resource flags] [--count N] [--backend NAME] -- CMD...
 omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemon queue
 ```
-
-`--yes` is accepted for backward compatibility but has no effect: `submit` now always
-routes through the scheduler and auto-places.
-
-**`--max-cost` meaning change.** `--max-cost` is now the **per-job USD ceiling**
-for the scheduler's paid escalation (§10). With `--time` it bounds the estimated
-total; without it the ceiling applies to runs with unknown cost. This is NOT the
-old chooser cost-filter that dropped offers above a $/hr threshold — existing
-scripts that used `--max-cost` as a filter should move to per-backend `max_hourly`
-in the config.
 
 ## 13. Implementation notes
 
@@ -716,13 +708,12 @@ in the config.
                    # Offer, JobStatus, JobHandle, JobState, Placement, Slot,
                    # Cost, Availability, Deadline, JobPolicy, Decision
     config.py      # TOML load, backend registry (project_root, gpu_map, max_parallel),
-                   # PolicyConfig, DaemonConfig, BudgetConfig
+                   # PolicyConfig, DaemonConfig
     repo.py        # git state, clean/pushed checks, RepoRef, env_file, bundle creation,
                    # remote_clone_plan/worker_clone_url/remote_is_public (public-repo direct clone)
     bootstrap.py   # bootstrap.sh generation (shared payload), notebook_env_spec
-    budget.py      # pure BudgetLedger (committed/spent, day/week windows, can_afford)
-    scheduler.py   # pure tick(jobs, slots, ledger, now) -> decisions; SchedPolicy
-    control.py     # impure Control driver: reconcile → gather → tick → enact; reprioritize; budget
+    scheduler.py   # pure tick(jobs, slots, now) -> decisions; SchedPolicy
+    control.py     # impure Control driver: reconcile → gather → tick → enact
     providers/     # base.py (Provider protocol, CancelMode),
                    # adapter.py (BackendProvider: Backend+Store → Provider seam)
     state/         # store.py (Store, open_store, reserve, ledger_add/realize),
@@ -737,8 +728,7 @@ in the config.
                    # vast.py, thunder.py
     cli.py         # typer app
   ```
-- Testing tiers: (1) pure unit (codegen, ranking, repo state, scheduler tick,
-  budget ledger); (2) Hypothesis stateful invariant suite (`tests/test_scheduler_invariants.py`,
+- Testing tiers: (1) pure unit (codegen, ranking, repo state, scheduler tick); (2) Hypothesis stateful invariant suite (`tests/test_scheduler_invariants.py`,
   8 invariants over real Control + SQLite Store + Fake/Flaky providers); (3) e2e through
   `local` backend — full submit→run→pull without network; (4) dockerized sshd and
   slurm cluster integration tests, opt-in; (5) live backends — needs user creds.
