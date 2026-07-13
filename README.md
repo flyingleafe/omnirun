@@ -5,28 +5,34 @@ university Slurm cluster over SSH, any box you can ssh into, Kaggle, Colab, or a
 auto-provisioned marketplace GPU (RunPod / Vast.ai / Thunder Compute). One
 `submit` pins the exact commit, ships it to the worker, builds the Python env
 from your lockfiles (uv / micromamba), runs the command, and collects outputs —
-after showing you a cost-vs-wait offer table so you can pick "free but queued"
-over "$2.79/hr right now" (or let it auto-pick).
+the scheduler automatically picks the cheapest/fastest option that fits.
 
 ```console
 $ omnirun submit --gpus 1 --gpu-type A100 --time 4h -- python train.py --epochs 50
-
-  #  offer                                    $/hr    est. total  wait          notes
-  1  uni: gpu partition (1x A100)             free    -           idle nodes available
-  2  thunder: a100xl $1.09/hr                 1.09    $4.36       ~2-3 min      virtualized GPU-over-TCP…
-  3  vast: A100_SXM4 x1 $1.21/hr (Iceland)    1.21    $4.84       ~2-3 min      offers churn…
-  4  runpod: NVIDIA A100 80GB PCIe (SECURE)   1.64    $6.56       ~2-3 min
-  (kaggle: unfit — A100 requires Colab-Pro-linked account)
-
-pick an offer # 1
 submitted train-a3f9c1 -> uni: gpu partition (1x A100)
 follow logs with: omnirun logs -f train-a3f9c1
 
 $ omnirun logs -f train-a3f9c1
 epoch 1/50 loss=2.31 ...
 
+$ omnirun cancel train-a3f9c1          # graceful stop; add --force to hard-kill
+cancelled train-a3f9c1
+
 $ omnirun pull train-a3f9c1
 pulled 3 path(s) to omnirun-outputs/train-a3f9c1
+```
+
+`omnirun offers` shows the full ranked table without submitting — useful before
+you commit:
+
+```console
+$ omnirun offers --gpus 1 --gpu-type A100 --time 4h
+  #  offer                                    $/hr    est. total  wait          notes
+  1  uni: gpu partition (1x A100)             free    -           idle nodes available
+  2  thunder: a100xl $1.09/hr                 1.09    $4.36       ~2-3 min      virtualized GPU-over-TCP…
+  3  vast: A100_SXM4 x1 $1.21/hr (Iceland)    1.21    $4.84       ~2-3 min      offers churn…
+  4  runpod: NVIDIA A100 80GB PCIe (SECURE)   1.64    $6.56       ~2-3 min
+  (kaggle: unfit — A100 requires Colab-Pro-linked account)
 ```
 
 ## How it works
@@ -58,8 +64,14 @@ on the worker:
 5. collect your `outputs` globs into the per-job dir (`jobs/<job_id>/`, which
    holds only logs, outputs, and `result.json`) for `omnirun pull`.
 
+**Placement is automatic.** `submit` runs a synchronous scheduler tick that
+probes backends, picks the cheapest/fastest fitting option (free first, paid
+only if no free slot fits), and places the job — all in one command. No manual offer-picking. `omnirun offers` remains the way to inspect
+the option table before committing.
+
 The direct `omnirun submit` path is **daemonless and has no control plane**.
-Client state is plain JSON under `~/.local/share/omnirun/jobs/<id>/meta.json`;
+Client state lives in a SQLite database at
+`~/.local/share/omnirun/omnirun.db` (see [State storage](#state-storage-optional));
 job status is derived by polling the worker's job dir (result.json presence,
 heartbeat freshness) merged with runtime-native signals (Slurm state, PID
 liveness, kernel status) — pull, not callbacks. Your laptop can be off while
@@ -70,12 +82,34 @@ an **optional** scheduler daemon you run yourself (`omnirun serve`) — see
 [Queueing many jobs](#queueing-many-jobs-optional). It's an add-on, not a
 requirement: single submits never touch it.
 
+## State storage (optional)
+
+omnirun stores all state in a SQLite database
+(`~/.local/share/omnirun/omnirun.db`). The `[state]` config section lets you
+relocate it (a Postgres backend for a shared daemon is a planned Tier-2
+addition, not yet shipped):
+
+```toml
+[state]
+# path = "/custom/omnirun.db"                 # explicit SQLite path
+# url  = "sqlite:////abs/path/omnirun.db"     # explicit SQLite URL (wins over path)
+```
+
+**Migrating from an earlier omnirun version** (if you have JSON state files):
+
+```bash
+omnirun state migrate          # import from default state dir
+omnirun state migrate --from /path/to/state  # or from a custom dir
+omnirun state migrate --dry-run              # count what would be imported
+omnirun state path             # print the active database URL
+```
+
 ## Queueing many jobs (optional)
 
 `omnirun serve` runs an always-on scheduler daemon in the foreground (background
 it yourself — it's meant to live on a small VPS under `mosh`/`tmux`). It listens
 on a localhost TCP socket (default `127.0.0.1:8787`) and owns a durable queue
-persisted as plain JSON, so a restart resumes where it left off.
+persisted in the SQL state store, so a restart resumes where it left off.
 
 ```bash
 omnirun serve &                              # start the daemon (localhost only)
@@ -240,7 +274,7 @@ Global: `omnirun --config PATH <command>` (default config: `$OMNIRUN_CONFIG` or
 `~/.config/omnirun/config.toml`). Every command that takes a job accepts a
 unique id prefix.
 
-**`omnirun submit [OPTIONS] -- COMMAND...`** — probe, pick an offer, run.
+**`omnirun submit [OPTIONS] -- COMMAND...`** — let the scheduler pick and place.
 
 | option | meaning |
 |---|---|
@@ -253,22 +287,21 @@ unique id prefix.
 | `--outputs GLOB` | output glob relative to repo root (repeatable) |
 | `--env K=V` | env var forwarded to the job (repeatable) |
 | `--backend NAME` | restrict to one configured backend |
-| `--yes`, `-y` | don't ask; take the top-ranked offer |
-| `--max-cost $` | drop offers whose estimated total cost exceeds this |
 | `--push` | auto-push an unpushed HEAD to origin |
 | `--dry-run` | print the rendered payload (Slurm: full sbatch script) and exit |
 
 **`omnirun offers [resource flags] [--backend NAME]`** — probe and print the
-offer table without submitting (same resource flags as `submit`).
+offer table without submitting (same resource flags as `submit`, minus policy
+flags). Use this to inspect options before committing.
 
 **`omnirun serve [--host H] [--port P]`** — run the optional scheduler daemon in
 the foreground (background it yourself). Listens on a localhost TCP socket
 (default `127.0.0.1:8787`, overridable in config or with these flags).
 
-**`omnirun enqueue [OPTIONS] --count N -- COMMAND...`** — hand a job to the
-running daemon's queue. Takes all of `submit`'s resource flags (`--gpus`,
-`--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`, `--outputs`,
-`--env`, `--push`) plus `--count N` (enqueue N copies) and
+**`omnirun enqueue [OPTIONS] [--count N] -- COMMAND...`** — hand a job to the
+running daemon's queue. Takes all of `submit`'s resource flags
+(`--gpus`, `--gpu-type`, `--vram`, `--time`, `--cpus`, `--mem`, `--disk`,
+`--outputs`, `--env`, `--push`) plus `--count N` (enqueue N copies) and
 `--backend NAME` (restrict placement to one backend).
 
 **`omnirun queue [--wait] [--cancel QID|all]`** — show the daemon's queue;
@@ -297,6 +330,10 @@ them LOST.
 **`omnirun backends check [NAME]`** — config + connectivity sanity check per
 backend. For SSH/Slurm this establishes the ControlMaster session
 interactively, so 2FA prompts happen here, once.
+
+**`omnirun backends discover [NAME]`** — probe each backend's live capabilities
+and health facts and cache them in the store (TTL-based; used by the scheduler
+for admission).
 
 **`omnirun config-path`** — print the resolved config path and whether it exists.
 

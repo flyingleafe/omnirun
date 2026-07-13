@@ -10,6 +10,7 @@ Follows research/slurm-ssh.md: sbatch rendered locally and piped over stdin
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections.abc import Iterator
@@ -24,6 +25,7 @@ from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -36,7 +38,9 @@ from omnirun.models import (
     normalize_gpu_type,
 )
 from omnirun.repo import local_root_of
-from omnirun.store import JobStore
+from omnirun.state import default_db_url, open_store
+
+log = logging.getLogger(__name__)
 
 # Slurm states that mean "not started yet" / "still occupying a slot".
 QUEUED_STATES = {
@@ -80,6 +84,65 @@ def _scontrol_field(line: str, key: str) -> str | None:
         if tok.startswith(key + "="):
             return tok[len(key) + 1 :]
     return None
+
+
+def _check_assoc(
+    exec_: Exec,
+    account: str,
+    partition: str,
+    qos: str | None,
+) -> str | None:
+    """Return a human-readable error string if the account+partition+QOS combo
+    is not in the user's sacctmgr associations, or None if it's valid (or if
+    sacctmgr is unavailable/unparseable — best-effort, never degrades on parse
+    failure alone).
+    """
+    try:
+        r = exec_.run(
+            "sacctmgr -nP show assoc user=$USER format=Account,Partition,QOS",
+            timeout=15,
+        )
+        if not r.ok or not r.stdout.strip():
+            return None  # can't tell → leave health as-is
+        valid_combos: list[tuple[str, str, set[str]]] = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            acct, prt, qos_field = parts[0], parts[1], parts[2]
+            # QOS column is comma-separated list of allowed QOSes
+            allowed_qos = {q.strip() for q in qos_field.split(",") if q.strip()}
+            valid_combos.append((acct.strip(), prt.strip(), allowed_qos))
+
+        want_account = account.lower()
+        want_partition = partition.lower()
+        want_qos = qos.lower() if qos else None
+
+        for acct, prt, allowed_qos in valid_combos:
+            if acct.lower() != want_account:
+                continue
+            if prt.lower() not in (want_partition, ""):
+                continue
+            # Partition matches (or is a catch-all empty).  Check QOS.
+            if want_qos is None or any(q.lower() == want_qos for q in allowed_qos):
+                return None  # valid combo found
+
+        # Build a readable summary of what IS valid for this account
+        valid_parts = sorted(
+            {prt for acct, prt, _ in valid_combos if acct.lower() == want_account}
+        )
+        valid_summary = ", ".join(valid_parts) if valid_parts else "(none found)"
+        if qos:
+            return (
+                f"account {account!r} + qos {qos!r} not valid on partition"
+                f" {partition!r} — valid partitions for this account: {valid_summary}"
+            )
+        return (
+            f"account {account!r} not valid on partition {partition!r}"
+            f" — valid partitions: {valid_summary}"
+        )
+    except Exception:  # parse errors → best-effort, never crash discover
+        return None
 
 
 def _parse_sinfo_gres(text: str) -> list[str]:
@@ -212,10 +275,12 @@ class SlurmBackend(Backend):
             ensure(interactive=interactive)
 
     def discover(self) -> ProviderFacts:
-        """Query the cluster for partition walltime, GRES GPU types, and QOS parallelism.
+        """Query the cluster for partition walltime, GRES GPU types, QOS limits,
+        and account/partition/QOS association validity.
 
         Never raises — returns UNREACHABLE facts if the host is unreachable.
-        Unknown facts stay None (never fabricated).
+        Unknown facts stay None (never fabricated).  Association failures
+        degrade to Health.DEGRADED with a descriptive health_detail.
         """
         now = datetime.now(timezone.utc)
         try:
@@ -238,13 +303,35 @@ class SlurmBackend(Backend):
             qos = self.config.qos
             if qos:
                 q = self.exec_.run(
-                    f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxSubmitJobsPerUser",
+                    f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxWall,MaxSubmitJobsPerUser",
                     timeout=15,
                 )
                 if q.ok:
-                    field = q.stdout.strip().split("|")[0].strip()
-                    if field.isdigit():
-                        caps.max_parallel_jobs = int(field)
+                    raw = q.stdout.strip()
+                    fields = raw.split("|")
+                    max_wall_str = fields[0].strip() if fields else ""
+                    max_submit_str = fields[1].strip() if len(fields) > 1 else ""
+                    qos_wall = _parse_slurm_duration(max_wall_str)
+                    if qos_wall is not None:
+                        # fold QOS wall cap into partition cap: effective limit is min
+                        if caps.max_walltime is None:
+                            caps.max_walltime = qos_wall
+                        else:
+                            caps.max_walltime = min(caps.max_walltime, qos_wall)
+                    if max_submit_str.isdigit():
+                        caps.max_parallel_jobs = int(max_submit_str)
+
+            # Validate account+partition+QOS association (best-effort: bad parse
+            # leaves health as-is; only a confirmed mismatch degrades health).
+            health: Health = Health.OK
+            health_detail = "ok"
+            account = self.config.account
+            if account and part:
+                assoc_detail = _check_assoc(self.exec_, account, part, qos)
+                if assoc_detail is not None:
+                    health = Health.DEGRADED
+                    health_detail = assoc_detail
+
         except Exception as e:  # discover never raises
             return ProviderFacts(
                 backend=self.name,
@@ -256,8 +343,8 @@ class SlurmBackend(Backend):
             backend=self.name,
             discovered_at=now,
             capabilities=caps,
-            health=Health.OK,
-            health_detail="ok",
+            health=health,
+            health_detail=health_detail,
         )
 
     def _wait_key(self, gpu_type: str | None) -> str:
@@ -326,7 +413,11 @@ class SlurmBackend(Backend):
         except Exception:
             pass
         try:
-            median = JobStore().median_wait_s(self.name, self._wait_key(res.gpu_type))
+            store = open_store(default_db_url())
+            try:
+                median = store.median_wait_s(self.name, self._wait_key(res.gpu_type))
+            finally:
+                store.close()
         except Exception:
             median = None
         if median is not None:
@@ -391,6 +482,7 @@ class SlurmBackend(Backend):
         offer: Offer | None = None,
         on_provisioning: ProvisioningSink | None = None,
     ) -> JobHandle:
+        self._enforce_walltime(spec)
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
         project_root = jobdir.resolve_project_root(
@@ -423,6 +515,55 @@ class SlurmBackend(Backend):
                 "wait_key": self._wait_key(spec.resources.gpu_type),
             },
         )
+
+    def _enforce_walltime(self, spec: JobSpec) -> None:
+        """Refuse a submit if the requested wall-time exceeds the effective cap;
+        warn when --time is omitted so the user isn't silently on the cluster default.
+
+        Best-effort: uses cached ProviderFacts if available; skips check when not.
+        Intentionally kept even though the unified capabilities gate also rejects
+        an over-cap job: this fires on the explicit ``--backend slurm`` path (which
+        never consults the offer table) and gives a wall-time-specific message.
+        """
+        try:
+            store = open_store(default_db_url())
+            try:
+                facts = store.load_facts(self.name)
+            finally:
+                store.close()
+        except Exception:
+            facts = None
+        max_walltime = facts.capabilities.max_walltime if facts else None
+        requested = spec.resources.time
+        qos_tag = f" (qos {self.config.qos!r})" if self.config.qos else ""
+
+        if requested is not None and max_walltime is not None:
+            if requested > max_walltime:
+                cap_fmt = _fmt_time(max_walltime)
+                req_fmt = _fmt_time(requested)
+                raise BackendError(
+                    f"wall-time cap{qos_tag} is {cap_fmt};"
+                    f" requested {req_fmt} — lower --time or choose a different backend"
+                )
+        if requested is None:
+            resolved = self.config.extra("time_default", "1:00:00")
+            if max_walltime is not None:
+                effective = min(
+                    _parse_slurm_duration(resolved) or max_walltime, max_walltime
+                )
+                log.warning(
+                    "%s: --time not set; effective wall-time will be %s%s"
+                    " (cluster/QOS default may be lower — set --time explicitly)",
+                    self.name,
+                    _fmt_time(effective),
+                    qos_tag,
+                )
+            else:
+                log.warning(
+                    "%s: --time not set; cluster default applies (typically 1h–4h)."
+                    " Set --time explicitly to avoid silent kills.",
+                    self.name,
+                )
 
     # --- status ---------------------------------------------------------------------
 
@@ -554,7 +695,11 @@ class SlurmBackend(Backend):
             if wait_s < 0:
                 return
             key = handle.data.get("wait_key") or self._wait_key(None)
-            JobStore().record_wait(self.name, key, wait_s)
+            store = open_store(default_db_url())
+            try:
+                store.record_wait(self.name, key, wait_s)
+            finally:
+                store.close()
         except Exception:
             pass
 
@@ -579,11 +724,12 @@ class SlurmBackend(Backend):
 
         return gen()
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sid = handle.data["slurm_job_id"]
-        r = self.exec_.run(f"scancel {sid}")
+        cmd = f"scancel -s KILL {sid}" if mode is CancelMode.FORCE else f"scancel {sid}"
+        r = self.exec_.run(cmd)
         if not r.ok:
-            raise BackendError(f"scancel {sid} failed: {r.stderr.strip()}")
+            raise BackendError(f"{cmd} failed: {r.stderr.strip()}")
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)

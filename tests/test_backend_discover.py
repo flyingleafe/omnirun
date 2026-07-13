@@ -1,6 +1,13 @@
 from omnirun.backends.base import Backend, register
 from omnirun.config import BackendConfig, GpuDecl
-from omnirun.models import Health, JobHandle, Offer, ResourceSpec, StatusReport
+from omnirun.models import (
+    CancelMode,
+    Health,
+    JobHandle,
+    Offer,
+    ResourceSpec,
+    StatusReport,
+)
 
 
 @register("discotest")
@@ -17,7 +24,7 @@ class _DiscoBackend(Backend):
     def logs(self, handle, follow: bool = False):
         raise NotImplementedError
 
-    def cancel(self, handle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         raise NotImplementedError
 
     def pull_outputs(self, handle, dest):

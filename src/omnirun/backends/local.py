@@ -18,6 +18,7 @@ from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import shell_quote
 from omnirun.execlayer.local import LocalExec
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -181,18 +182,9 @@ class LocalBackend(Backend):
             is_terminal=lambda: self.status(handle).status.terminal,
         )
 
-    def cancel(self, handle: JobHandle) -> None:
-        job_dir = handle.data["job_dir"]
-        pid = (self.exec.read_file(f"{job_dir}/pid") or "").strip()
-        if not pid.isdigit():
-            return
-        r = self.exec.run(f"ps -o pgid= -p {pid}")
-        pgid = r.stdout.strip()
-        pgid = pgid if r.ok and pgid.isdigit() else pid
-        # best-effort: TERM the whole process group (setsid made pid its leader)
-        self.exec.run(
-            f"kill -s TERM -- -{pgid} 2>/dev/null; kill -s TERM {pid} 2>/dev/null; true"
-        )
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        sig = "KILL" if mode is CancelMode.FORCE else "TERM"
+        jobdir.signal_job(self.exec, handle.data["job_dir"], sig)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec, handle.data["job_dir"], dest)

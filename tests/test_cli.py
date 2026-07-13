@@ -18,23 +18,32 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.cli import app
-from omnirun.factstore import FactStore as _FactStore
 from omnirun.models import (
+    CancelMode,
     Capabilities as _Capabilities,
     Health as _Health,
     JobHandle,
+    JobRecord,
     JobSpec,
+    JobState,
     JobStatus,
     Offer,
+    Placement,
     ProviderFacts as _ProviderFacts,
     RepoRef,
     ResourceSpec,
     StatusReport,
 )
 from omnirun.repo import RepoError
-from omnirun.store import JobStore
+from omnirun.state import Store, default_db_url, open_store
 
 runner = CliRunner()
+
+
+def _store() -> Store:
+    """Open the same SQL state store the CLI uses (default DB under
+    ``$OMNIRUN_STATE_DIR``, which the ``env`` fixture points at a tmp dir)."""
+    return open_store(default_db_url())
 
 
 @register("stub")
@@ -76,7 +85,7 @@ class StubBackend(Backend):
         yield "hello from stub"
         yield f"following={follow}"
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         type(self).cancelled.append(handle.job_id)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
@@ -126,7 +135,9 @@ class UnreachableBackend(Backend):
     ) -> Iterator[str]:  # pragma: no cover
         yield ""
 
-    def cancel(self, handle: JobHandle) -> None:  # pragma: no cover
+    def cancel(
+        self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+    ) -> None:  # pragma: no cover
         pass
 
     def pull_outputs(
@@ -167,7 +178,9 @@ class ProvisionThenFailBackend(Backend):
     ) -> Iterator[str]:  # pragma: no cover
         yield ""
 
-    def cancel(self, handle: JobHandle) -> None:  # pragma: no cover
+    def cancel(
+        self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL
+    ) -> None:  # pragma: no cover
         pass
 
     def pull_outputs(
@@ -225,9 +238,9 @@ def env(tmp_path, monkeypatch):
 
 def submit_one(*extra: str) -> str:
     """Submit a job through the CLI and return its job_id."""
-    result = runner.invoke(app, ["submit", "--yes", *extra, "--", "python", "train.py"])
+    result = runner.invoke(app, ["submit", *extra, "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
-    ids = JobStore().list_ids()
+    ids = _store().list_job_ids()
     assert len(ids) == 1
     return ids[0]
 
@@ -235,36 +248,63 @@ def submit_one(*extra: str) -> str:
 # ------------------------------------------------------------------ submit
 
 
-def test_submit_interrupted_after_provision_leaves_reclaimable_stub(env):
-    """A submit that dies after renting still persists a stub record carrying the
-    instance id, so `ps`/`gc` can see and reclaim the orphan (issue #7)."""
+def test_submit_failed_placement_leaves_retryable_queued_job(env):
+    """A backend.submit that raises during placement releases the reservation back
+    to QUEUED (attempts bumped); submit exits 0 with an informational 'queued'
+    message (not an error) so the user knows the job persists for a later tick.
+    NOTE (Phase-3 regression vs. the old direct path): ``BackendProvider.place``
+    does not thread ``on_provisioning``, so a marketplace instance rented mid-submit
+    is NOT captured as a reclaimable stub here — that anti-orphan hook is a Phase-4
+    concern (see task report)."""
     result = runner.invoke(
-        app, ["submit", "--yes", "--backend", "provfail", "--", "python", "train.py"]
+        app, ["submit", "--backend", "provfail", "--", "python", "train.py"]
     )
-    assert result.exit_code != 0  # the submit failed...
+    assert result.exit_code == 0, result.output  # job persists; user informed
+    assert "queued" in result.output
+    assert "later tick" in result.output
 
-    ids = JobStore().list_ids()
-    assert len(ids) == 1  # ...but a record survived
-    rec = JobStore().load(ids[0])
-    assert rec is not None and rec.handle is not None
-    assert rec.handle.data == {"instance_id": "inst-42", "provisioning": True}
+    ids = _store().list_job_ids()
+    assert len(ids) == 1  # QUEUED record survives for a retry
+    rec = _store().load_job(ids[0])
+    assert rec is not None
+    assert rec.state is JobState.QUEUED
+    assert rec.placement is None
+    assert rec.attempts >= 1  # the failed place counted as an attempt
 
 
-def test_submit_yes_happy_path(env):
+def test_daemonless_submit_no_fitting_offer_exits_0_queued(env):
+    """Daemonless submit that can't place right now exits 0 and leaves QUEUED.
+    The job persists so a later `omnirun serve` (or manual submit) can place it."""
+    result = runner.invoke(
+        app, ["submit", "--backend", "offline", "--", "python", "train.py"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "queued" in result.output
+    assert "later tick" in result.output or "omnirun serve" in result.output
+
+    ids = _store().list_job_ids()
+    assert len(ids) == 1
+    rec = _store().load_job(ids[0])
+    assert rec is not None
+    assert rec.state is JobState.QUEUED
+    assert rec.placement is None
+
+
+def test_submit_happy_path(env):
     result = runner.invoke(
         app,
-        ["submit", "--yes", "--gpus", "1", "--time", "2h", "--", "python", "train.py"],
+        ["submit", "--gpus", "1", "--time", "2h", "--", "python", "train.py"],
     )
     assert result.exit_code == 0, result.output
 
-    ids = JobStore().list_ids()
+    ids = _store().list_job_ids()
     assert len(ids) == 1
     job_id = ids[0]
     assert job_id.startswith("python-")
     assert job_id in result.output
     assert "omnirun logs -f" in result.output
 
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None
     assert rec.handle is not None and rec.handle.data["token"] == f"t-{job_id}"
     assert rec.offer is not None and rec.offer.backend == "stub"
@@ -286,7 +326,7 @@ def test_submit_env_var_parsing(env):
 
 
 def test_submit_rejects_malformed_env(env):
-    result = runner.invoke(app, ["submit", "--yes", "--env", "NOVALUE", "--", "x"])
+    result = runner.invoke(app, ["submit", "--env", "NOVALUE", "--", "x"])
     assert result.exit_code == 1
     assert "KEY=VALUE" in result.output
     assert not StubBackend.submitted
@@ -297,32 +337,28 @@ def test_submit_dirty_repo_error(env, monkeypatch):
         raise RepoError("working tree has uncommitted changes — commit them first")
 
     monkeypatch.setattr("omnirun.repo.capture_repo_state", raise_dirty)
-    result = runner.invoke(app, ["submit", "--yes", "--", "python", "train.py"])
+    result = runner.invoke(app, ["submit", "--", "python", "train.py"])
     assert result.exit_code == 1
     assert "uncommitted changes" in result.output
     assert not StubBackend.submitted
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_rejects_dirty_flag(env):
     # --dirty was removed: dirty trees are always refused, with no escape hatch
-    result = runner.invoke(
-        app, ["submit", "--yes", "--dirty", "--", "python", "train.py"]
-    )
+    result = runner.invoke(app, ["submit", "--dirty", "--", "python", "train.py"])
     assert result.exit_code != 0
     assert not StubBackend.submitted
 
 
 def test_submit_dry_run_prints_payload_without_submitting(env):
-    result = runner.invoke(
-        app, ["submit", "--dry-run", "--yes", "--", "python", "train.py"]
-    )
+    result = runner.invoke(app, ["submit", "--dry-run", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
     assert "#!/usr/bin/env bash" in result.output
     assert "python train.py" in result.output
     assert "dry run" in result.output
     assert not StubBackend.submitted
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_dry_run_offline_backend_skips_probe(env):
@@ -335,7 +371,7 @@ def test_submit_dry_run_offline_backend_skips_probe(env):
     assert result.exit_code == 0, result.output
     assert "#!/usr/bin/env bash" in result.output
     assert "python train.py" in result.output
-    assert JobStore().list_ids() == []
+    assert _store().list_job_ids() == []
 
 
 def test_submit_backend_restriction(env):
@@ -348,13 +384,15 @@ def test_submit_backend_restriction(env):
 
 
 def test_submit_unknown_backend_errors(env):
-    result = runner.invoke(app, ["submit", "--yes", "--backend", "nope", "--", "x"])
+    result = runner.invoke(app, ["submit", "--backend", "nope", "--", "x"])
     assert result.exit_code == 1
     assert "not configured" in result.output
 
 
-def test_submit_interactive_pick(env):
-    # two paid offers -> genuine tradeoff -> prompt; cheaper one ranks first
+def test_submit_scheduler_picks_cheapest_paid(env):
+    # Two paid offers, no free option: the scheduler auto-escalates to the
+    # cheapest affordable one (needs a --time so total cost is knowable). This
+    # supersedes the old interactive offer-table pick — placement is automatic.
     env.config_file.write_text(
         """\
 [backends.pricey]
@@ -366,43 +404,14 @@ type = "stub"
 cost_per_hour = 1.0
 """
     )
-    result = runner.invoke(app, ["submit", "--", "python", "train.py"], input="1\n")
+    result = runner.invoke(app, ["submit", "--time", "1h", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
-    assert "pick an offer #" in result.output
+    assert "pick an offer #" not in result.output  # no prompt: auto-placed
     [(job_id, (_, offer))] = StubBackend.submitted.items()
     assert offer.backend == "cheap"
-    rec = JobStore().load(job_id)
-    assert rec is not None and rec.offer is not None
-    assert rec.offer.backend == "cheap"
-
-
-def test_submit_max_cost_filters_to_single_offer(env):
-    env.config_file.write_text(
-        """\
-[backends.pricey]
-type = "stub"
-cost_per_hour = 5.0
-
-[backends.cheap]
-type = "stub"
-cost_per_hour = 1.0
-"""
-    )
-    # no --yes: max-cost filter leaves exactly one fitting offer -> auto-pick
-    result = runner.invoke(app, ["submit", "--max-cost", "2", "--", "x"])
-    assert result.exit_code == 0, result.output
-    [(_, (_, offer))] = StubBackend.submitted.items()
-    assert offer.backend == "cheap"
-
-
-def test_submit_max_cost_can_exclude_everything(env):
-    env.config_file.write_text(
-        '[backends.pricey]\ntype = "stub"\ncost_per_hour = 5.0\n'
-    )
-    result = runner.invoke(app, ["submit", "--yes", "--max-cost", "0.5", "--", "x"])
-    assert result.exit_code == 1
-    assert "no fitting offers" in result.output
-    assert not StubBackend.submitted
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.placement is not None
+    assert rec.placement.provider_name == "cheap"
 
 
 def test_submit_merges_repo_omnirun_toml_defaults(env):
@@ -459,7 +468,7 @@ def test_ps_lists_and_persists_refreshed_status(env):
     assert job_id in result.output
     assert "running" in result.output
     assert "python train.py" in result.output
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.RUNNING
 
@@ -513,9 +522,35 @@ def test_cancel_updates_store(env):
     result = runner.invoke(app, ["cancel", job_id])
     assert result.exit_code == 0, result.output
     assert StubBackend.cancelled == [job_id]
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.CANCELLED
+
+
+def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
+    modes: list[CancelMode] = []
+    monkeypatch.setattr(
+        StubBackend,
+        "cancel",
+        lambda self, handle, mode=CancelMode.GRACEFUL: modes.append(mode),
+    )
+    job_id = submit_one()
+    result = runner.invoke(app, ["cancel", "--force", job_id])
+    assert result.exit_code == 0, result.output
+    assert modes == [CancelMode.FORCE]
+
+
+def test_cli_cancel_default_is_graceful(env, monkeypatch):
+    modes: list[CancelMode] = []
+    monkeypatch.setattr(
+        StubBackend,
+        "cancel",
+        lambda self, handle, mode=CancelMode.GRACEFUL: modes.append(mode),
+    )
+    job_id = submit_one()
+    result = runner.invoke(app, ["cancel", job_id])
+    assert result.exit_code == 0, result.output
+    assert modes == [CancelMode.GRACEFUL]
 
 
 def test_pull_outputs(env, tmp_path):
@@ -524,8 +559,95 @@ def test_pull_outputs(env, tmp_path):
     result = runner.invoke(app, ["pull", job_id, str(dest)])
     assert result.exit_code == 0, result.output
     assert (dest / "result.txt").read_text() == "42"
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.outputs_pulled_to == str(dest)
+
+
+# ------------------------------------- daemon-placed jobs (placement, handle=None)
+
+
+def _seed_daemon_placed_job(job_id: str = "daemon-placed-01") -> JobRecord:
+    """Persist a RUNNING job the way the DAEMON leaves it: a scheduler
+    ``Placement`` set (on the ``stub`` provider) but the legacy ``handle`` NEVER
+    populated (``_bridge_placement`` only runs on the daemonless submit path)."""
+    rec = JobRecord(
+        spec=JobSpec(
+            job_id=job_id,
+            name="daemon",
+            command="python train.py",
+            resources=ResourceSpec(),
+            repo=RepoRef(
+                remote_url="git@example.com:me/proj.git",
+                sha="b" * 40,
+                branch="main",
+                slug="proj",
+            ),
+        ),
+        state=JobState.RUNNING,
+        submitted_at=datetime.now(timezone.utc),
+        handle=None,  # the regression: daemon never mirrors placement -> handle
+        placement=Placement(
+            provider_name="stub",
+            job_id=job_id,
+            handle={"token": f"t-{job_id}"},
+            state=JobStatus.RUNNING,
+        ),
+    )
+    _store().save_job(rec)
+    return rec
+
+
+def test_effective_handle_reconstructs_from_placement(env):
+    """The read-side bridge derives the backend handle from a placement when the
+    legacy ``handle`` is None (a daemon-placed job) and returns None only for a
+    truly never-placed job."""
+    from omnirun.cli import _effective_handle
+
+    rec = _seed_daemon_placed_job()
+    handle = _effective_handle(rec)
+    assert handle is not None
+    assert handle.backend == "stub"
+    assert handle.job_id == rec.spec.job_id
+    assert handle.data == {"token": f"t-{rec.spec.job_id}"}
+
+    # A record with neither handle nor placement stays unreachable (None).
+    bare = rec.model_copy(update={"placement": None, "handle": None})
+    assert _effective_handle(bare) is None
+
+    # An already-mirrored handle wins verbatim over the placement.
+    mirrored = rec.model_copy(
+        update={"handle": JobHandle(backend="other", job_id="x", data={"k": "v"})}
+    )
+    got = _effective_handle(mirrored)
+    assert got is not None and got.backend == "other" and got.data == {"k": "v"}
+
+
+def test_daemon_placed_job_reachable_by_lifecycle_commands(env):
+    """Regression: ``logs``/``cancel``/``status`` on a daemon-placed job (placement
+    set, handle None) must reach the backend, NOT raise 'never submitted'."""
+    rec = _seed_daemon_placed_job()
+    job_id = rec.spec.job_id
+
+    # logs: streams from the reconstructed handle instead of erroring.
+    result = runner.invoke(app, ["logs", job_id])
+    assert result.exit_code == 0, result.output
+    assert "hello from stub" in result.output
+    assert "never submitted" not in result.output
+
+    # status: refreshes live via the backend and shows the provider.
+    result = runner.invoke(app, ["status", job_id])
+    assert result.exit_code == 0, result.output
+    assert "running" in result.output
+    assert "stub" in result.output
+    assert "never submitted" not in result.output
+
+    # cancel: reaches the backend cancel through the reconstructed handle.
+    result = runner.invoke(app, ["cancel", job_id])
+    assert result.exit_code == 0, result.output
+    assert StubBackend.cancelled == [job_id]
+    rec2 = _store().load_job(job_id)
+    assert rec2 is not None and rec2.last_status is not None
+    assert rec2.last_status.status is JobStatus.CANCELLED
 
 
 # ------------------------------------------------------------------ gc / backends / config-path
@@ -545,7 +667,7 @@ def test_gc_skips_non_terminal_unless_all(env):
     assert "1 cleaned" in result.output
     # a still-live job is cancelled (best-effort) before its resources are reaped
     assert StubBackend.cancelled == [job_id]
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.LOST
 
@@ -561,7 +683,7 @@ def test_gc_all_tolerates_cancel_failure(env, monkeypatch):
     result = runner.invoke(app, ["gc", "--all"])
     assert result.exit_code == 0, result.output
     assert "1 cleaned" in result.output  # gc proceeded despite the failed cancel
-    rec = JobStore().load(job_id)
+    rec = _store().load_job(job_id)
     assert rec is not None and rec.last_status is not None
     assert rec.last_status.status is JobStatus.LOST
 
@@ -599,26 +721,22 @@ def test_config_path_reports_existence(env):
 
 
 def test_backends_discover_populates_cache(env):
-    from omnirun.factstore import FactStore
-
     result = runner.invoke(app, ["backends", "discover"])
     assert result.exit_code == 0, result.output
-    facts = FactStore().load("stub")
+    facts = _store().load_facts("stub")
     assert facts is not None
     assert facts.health.value in {"ok", "degraded", "unreachable"}
     assert "stub" in result.output
 
 
 def test_backends_discover_named_backend(env):
-    from omnirun.factstore import FactStore
-
     result = runner.invoke(app, ["backends", "discover", "stub"])
     assert result.exit_code == 0, result.output
-    facts = FactStore().load("stub")
+    facts = _store().load_facts("stub")
     assert facts is not None
     assert "stub" in result.output
     # The other configured backends are not discovered when a name is given
-    assert FactStore().load("offline") is None
+    assert _store().load_facts("offline") is None
 
 
 def test_backends_discover_unknown_backend_errors(env):
@@ -636,7 +754,7 @@ def _seed_facts(
     discovered_at: datetime | None = None,
     ttl_s: float = 3600.0,
 ) -> None:
-    _FactStore().save(
+    _store().save_facts(
         _ProviderFacts(
             backend="stub",
             discovered_at=discovered_at or datetime.now(timezone.utc),
@@ -670,3 +788,37 @@ def test_stale_facts_do_not_block(env):
     result = runner.invoke(app, ["offers", "--gpus", "1", "--time", "5h"])
     assert result.exit_code == 0, result.output
     assert "exceeds max walltime" not in result.output  # stale facts must not block
+
+
+# ------------------------------------------------------------------ logs
+
+
+def test_logs_follow_uses_effective_handle_for_placement_only_record(env, job_spec):
+    store = _store()
+    rec = JobRecord(
+        spec=job_spec.model_copy(update={"job_id": "logs-1"}),
+        state=JobState.RUNNING,
+        placement=Placement(
+            provider_name="stub",
+            job_id="logs-1",
+            handle={"token": "t-logs-1"},
+            state=JobStatus.RUNNING,
+        ),
+    )
+    store.save_job(rec)
+    result = runner.invoke(app, ["logs", "-f", "logs-1"])
+    assert result.exit_code == 0, result.output
+    assert "hello from stub" in result.output
+    assert (
+        "following=True" in result.output
+    )  # follow flag threaded through the rebuilt handle
+
+
+# ------------------------------------------------------------------ state sub-app
+
+
+def test_cli_state_path() -> None:
+    """omnirun state path prints a string ending in omnirun.db."""
+    result = runner.invoke(app, ["state", "path"])
+    assert result.exit_code == 0, result.output
+    assert "omnirun.db" in result.output

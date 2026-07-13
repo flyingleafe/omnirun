@@ -46,6 +46,12 @@ def run_bootstrap(script: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_bootstrap_records_pgid(job_spec: JobSpec) -> None:
+    script = generate_bootstrap(job_spec)
+    assert 'ps -o pgid= -p "$$"' in script or "/pgid" in script
+    assert "$JOB_DIR/pgid" in script
+
+
 def test_script_passes_bash_syntax_check(job_spec: JobSpec, tmp_path: Path) -> None:
     script = tmp_path / "bootstrap.sh"
     script.write_text(generate_bootstrap(job_spec))
@@ -221,6 +227,20 @@ def test_generated_script_uses_mkdir_lock_not_flock(job_spec: JobSpec) -> None:
         # or `flock "` (flock with a file arg) must not appear.
         assert "flock 9" not in script, f"flock fd-9 found in {kind} script"
         assert 'flock "' not in script, f"flock file-arg found in {kind} script"
+
+
+def test_lock_refreshes_heartbeat_and_unlock_kills_refresher(
+    job_spec: JobSpec,
+) -> None:
+    """A held lock must keep its heartbeat fresh so a long `uv sync` (slower than
+    the stale-lock timeout) is not stolen mid-build (the residual #12 race), and
+    omnirun_unlock must stop that background refresher."""
+    script = generate_bootstrap(_make_spec(job_spec, EnvKind.UV))
+    # a background refresher rewrites the lock heartbeat on an interval
+    assert 'echo $! > "$d/hb.pid"' in script
+    assert "while :; do sleep 60;" in script
+    # unlock kills the refresher before removing the lock dir
+    assert 'kill "$(cat "$1/hb.pid")"' in script
 
 
 def test_generated_script_venv_lock_uses_dot_d_directory(job_spec: JobSpec) -> None:

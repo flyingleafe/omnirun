@@ -110,15 +110,6 @@ def rank(
     return ranked
 
 
-def apply_max_cost(
-    ranked: list[RankedOffer], max_cost: float | None
-) -> list[RankedOffer]:
-    """Drop offers whose estimated total cost exceeds max_cost (free ones stay)."""
-    if max_cost is None:
-        return ranked
-    return [r for r in ranked if (r.total_cost or 0.0) <= max_cost]
-
-
 def auto_pick(ranked: list[RankedOffer], policy: PolicyConfig) -> RankedOffer | None:
     """DESIGN §4: auto-pick iff the top offer is free with a known wait under
     auto_wait_threshold, or exactly one offer fits. Otherwise ask the human."""

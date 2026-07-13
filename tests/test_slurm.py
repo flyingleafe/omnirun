@@ -13,8 +13,15 @@ from omnirun.backends.base import BackendError
 from omnirun.backends.slurm import SlurmBackend, render_sbatch
 from omnirun.config import BackendConfig
 from omnirun.execlayer.base import Exec, ExecError, ExecResult
-from omnirun.models import JobHandle, JobSpec, JobStatus, RepoRef, ResourceSpec
-from omnirun.store import JobStore
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+)
+from omnirun.state import default_db_url, open_store
 
 
 class FakeExec(Exec):
@@ -374,10 +381,22 @@ def test_status_records_wait_on_first_running(state_dir):
     )
     b = make_backend(fake, partition="gpu")
     b.status(HANDLE)
-    assert JobStore().median_wait_s("uni", "gpu:A100") == 300.0
+    assert open_store(default_db_url()).median_wait_s("uni", "gpu:A100") == 300.0
     b.status(HANDLE)  # second sighting must not double-record
-    history = (state_dir / "wait_history.json").read_text()
-    assert history.count("300") == 1
+    # Exactly one wait sample was recorded for (uni, gpu:A100).
+    from sqlalchemy import func, select
+
+    from omnirun.state.schema import wait_samples
+
+    store = open_store(default_db_url())
+    with store._engine.connect() as conn:
+        n = conn.execute(
+            select(func.count())
+            .select_from(wait_samples)
+            .where(wait_samples.c.backend == "uni")
+            .where(wait_samples.c.key == "gpu:A100")
+        ).scalar_one()
+    assert n == 1
 
 
 def test_status_completed_prefers_result_json():
@@ -561,7 +580,7 @@ def test_probe_idle_nodes_must_match_gres_type():
 
 def test_probe_wait_tier2_own_history():
     fake = FakeExec()  # sinfo returns no idle nodes (default empty)
-    JobStore().record_wait("uni", "gpu:A100", 600.0)
+    open_store(default_db_url()).record_wait("uni", "gpu:A100", 600.0)
     b = make_backend(fake, partition="gpu", gpu_map={"A100": "gres:a100:{n}"})
     (offer,) = b.probe(ResourceSpec(gpus=1, gpu_type="A100"))
     assert offer.wait_estimate_s == 600.0
@@ -607,6 +626,18 @@ def test_cancel_failure_raises():
     fake.add(r"scancel", returncode=1, stderr="scancel: error: kill_job error")
     with pytest.raises(BackendError, match="scancel"):
         make_backend(fake).cancel(HANDLE)
+
+
+def test_cancel_graceful_scancels():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.GRACEFUL)
+    assert any(c.startswith("scancel ") and "-s KILL" not in c for c in fake.commands)
+
+
+def test_cancel_force_scancels_with_kill():
+    fake = FakeExec()
+    make_backend(fake).cancel(HANDLE, CancelMode.FORCE)
+    assert any("scancel -s KILL" in c for c in fake.commands)
 
 
 def test_pull_outputs_via_jobdir(tmp_path):

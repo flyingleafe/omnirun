@@ -53,7 +53,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, Field
@@ -64,6 +64,7 @@ from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.repo import local_root_of
 from omnirun.models import (
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -72,10 +73,14 @@ from omnirun.models import (
     StatusReport,
 )
 
+if TYPE_CHECKING:
+    from omnirun.execlayer.ssh import SSHExec as _SSHExecClass
+
+SSHExec: type[_SSHExecClass] | None
 try:  # built on a parallel track; absent only during early development
     from omnirun.execlayer.ssh import SSHExec
 except ImportError:  # pragma: no cover
-    SSHExec = None  # type: ignore[assignment]
+    SSHExec = None
 
 HTTP_TIMEOUT_S = 15.0
 PROVISION_POLL_S = 10.0
@@ -486,19 +491,18 @@ class MarketplaceBackend(Backend, ABC):
                 ) from e
         return paths
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         if handle.data.get("job_dir"):  # a provisioning stub has nothing to kill
-            try:  # best-effort remote kill; instance dies right after anyway
-                ex = self._exec_from_handle(handle)
-                q = shell_quote(handle.data["job_dir"])
-                ex.run(
-                    f"if [ -f {q}/pid ]; then p=$(cat {q}/pid); "
-                    f'kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; fi; true',
-                    timeout=30,
+            sig = "KILL" if mode is CancelMode.FORCE else "TERM"
+            try:  # best-effort remote signal; the instance dies right after anyway
+                jobdir.signal_job(
+                    self._exec_from_handle(handle), handle.data["job_dir"], sig
                 )
             except Exception:
                 pass
         instance_id = handle.data["instance_id"]
+        # Idempotent reap: terminate the billing instance if it still exists,
+        # REGARDLESS of the job's own state — a finished job can still be billing.
         if self._get_instance(instance_id) is not None:
             self._terminate(instance_id)
 

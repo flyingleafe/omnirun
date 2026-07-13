@@ -221,9 +221,10 @@ def test_bore_snippet_uses_port_flag() -> None:
     from omnirun.bootstrap import _bore_tunnel_block
 
     block = _bore_tunnel_block()
-    assert '--port "${{OMNIRUN_BORE_PORT}}"' in block or '--port "${OMNIRUN_BORE_PORT}"' in block, (
-        "bore snippet does not use --port to pass the pre-assigned port"
-    )
+    assert (
+        '--port "${{OMNIRUN_BORE_PORT}}"' in block
+        or '--port "${OMNIRUN_BORE_PORT}"' in block
+    ), "bore snippet does not use --port to pass the pre-assigned port"
 
 
 def test_bore_snippet_does_not_use_auto_assign() -> None:
@@ -238,7 +239,9 @@ def test_bore_snippet_does_not_use_auto_assign() -> None:
         # line or in the subsequent lines of the command continuation).
         # We just verify the block as a whole contains --port.
         pass
-    assert "--port" in block, "bore snippet must use --port for deterministic assignment"
+    assert "--port" in block, (
+        "bore snippet must use --port for deterministic assignment"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +269,9 @@ def _make_colab_handle() -> JobHandle:
 
 
 class TestColabSSHEndpoint:
-    def test_returns_none_when_bore_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_none_when_bore_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())
         be = _make_colab_backend()
         assert be.ssh_endpoint(_make_colab_handle()) is None
@@ -423,7 +428,13 @@ class TestSshBackendSSHEndpoint:
         handle = JobHandle(
             backend="mybox",
             job_id=JOB_ID,
-            data={"job_dir": "/tmp/x", "root": "/tmp", "slug": "proj", "host": "mybox.example.com", "pid": 1},
+            data={
+                "job_dir": "/tmp/x",
+                "root": "/tmp",
+                "slug": "proj",
+                "host": "mybox.example.com",
+                "pid": 1,
+            },
         )
         ep = be.ssh_endpoint(handle)
         assert ep is not None
@@ -444,7 +455,9 @@ class TestSshBackendSSHEndpoint:
     ) -> None:
         from omnirun.backends.ssh import SshBackend
 
-        cfg = BackendConfig.model_validate({"type": "ssh", "host": "mybox.example.com", "port": 2222})
+        cfg = BackendConfig.model_validate(
+            {"type": "ssh", "host": "mybox.example.com", "port": 2222}
+        )
         be = SshBackend("mybox", cfg)
         fake_key = tmp_path / "id_ed25519"
         fake_key.write_text("FAKE")
@@ -547,23 +560,23 @@ class TestOmnirunSshCommand:
 
         monkeypatch.setattr(os, "execvp", fake_execvp)
 
-        # Patch store to return our fake records.
-        from omnirun.store import JobStore
+        import omnirun.cli as cli_mod
 
-        def fake_resolve(self_: Any, ref: str) -> JobRecord:
+        # Patch the SQL store lookup to return our fake records (new Store API).
+        def fake_resolve_job(ref: str) -> JobRecord:
             for r in store_records:
                 if r.spec.job_id == ref or r.spec.job_id.startswith(ref):
                     return r
             raise KeyError(ref)
 
-        monkeypatch.setattr(JobStore, "resolve", fake_resolve)
+        fake_store = MagicMock()
+        fake_store.resolve_job.side_effect = fake_resolve_job
+        monkeypatch.setattr(cli_mod, "open_store", lambda url: fake_store)
 
         # Patch _backend_for to return a mock backend.
         fake_be = MagicMock()
         fake_be.config.type = "colab"
         fake_be.ssh_endpoint.return_value = endpoint
-
-        import omnirun.cli as cli_mod
 
         monkeypatch.setattr(cli_mod, "_backend_for", lambda cfg, name: fake_be)
         monkeypatch.setattr(cli_mod, "_load_cfg", lambda: MagicMock())

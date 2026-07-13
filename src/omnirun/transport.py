@@ -34,7 +34,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from omnirun.store import default_store_dir
+from omnirun.state import default_store_dir
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +89,14 @@ def ensure_keypair(job_id: str, state_dir: Path | None = None) -> str:
     result = subprocess.run(
         [
             "ssh-keygen",
-            "-t", "ed25519",
-            "-N", "",
-            "-C", f"omnirun-{job_id}",
-            "-f", str(priv),
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            f"omnirun-{job_id}",
+            "-f",
+            str(priv),
         ],
         capture_output=True,
         text=True,
@@ -143,10 +147,14 @@ def managed_keypair(state_dir: Path | None = None) -> tuple[Path, str]:
     result = subprocess.run(
         [
             "ssh-keygen",
-            "-t", "ed25519",
-            "-N", "",
-            "-C", "omnirun",
-            "-f", str(priv),
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "omnirun",
+            "-f",
+            str(priv),
         ],
         capture_output=True,
         text=True,

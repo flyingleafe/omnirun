@@ -13,11 +13,12 @@ import os
 import tomllib
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from omnirun.models import normalize_gpu_type
+from omnirun.state import default_db_url
 
 
 class PolicyConfig(BaseModel):
@@ -158,10 +159,33 @@ class BoreConfig(BaseModel):
         return cfg.model_copy(update=overrides) if overrides else cfg
 
 
+class StateConfig(BaseModel):
+    """Where the SQL state store lives (DESIGN §9).
+
+    The store is SQLite-only today — a Postgres dialect is a deferred Tier-2
+    concern, so it is not offered here (a config that selected it would only
+    break at the first write). ``url`` is an explicit SQLAlchemy SQLite URL that
+    wins outright; otherwise ``path`` becomes a SQLite file URL, and with
+    neither set the default ``$OMNIRUN_STATE_DIR/omnirun.db`` is used.
+    """
+
+    backend: Literal["sqlite"] = "sqlite"
+    path: str | None = None
+    url: str | None = None
+
+    def resolved_url(self) -> str:
+        if self.url:
+            return self.url
+        if self.path:
+            return f"sqlite:///{self.path}"
+        return default_db_url()
+
+
 class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     bore: BoreConfig = Field(default_factory=BoreConfig)
+    state: StateConfig = Field(default_factory=StateConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
 

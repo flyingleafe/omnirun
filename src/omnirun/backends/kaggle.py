@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import shutil
 import tarfile
 import tempfile
@@ -50,6 +51,7 @@ from omnirun.bootstrap import (
 )
 from omnirun.config import BoreConfig
 from omnirun.models import (
+    CancelMode,
     Capabilities,
     Health,
     JobHandle,
@@ -61,6 +63,8 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
+
+_log = logging.getLogger("omnirun.backends.kaggle")
 
 # normalized GPU name -> kernel-metadata machine_shape
 KAGGLE_SHAPES: dict[str, str] = {
@@ -97,6 +101,10 @@ RESULT_TAR = "omnirun-job.tar.gz"
 # is unaffected by this cap. Override per backend with `max_source_bytes`.
 KAGGLE_MAX_SOURCE_BYTES = 1024 * 1024
 LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
+LIVE_TAIL_NOTE = (
+    "OMNIRUN: kaggle exposes run logs only after the kernel completes; "
+    "live tail unavailable mid-run"
+)
 
 
 def _create_bundle(root: Path, sha: str, dest: Path) -> Path:
@@ -754,6 +762,7 @@ class KaggleBackend(Backend):
         api = self._api()
         ref = handle.data["kernel_ref"]
         offset = self._log_offsets.get(handle.job_id, 0)
+        noted = False
         while True:
             report = self.status(handle)
             text = self._fetch_log_text(api, ref)
@@ -762,6 +771,10 @@ class KaggleBackend(Backend):
                 offset = len(text)
                 self._log_offsets[handle.job_id] = offset
                 yield from new.splitlines()
+            elif follow and not noted and not report.status.terminal:
+                # Batch API: no mid-run log. Say so once, honestly (issue #4).
+                noted = True
+                yield LIVE_TAIL_NOTE
             if not follow or report.status.terminal:
                 return
             time.sleep(LOG_POLL_INTERVAL_S)
@@ -792,7 +805,7 @@ class KaggleBackend(Backend):
                 shutil.copytree(outputs, dest, dirs_exist_ok=True)
         return sorted(p for p in dest.rglob("*") if p.is_file())
 
-    def cancel(self, handle: JobHandle) -> None:
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         api = self._api()
         ref = handle.data["kernel_ref"]
         # the kaggle package historically has no kernel-cancel endpoint; use one
@@ -810,10 +823,19 @@ class KaggleBackend(Backend):
                     status=JobStatus.CANCELLED, detail="cancelled via API"
                 )
                 return
+        # No cancel endpoint in the installed client. Do NOT raise — that would
+        # abort a Control.cancel reap sweep and surprise the CLI. Release the
+        # tunnel port, mark cancelled locally, and log where to stop it by hand
+        # (idempotent, complete-enough: a Kaggle batch kernel self-terminates at
+        # its session cap anyway).
         _release_port(handle.job_id)
-        raise BackendError(
-            "the installed kaggle client has no kernel-cancel endpoint; "
-            f"stop the session manually at https://www.kaggle.com/code/{ref}"
+        _log.warning(
+            "kaggle client has no kernel-cancel endpoint; stop it at "
+            "https://www.kaggle.com/code/%s",
+            ref,
+        )
+        self._terminal[handle.job_id] = StatusReport(
+            status=JobStatus.CANCELLED, detail="cancel requested (no API endpoint)"
         )
 
     def gc(self, handle: JobHandle) -> None:

@@ -407,6 +407,9 @@ export OMNIRUN_OUTPUT="$JOB_DIR/outputs"
 
 mkdir -p "$JOB_DIR/logs" "$JOB_DIR/outputs" "$PROJECT_ROOT/.trees" "$PROJECT_ROOT/.locks" "$OMNIRUN_ROOT/cache"
 exec >> "$JOB_DIR/logs/bootstrap.log" 2>&1
+# Record our process-group id so cancel can TERM (then KILL) the whole group.
+# We run under setsid, so the pgid is our own pid; write it explicitly anyway.
+ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' > "$JOB_DIR/pgid" || echo "$$" > "$JOB_DIR/pgid"
 
 now() {{ date -u +%Y-%m-%dT%H:%M:%SZ; }}
 status() {{ echo "$1" > "$JOB_DIR/phase"; echo "OMNIRUN: [$(now)] $1 ${{2:-}}"; }}
@@ -431,8 +434,19 @@ omnirun_lock() {{
     sleep 1
   done
   echo "$HOSTNAME:$$ $(date +%s)" > "$d/heartbeat"
+  # Keep the lock heartbeat fresh for the whole critical section so a holder
+  # slower than $to (e.g. a cold `uv sync` reinstalling torch over GPFS) is
+  # never mistaken for dead and its lock stolen mid-build — the residual #12
+  # race the stamp-skip alone cannot close. The refresher dies with the process
+  # group on crash/cancel (like the job heartbeat) and is killed explicitly by
+  # omnirun_unlock on every exit path.
+  ( while :; do sleep 60; echo "$HOSTNAME:$$ $(date +%s)" > "$d/heartbeat" 2>/dev/null || exit 0; done ) &
+  echo $! > "$d/hb.pid"
 }}
-omnirun_unlock() {{ rm -rf "$1"; }}
+omnirun_unlock() {{
+  [ -f "$1/hb.pid" ] && kill "$(cat "$1/hb.pid")" 2>/dev/null
+  rm -rf "$1"
+}}
 
 status preparing
 # ---- code (shared worktree per revision, created once under a per-sha lock) -----

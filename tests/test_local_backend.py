@@ -8,10 +8,18 @@ from pathlib import Path
 
 import pytest
 
+from omnirun.backends import jobdir
 from omnirun.backends.base import backend_class
 from omnirun.backends.local import LocalBackend
 from omnirun.config import BackendConfig
-from omnirun.models import JobHandle, JobSpec, JobStatus, ResourceSpec, StatusReport
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    ResourceSpec,
+    StatusReport,
+)
 
 E2E_TIMEOUT_S = 60.0
 
@@ -180,3 +188,28 @@ def test_probe_unfit_mem(backend: LocalBackend) -> None:
     offers = backend.probe(ResourceSpec(mem_gb=1_000_000))
     assert not offers[0].fits
     assert any("RAM" in r for r in offers[0].unfit_reasons)
+
+
+def test_cancel_graceful_signals_term(
+    backend: LocalBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sigs: list[str] = []
+    monkeypatch.setattr(
+        jobdir, "signal_job", lambda exec_, job_dir, sig: sigs.append(sig)
+    )
+    backend.cancel(JobHandle(backend="local", job_id="x", data={"job_dir": "/tmp/x"}))
+    assert sigs == ["TERM"]
+
+
+def test_cancel_force_signals_kill(
+    backend: LocalBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sigs: list[str] = []
+    monkeypatch.setattr(
+        jobdir, "signal_job", lambda exec_, job_dir, sig: sigs.append(sig)
+    )
+    backend.cancel(
+        JobHandle(backend="local", job_id="x", data={"job_dir": "/tmp/x"}),
+        CancelMode.FORCE,
+    )
+    assert sigs == ["KILL"]

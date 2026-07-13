@@ -10,7 +10,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, SSHEndpoint, register
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    ProvisioningSink,
+    SSHEndpoint,
+    register,
+)
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
@@ -18,6 +24,7 @@ from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
 from omnirun.repo import local_root_of
 from omnirun.models import (
     KNOWN_GPU_VRAM_GB,
+    CancelMode,
     JobHandle,
     JobSpec,
     JobStatus,
@@ -301,16 +308,9 @@ class SshBackend(Backend):
             self.exec_, job_dir, follow=follow, is_terminal=is_terminal
         )
 
-    def cancel(self, handle: JobHandle) -> None:
-        job_dir = handle.data["job_dir"]
-        q = shell_quote(f"{job_dir}/pid")
-        # setsid made the pid its own process-group leader: TERM the whole
-        # group first (children incl. the user command), then the pid itself.
-        self.exec_.run(
-            f"p=$(cat {q} 2>/dev/null); "
-            f'if [ -n "$p" ]; then pkill -TERM -g "$p" 2>/dev/null; '
-            f'kill -TERM "$p" 2>/dev/null; fi; true'
-        )
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        sig = "KILL" if mode is CancelMode.FORCE else "TERM"
+        jobdir.signal_job(self.exec_, handle.data["job_dir"], sig)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)

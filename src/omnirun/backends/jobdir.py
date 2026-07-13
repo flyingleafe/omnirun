@@ -234,6 +234,24 @@ def pull_outputs(exec_: Exec, job_dir: str, dest: Path) -> list[Path]:
     return sorted(p for p in dest.rglob("*") if p.is_file())
 
 
+def signal_job(exec_: Exec, job_dir: str, sig: str) -> None:
+    """Send signal *sig* (e.g. ``"TERM"``/``"KILL"``) to the job's process group.
+
+    The worker recorded its process-group id in ``$JOB_DIR/pgid`` (a setsid session
+    leader, so pgid == the launched pid). We signal the whole group first
+    (``kill -<sig> -<pgid>`` — reaches the user command and its children), then the
+    pgid as a plain pid as a fallback. Best-effort: a missing pidfile or an
+    already-dead process is not an error. The shared worktree/venv are untouched —
+    a job never owns them.
+    """
+    q = shell_quote(f"{job_dir}/pgid")
+    exec_.run(
+        f"g=$(cat {q} 2>/dev/null); "
+        f'if [ -n "$g" ]; then kill -{sig} -"$g" 2>/dev/null || '
+        f'kill -{sig} "$g" 2>/dev/null; fi; true'
+    )
+
+
 def gc_job(exec_: Exec, job_dir: str, slug: str, root: str) -> None:
     """Remove the job dir only. The shared project (worktrees at $PROJECT_ROOT/
     .trees/<sha> and the .venv) persists as reusable cache — a job never owns

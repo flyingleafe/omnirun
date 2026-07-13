@@ -19,7 +19,15 @@ import omnirun.backends.colab as colab_mod
 from omnirun.backends.base import BackendError
 from omnirun.backends.colab import ColabBackend
 from omnirun.config import BackendConfig
-from omnirun.models import JobHandle, JobSpec, JobStatus, RepoRef, ResourceSpec
+from omnirun.models import (
+    CancelMode,
+    JobHandle,
+    JobSpec,
+    JobStatus,
+    RepoRef,
+    ResourceSpec,
+    StatusReport,
+)
 
 JOB_ID = "train-abc123"
 SHA = "b" * 40
@@ -112,6 +120,7 @@ def fake_bundle(monkeypatch):
     monkeypatch.setattr(colab_mod, "_env_file", lambda spec: None)
     # default: bore disabled — keeps submit byte-identical to non-bore baseline.
     from omnirun.config import BoreConfig
+
     monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())
 
 
@@ -448,6 +457,14 @@ def test_cancel_tolerates_dead_session(cli, backend):
     cli.handlers["exec"] = lambda argv, stdin: (1, "", "session not found")
     cli.handlers["stop"] = lambda argv, stdin: (1, "", "session not found")
     backend.cancel(make_handle())  # must not raise
+
+
+def test_cancel_stops_session_even_after_cached_terminal(cli, backend):
+    handle = make_handle()
+    backend._terminal[handle.job_id] = StatusReport(status=JobStatus.SUCCEEDED)
+    backend.cancel(handle, CancelMode.FORCE)
+    assert "stop" in cli.subcommands()
+    assert backend._terminal[handle.job_id].status is JobStatus.CANCELLED
 
 
 def test_gc_stops_session(cli, backend):

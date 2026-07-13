@@ -8,7 +8,7 @@ import os
 import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -27,20 +27,24 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
-from omnirun.factstore import FactStore
+from omnirun.control import Control
 from omnirun.models import (
+    CancelMode,
     EnvSpec,
     Health,
     JobHandle,
+    JobPolicy,
     JobRecord,
     JobSpec,
+    JobState,
     JobStatus,
     Offer,
     ResourceSpec,
     StatusReport,
 )
+from omnirun.providers import BackendProvider, Provider
 from omnirun.queue import QueueState
-from omnirun.store import JobStore
+from omnirun.state import Store, open_store
 
 app = typer.Typer(
     name="omnirun",
@@ -51,6 +55,9 @@ app = typer.Typer(
 )
 backends_app = typer.Typer(no_args_is_help=True, help="Backend management.")
 app.add_typer(backends_app, name="backends")
+
+state_app = typer.Typer(no_args_is_help=True, help="State store management.")
+app.add_typer(state_app, name="state")
 
 console = Console(highlight=False)
 
@@ -105,7 +112,7 @@ def friendly_errors(fn):
     return wrapper
 
 
-def _die(msg: str) -> None:
+def _die(msg: str) -> NoReturn:
     console.print(f"[red]error:[/red] {msg}")
     raise typer.Exit(1)
 
@@ -232,7 +239,7 @@ def _make_backends(
 
 
 def _apply_admission(
-    offers: list[Offer], res: ResourceSpec, store: FactStore
+    offers: list[Offer], res: ResourceSpec, store: Store
 ) -> list[Offer]:
     """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
     Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
@@ -240,7 +247,7 @@ def _apply_admission(
     for o in offers:
         if not o.fits:
             continue
-        facts = store.load(o.backend)
+        facts = store.load_facts(o.backend)
         if facts is None or not facts.is_fresh(now):
             continue
         reasons = facts.capabilities.satisfies(res)
@@ -258,7 +265,11 @@ def _probe(
         chooser.gather_offers(backends, res, timeout_s=cfg.policy.probe_timeout_s)
         + broken
     )
-    offers = _apply_admission(offers, res, FactStore())
+    store = open_store(cfg.state.resolved_url())
+    try:
+        offers = _apply_admission(offers, res, store)
+    finally:
+        store.close()
     ranked = chooser.rank(offers, res, cfg.policy)
     unfit = [o for o in offers if not o.fits]
     return backends, ranked, unfit
@@ -273,8 +284,60 @@ def _backend_for(cfg: Config, name: str) -> Backend:
     return make_backend(name, bcfg)
 
 
+def _effective_handle(rec: JobRecord) -> JobHandle | None:
+    """The backend handle the daemonless lifecycle commands should act on.
+
+    A daemonless ``submit`` mirrors a placement onto the legacy ``rec.handle`` via
+    ``_bridge_placement``. A DAEMON-placed job, however, only ever gets a
+    scheduler ``Placement`` written to its record (``handle`` stays ``None``) — so
+    ``logs``/``cancel``/``pull``/``status``/``gc`` must reconstruct the handle from
+    the placement to reach a job the daemon launched. Prefer the already-mirrored
+    ``rec.handle`` when present; otherwise derive it from the live ``placement``
+    exactly as ``BackendProvider.place`` built the handle it submitted with
+    (``backend`` = the placement's provider, ``data`` = the placement's handle
+    blob). Returns ``None`` only when the job was never placed anywhere (no handle,
+    no placement), which the callers treat as "never submitted".
+    """
+    if rec.handle is not None:
+        return rec.handle
+    p = rec.placement
+    if p is not None:
+        return JobHandle(backend=p.provider_name, job_id=p.job_id, data=p.handle)
+    return None
+
+
+def _bridge_placement(store: Store, rec: JobRecord) -> None:
+    """Project a scheduler ``placement`` onto the legacy ``handle``/``offer`` view.
+
+    The scheduler persists a job's live target as a :class:`Placement`; the
+    daemonless lifecycle commands (``ps``/``status``/``logs``/``cancel``/``pull``/
+    ``gc``) still speak the ``JobHandle``/``Offer``/``last_status`` vocabulary. To
+    keep both working off one record we mirror a placed record's placement into
+    those fields (additively — the placement stays authoritative for the
+    scheduler's capacity view). A record with no real placement is left untouched.
+    Persists in place; a no-op when there is nothing to bridge.
+    """
+    p = rec.placement
+    if p is None or not p.handle:
+        return
+    rec.handle = JobHandle(
+        backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle
+    )
+    if rec.offer is None:
+        rec.offer = Offer(
+            backend=p.provider_name,
+            label=f"{p.provider_name}: {p.state.value}",
+            gpu_type=rec.spec.resources.gpu_type,
+            gpus=rec.spec.resources.effective_gpus(),
+        )
+    # NB: last_status is intentionally left as-is (usually None right after a
+    # place): the lifecycle commands refresh it live via the backend, matching
+    # the pre-scheduler UX where a just-submitted job shows "?" until refreshed.
+    store.save_job(rec)
+
+
 def _refresh_status(
-    store: JobStore, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
+    store: Store, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
 ) -> StatusReport | None:
     """Refresh a non-terminal record's status via its backend; persist it.
     Returns the (possibly stale) best-known report, None if never had one."""
@@ -288,7 +351,7 @@ def _refresh_status(
         report = cache[name].status(rec.handle)
     except Exception:
         return st  # tolerate: unreachable backend must not break `ps`
-    store.update_status(rec.spec.job_id, report)
+    store.update_job_status(rec.spec.job_id, report)
     return report
 
 
@@ -359,6 +422,7 @@ def _build_job_spec(
         else list(job_defaults.get("outputs", []) or []),
         repo=repo_ref,
         env_vars=env_vars,
+        policy=JobPolicy(),
     )
 
 
@@ -398,12 +462,6 @@ def submit(
     ),
     backend: str | None = typer.Option(
         None, "--backend", help="Restrict to one configured backend."
-    ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y", help="Don't ask; take the top-ranked offer."
-    ),
-    max_cost: float | None = typer.Option(
-        None, "--max-cost", help="Drop offers whose est. total $ exceeds this."
     ),
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
@@ -449,51 +507,69 @@ def submit(
         _render_payload(backend_obj, spec, synthetic)
         return
 
-    backends, ranked, unfit = _probe(cfg, res, backend)
-    ranked = chooser.apply_max_cost(ranked, max_cost)
-    if not ranked:
-        console.print(chooser.render_offer_table(ranked, unfit, res))
-        suffix = f" under --max-cost {max_cost:g}" if max_cost is not None else ""
-        _die(f"no fitting offers{suffix}")
-
-    picked = chooser.auto_pick(ranked, cfg.policy)
-    if picked is None and yes:
-        picked = ranked[0]
-    if picked is not None:
-        console.print(f"picked: {picked.offer.label}")
-    else:
-        console.print(chooser.render_offer_table(ranked, unfit, res))
-        n = typer.prompt("pick an offer #", type=int)
-        if not 1 <= n <= len(ranked):
-            _die(f"offer #{n} is not on the table")
-        picked = ranked[n - 1]
-
-    backend_obj = backends[picked.offer.backend]
-
+    # --dry-run without a named backend: the chooser still selects which backend
+    # to preview (display only — nothing is submitted, no Control involved).
     if dry_run:
-        _render_payload(backend_obj, spec, picked.offer)
+        backends, ranked, unfit = _probe(cfg, res, backend)
+        if not ranked:
+            console.print(chooser.render_offer_table(ranked, unfit, res))
+            _die("no fitting offers")
+        picked = chooser.auto_pick(ranked, cfg.policy) or ranked[0]
+        _render_payload(backends[picked.offer.backend], spec, picked.offer)
         return
 
-    store = JobStore()
-    picked_offer = picked.offer
+    # Real placement now runs through the scheduler: the pure ``tick`` inside
+    # ``Control`` reconciles, reserves atomically, and places on the cheapest
+    # offer that fits — the same tick the daemon runs. The chooser remains the
+    # engine of ``omnirun offers`` (display only).
+    store = open_store(cfg.state.resolved_url())
+    try:
+        _submit_via_control(store, cfg, spec, backend)
+    finally:
+        store.close()
 
-    def _persist(h: JobHandle) -> None:
-        # Called once with a provisioning stub (if the backend rents something
-        # before the handle is ready) and again with the final handle, so an
-        # interrupted submit still leaves a reclaimable record (#7).
-        store.save(
-            JobRecord(
-                spec=spec,
-                handle=h,
-                offer=picked_offer,
-                submitted_at=datetime.now(timezone.utc),
-            )
+
+def _submit_via_control(
+    store: Store, cfg: Config, spec: JobSpec, backend: str | None
+) -> None:
+    """Persist *spec* QUEUED, run one synchronous tick, and report the outcome.
+
+    Daemonless: ``Control`` does its own single tick here — no background process
+    is required (a placed job then runs on the backend while the laptop is free).
+    ``--backend`` narrows the provider set the scheduler may place onto.
+    """
+    backends, _broken = _make_backends(cfg, backend)
+    providers: dict[str, Provider] = {
+        name: BackendProvider(be, store) for name, be in backends.items()
+    }
+    control = Control(store, providers)
+    now = datetime.now(timezone.utc)
+    job_id = control.submit(spec, now=now)
+    control.run_tick(now)
+
+    rec = store.load_job(job_id)
+    if rec is None:  # pragma: no cover — we just wrote it
+        _die(f"job {job_id} vanished after submit")
+    _bridge_placement(store, rec)
+
+    if rec.placement is not None and rec.placement.handle:
+        label = (
+            rec.offer.label if rec.offer is not None else rec.placement.provider_name
         )
-
-    handle = backend_obj.submit(spec, picked_offer, on_provisioning=_persist)
-    _persist(handle)
-    console.print(f"[green]submitted[/green] {spec.job_id} -> {picked.offer.label}")
-    console.print(f"follow logs with: omnirun logs -f {spec.job_id}")
+        console.print(f"[green]submitted[/green] {job_id} -> {label}")
+        console.print(f"follow logs with: omnirun logs -f {job_id}")
+        return
+    if rec.state is JobState.HELD:
+        reason = rec.last_status.detail if rec.last_status else "no slot can satisfy it"
+        _die(f"job {job_id} cannot be placed: {reason}")
+    # QUEUED but unplaced: admissible yet no fitting offer right now.
+    # The record persists; a running `omnirun serve` will place it on the next
+    # tick. Daemonless submits have no auto-wakeup, so inform the user and
+    # exit 0 — the job is not lost, merely waiting.
+    console.print(
+        f"queued {job_id}: no slot free right now — it will place on a later tick; "
+        "run `omnirun serve` to place it in the background"
+    )
 
 
 # --------------------------------------------------------------------------- offers
@@ -702,12 +778,12 @@ def _queue_wait(host: str, port: int) -> None:
 @app.command(help="List all known jobs with refreshed statuses.")
 @friendly_errors
 def ps() -> None:
-    store = JobStore()
-    records = store.list_records()
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    records = store.list_jobs()
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
-    cfg = _load_cfg()
     cache: dict[str, Backend] = {}
     now = datetime.now(timezone.utc)
 
@@ -739,20 +815,21 @@ def ps() -> None:
 @app.command(help="Refresh and show one job's details (accepts a unique id prefix).")
 @friendly_errors
 def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
     cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
+    handle = _effective_handle(rec)
     st = rec.last_status
-    if rec.handle is not None and (st is None or not st.status.terminal):
-        be = _backend_for(cfg, rec.handle.backend)
-        st = be.status(rec.handle)
-        store.update_status(rec.spec.job_id, st)
+    if handle is not None and (st is None or not st.status.terminal):
+        be = _backend_for(cfg, handle.backend)
+        st = be.status(handle)
+        store.update_job_status(rec.spec.job_id, st)
 
     rows: list[tuple[str, str]] = [
         ("job", rec.spec.job_id),
         ("name", rec.spec.name),
         ("command", rec.spec.command),
-        ("backend", rec.handle.backend if rec.handle else "-"),
+        ("backend", handle.backend if handle else "-"),
         ("offer", rec.offer.label if rec.offer else "-"),
         (
             "repo",
@@ -785,26 +862,35 @@ def logs(
         False, "--follow", "-f", help="Tail until the job finishes."
     ),
 ) -> None:
-    rec = JobStore().resolve(job)
-    if rec.handle is None:
+    cfg = _load_cfg()
+    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
-    be = _backend_for(_load_cfg(), rec.handle.backend)
-    for line in be.logs(rec.handle, follow=follow):
+    be = _backend_for(cfg, handle.backend)
+    for line in be.logs(handle, follow=follow):
         typer.echo(line.rstrip("\n"))
 
 
-@app.command(help="Cancel a running job.")
+@app.command(help="Cancel a running job (graceful by default; --force = hard kill).")
 @friendly_errors
-def cancel(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
-    if rec.handle is None:
+def cancel(
+    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Skip the graceful window; hard-kill immediately."
+    ),
+) -> None:
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
-    be = _backend_for(_load_cfg(), rec.handle.backend)
-    be.cancel(rec.handle)
-    store.update_status(
+    be = _backend_for(cfg, handle.backend)
+    be.cancel(handle, CancelMode.FORCE if force else CancelMode.GRACEFUL)
+    store.update_job_status(
         rec.spec.job_id,
         StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
     )
@@ -819,15 +905,17 @@ def pull(
         None, help="Destination dir (default: ./omnirun-outputs/<job_id>)."
     ),
 ) -> None:
-    store = JobStore()
-    rec = store.resolve(job)
-    if rec.handle is None:
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    rec = store.resolve_job(job)
+    handle = _effective_handle(rec)
+    if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
     dest = dest or Path("omnirun-outputs") / rec.spec.job_id
-    be = _backend_for(_load_cfg(), rec.handle.backend)
-    paths = be.pull_outputs(rec.handle, dest)
+    be = _backend_for(cfg, handle.backend)
+    paths = be.pull_outputs(handle, dest)
     rec.outputs_pulled_to = str(dest)
-    store.save(rec)
+    store.save_job(rec)
     console.print(f"pulled {len(paths)} path(s) to {dest}")
 
 
@@ -838,32 +926,33 @@ def gc(
         False, "--all", help="Also gc non-terminal jobs (they are marked LOST)."
     ),
 ) -> None:
-    store = JobStore()
     cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
     cleaned = failed = skipped = 0
-    for rec in store.list_records():
+    for rec in store.list_jobs():
         st = rec.last_status
         terminal = st is not None and st.status.terminal
-        if rec.handle is None:
+        handle = _effective_handle(rec)
+        if handle is None:
             continue
         if not terminal and not all_:
             skipped += 1
             continue
         try:
-            be = _backend_for(cfg, rec.handle.backend)
+            be = _backend_for(cfg, handle.backend)
             if not terminal:
                 try:  # best-effort: stop a still-live job before reaping it
-                    be.cancel(rec.handle)
+                    be.cancel(handle)
                 except Exception:
                     pass
-            be.gc(rec.handle)
+            be.gc(handle)
         except Exception as e:
             failed += 1
             console.print(f"[yellow]warn:[/yellow] gc of {rec.spec.job_id} failed: {e}")
             continue
         cleaned += 1
         if not terminal:
-            store.update_status(
+            store.update_job_status(
                 rec.spec.job_id,
                 StatusReport(status=JobStatus.LOST, detail="reaped by gc --all"),
             )
@@ -934,14 +1023,14 @@ def backends_discover(
             known = ", ".join(sorted(sections)) or "none configured"
             raise BackendError(f"backend {name!r} is not configured (known: {known})")
         sections = {name: sections[name]}
-    store = FactStore()
+    store = open_store(cfg.state.resolved_url())
     table = Table("backend", "health", "GPUs", "max walltime", "max parallel", "notes")
     for nm, bcfg in sections.items():
         if not bcfg.enabled:
             table.add_row(nm, "disabled", "-", "-", "-", "", style="dim")
             continue
         facts = make_backend(nm, bcfg).discover()
-        store.save(facts)
+        store.save_facts(facts)
         c = facts.capabilities
         table.add_row(
             nm,
@@ -980,13 +1069,12 @@ def ssh(
         omnirun ssh train-abc123
         omnirun ssh train-abc123 -- nvidia-smi
     """
-    store = JobStore()
-    rec = store.resolve(job)
-    if rec.handle is None:
+    cfg = _load_cfg()
+    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
+    handle = _effective_handle(rec)
+    if handle is None:
         _die(f"job {rec.spec.job_id} was never submitted; cannot ssh into it")
-    handle = rec.handle
-    assert handle is not None  # _die() above raises typer.Exit; assert narrows type
-    be = _backend_for(_load_cfg(), handle.backend)
+    be = _backend_for(cfg, handle.backend)
     ep = be.ssh_endpoint(handle)
     if ep is None:
         # Give a clear reason based on backend type.
@@ -1026,6 +1114,16 @@ def config_path() -> None:
     p = _state["config_path"] or default_config_path()
     note = "exists" if Path(p).exists() else "missing — create it to configure backends"
     typer.echo(f"{p} ({note})")
+
+
+# --------------------------------------------------------------------------- state
+
+
+@state_app.command("path", help="Print the default SQLite DB URL.")
+def state_path() -> None:
+    from omnirun.state import default_db_url
+
+    typer.echo(default_db_url())
 
 
 if __name__ == "__main__":
