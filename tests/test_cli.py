@@ -238,7 +238,7 @@ def env(tmp_path, monkeypatch):
 
 def submit_one(*extra: str) -> str:
     """Submit a job through the CLI and return its job_id."""
-    result = runner.invoke(app, ["submit", "--yes", *extra, "--", "python", "train.py"])
+    result = runner.invoke(app, ["submit", *extra, "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
     ids = _store().list_job_ids()
     assert len(ids) == 1
@@ -249,20 +249,22 @@ def submit_one(*extra: str) -> str:
 
 
 def test_submit_failed_placement_leaves_retryable_queued_job(env):
-    """A backend.submit that raises during placement no longer aborts silently:
-    the scheduler releases the reservation back to QUEUED (attempts bumped) and
-    submit reports it could not place. NOTE (Phase-3 regression vs. the old direct
-    path): ``BackendProvider.place`` does not thread ``on_provisioning``, so a
-    marketplace instance rented mid-submit is NOT captured as a reclaimable stub
-    here — that anti-orphan hook is a Phase-4 concern (see task report)."""
+    """A backend.submit that raises during placement releases the reservation back
+    to QUEUED (attempts bumped); submit exits 0 with an informational 'queued'
+    message (not an error) so the user knows the job persists for a later tick.
+    NOTE (Phase-3 regression vs. the old direct path): ``BackendProvider.place``
+    does not thread ``on_provisioning``, so a marketplace instance rented mid-submit
+    is NOT captured as a reclaimable stub here — that anti-orphan hook is a Phase-4
+    concern (see task report)."""
     result = runner.invoke(
         app, ["submit", "--backend", "provfail", "--", "python", "train.py"]
     )
-    assert result.exit_code != 0  # the placement failed...
-    assert "could not be placed" in result.output
+    assert result.exit_code == 0, result.output  # job persists; user informed
+    assert "queued" in result.output
+    assert "later tick" in result.output
 
     ids = _store().list_job_ids()
-    assert len(ids) == 1  # ...but the QUEUED record survives for a retry
+    assert len(ids) == 1  # QUEUED record survives for a retry
     rec = _store().load_job(ids[0])
     assert rec is not None
     assert rec.state is JobState.QUEUED
@@ -270,10 +272,28 @@ def test_submit_failed_placement_leaves_retryable_queued_job(env):
     assert rec.attempts >= 1  # the failed place counted as an attempt
 
 
-def test_submit_yes_happy_path(env):
+def test_daemonless_submit_no_fitting_offer_exits_0_queued(env):
+    """Daemonless submit that can't place right now exits 0 and leaves QUEUED.
+    The job persists so a later `omnirun serve` (or manual submit) can place it."""
+    result = runner.invoke(
+        app, ["submit", "--backend", "offline", "--", "python", "train.py"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "queued" in result.output
+    assert "later tick" in result.output or "omnirun serve" in result.output
+
+    ids = _store().list_job_ids()
+    assert len(ids) == 1
+    rec = _store().load_job(ids[0])
+    assert rec is not None
+    assert rec.state is JobState.QUEUED
+    assert rec.placement is None
+
+
+def test_submit_happy_path(env):
     result = runner.invoke(
         app,
-        ["submit", "--yes", "--gpus", "1", "--time", "2h", "--", "python", "train.py"],
+        ["submit", "--gpus", "1", "--time", "2h", "--", "python", "train.py"],
     )
     assert result.exit_code == 0, result.output
 
@@ -306,7 +326,7 @@ def test_submit_env_var_parsing(env):
 
 
 def test_submit_rejects_malformed_env(env):
-    result = runner.invoke(app, ["submit", "--yes", "--env", "NOVALUE", "--", "x"])
+    result = runner.invoke(app, ["submit", "--env", "NOVALUE", "--", "x"])
     assert result.exit_code == 1
     assert "KEY=VALUE" in result.output
     assert not StubBackend.submitted
@@ -317,7 +337,7 @@ def test_submit_dirty_repo_error(env, monkeypatch):
         raise RepoError("working tree has uncommitted changes — commit them first")
 
     monkeypatch.setattr("omnirun.repo.capture_repo_state", raise_dirty)
-    result = runner.invoke(app, ["submit", "--yes", "--", "python", "train.py"])
+    result = runner.invoke(app, ["submit", "--", "python", "train.py"])
     assert result.exit_code == 1
     assert "uncommitted changes" in result.output
     assert not StubBackend.submitted
@@ -326,17 +346,13 @@ def test_submit_dirty_repo_error(env, monkeypatch):
 
 def test_submit_rejects_dirty_flag(env):
     # --dirty was removed: dirty trees are always refused, with no escape hatch
-    result = runner.invoke(
-        app, ["submit", "--yes", "--dirty", "--", "python", "train.py"]
-    )
+    result = runner.invoke(app, ["submit", "--dirty", "--", "python", "train.py"])
     assert result.exit_code != 0
     assert not StubBackend.submitted
 
 
 def test_submit_dry_run_prints_payload_without_submitting(env):
-    result = runner.invoke(
-        app, ["submit", "--dry-run", "--yes", "--", "python", "train.py"]
-    )
+    result = runner.invoke(app, ["submit", "--dry-run", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
     assert "#!/usr/bin/env bash" in result.output
     assert "python train.py" in result.output
@@ -368,7 +384,7 @@ def test_submit_backend_restriction(env):
 
 
 def test_submit_unknown_backend_errors(env):
-    result = runner.invoke(app, ["submit", "--yes", "--backend", "nope", "--", "x"])
+    result = runner.invoke(app, ["submit", "--backend", "nope", "--", "x"])
     assert result.exit_code == 1
     assert "not configured" in result.output
 

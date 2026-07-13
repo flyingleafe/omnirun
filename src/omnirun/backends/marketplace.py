@@ -53,7 +53,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, Field
@@ -73,10 +73,14 @@ from omnirun.models import (
     StatusReport,
 )
 
+if TYPE_CHECKING:
+    from omnirun.execlayer.ssh import SSHExec as _SSHExecClass
+
+SSHExec: type[_SSHExecClass] | None
 try:  # built on a parallel track; absent only during early development
     from omnirun.execlayer.ssh import SSHExec
 except ImportError:  # pragma: no cover
-    SSHExec = None  # type: ignore[assignment]
+    SSHExec = None
 
 HTTP_TIMEOUT_S = 15.0
 PROVISION_POLL_S = 10.0

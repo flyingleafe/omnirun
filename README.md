@@ -295,7 +295,6 @@ unique id prefix.
 | `--start-by T` | latest acceptable start time (same format as `--finish-by`) |
 | `--max-cost $` | **per-job USD ceiling** — the scheduler won't spend more than this on a single paid placement (works best with `--time`; see note below) |
 | `--push` | auto-push an unpushed HEAD to origin |
-| `--yes`, `-y` | accepted for backward compatibility; placement is now always automatic |
 | `--dry-run` | print the rendered payload (Slurm: full sbatch script) and exit |
 
 > **`--max-cost` change from earlier versions.** This flag is now a per-job

@@ -397,7 +397,7 @@ class Daemon:
         The ``queue`` table is the client-facing view; the scheduler places over
         the ``jobs`` table. A newly enqueued entry gets a matching QUEUED job
         record (keyed by its ``spec.job_id``) whose ``submitted_at`` is the
-        enqueue time, so the tick's priority/urgency ranking honors queue order.
+        enqueue time, so the tick's submitted_at ranking honors queue order.
         Idempotent — an entry whose job already exists is left untouched.
         """
         for entry in self._store.load_entries():

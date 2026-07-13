@@ -461,9 +461,6 @@ def submit(
     backend: str | None = typer.Option(
         None, "--backend", help="Restrict to one configured backend."
     ),
-    yes: bool = typer.Option(
-        False, "--yes", "-y", help="Accept the scheduler's automatic placement."
-    ),
     push: bool = typer.Option(
         False, "--push", help="Auto-push an unpushed HEAD to the remote."
     ),
@@ -473,7 +470,6 @@ def submit(
         help="Print the rendered payload for the chosen backend; do not submit.",
     ),
 ) -> None:
-    _ = yes  # placement is automatic now; --yes kept for backward compatibility
     spec = _build_job_spec(
         command,
         name=name,
@@ -565,11 +561,12 @@ def _submit_via_control(
         reason = rec.last_status.detail if rec.last_status else "no slot can satisfy it"
         _die(f"job {job_id} cannot be placed: {reason}")
     # QUEUED but unplaced: admissible yet no fitting offer right now.
-    # The record persists; a running `omnirun serve` (or a later manual submit)
-    # can still place it, but a daemonless submit has no auto-wakeup.
-    _die(
-        f"job {job_id} could not be placed now: no fitting offer "
-        "(relax resource requirements, or run `omnirun serve`)"
+    # The record persists; a running `omnirun serve` will place it on the next
+    # tick. Daemonless submits have no auto-wakeup, so inform the user and
+    # exit 0 — the job is not lost, merely waiting.
+    console.print(
+        f"queued {job_id}: no slot free right now — it will place on a later tick; "
+        "run `omnirun serve` to place it in the background"
     )
 
 

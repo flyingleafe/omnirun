@@ -423,7 +423,7 @@ def test_reserve_entry_race_single_winner(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 5: scheduler-state columns, slot-level reserve, budget-ledger persistence
+# Task 5: scheduler-state columns, slot-level reserve
 # ---------------------------------------------------------------------------
 
 

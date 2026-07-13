@@ -31,11 +31,11 @@ class SchedPolicy(BaseModel):
     """Tick-level knobs.
 
     Attributes:
-        allow_paid: When ``True`` (default) a job with no fitting free slot
-            may escalate to the cheapest paid slot that fits. When ``False``
-            the tick will *only* ever place on free slots; a job that can't be
-            served for free this tick simply waits (liveness preserved — it is
-            never held or refused). Mirrors the CLI's ``--free-only`` gate.
+        allow_paid: When ``True`` (default, permissive) a job with no fitting
+            free slot may escalate to the cheapest paid slot that fits. When
+            ``False`` the tick will *only* ever place on free slots; a job that
+            can't be served for free this tick simply waits (liveness preserved
+            — it is never held or refused).
     """
 
     allow_paid: bool = True

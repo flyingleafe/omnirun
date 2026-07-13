@@ -121,7 +121,12 @@ class TestPurity:
         source = Path(sched.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
 
-        forbidden_roots = {"omnirun.state", "omnirun.backends", "omnirun.providers"}
+        forbidden_roots = {
+            "omnirun.state",
+            "omnirun.backends",
+            "omnirun.providers",
+            "omnirun.budget",
+        }
         # Any generic I/O the scheduler has no business touching.
         forbidden_io = {"socket", "http", "urllib", "requests", "httpx", "sqlite3"}
 
