@@ -102,9 +102,12 @@ class BoreConfig(BaseModel):
                       located on the bore VPS).
       control_port  — bore control port, default 7835.
       secret        — shared secret gating tunnel creation (worker-only).
+      port_min      — start of the deterministic tunnel port range (inclusive).
+      port_max      — end of the deterministic tunnel port range (inclusive).
 
     Env-var overrides (take precedence over TOML):
-      BORE_PUBLIC_HOST, BORE_PRIVATE_HOST, BORE_CONTROL_PORT, BORE_SECRET
+      BORE_PUBLIC_HOST, BORE_PRIVATE_HOST, BORE_CONTROL_PORT, BORE_SECRET,
+      BORE_PORT_MIN, BORE_PORT_MAX
     """
 
     # Worker-facing: the bore server's public DNS/IP that workers dial out to.
@@ -116,6 +119,11 @@ class BoreConfig(BaseModel):
     control_port: int = 7835
     # Shared secret gating tunnel creation on the bore server.
     secret: str | None = None
+    # Deterministic tunnel port range — omnirun assigns ports to workers so the
+    # client knows which port to connect to without reading a live log.  Must
+    # match the bore server's --port-range.
+    port_min: int = 20000
+    port_max: int = 20099
 
     @property
     def enabled(self) -> bool:
@@ -143,6 +151,10 @@ class BoreConfig(BaseModel):
             overrides["control_port"] = int(v)
         if (v := os.environ.get("BORE_SECRET")) is not None:
             overrides["secret"] = v or None
+        if (v := os.environ.get("BORE_PORT_MIN")) is not None:
+            overrides["port_min"] = int(v)
+        if (v := os.environ.get("BORE_PORT_MAX")) is not None:
+            overrides["port_max"] = int(v)
         return cfg.model_copy(update=overrides) if overrides else cfg
 
 

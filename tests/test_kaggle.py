@@ -601,15 +601,21 @@ def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
 def test_submit_with_bore_injects_env_vars_into_harness(
     fake_api, backend, monkeypatch
 ) -> None:
-    """When bore is enabled, the four OMNIRUN_BORE_*/OMNIRUN_SSH_PUBKEY vars must
-    appear as os.environ assignments in the generated run.py harness.  The vars
-    must be present before the subprocess.Popen call that runs bootstrap.sh, and
-    they must never appear in the git bundle or bootstrap.sh blob."""
+    """When bore is enabled, the bore env vars (including OMNIRUN_BORE_PORT and
+    OMNIRUN_SSH_PUBKEY) must appear as os.environ assignments in the generated
+    run.py harness.  The vars must be present before the subprocess.Popen call
+    that runs bootstrap.sh, and they must never appear in the git bundle or
+    bootstrap.sh blob."""
+    from pathlib import Path
+
     bore = _make_bore_cfg()
     monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
     monkeypatch.setattr(
-        kaggle_mod, "_ensure_keypair", lambda job_id: "ssh-ed25519 AAAA test-pubkey"
+        kaggle_mod,
+        "_managed_keypair",
+        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test-pubkey"),
     )
+    monkeypatch.setattr(kaggle_mod, "_allocate_port", lambda job_id, bore: 20042)
 
     spec = make_spec(gpu_type="P100")
     offer = backend.probe(spec.resources)[0]
@@ -622,6 +628,7 @@ def test_submit_with_bore_injects_env_vars_into_harness(
         "OMNIRUN_BORE_SECRET",
         "OMNIRUN_BORE_CONTROL_PORT",
         "OMNIRUN_SSH_PUBKEY",
+        "OMNIRUN_BORE_PORT",
     ):
         assert f'os.environ[{var!r}]' in run_py, f"{var!r} not found in run_py"
 
@@ -629,6 +636,7 @@ def test_submit_with_bore_injects_env_vars_into_harness(
     assert "s3cr3t" in run_py
     assert "7835" in run_py
     assert "test-pubkey" in run_py
+    assert "20042" in run_py
 
     # The bore vars must NOT appear in the embedded bootstrap.sh
     m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)

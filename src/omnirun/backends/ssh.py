@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink, SSHEndpoint, register
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
@@ -28,6 +28,14 @@ from omnirun.models import (
 
 GPU_BUSY_UTIL_PCT = 80
 VRAM_TOLERANCE_GB = 0.5  # nvidia-smi reports 24564 MiB for a "24 GB" card
+
+
+def _managed_keypair() -> tuple[Path, str]:
+    """Return (private_key_path, pubkey_str) for the omnirun-managed keypair
+    (monkeypatched in tests)."""
+    from omnirun.transport import managed_keypair
+
+    return managed_keypair()
 
 
 def _compress(s: str) -> str:
@@ -310,6 +318,28 @@ class SshBackend(Backend):
     def gc(self, handle: JobHandle) -> None:
         jobdir.gc_job(
             self.exec_, handle.data["job_dir"], handle.data["slug"], handle.data["root"]
+        )
+
+    def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
+        """Return SSH connection params for this job.
+
+        The ssh backend already communicates over SSH, so we return the same
+        host + port the ``SSHExec`` uses.  The omnirun-managed key is offered;
+        if the target was set up with the user's own key, authentication will
+        use whatever ``~/.ssh/config`` or the agent provides instead — the
+        managed key is just the default identity presented.
+
+        Returns None if 'host' is not configured on this backend.
+        """
+        if not self.config.host:
+            return None
+        key_path, _pub = _managed_keypair()
+        port = self.config.extra("port") or 22
+        return SSHEndpoint(
+            host=self.config.host,
+            port=int(port),
+            user="",  # empty = use default from ~/.ssh/config or SSH_USER
+            key_path=key_path,
         )
 
     def check(self) -> str:

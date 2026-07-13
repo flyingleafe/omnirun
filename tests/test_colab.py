@@ -475,13 +475,19 @@ def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
 
 
 def test_submit_with_bore_injects_env_vars_into_launcher(cli, backend, monkeypatch):
-    """When bore is enabled, the four OMNIRUN_BORE_*/OMNIRUN_SSH_PUBKEY vars
-    must appear in the launcher snippet's env dict (sent via `colab exec`)."""
+    """When bore is enabled, the bore env vars (including OMNIRUN_BORE_PORT and
+    OMNIRUN_SSH_PUBKEY) must appear in the launcher snippet's env dict (sent
+    via `colab exec`)."""
+    from pathlib import Path
+
     bore = _make_bore_cfg()
     monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
     monkeypatch.setattr(
-        colab_mod, "_ensure_keypair", lambda job_id: "ssh-ed25519 AAAA test-pubkey"
+        colab_mod,
+        "_managed_keypair",
+        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test-pubkey"),
     )
+    monkeypatch.setattr(colab_mod, "_allocate_port", lambda job_id, bore: 20042)
     cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
 
     spec = make_spec(gpu_type="T4")
@@ -501,6 +507,8 @@ def test_submit_with_bore_injects_env_vars_into_launcher(cli, backend, monkeypat
     assert "7835" in launcher
     assert "OMNIRUN_SSH_PUBKEY" in launcher
     assert "test-pubkey" in launcher
+    assert "OMNIRUN_BORE_PORT" in launcher
+    assert "20042" in launcher
 
 
 def test_submit_without_bore_launcher_is_byte_unchanged(cli, backend, monkeypatch):

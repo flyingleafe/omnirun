@@ -85,19 +85,20 @@ def _bore_tunnel_block() -> str:
         making bore local 22 fail with "could not connect to localhost:22")
       - ssh-keygen -A before sshd   (safety net if postinstall didn't create host keys)
 
-    Bore invocation: `bore local 22 --to "$OMNIRUN_BORE_PUBLIC_HOST" ...`
+    Bore invocation: `bore local 22 --to "$OMNIRUN_BORE_PUBLIC_HOST" --port "$OMNIRUN_BORE_PORT"`
       - `--to` takes a BARE HOST only (bore 0.6.0 — control port is fixed at 7835,
         there is no client flag for it).
-      - NO `--port` → server auto-assigns tunnel port to avoid collisions.
+      - `--port` is taken from OMNIRUN_BORE_PORT (assigned deterministically by the
+        client at submit time so no live log discovery is needed).
 
     Env vars consumed (injected by the notebook backends when bore is enabled;
     when unset the block skips entirely — non-bore jobs are byte-unaffected):
       OMNIRUN_BORE_PUBLIC_HOST, OMNIRUN_BORE_SECRET, OMNIRUN_BORE_CONTROL_PORT,
-      OMNIRUN_SSH_PUBKEY.
+      OMNIRUN_SSH_PUBKEY, OMNIRUN_BORE_PORT.
 
-    The snippet emits one line to the job log on success:
+    The snippet emits one line to the job log on success (kept for debugging):
       OMNIRUN_TUNNEL host=<host> port=<port>
-    The client (T3+) scans for this line to obtain the tunnel address.
+    The client does NOT depend on this line — it uses the pre-assigned port.
     """
     return f"""\
 # ---- bore tunnel (ssh-everywhere) — runtime-guarded, non-fatal ---------------
@@ -134,10 +135,11 @@ SSHD_EOF
     command -v bore >/dev/null 2>&1 || {{
       curl -fsSL {_BORE_RELEASE_URL} | tar xz -C /usr/local/bin bore
     }}
-    # --- open tunnel; --to takes a bare host (bore 0.6.0); NO --port (auto-assign) ---
+    # --- open tunnel; --to takes a bare host (bore 0.6.0); --port pre-assigned by client ---
     _bore_host="${{OMNIRUN_BORE_PUBLIC_HOST}}"
     bore local 22 --to "${{_bore_host}}" \\
       ${{OMNIRUN_BORE_SECRET:+--secret "${{OMNIRUN_BORE_SECRET}}"}} \\
+      --port "${{OMNIRUN_BORE_PORT}}" \\
       > /tmp/omnirun-bore.log 2>&1 &
     # --- wait up to 30s for bore to announce the assigned port ---
     _bore_line=""
@@ -150,7 +152,7 @@ SSHD_EOF
       _bore_addr=$(printf '%s' "$_bore_line" | sed -n 's/.*listening at //p')
       echo "OMNIRUN_TUNNEL host=${{_bore_addr%:*}} port=${{_bore_addr##*:}}"
     else
-      echo "OMNIRUN_TUNNEL: warning — tunnel did not come up within 30s; falling back to legacy monitoring" >&2
+      echo "OMNIRUN_TUNNEL: warning — tunnel did not come up within 30s" >&2
     fi
   }} || echo "OMNIRUN_TUNNEL: warning — ssh/bore setup failed; job continues" >&2
 fi

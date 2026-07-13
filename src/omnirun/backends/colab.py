@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from omnirun.backends import jobdir, tarsafe
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink, SSHEndpoint, register
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
@@ -137,12 +137,34 @@ def _bore_cfg() -> BoreConfig:
     return load_config().bore
 
 
-def _ensure_keypair(job_id: str) -> str:
-    """Generate (or reuse) the per-job throwaway SSH keypair (monkeypatched
-    in tests).  Returns the public key string."""
-    from omnirun.transport import ensure_keypair
+def _managed_keypair() -> tuple[Path, str]:
+    """Return (private_key_path, pubkey_str) for the omnirun-managed keypair
+    (monkeypatched in tests)."""
+    from omnirun.transport import managed_keypair
 
-    return ensure_keypair(job_id)
+    return managed_keypair()
+
+
+def _allocate_port(job_id: str, bore: BoreConfig) -> int:
+    """Allocate a deterministic bore tunnel port for ``job_id`` (monkeypatched
+    in tests)."""
+    from omnirun.transport import allocate
+
+    return allocate(None, job_id, bore.port_min, bore.port_max)
+
+
+def _port_for(job_id: str) -> int | None:
+    """Return the port currently allocated to ``job_id``, or None."""
+    from omnirun.transport import port_for
+
+    return port_for(None, job_id)
+
+
+def _release_port(job_id: str) -> None:
+    """Release the bore tunnel port allocated to ``job_id``."""
+    from omnirun.transport import release
+
+    release(None, job_id)
 
 
 def _ts(s: str | None) -> datetime | None:
@@ -407,12 +429,14 @@ class ColabBackend(Backend):
         bore = _bore_cfg()
         bore_env: dict[str, str] = {}
         if bore.enabled:
-            pubkey = _ensure_keypair(spec.job_id)
+            _key_path, pubkey = _managed_keypair()
+            bore_port = _allocate_port(spec.job_id, bore)
             bore_env = {
                 "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
                 "OMNIRUN_BORE_SECRET": bore.secret or "",
                 "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
                 "OMNIRUN_SSH_PUBKEY": pubkey,
+                "OMNIRUN_BORE_PORT": str(bore_port),
             }
 
         # a public repo is cloned by the worker directly (bootstrap does the git
@@ -715,6 +739,7 @@ class ColabBackend(Backend):
             self._colab("stop", "-s", session)
         except BackendError:
             pass  # session already reclaimed == effectively cancelled
+        _release_port(handle.job_id)
         self._terminal[handle.job_id] = StatusReport(
             status=JobStatus.CANCELLED, detail="killed process group + stopped session"
         )
@@ -724,6 +749,31 @@ class ColabBackend(Backend):
             self._colab("stop", "-s", handle.data["session"])
         except Exception:
             pass  # already gone
+        _release_port(handle.job_id)
+
+    def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
+        """Return SSH endpoint via the bore tunnel, or None.
+
+        Returns None when:
+        - bore is not configured;
+        - no port has been allocated for this job (job was not submitted with bore);
+        - the job is in a terminal state (tunnel is gone).
+        """
+        bore = _bore_cfg()
+        if not bore.enabled:
+            return None
+        # Terminal jobs no longer have a live tunnel.
+        st = self._terminal.get(handle.job_id)
+        if st is not None and st.status.terminal:
+            return None
+        port = _port_for(handle.job_id)
+        if port is None:
+            return None
+        host = bore.public_host
+        if host is None:
+            return None
+        key_path, _pub = _managed_keypair()
+        return SSHEndpoint(host=host, port=port, user="root", key_path=key_path)
 
     def check(self) -> str:
         version = self._colab("version", timeout=10).strip().splitlines()
