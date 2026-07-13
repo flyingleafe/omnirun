@@ -14,6 +14,7 @@ import sys
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,14 +24,12 @@ from omnirun.backends.kaggle import KaggleBackend
 from omnirun.config import BackendConfig
 from omnirun.models import (
     JobHandle,
-    JobRecord,
     JobSpec,
     JobStatus,
     RepoRef,
     ResourceSpec,
     StatusReport,
 )
-from omnirun.state import default_db_url, open_store
 
 JOB_ID = "train-abc123"
 SHA = "a" * 40
@@ -96,6 +95,11 @@ class FakeKaggleApi:
         self.output_files: dict[str, bytes] = {}
         self.dataset_folders: list[dict] = []
         self.kernel_folders: list[dict] = []
+        # weekly GPU quota (real quota_view() shape); default: plenty remaining
+        self.gpu_total_h = 45.0
+        self.gpu_used_h = 0.0
+        self.quota_refresh: object | None = None
+        self.quota_error: Exception | None = None
 
     def authenticate(self) -> None:
         if self.auth_error:
@@ -138,6 +142,17 @@ class FakeKaggleApi:
         for name, data in self.output_files.items():
             (Path(path) / name).write_bytes(data)
 
+    def quota_view(self):
+        if self.quota_error:
+            raise self.quota_error
+        gpu = SimpleNamespace(
+            time_used=timedelta(hours=self.gpu_used_h),
+            total_time_allowed=timedelta(hours=self.gpu_total_h),
+        )
+        return SimpleNamespace(
+            gpu_quota=gpu, tpu_quota=None, quota_refresh_time=self.quota_refresh
+        )
+
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
@@ -156,6 +171,10 @@ def fake_bundle(monkeypatch):
     # (no gh/curl/ls-remote to the network). Tests override these per-case.
     monkeypatch.setattr(kaggle_mod, "_remote_clone_plan", lambda ref, root: None)
     monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: None)
+    # default: bore disabled — keeps harness byte-identical to non-bore baseline.
+    from omnirun.config import BoreConfig
+
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: BoreConfig())
 
 
 @pytest.fixture
@@ -267,45 +286,33 @@ def test_probe_cpu_offer_when_no_gpu(backend):
     assert offers[0].details["machine_shape"] is None
 
 
-def _store_gpu_job(hours: float) -> None:
-    now = datetime.now(timezone.utc)
-    rec = JobRecord(
-        spec=make_spec(gpus=1),
-        handle=make_handle(),
-        submitted_at=now - timedelta(hours=hours),
-        last_status=StatusReport(
-            status=JobStatus.SUCCEEDED,
-            exit_code=0,
-            started_at=now - timedelta(hours=hours),
-            finished_at=now,
-        ),
-    )
-    open_store(default_db_url()).save_job(rec)
-
-
-def test_probe_quota_exhausted_makes_gpu_offers_unfit(backend):
-    _store_gpu_job(hours=31)  # 31 GPU-hours this week > default 30h budget
+def test_probe_quota_exhausted_makes_gpu_offers_unfit(fake_api, backend):
+    # the REAL quota API (quota_view) reports 0 remaining -> block
+    fake_api.gpu_used_h = 45.0  # used == total
+    fake_api.quota_refresh = datetime(2026, 7, 18, tzinfo=timezone.utc)
     offers = backend.probe(ResourceSpec(gpus=1))
     assert offers
     for o in offers:
         assert not o.fits
-        assert any("weekly quota likely exhausted" in r for r in o.unfit_reasons)
+        assert any("weekly GPU quota exhausted" in r for r in o.unfit_reasons)
+        assert any("2026-07-18" in r for r in o.unfit_reasons)
 
 
-def test_probe_quota_within_budget_fits(backend):
-    _store_gpu_job(hours=2)
+def test_probe_quota_within_budget_fits(fake_api, backend):
+    # 16.74h remaining of 45h (the real reported case) -> GPU offers fit
+    fake_api.gpu_total_h = 45.0
+    fake_api.gpu_used_h = 28.26
     offers = backend.probe(ResourceSpec(gpus=1))
+    assert offers
     assert all(o.fits for o in offers)
 
 
-def test_probe_quota_respects_config_override(fake_api):
-    backend = KaggleBackend(
-        "kaggle",
-        BackendConfig.model_validate({"type": "kaggle", "weekly_gpu_hours": 1}),
-    )
-    _store_gpu_job(hours=2)
+def test_probe_quota_unknown_does_not_block(fake_api, backend):
+    # if the quota API errors, be optimistic (never falsely reject a submit)
+    fake_api.quota_error = RuntimeError("quota endpoint down")
     offers = backend.probe(ResourceSpec(gpus=1))
-    assert all(not o.fits for o in offers)
+    assert offers
+    assert all(o.fits for o in offers)
 
 
 # ---- submit ----------------------------------------------------------------
@@ -574,6 +581,20 @@ def test_cancel_without_api_support_is_idempotent_noop(fake_api, backend):
     assert backend.status(handle).status is JobStatus.CANCELLED
 
 
+def test_cancel_releases_tunnel_port_on_no_endpoint_path(fake_api, backend):
+    # Bug 1 (T4 live): cancel must free the deterministic tunnel port on the
+    # no-cancel-endpoint path too (not only the API-success path) — else ports
+    # leak until gc. That path is a non-raising idempotent noop.
+    from omnirun import transport
+
+    handle = make_handle()
+    transport.allocate(None, handle.job_id, 20000, 20099)
+    assert transport.port_for(None, handle.job_id) is not None
+    backend.cancel(handle)  # no cancel endpoint — must NOT raise
+    assert backend.status(handle).status is JobStatus.CANCELLED
+    assert transport.port_for(None, handle.job_id) is None
+
+
 def test_cancel_uses_api_when_available(fake_api, backend):
     cancelled: list[str] = []
     fake_api.kernels_cancel = cancelled.append
@@ -587,7 +608,152 @@ def test_check_reports_username(fake_api, backend):
     assert "testuser" in backend.check()
 
 
-# ---- logs -------------------------------------------------------------------
+# ---- bore env injection (ssh-everywhere T2) ------------------------------------
+
+
+def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
+    from omnirun.config import BoreConfig
+
+    return BoreConfig(public_host=host, secret=secret, control_port=7835)
+
+
+def test_submit_with_bore_injects_env_vars_into_harness(
+    fake_api, backend, monkeypatch
+) -> None:
+    """When bore is enabled, the bore env vars (including OMNIRUN_BORE_PORT and
+    OMNIRUN_SSH_PUBKEY) must appear as os.environ assignments in the generated
+    run.py harness.  The vars must be present before the subprocess.Popen call
+    that runs bootstrap.sh, and they must never appear in the git bundle or
+    bootstrap.sh blob."""
+    from pathlib import Path
+
+    bore = _make_bore_cfg()
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
+    monkeypatch.setattr(
+        kaggle_mod,
+        "_managed_keypair",
+        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test-pubkey"),
+    )
+    monkeypatch.setattr(kaggle_mod, "_allocate_port", lambda job_id, bore: 20042)
+
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    for var in (
+        "OMNIRUN_BORE_PUBLIC_HOST",
+        "OMNIRUN_BORE_SECRET",
+        "OMNIRUN_BORE_CONTROL_PORT",
+        "OMNIRUN_SSH_PUBKEY",
+        "OMNIRUN_BORE_PORT",
+    ):
+        assert f"os.environ[{var!r}]" in run_py, f"{var!r} not found in run_py"
+
+    assert "bore.example.com" in run_py
+    assert "s3cr3t" in run_py
+    assert "7835" in run_py
+    assert "test-pubkey" in run_py
+    assert "20042" in run_py
+
+    # The bore vars must NOT appear in the embedded bootstrap.sh
+    m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
+    assert m
+    bootstrap = base64.b64decode(m.group(1)).decode()
+    assert "s3cr3t" not in bootstrap, "bore secret must not be in bootstrap.sh"
+    assert "test-pubkey" not in bootstrap, "pubkey literal must not be in bootstrap.sh"
+
+
+def _enable_bore_endpoint(backend, monkeypatch, handle) -> None:
+    """Wire a live ssh endpoint for ``handle``: bore enabled, key + port present."""
+    from pathlib import Path
+
+    bore = _make_bore_cfg()
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
+    monkeypatch.setattr(
+        kaggle_mod,
+        "_managed_keypair",
+        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test"),
+    )
+    from omnirun import transport
+
+    transport.allocate(None, handle.job_id, bore.port_min, bore.port_max)
+
+
+def test_logs_streams_over_ssh_when_endpoint_reachable(
+    fake_api, backend, monkeypatch
+) -> None:
+    """A running job with a reachable bore endpoint tails bootstrap.log over ssh
+    — never touching the (non-live) kernel-log API."""
+    handle = make_handle()
+    _enable_bore_endpoint(backend, monkeypatch, handle)
+    monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: True)
+
+    seen: dict[str, str] = {}
+
+    def fake_stream(ep, remote_path, follow):
+        seen["remote_path"] = remote_path
+        yield "hello from worker"
+        yield "second line"
+
+    monkeypatch.setattr(kaggle_mod, "stream_log_file", fake_stream)
+
+    def boom(*a, **k):
+        raise AssertionError("kernel-log API must not be used when ssh is reachable")
+
+    monkeypatch.setattr(backend, "_fetch_log_text", boom)
+
+    assert list(backend.logs(handle, follow=False)) == [
+        "hello from worker",
+        "second line",
+    ]
+    assert seen["remote_path"].endswith(f"/jobs/{JOB_ID}/logs/bootstrap.log")
+    assert kaggle_mod.KAGGLE_ROOT in seen["remote_path"]
+
+
+def test_logs_falls_back_to_api_when_endpoint_unreachable(
+    fake_api, backend, monkeypatch
+) -> None:
+    """If the endpoint exists but is not (yet) connectable, logs fall back to the
+    kernel-log API rather than yielding nothing."""
+    handle = make_handle()
+    _enable_bore_endpoint(backend, monkeypatch, handle)
+    monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: False)
+
+    def no_stream(*a, **k):
+        raise AssertionError("must not stream over ssh when unreachable")
+
+    monkeypatch.setattr(kaggle_mod, "stream_log_file", no_stream)
+    fake_api.status_value = "complete"
+    monkeypatch.setattr(
+        backend, "_fetch_log_text", lambda api, ref: "api line 1\napi line 2"
+    )
+
+    assert list(backend.logs(handle, follow=False)) == ["api line 1", "api line 2"]
+
+
+def test_submit_without_bore_harness_has_no_bore_vars(
+    fake_api, backend, monkeypatch
+) -> None:
+    """When bore is disabled, the harness must be byte-identical to the pre-bore
+    baseline — no OMNIRUN_BORE_* or OMNIRUN_SSH_PUBKEY assignments."""
+    from omnirun.config import BoreConfig
+
+    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: BoreConfig())
+
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    backend.submit(spec, offer)
+
+    run_py = fake_api.kernel_folders[0]["run_py"]
+
+    assert "OMNIRUN_BORE_PUBLIC_HOST" not in run_py
+    assert "OMNIRUN_BORE_SECRET" not in run_py
+    assert "OMNIRUN_SSH_PUBKEY" not in run_py
+
+
+# ---- logs (API-fallback honesty note) ---------------------------------------
 
 
 def test_logs_follow_emits_honesty_note_before_complete(fake_api, backend, monkeypatch):

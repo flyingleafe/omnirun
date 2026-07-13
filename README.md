@@ -207,7 +207,7 @@ extra_directives = ["--mail-type=FAIL"]  # raw #SBATCH lines
 # ---- Kaggle kernels (free GPU quota) ----
 [backends.kaggle]
 type = "kaggle"              # creds: ~/.config/kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY
-# weekly_gpu_hours = 30      # local budget; Kaggle exposes no quota API
+                            # weekly GPU quota is read live from Kaggle's quota API
 
 # ---- Colab via the official google-colab-cli ----
 [backends.colab]
@@ -367,9 +367,9 @@ case only) is a size cap on the embed, so only code-sized repos fit (data is
 never shipped — jobs fetch their own). A gitignored `<repo>/.env` is injected too
 (embedded base64, decoded to a 0600 file and sourced) — Kaggle now supports `.env`
 the same as Colab.
-Kaggle has no quota API, so omnirun tracks your weekly GPU-hour spend locally
-(`weekly_gpu_hours`) and marks offers unfit when the budget looks exhausted —
-it is an estimate, not the truth. L4/A100/H100 shapes exist but are gated
+omnirun reads your weekly GPU allowance live from Kaggle's quota API and marks
+GPU offers unfit only when the real remaining quota is exhausted (0h) — no local
+guessing or manual budget to keep in sync. L4/A100/H100 shapes exist but are gated
 behind a Colab-Pro-linked account; omnirun surfaces them with a "push may be
 rejected" warning. Needs a phone-verified account for GPU + internet kernels.
 

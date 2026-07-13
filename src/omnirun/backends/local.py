@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, ProvisioningSink, register
+from omnirun.backends.base import Backend, ProvisioningSink, SSHEndpoint, register
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import shell_quote
 from omnirun.execlayer.local import LocalExec
@@ -30,6 +30,14 @@ from omnirun.repo import local_root_of
 
 if TYPE_CHECKING:
     from omnirun.config import BackendConfig
+
+
+def _managed_keypair() -> tuple[Path, str]:
+    """Return (private_key_path, pubkey_str) for the omnirun-managed keypair
+    (monkeypatched in tests)."""
+    from omnirun.transport import managed_keypair
+
+    return managed_keypair()
 
 
 @register("local")
@@ -188,6 +196,16 @@ class LocalBackend(Backend):
             handle.data["slug"],
             handle.data["root"],
         )
+
+    def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
+        """Return SSH connection params for jobs run on this machine.
+
+        Local jobs run on localhost, so the endpoint is localhost:22 with the
+        omnirun-managed key.  This lets ``omnirun ssh <job>`` work uniformly
+        for local jobs if sshd is running and the managed key is authorized.
+        """
+        key_path, _pub = _managed_keypair()
+        return SSHEndpoint(host="localhost", port=22, user="", key_path=key_path)
 
     def check(self) -> str:
         return "ok: runs jobs on this machine"

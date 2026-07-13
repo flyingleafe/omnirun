@@ -34,14 +34,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    ProvisioningSink,
+    SSHEndpoint,
+    register,
+)
 from omnirun.backends import jobdir, tarsafe
+from omnirun.sshconn import endpoint_reachable, stream_log_file
 from omnirun.bootstrap import (
     BootstrapParams,
     CodeSource,
     generate_bootstrap,
     notebook_env_spec,
 )
+from omnirun.config import BoreConfig
 from omnirun.models import (
     CancelMode,
     Capabilities,
@@ -129,6 +137,64 @@ def _env_file(spec: JobSpec):
     return repo.env_file(_local_root(spec))
 
 
+def _bore_cfg() -> BoreConfig:
+    """Load the global bore config (lazy, monkeypatched in tests).
+
+    Kept as a module-level function so tests can replace it with a fake that
+    returns a specific BoreConfig without touching the filesystem.
+    """
+    from omnirun.config import load_config
+
+    return load_config().bore
+
+
+def _managed_keypair() -> tuple[Path, str]:
+    """Return (private_key_path, pubkey_str) for the omnirun-managed keypair
+    (monkeypatched in tests)."""
+    from omnirun.transport import managed_keypair
+
+    return managed_keypair()
+
+
+def _allocate_port(job_id: str, bore: BoreConfig) -> int:
+    """Allocate a deterministic bore tunnel port for ``job_id`` (monkeypatched
+    in tests)."""
+    from omnirun.transport import allocate
+
+    return allocate(None, job_id, bore.port_min, bore.port_max)
+
+
+def _port_for(job_id: str) -> int | None:
+    """Return the port currently allocated to ``job_id``, or None."""
+    from omnirun.transport import port_for
+
+    return port_for(None, job_id)
+
+
+def _release_port(job_id: str) -> None:
+    """Release the bore tunnel port allocated to ``job_id``."""
+    from omnirun.transport import release
+
+    release(None, job_id)
+
+
+def _remaining_from_quota(q: object) -> tuple[float | None, str | None]:
+    """Parse ``KaggleApi.quota_view()`` into (remaining_gpu_hours, refresh_iso).
+
+    ``remaining_gpu_hours`` is None when the API did not report a GPU quota
+    (older client or a shape we don't recognize) — callers treat None as
+    "quota unknown, do not block".  This is the single source of truth for the
+    real weekly GPU allowance, shared by discover() and probe() so they can
+    never disagree (they did: probe used to guess from local job records)."""
+    gpu = getattr(q, "gpu_quota", None)
+    remaining_h: float | None = None
+    if gpu is not None:
+        remaining = gpu.total_time_allowed - gpu.time_used
+        remaining_h = max(0.0, remaining.total_seconds() / 3600.0)
+    refresh = getattr(q, "quota_refresh_time", None)
+    return remaining_h, (refresh.isoformat() if refresh else None)
+
+
 def _load_kaggle_api_class() -> Any:
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
@@ -149,12 +215,29 @@ def _ts(s: str | None) -> datetime | None:
 
 
 def _render_harness(
-    job_id: str, bootstrap_b64: str, bundle_b64: str, env_b64: str
+    job_id: str,
+    bootstrap_b64: str,
+    bundle_b64: str,
+    env_b64: str,
+    infra_env: dict[str, str] | None = None,
 ) -> str:
     """The script-kernel payload: decode the embedded bootstrap.sh (+ the git
     bundle, unless the repo is public and bootstrap clones it directly, + any
     out-of-band .env), run bootstrap under /kaggle/tmp, stream its log to kernel
-    stdout, then persist results to /kaggle/working."""
+    stdout, then persist results to /kaggle/working.
+
+    ``infra_env`` is a dict of extra env vars to inject before running bootstrap
+    (bore credentials, SSH pubkey).  These are written as literal ``os.environ``
+    assignments inside the generated Python — they never touch git or the bundle.
+    When ``infra_env`` is None or empty, the harness is byte-identical to before.
+    """
+    infra_env_lines = ""
+    if infra_env:
+        infra_env_lines = "\n".join(
+            f"os.environ[{k!r}] = {v!r}" for k, v in sorted(infra_env.items())
+        )
+        infra_env_lines = infra_env_lines + "\n"
+
     return f'''\
 """omnirun harness for job {job_id} — generated, do not edit."""
 import base64, os, subprocess, sys, tarfile, time
@@ -168,7 +251,7 @@ ENV_B64 = "{env_b64}"
 
 os.makedirs(JOB_DIR, exist_ok=True)
 os.environ["OMNIRUN_ROOT"] = ROOT
-with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
+{infra_env_lines}with open(JOB_DIR + "/bootstrap.sh", "wb") as f:
     f.write(base64.b64decode(BOOTSTRAP_B64))
 if BUNDLE_B64:  # empty when the repo is public (bootstrap clones it directly)
     with open(JOB_DIR + "/bundle.git", "wb") as f:
@@ -253,15 +336,10 @@ class KaggleBackend(Backend):
         now = datetime.now(timezone.utc)
         try:
             q = self._api().quota_view()
-            remaining_h: float | None = None
-            gpu = getattr(q, "gpu_quota", None)
-            if gpu is not None:
-                remaining = gpu.total_time_allowed - gpu.time_used
-                remaining_h = max(0.0, remaining.total_seconds() / 3600.0)
-            refresh = getattr(q, "quota_refresh_time", None)
+            remaining_h, refresh = _remaining_from_quota(q)
             budget = {
                 "gpu_hours_remaining": remaining_h,
-                "refresh": refresh.isoformat() if refresh else None,
+                "refresh": refresh,
             }
             exhausted = remaining_h is not None and remaining_h <= 0.0
             caps = Capabilities(
@@ -287,36 +365,21 @@ class KaggleBackend(Backend):
 
     # ---- probe ---------------------------------------------------------------
 
-    def _weekly_gpu_hours_used(self) -> float:
-        """Best-effort sum of this week's kaggle GPU job durations (no quota API)."""
-        try:
-            from omnirun.state import default_db_url, open_store
+    def _gpu_quota_reasons(self) -> list[str]:
+        """Return an unfit reason iff the REAL weekly GPU quota is exhausted.
 
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-            used = 0.0
-            store = open_store(default_db_url())
-            records = store.list_jobs()
-            store.close()
-            for rec in records:
-                if rec.handle is None or rec.handle.backend != self.name:
-                    continue
-                if not rec.spec.resources.wants_gpu():
-                    continue
-                sub = rec.submitted_at
-                if sub is None:
-                    continue
-                if sub.tzinfo is None:
-                    sub = sub.replace(tzinfo=timezone.utc)
-                if sub < cutoff:
-                    continue
-                st = rec.last_status
-                if st and st.started_at and st.finished_at:
-                    used += (st.finished_at - st.started_at).total_seconds() / 3600
-                elif rec.spec.resources.time:
-                    used += rec.spec.resources.time.total_seconds() / 3600
-            return used
+        Reads the live quota API (same source as discover()) rather than
+        guessing from local job records or a static config budget — so a job is
+        blocked only when Kaggle itself would refuse it (remaining <= 0).  A
+        quota the API can't report (None) never blocks."""
+        try:
+            remaining_h, refresh = _remaining_from_quota(self._api().quota_view())
         except Exception:
-            return 0.0
+            return []  # quota unknown → be optimistic, let the submit try
+        if remaining_h is None or remaining_h > 0:
+            return []
+        when = f" — refreshes {refresh}" if refresh else ""
+        return [f"weekly GPU quota exhausted{when}"]
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
         try:
@@ -361,15 +424,7 @@ class KaggleBackend(Backend):
                 )
             ]
 
-        budget = float(self.config.extra("weekly_gpu_hours", 30))
-        used = self._weekly_gpu_hours_used()
-        quota_reasons = (
-            [
-                f"weekly quota likely exhausted (~{used:.1f}h used of {budget:.0f}h budget)"
-            ]
-            if used >= budget
-            else []
-        )
+        quota_reasons = self._gpu_quota_reasons()
 
         n = res.effective_gpus()
         floor = res.vram_floor_gb()
@@ -493,6 +548,22 @@ class KaggleBackend(Backend):
                 base64.b64encode(envf.read_text().encode()).decode() if envf else ""
             )
 
+            # bore infra env — injected as os.environ assignments inside run.py;
+            # never touches git or the bundle.  Empty when bore is disabled so the
+            # harness is byte-identical to a non-bore submission.
+            bore = _bore_cfg()
+            infra_env: dict[str, str] | None = None
+            if bore.enabled:
+                _key_path, pubkey = _managed_keypair()
+                bore_port = _allocate_port(job_id, bore)
+                infra_env = {
+                    "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
+                    "OMNIRUN_BORE_SECRET": bore.secret or "",
+                    "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
+                    "OMNIRUN_SSH_PUBKEY": pubkey,
+                    "OMNIRUN_BORE_PORT": str(bore_port),
+                }
+
             script = generate_bootstrap(
                 notebook_env_spec(spec),
                 BootstrapParams(
@@ -507,7 +578,7 @@ class KaggleBackend(Backend):
             )
             boot_b64 = base64.b64encode(script.encode()).decode()
 
-            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64)
+            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64, infra_env)
             self._guard_source_size(harness, shipped_bundle=bool(bundle_b64))
 
             k_dir = stage / "kernel"
@@ -679,6 +750,15 @@ class KaggleBackend(Backend):
         return raw
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
+        # Prefer the bore tunnel: `tail -F bootstrap.log` over ssh is truly live,
+        # unlike the kernel log (which the API only serves in non-live snapshots).
+        # Fall back to the API path when the endpoint is absent or not (yet)
+        # connectable, so a slow-to-start kernel never duplicates output.
+        ep = self.ssh_endpoint(handle)
+        if ep is not None and endpoint_reachable(ep):
+            job_dir = f"{KAGGLE_ROOT}/jobs/{handle.job_id}"
+            yield from stream_log_file(ep, f"{job_dir}/logs/bootstrap.log", follow)
+            return
         api = self._api()
         ref = handle.data["kernel_ref"]
         offset = self._log_offsets.get(handle.job_id, 0)
@@ -736,15 +816,19 @@ class KaggleBackend(Backend):
                 try:
                     fn(ref)
                 except Exception as e:
+                    _release_port(handle.job_id)
                     raise BackendError(f"kernel cancel failed: {e}") from e
+                _release_port(handle.job_id)
                 self._terminal[handle.job_id] = StatusReport(
                     status=JobStatus.CANCELLED, detail="cancelled via API"
                 )
                 return
         # No cancel endpoint in the installed client. Do NOT raise — that would
-        # abort a Control.cancel reap sweep and surprise the CLI. Mark cancelled
-        # locally and log where to stop it by hand (idempotent, complete-enough:
-        # a Kaggle batch kernel self-terminates at its session cap anyway).
+        # abort a Control.cancel reap sweep and surprise the CLI. Release the
+        # tunnel port, mark cancelled locally, and log where to stop it by hand
+        # (idempotent, complete-enough: a Kaggle batch kernel self-terminates at
+        # its session cap anyway).
+        _release_port(handle.job_id)
         _log.warning(
             "kaggle client has no kernel-cancel endpoint; stop it at "
             "https://www.kaggle.com/code/%s",
@@ -758,7 +842,31 @@ class KaggleBackend(Backend):
         """Nothing worker-side to reap: the code bundle rode inside the kernel
         (no dataset), and the kernel version itself is lightweight and private.
         Stale omnirun-* kernels can be removed on kaggle.com if desired."""
-        return
+        _release_port(handle.job_id)
+
+    def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
+        """Return SSH endpoint via the bore tunnel, or None.
+
+        Returns None when:
+        - bore is not configured;
+        - no port has been allocated for this job (submitted without bore);
+        - the job is in a terminal state (tunnel is gone).
+        """
+        bore = _bore_cfg()
+        if not bore.enabled:
+            return None
+        # Terminal jobs no longer have a live tunnel.
+        st = self._terminal.get(handle.job_id)
+        if st is not None and st.status.terminal:
+            return None
+        port = _port_for(handle.job_id)
+        if port is None:
+            return None
+        host = bore.public_host
+        if host is None:
+            return None
+        key_path, _pub = _managed_keypair()
+        return SSHEndpoint(host=host, port=port, user="root", key_path=key_path)
 
     def check(self) -> str:
         api = self._api()

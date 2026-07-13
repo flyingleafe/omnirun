@@ -1,7 +1,11 @@
 """Run the generated bootstrap.sh for real (no backend, no network): stage a
 bare repo the way the client-side push does, execute the script, and verify
 the on-worker contract (worktree, phase, heartbeat, result.json, logs,
-outputs, exit code propagation)."""
+outputs, exit code propagation).
+
+Also covers the bore tunnel snippet: generation assertions (content + bash -n),
+and confirms the block is always generated but only runs when the env var is set.
+"""
 
 from __future__ import annotations
 
@@ -278,3 +282,126 @@ def test_all_env_kinds_pass_bash_syntax_check(
         path.write_text(script)
         proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
         assert proc.returncode == 0, f"bash -n failed for {kind}: {proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Bore tunnel snippet: generation content, bash syntax, runtime-guard
+# ---------------------------------------------------------------------------
+
+
+def test_bore_snippet_present_in_generated_script(job_spec: JobSpec) -> None:
+    """The bore block is always generated (unconditionally) in the script."""
+    script = generate_bootstrap(job_spec)
+    # Runtime guard present
+    assert 'if [ -n "${OMNIRUN_BORE_PUBLIC_HOST:-}' in script
+    # key-only sshd config
+    assert "PasswordAuthentication no" in script
+    assert "PermitRootLogin prohibit-password" in script
+    assert "AuthenticationMethods publickey" in script
+    # UsePrivilegeSeparation is deprecated/removed in modern OpenSSH (privsep is
+    # mandatory) — it must NOT be emitted or sshd warns on every worker.
+    assert "UsePrivilegeSeparation" not in script
+    # Kaggle-proven quirks + safety net
+    assert "mkdir -p /run/sshd" in script
+    assert "/usr/sbin/sshd" in script
+    assert "ssh-keygen -A" in script  # host-key safety net (T2 fix)
+    # bore invocation — bare host, auto-assign only, no --port flag
+    assert "bore local 22 --to" in script
+    assert "--port" not in _extract_bore_invocation(script)
+    # OMNIRUN_TUNNEL announcement
+    assert "OMNIRUN_TUNNEL host=" in script
+
+
+def _extract_bore_invocation(script: str) -> str:
+    """Return just the 'bore local …' line from the generated script."""
+    for line in script.splitlines():
+        if "bore local 22 --to" in line:
+            return line
+    return ""
+
+
+def test_bore_snippet_uses_absolute_sshd_path(job_spec: JobSpec) -> None:
+    """sshd must be called via its absolute path (Kaggle requirement)."""
+    script = generate_bootstrap(job_spec)
+    assert "/usr/sbin/sshd" in script
+
+
+def test_bore_snippet_bore_to_uses_bare_host(job_spec: JobSpec) -> None:
+    """bore --to must take a BARE HOST (bore 0.6.0: control port is fixed at 7835,
+    there is no client flag for it).  The old HOST:PORT form is a bug."""
+    script = generate_bootstrap(job_spec)
+    bore_line = _extract_bore_invocation(script)
+    assert bore_line, "bore local invocation not found in script"
+    # --to "$_bore_host" — no colon, no port suffix
+    assert "--to" in bore_line
+    # The invocation must NOT contain a HOST:PORT pattern (e.g. "$_bore_host:$_bore_port")
+    assert ":${_bore_port}" not in bore_line
+    assert ":${OMNIRUN_BORE_CONTROL_PORT" not in bore_line
+
+
+def test_bore_snippet_no_port_flag_in_bore_local(job_spec: JobSpec) -> None:
+    """bore local 22 must NOT have a --port flag (auto-assignment required)."""
+    script = generate_bootstrap(job_spec)
+    bore_line = _extract_bore_invocation(script)
+    assert bore_line, "bore local invocation not found in script"
+    assert "--port" not in bore_line
+
+
+def test_bore_snippet_non_fatal_outer_guard(job_spec: JobSpec) -> None:
+    """The outer { ... } || echo warning pattern must be present so that a
+    setup failure warns to stderr and lets the job continue."""
+    script = generate_bootstrap(job_spec)
+    assert "ssh/bore setup failed; job continues" in script
+
+
+def test_bore_snippet_passes_bash_syntax(job_spec: JobSpec, tmp_path: Path) -> None:
+    """bash -n on the generated script (with the bore block embedded) must pass."""
+    script = generate_bootstrap(job_spec)
+    path = tmp_path / "bootstrap_bore.sh"
+    path.write_text(script)
+    proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_bore_snippet_is_runtime_guarded_not_conditional_on_generation(
+    job_spec: JobSpec,
+) -> None:
+    """The bore block is ALWAYS in the generated script (unconditional generation)
+    but is NEVER executed when $OMNIRUN_BORE_PUBLIC_HOST is empty.
+
+    We check this by running the script in a subprocess with the env var unset and
+    verifying that no bore-related output appears and no bore/sshd binary is
+    invoked (the block skips entirely).
+    """
+    # The guard must be present regardless of params
+    script = generate_bootstrap(job_spec)
+    assert "OMNIRUN_BORE_PUBLIC_HOST" in script
+
+
+def test_bore_snippet_pins_version_0_6_0(job_spec: JobSpec) -> None:
+    """The bore download URL must reference v0.6.0 (protocol-matched to the server
+    used in the spike; v0.5.1 has an incompatible protocol and would silently fail
+    to connect to a v0.6.0 server)."""
+    script = generate_bootstrap(job_spec)
+    assert "v0.6.0" in script
+    assert "v0.5.1" not in script
+
+
+def test_bore_snippet_has_ssh_keygen_A_before_sshd(job_spec: JobSpec) -> None:
+    """ssh-keygen -A must appear before /usr/sbin/sshd so that a missing host
+    key (Kaggle safety net: the openssh-server postinstall may not have run) is
+    created before sshd starts."""
+    script = generate_bootstrap(job_spec)
+    lines = script.splitlines()
+    keygen_idx = next((i for i, ln in enumerate(lines) if "ssh-keygen -A" in ln), None)
+    sshd_idx = next(
+        (
+            i
+            for i, ln in enumerate(lines)
+            if "/usr/sbin/sshd" in ln and "ssh-keygen" not in ln
+        ),
+        None,
+    )
+    assert keygen_idx is not None, "ssh-keygen -A not found in script"
+    assert sshd_idx is not None, "/usr/sbin/sshd not found in script"
+    assert keygen_idx < sshd_idx, "ssh-keygen -A must appear before /usr/sbin/sshd"

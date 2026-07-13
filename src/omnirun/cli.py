@@ -4,6 +4,7 @@ backend -> store. All real logic lives in those modules (DESIGN §9)."""
 from __future__ import annotations
 
 import functools
+import os
 import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from rich.table import Table
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
+from omnirun.sshconn import ssh_argv
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.config import (
@@ -1039,6 +1041,70 @@ def backends_discover(
             facts.health_detail,
         )
     console.print(table)
+
+
+@app.command(
+    help="Open an interactive SSH session (or run CMD) on a provisioned job.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+@friendly_errors
+def ssh(
+    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    cmd: list[str] = typer.Argument(
+        default=None,
+        help="Optional remote command to run (instead of an interactive shell).",
+    ),
+) -> None:
+    """SSH into a provisioned, not-yet-torn-down job.
+
+    Opens an interactive PTY when no CMD is given, or runs CMD and exits with
+    its exit code.  Uses the omnirun-managed keypair so no key management is
+    needed.
+
+    Works for notebook jobs via their bore tunnel (``--port`` assigned at
+    submit time) and for ssh/local jobs via their direct host.
+
+    Example::
+
+        omnirun ssh train-abc123
+        omnirun ssh train-abc123 -- nvidia-smi
+    """
+    cfg = _load_cfg()
+    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
+    handle = _effective_handle(rec)
+    if handle is None:
+        _die(f"job {rec.spec.job_id} was never submitted; cannot ssh into it")
+    be = _backend_for(cfg, handle.backend)
+    ep = be.ssh_endpoint(handle)
+    if ep is None:
+        # Give a clear reason based on backend type.
+        backend_type = be.config.type
+        if backend_type in ("slurm",):
+            reason = (
+                f"backend {handle.backend!r} (type={backend_type}) does not support "
+                "omnirun ssh — Slurm jobs need login-node+srun (follow-up feature)"
+            )
+        elif backend_type in ("runpod", "vast", "thunder"):
+            reason = (
+                f"backend {handle.backend!r} (type={backend_type}) does not support "
+                "omnirun ssh — marketplace backends have their own endpoint (follow-up feature)"
+            )
+        else:
+            reason = (
+                f"job {rec.spec.job_id!r} is not ssh-reachable — "
+                "is it provisioned and still running? "
+                "(bore may not be configured, or the job has finished)"
+            )
+        _die(reason)
+    assert ep is not None
+
+    # Build the ssh argv via the shared helper (same flags the notebook `logs`
+    # path uses). Route through the user's own `ssh` binary (invariant: never
+    # bypass it). No CMD → interactive PTY; CMD → run it and exit with its code.
+    argv = ssh_argv(ep, remote_cmd=list(cmd) if cmd else None, interactive=not cmd)
+
+    # exec replaces the current process — exit code is the ssh exit code.
+    os.execvp("ssh", argv)
 
 
 @app.command(

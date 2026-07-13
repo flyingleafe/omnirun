@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
@@ -31,6 +32,28 @@ if TYPE_CHECKING:
 
 class BackendError(RuntimeError):
     """Raised for backend-level failures with a user-actionable message."""
+
+
+@dataclass
+class SSHEndpoint:
+    """SSH connection parameters for ``omnirun ssh <job>``.
+
+    Returned by ``Backend.ssh_endpoint(handle)`` when the job is reachable
+    over SSH.  None means the job is not currently ssh-reachable (not yet
+    provisioned, already torn down, or the backend does not support it).
+
+    Attributes:
+        host:     Hostname or IP to connect to.
+        port:     SSH (or bore tunnel) port number.
+        user:     Remote login user (typically ``root`` for notebook workers).
+        key_path: Path to the private key to use for authentication; the
+                  omnirun-managed key at ``<state_dir>/ssh/id_ed25519``.
+    """
+
+    host: str
+    port: int
+    user: str
+    key_path: Path
 
 
 #: Optional hook submit() calls the instant it creates a *billable* resource,
@@ -100,6 +123,20 @@ class Backend(ABC):
 
         Called by `omnirun gc` for terminal jobs. Default: nothing to do.
         Backends with billable resources MUST override."""
+
+    def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
+        """Return SSH connection parameters for this job, or None.
+
+        None is returned when:
+        - the job is not yet provisioned or has been torn down;
+        - the backend does not support direct SSH access (e.g. Slurm, marketplace).
+
+        The default implementation returns None.  Notebook backends (colab,
+        kaggle) return an ``SSHEndpoint`` pointing at the bore tunnel port
+        assigned at submit time when bore is configured.  SSH/local backends
+        return the direct target they already use.
+        """
+        return None
 
     def check(self) -> str:
         """Connectivity/config sanity check for `omnirun backends check`.

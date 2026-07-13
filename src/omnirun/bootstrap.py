@@ -56,6 +56,107 @@ MICROMAMBA_INSTALL = (
     ' | tar -xj -C "$OMNIRUN_ROOT/bin" --strip-components=1 bin/micromamba'
 )
 
+# bore v0.6.0 static musl binary — protocol-matched to the server/client on this
+# machine (verified in the spike); v0.5.1 uses a different protocol and would
+# silently fail to connect to a v0.6.0 server.
+_BORE_RELEASE_URL = (
+    "https://github.com/ekzhang/bore/releases/download/v0.6.0"
+    "/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+)
+
+
+def _bore_tunnel_block() -> str:
+    """Shell snippet that starts a key-only sshd + bore tunnel in the background.
+
+    Runtime-guarded: the block runs only when $OMNIRUN_BORE_PUBLIC_HOST is set.
+    A non-bore job's script is byte-unaffected (the env var is empty → entire
+    block skips).
+
+    Non-fatal: any failure inside the outer { ... } warns to stderr and lets
+    the job continue.  An ssh/bore failure must never fail the job.
+
+    Bakes in the three Kaggle-proven quirks (harmless on Colab):
+      - mkdir -p /run/sshd   (privsep dir absent on Kaggle by default)
+      - /usr/sbin/sshd        (absolute path — Kaggle requirement)
+      - -f /tmp/omnirun-sshd.conf  standalone config — bypass base sshd_config
+        (live-verified: Colab's base sshd_config sets ListenAddress 127.0.0.1
+        and Port 2222; a drop-in under sshd_config.d/ does NOT override those
+        and sshd would listen on loopback:2222 instead of 0.0.0.0:22,
+        making bore local 22 fail with "could not connect to localhost:22")
+      - ssh-keygen -A before sshd   (safety net if postinstall didn't create host keys)
+
+    Bore invocation: `bore local 22 --to "$OMNIRUN_BORE_PUBLIC_HOST" --port "$OMNIRUN_BORE_PORT"`
+      - `--to` takes a BARE HOST only (bore 0.6.0 — control port is fixed at 7835,
+        there is no client flag for it).
+      - `--port` is taken from OMNIRUN_BORE_PORT (assigned deterministically by the
+        client at submit time so no live log discovery is needed).
+
+    Env vars consumed (injected by the notebook backends when bore is enabled;
+    when unset the block skips entirely — non-bore jobs are byte-unaffected):
+      OMNIRUN_BORE_PUBLIC_HOST, OMNIRUN_BORE_SECRET, OMNIRUN_BORE_CONTROL_PORT,
+      OMNIRUN_SSH_PUBKEY, OMNIRUN_BORE_PORT.
+
+    The snippet emits one line to the job log on success (kept for debugging):
+      OMNIRUN_TUNNEL host=<host> port=<port>
+    The client does NOT depend on this line — it uses the pre-assigned port.
+    """
+    return f"""\
+# ---- bore tunnel (ssh-everywhere) — runtime-guarded, non-fatal ---------------
+if [ -n "${{OMNIRUN_BORE_PUBLIC_HOST:-}}" ]; then
+  {{
+    # --- install openssh-server if missing ---
+    command -v sshd >/dev/null 2>&1 || \\
+      (apt-get update -qq && apt-get install -y -qq openssh-server) >/dev/null 2>&1
+    # --- key-only sshd (Kaggle/Colab quirks) ---
+    # Use -f with a standalone config to bypass the base sshd_config entirely.
+    # Colab's /etc/ssh/sshd_config sets Port 2222 and ListenAddress 127.0.0.1;
+    # a drop-in in sshd_config.d/ does NOT override those directives — sshd
+    # would listen on loopback:2222 and bore local 22 would fail to connect.
+    mkdir -p /run/sshd ~/.ssh
+    printf '%s\\n' "${{OMNIRUN_SSH_PUBKEY:-}}" > ~/.ssh/authorized_keys
+    chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys
+    # generate host keys if the openssh-server postinstall didn't (Kaggle safety net)
+    ssh-keygen -A >/dev/null 2>&1 || true
+    cat > /tmp/omnirun-sshd.conf <<'SSHD_EOF'
+# omnirun standalone sshd config — bypasses the base sshd_config entirely
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+AuthenticationMethods publickey
+UsePAM no
+PrintMotd no
+SSHD_EOF
+    /usr/sbin/sshd -f /tmp/omnirun-sshd.conf
+    # --- install bore (static musl binary, v0.6.0) if not already present ---
+    command -v bore >/dev/null 2>&1 || {{
+      curl -fsSL {_BORE_RELEASE_URL} | tar xz -C /usr/local/bin bore
+    }}
+    # --- open tunnel; --to takes a bare host (bore 0.6.0); --port pre-assigned by client ---
+    _bore_host="${{OMNIRUN_BORE_PUBLIC_HOST}}"
+    bore local 22 --to "${{_bore_host}}" \\
+      ${{OMNIRUN_BORE_SECRET:+--secret "${{OMNIRUN_BORE_SECRET}}"}} \\
+      --port "${{OMNIRUN_BORE_PORT}}" \\
+      > /tmp/omnirun-bore.log 2>&1 &
+    # --- wait up to 30s for bore to announce the assigned port ---
+    _bore_line=""
+    for _i in $(seq 1 30); do
+      _bore_line=$(grep -m1 'listening at' /tmp/omnirun-bore.log 2>/dev/null) && \\
+        [ -n "$_bore_line" ] && break
+      sleep 1
+    done
+    if [ -n "$_bore_line" ]; then
+      _bore_addr=$(printf '%s' "$_bore_line" | sed -n 's/.*listening at //p')
+      echo "OMNIRUN_TUNNEL host=${{_bore_addr%:*}} port=${{_bore_addr##*:}}"
+    else
+      echo "OMNIRUN_TUNNEL: warning — tunnel did not come up within 30s" >&2
+    fi
+  }} || echo "OMNIRUN_TUNNEL: warning — ssh/bore setup failed; job continues" >&2
+fi
+"""
+
 
 @dataclass
 class CodeSource:
@@ -376,6 +477,7 @@ set +a
 {exports}
 {pre_run}
 
+{_bore_tunnel_block()}\
 # ---- heartbeat ----------------------------------------------------------------
 ( while true; do now > "$JOB_DIR/heartbeat"; sleep {HEARTBEAT_INTERVAL_S}; done ) &
 HB_PID=$!

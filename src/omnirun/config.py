@@ -93,6 +93,72 @@ class DaemonConfig(BaseModel):
     poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
 
 
+class BoreConfig(BaseModel):
+    """Config for a self-hosted bore tunnel server (ssh-everywhere feature).
+
+    TOML section: [bore]
+      public_host   — bore server address; workers dial this to open a tunnel.
+      private_host  — address the client uses to reach open tunnel ports; defaults
+                      to public_host (set to "localhost" when the daemon is co-
+                      located on the bore VPS).
+      control_port  — bore control port, default 7835.
+      secret        — shared secret gating tunnel creation (worker-only).
+      port_min      — start of the deterministic tunnel port range (inclusive).
+      port_max      — end of the deterministic tunnel port range (inclusive).
+
+    Env-var overrides (take precedence over TOML):
+      BORE_PUBLIC_HOST, BORE_PRIVATE_HOST, BORE_CONTROL_PORT, BORE_SECRET,
+      BORE_PORT_MIN, BORE_PORT_MAX
+    """
+
+    # Worker-facing: the bore server's public DNS/IP that workers dial out to.
+    public_host: str | None = None
+    # Client-facing: address used by the client to reach open tunnel ports.
+    # Falls back to public_host when not set.
+    private_host: str | None = None
+    # Bore control port (matches bore's own default).
+    control_port: int = 7835
+    # Shared secret gating tunnel creation on the bore server.
+    secret: str | None = None
+    # Deterministic tunnel port range — omnirun assigns ports to workers so the
+    # client knows which port to connect to without reading a live log.  Must
+    # match the bore server's --port-range.
+    port_min: int = 20000
+    port_max: int = 20099
+
+    @property
+    def enabled(self) -> bool:
+        """True when a bore server is configured (public_host is set)."""
+        return self.public_host is not None
+
+    @property
+    def effective_private_host(self) -> str | None:
+        """The host the client connects to for tunnel ports.
+
+        Falls back to public_host when private_host is not set explicitly, so
+        a single-host setup needs only public_host in the config."""
+        return self.private_host if self.private_host is not None else self.public_host
+
+    @classmethod
+    def from_env_and_toml(cls, data: dict[str, object]) -> "BoreConfig":
+        """Load from a TOML-sourced dict, then apply env-var overrides."""
+        cfg = cls.model_validate(data)
+        overrides: dict[str, object] = {}
+        if (v := os.environ.get("BORE_PUBLIC_HOST")) is not None:
+            overrides["public_host"] = v or None
+        if (v := os.environ.get("BORE_PRIVATE_HOST")) is not None:
+            overrides["private_host"] = v or None
+        if (v := os.environ.get("BORE_CONTROL_PORT")) is not None:
+            overrides["control_port"] = int(v)
+        if (v := os.environ.get("BORE_SECRET")) is not None:
+            overrides["secret"] = v or None
+        if (v := os.environ.get("BORE_PORT_MIN")) is not None:
+            overrides["port_min"] = int(v)
+        if (v := os.environ.get("BORE_PORT_MAX")) is not None:
+            overrides["port_max"] = int(v)
+        return cfg.model_copy(update=overrides) if overrides else cfg
+
+
 class StateConfig(BaseModel):
     """Where the SQL state store lives (DESIGN §9).
 
@@ -118,6 +184,7 @@ class StateConfig(BaseModel):
 class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    bore: BoreConfig = Field(default_factory=BoreConfig)
     state: StateConfig = Field(default_factory=StateConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
@@ -136,12 +203,16 @@ def default_config_path() -> Path:
 def load_config(path: Path | None = None) -> Config:
     path = path or default_config_path()
     if not path.exists():
-        return Config()
-    try:
-        data = tomllib.loads(path.read_text())
-        return Config.model_validate(data)
-    except (tomllib.TOMLDecodeError, ValueError) as e:
-        raise ConfigError(f"bad config at {path}: {e}") from e
+        cfg = Config()
+    else:
+        try:
+            data = tomllib.loads(path.read_text())
+            cfg = Config.model_validate(data)
+        except (tomllib.TOMLDecodeError, ValueError) as e:
+            raise ConfigError(f"bad config at {path}: {e}") from e
+    # Apply env-var overrides for bore config (env wins over TOML).
+    bore = BoreConfig.from_env_and_toml(cfg.bore.model_dump())
+    return cfg.model_copy(update={"bore": bore})
 
 
 def load_repo_defaults(repo_root: Path) -> dict[str, Any]:
