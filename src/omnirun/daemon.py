@@ -149,9 +149,9 @@ class Daemon:
 
         # One Store for the whole daemon (queue + job persistence). An explicit
         # state_dir (tests, or a caller relocating the daemon's state home) puts
-        # the SQLite DB there; otherwise honor the configured state URL (which
-        # may be Postgres). daemon.json still tracks the liveness address under
-        # state_root regardless.
+        # the SQLite DB there; otherwise honor the configured state URL.
+        # daemon.json still tracks the liveness address under state_root
+        # regardless.
         db_url = (
             f"sqlite:///{self.state_root / 'omnirun.db'}"
             if state_dir is not None

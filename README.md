@@ -84,16 +84,15 @@ requirement: single submits never touch it.
 
 ## State storage (optional)
 
-By default omnirun stores all state in a SQLite database
+omnirun stores all state in a SQLite database
 (`~/.local/share/omnirun/omnirun.db`). The `[state]` config section lets you
-point it at a Postgres database instead (e.g. when running the scheduler daemon
-on a VPS):
+relocate it (a Postgres backend for a shared daemon is a planned Tier-2
+addition, not yet shipped):
 
 ```toml
 [state]
-backend = "sqlite"            # default; or "postgres"
-# path = "/custom/omnirun.db"  # explicit SQLite path
-# url  = "postgresql+psycopg://user:pw@host/db"  # overrides backend/path
+# path = "/custom/omnirun.db"                 # explicit SQLite path
+# url  = "sqlite:////abs/path/omnirun.db"     # explicit SQLite URL (wins over path)
 ```
 
 **Migrating from an earlier omnirun version** (if you have JSON state files):

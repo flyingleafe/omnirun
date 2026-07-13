@@ -96,12 +96,14 @@ class DaemonConfig(BaseModel):
 class StateConfig(BaseModel):
     """Where the SQL state store lives (DESIGN §9).
 
-    ``backend`` selects the engine; ``url`` is an explicit SQLAlchemy URL that
-    wins outright; otherwise a ``path`` becomes a SQLite file URL, and with
+    The store is SQLite-only today — a Postgres dialect is a deferred Tier-2
+    concern, so it is not offered here (a config that selected it would only
+    break at the first write). ``url`` is an explicit SQLAlchemy SQLite URL that
+    wins outright; otherwise ``path`` becomes a SQLite file URL, and with
     neither set the default ``$OMNIRUN_STATE_DIR/omnirun.db`` is used.
     """
 
-    backend: Literal["sqlite", "postgres"] = "sqlite"
+    backend: Literal["sqlite"] = "sqlite"
     path: str | None = None
     url: str | None = None
 

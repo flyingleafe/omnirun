@@ -158,7 +158,7 @@ class Store:
         return str(row)
 
     def set_meta(self, key: str, value: str) -> None:
-        """Upsert ``meta[key] = value`` (dialect-aware, one transaction)."""
+        """Upsert ``meta[key] = value`` in one transaction."""
         with self.transaction() as conn:
             self._upsert(conn, meta, ["key"], {"key": key, "value": value})
 
@@ -176,7 +176,7 @@ class Store:
         self._engine.dispose()
 
     # ------------------------------------------------------------------
-    # Dialect-aware upsert helper (the ONE place dialect logic lives).
+    # SQLite upsert helper — the one place INSERT … ON CONFLICT is built.
     # Tasks 3–4 reuse this same helper for their tables.
     # ------------------------------------------------------------------
 
