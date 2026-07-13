@@ -1034,3 +1034,13 @@ def test_logs_follow_uses_effective_handle_for_placement_only_record(env, job_sp
     assert (
         "following=True" in result.output
     )  # follow flag threaded through the rebuilt handle
+
+
+# ------------------------------------------------------------------ state sub-app
+
+
+def test_cli_state_path() -> None:
+    """omnirun state path prints a string ending in omnirun.db."""
+    result = runner.invoke(app, ["state", "path"])
+    assert result.exit_code == 0, result.output
+    assert "omnirun.db" in result.output

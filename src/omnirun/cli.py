@@ -1260,42 +1260,5 @@ def state_path() -> None:
     typer.echo(default_db_url())
 
 
-@state_app.command("migrate", help="Import legacy JSON state into the SQL store.")
-@friendly_errors
-def state_migrate(
-    from_dir: Path = typer.Option(
-        None,
-        "--from",
-        help="Legacy JSON state directory (default: $OMNIRUN_STATE_DIR or XDG default).",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Parse and count records but write nothing to the DB.",
-    ),
-) -> None:
-    from omnirun.state import default_store_dir
-    from omnirun.state.migrate import import_json_tree
-
-    src = from_dir if from_dir is not None else default_store_dir()
-    cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    try:
-        report = import_json_tree(src, store, dry_run=dry_run)
-    finally:
-        store.close()
-
-    if dry_run:
-        console.print("[bold yellow]DRY RUN — nothing written[/bold yellow]")
-    console.print(
-        f"jobs={report.jobs}  facts={report.facts}  "
-        f"queue={report.queue}  waits={report.waits}"
-    )
-    if report.skipped:
-        console.print(f"[yellow]skipped {len(report.skipped)} file(s):[/yellow]")
-        for item in report.skipped:
-            console.print(f"  {item}")
-
-
 if __name__ == "__main__":
     app()

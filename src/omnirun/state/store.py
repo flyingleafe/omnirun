@@ -1,11 +1,6 @@
 """The SQL ``Store`` — one portable state repository over SQLAlchemy Core 2.0.
 
-SQLite on the laptop (zero-setup, the tested-for-real default) and Postgres on a
-VPS share one engine-construction path and one schema (``schema.py``). Dialect
-differences (write locking, JSON type, upsert) are handled inside this package,
-never at call sites.
-
-``$OMNIRUN_STATE_DIR`` stays the state home: the SQLite file lives at
+SQLite only: zero-setup, the tested-for-real default. The SQLite file lives at
 ``$OMNIRUN_STATE_DIR/omnirun.db`` by default (``default_db_url``).
 """
 
@@ -30,10 +25,8 @@ from sqlalchemy import (
     insert,
     make_url,
     select,
-    text,
     update,
 )
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnirun.budget import BudgetLedger, LedgerEntry
@@ -107,8 +100,7 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
     acquires the reserved write lock up front. A ``busy_timeout`` makes a
     contending ``BEGIN IMMEDIATE`` wait for the holder to commit rather than fail
     immediately, so the concurrency-loser in ``reserve_entry`` serializes and
-    returns False instead of hitting "database is locked". Guarded to the sqlite
-    dialect so Postgres is untouched.
+    returns False instead of hitting "database is locked".
     """
 
     @event.listens_for(engine, "connect")
@@ -126,8 +118,7 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
 class Store:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
-        if engine.dialect.name == "sqlite":
-            _install_sqlite_write_lock(engine)
+        _install_sqlite_write_lock(engine)
 
     def create_all(self) -> None:
         metadata.create_all(self._engine, tables=list(ALL_TABLES))
@@ -181,10 +172,8 @@ class Store:
     def transaction(self) -> Iterator[Connection]:
         """Open a write transaction.
 
-        On SQLite the ``begin`` event handler issues ``BEGIN IMMEDIATE`` so the
-        reserved write lock is taken up front (serializing ``reserve_*``). On
-        Postgres this is an ordinary transaction; row-level locking is expressed
-        by the statements run inside it (``select(...).with_for_update()``).
+        The ``begin`` event handler issues ``BEGIN IMMEDIATE`` so the reserved
+        write lock is taken up front (serializing ``reserve_*`` on SQLite).
         """
         with self._engine.begin() as conn:
             yield conn
@@ -206,25 +195,17 @@ class Store:
     ) -> None:
         """Execute an upsert (INSERT … ON CONFLICT DO UPDATE) for *table*.
 
-        Picks the SQLite or Postgres dialect-specific insert so that
-        ``.on_conflict_do_update`` is available on both engines. *pk_cols*
-        names the conflict-target columns (the primary key, or a unique index);
-        *values* is the full row dict, which is also used as the update set.
+        Uses the SQLite dialect-specific insert so that ``.on_conflict_do_update``
+        is available. *pk_cols* names the conflict-target columns (the primary key,
+        or a unique index); *values* is the full row dict, which is also used as
+        the update set.
         """
-        if self._engine.dialect.name == "sqlite":
-            stmt = sqlite_insert(table).values(**values)
-            non_pk = {k: v for k, v in values.items() if k not in pk_cols}
-            upsert_stmt = stmt.on_conflict_do_update(
-                index_elements=pk_cols,
-                set_=non_pk,
-            )
-        else:
-            stmt = pg_insert(table).values(**values)
-            non_pk = {k: v for k, v in values.items() if k not in pk_cols}
-            upsert_stmt = stmt.on_conflict_do_update(
-                index_elements=pk_cols,
-                set_=non_pk,
-            )
+        stmt = sqlite_insert(table).values(**values)
+        non_pk = {k: v for k, v in values.items() if k not in pk_cols}
+        upsert_stmt = stmt.on_conflict_do_update(
+            index_elements=pk_cols,
+            set_=non_pk,
+        )
         conn.execute(upsert_stmt)
 
     # ------------------------------------------------------------------
@@ -359,10 +340,10 @@ class Store:
     def reserve(self, slot: Slot, rec: JobRecord) -> bool:
         """Atomically reserve job *rec* onto *slot* if the provider is under cap.
 
-        The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly
-        (including the Postgres per-provider advisory lock). Inside ONE
-        ``transaction()`` we re-read the job row ``with_for_update()``, and — only
-        if the persisted record is still placeable (``QUEUED`` or ``HELD``) and
+        The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly.
+        Inside ONE ``transaction()`` (which holds the SQLite reserved write lock via
+        ``BEGIN IMMEDIATE``) we re-read the job row ``with_for_update()``, and —
+        only if the persisted record is still placeable (``QUEUED`` or ``HELD``) and
         ``_count_active_jobs(slot.provider_name) < slot.capacity`` — flip it to
         ``PLACING`` with a fresh ``Placement`` on *slot*'s provider, UPDATEing the
         row (state/backend/data) directly on the same connection. Because the
@@ -386,21 +367,9 @@ class Store:
         job_id = rec.spec.job_id
         provider = slot.provider_name
         with self.transaction() as conn:
-            if conn.dialect.name == "postgresql":
-                # Postgres runs READ COMMITTED and the FOR UPDATE below locks only
-                # the target job row, leaving the cap count (which reads OTHER
-                # rows) unlocked — so two txns reserving DIFFERENT jobs on the same
-                # provider could both pass the check and over-book. Serialize
-                # reservers per-provider with a transaction-scoped advisory lock
-                # (auto-released at commit). SQLite needs none: its BEGIN IMMEDIATE
-                # already serializes the whole transaction. Same rule as
-                # ``reserve_entry``.
-                conn.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:p))"),
-                    {"p": provider},
-                )
-            # Re-read under the lock: FOR UPDATE on Postgres, a no-op clause on
-            # SQLite where BEGIN IMMEDIATE already serializes the whole txn.
+            # Re-read under the lock: BEGIN IMMEDIATE (issued in the ``begin``
+            # event handler) already serializes the whole write transaction on
+            # SQLite, so with_for_update() is a no-op but harmless.
             row = conn.execute(
                 select(jobs.c.data).where(jobs.c.job_id == job_id).with_for_update()
             ).fetchone()
@@ -682,12 +651,12 @@ class Store:
         """Atomically reserve entry *qid* onto *backend* if under *cap*.
 
         The #12 double-book guard. Inside ONE ``transaction()`` (which holds the
-        SQLite reserved write lock / lets Postgres take a ``FOR UPDATE`` row
-        lock) we re-read the entry ``with_for_update()``, then — only if it is
-        still ``PENDING`` and ``_count_active(backend) < cap`` — flip it to
-        ``PLACING`` with *backend* set, all on the same connection. Because the
-        count and the update share the one transaction, no concurrent tick or
-        machine can slip a second reservation past the cap.
+        SQLite reserved write lock via ``BEGIN IMMEDIATE``) we re-read the entry
+        ``with_for_update()``, then — only if it is still ``PENDING`` and
+        ``_count_active(backend) < cap`` — flip it to ``PLACING`` with *backend*
+        set, all on the same connection. Because the count and the update share
+        the one transaction, no concurrent tick or machine can slip a second
+        reservation past the cap.
 
         Returns ``True`` if the entry was reserved, ``False`` otherwise (missing,
         not ``PENDING``, or the cap is already full).
@@ -696,20 +665,9 @@ class Store:
         directly); reload via ``get_entry`` if you need the post-reserve object.
         """
         with self.transaction() as conn:
-            if conn.dialect.name == "postgresql":
-                # Postgres runs READ COMMITTED and the FOR UPDATE below locks only
-                # the target row, leaving the cap count (which reads OTHER rows)
-                # unlocked — so two txns reserving DIFFERENT entries on the same
-                # backend could both pass the check and over-book. Serialize
-                # reservers per-backend with a transaction-scoped advisory lock
-                # (auto-released at commit). SQLite needs none: its BEGIN IMMEDIATE
-                # already serializes the whole transaction.
-                conn.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:b))"),
-                    {"b": backend},
-                )
-            # Re-read under the lock: FOR UPDATE on Postgres, a no-op clause on
-            # SQLite where BEGIN IMMEDIATE already serializes the whole txn.
+            # Re-read under the lock: BEGIN IMMEDIATE (issued in the ``begin``
+            # event handler) already serializes the whole write transaction on
+            # SQLite, so with_for_update() is a no-op but harmless.
             row = conn.execute(
                 select(queue.c.data).where(queue.c.qid == qid).with_for_update()
             ).fetchone()

@@ -1,8 +1,8 @@
-"""Pluggable SQL state layer (DESIGN §9).
+"""SQL state layer (DESIGN §9).
 
-One ``Store`` repository over SQLAlchemy Core 2.0 — SQLite on the laptop,
-Postgres on a VPS — behind a single typed interface. Replaces the former atomic
-JSON stores (``JobStore``/``FactStore``/``QueueStore``).
+One ``Store`` repository over SQLAlchemy Core 2.0 — SQLite on the laptop —
+behind a single typed interface. Replaces the former atomic JSON stores
+(``JobStore``/``FactStore``/``QueueStore``).
 """
 
 from __future__ import annotations
