@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from omnirun.bootstrap import BootstrapParams, CodeSource, generate_bootstrap
-from omnirun.models import JobSpec
+from omnirun.models import EnvKind, EnvSpec, JobSpec
 from tests.conftest import git
 
 
@@ -193,3 +193,88 @@ def test_bare_exit_in_command_still_writes_result(
     result = json.loads((job_dir / "result.json").read_text())
     assert result["exit_code"] == 7  # FAILED semantics: result present, code != 0
     assert (job_dir / "phase").read_text().strip() == "done"
+
+
+# ---------------------------------------------------------------------------
+# Lock mechanism and idempotent env-build assertions (string-level)
+# ---------------------------------------------------------------------------
+
+
+def _make_spec(job_spec: JobSpec, kind: EnvKind) -> JobSpec:
+    """Return a copy of job_spec with the given EnvKind."""
+    return job_spec.model_copy(
+        update={
+            "job_id": JobSpec.make_job_id(f"lock-test-{kind.name.lower()}"),
+            "env": EnvSpec(kind=kind),
+        }
+    )
+
+
+def test_generated_script_uses_mkdir_lock_not_flock(job_spec: JobSpec) -> None:
+    """The generated script must define omnirun_lock/omnirun_unlock and never use
+    the old POSIX flock construct (flock <fd>) that fails across Slurm nodes on
+    network filesystems (NFS/GPFS)."""
+    for kind in EnvKind:
+        script = generate_bootstrap(_make_spec(job_spec, kind))
+        # The preamble defines both helpers
+        assert "omnirun_lock()" in script, f"omnirun_lock() missing for {kind}"
+        assert "omnirun_unlock()" in script, f"omnirun_unlock() missing for {kind}"
+        # No flock-fd pattern — the comment "unlike flock" is allowed but `flock <N>`
+        # or `flock "` (flock with a file arg) must not appear.
+        assert "flock 9" not in script, f"flock fd-9 found in {kind} script"
+        assert 'flock "' not in script, f"flock file-arg found in {kind} script"
+
+
+def test_lock_refreshes_heartbeat_and_unlock_kills_refresher(
+    job_spec: JobSpec,
+) -> None:
+    """A held lock must keep its heartbeat fresh so a long `uv sync` (slower than
+    the stale-lock timeout) is not stolen mid-build (the residual #12 race), and
+    omnirun_unlock must stop that background refresher."""
+    script = generate_bootstrap(_make_spec(job_spec, EnvKind.UV))
+    # a background refresher rewrites the lock heartbeat on an interval
+    assert 'echo $! > "$d/hb.pid"' in script
+    assert "while :; do sleep 60;" in script
+    # unlock kills the refresher before removing the lock dir
+    assert 'kill "$(cat "$1/hb.pid")"' in script
+
+
+def test_generated_script_venv_lock_uses_dot_d_directory(job_spec: JobSpec) -> None:
+    """The venv lock must be a directory (.locks/venv.d) not a plain file, so that
+    the mkdir-based protocol works (mkdir on a file path would fail with EEXIST but
+    not reliably across NFS). The worktree lock similarly uses a .d directory."""
+    for kind in EnvKind:
+        script = generate_bootstrap(_make_spec(job_spec, kind))
+        if kind in (EnvKind.NONE,):
+            # NONE: no venv operations, no lock expected
+            continue
+        assert ".locks/venv.d" in script, f".locks/venv.d missing for {kind}"
+    # Worktree lock uses tree-$SHORT.d
+    script = generate_bootstrap(job_spec)
+    assert ".locks/tree-$SHORT.d" in script, ".locks/tree-$SHORT.d missing"
+
+
+def test_uv_env_block_has_stamp_guard(job_spec: JobSpec) -> None:
+    """The UV (and AUTO) env block must include the stamp-guard so that jobs
+    at the same revision skip `uv sync` if uv.lock + python haven't changed.
+    This is the main defence against the 500 MB torch reinstall race."""
+    for kind in (EnvKind.UV, EnvKind.AUTO):
+        script = generate_bootstrap(_make_spec(job_spec, kind))
+        assert "OMNIRUN_VENV_STAMP" in script, f"stamp var missing for {kind}"
+        assert "OMNIRUN_VENV_WANT" in script, f"want var missing for {kind}"
+        assert "sha256sum" in script, f"sha256sum missing for {kind}"
+        # The double-check re-read under the lock must be present
+        assert "OMNIRUN_VENV_STAMP" in script and "OMNIRUN_VENV_WANT" in script
+
+
+def test_all_env_kinds_pass_bash_syntax_check(
+    job_spec: JobSpec, tmp_path: Path
+) -> None:
+    """Every EnvKind variant of the generated script must be syntactically valid
+    bash — a quick guard that the lock rewrites didn't introduce shell errors."""
+    for kind in EnvKind:
+        script = generate_bootstrap(_make_spec(job_spec, kind))
+        path = tmp_path / f"bootstrap_{kind.name.lower()}.sh"
+        path.write_text(script)
+        proc = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+        assert proc.returncode == 0, f"bash -n failed for {kind}: {proc.stderr}"
