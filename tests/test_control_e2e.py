@@ -1,7 +1,7 @@
 """Happy-path end-to-end test through the REAL ``Control`` loop.
 
 One well-behaved ``FakeProvider`` offering a single FREE slot, a real
-SQLite-backed ``Store``, and a minimal job with no deadline. We drive
+SQLite-backed ``Store``, and a minimal job. We drive
 ``Control.submit`` + three ``run_tick``s and assert the full lifecycle:
 
     QUEUED --(tick T0: match+reserve+place)--> RUNNING
@@ -9,9 +9,8 @@ SQLite-backed ``Store``, and a minimal job with no deadline. We drive
            --(tick T2: reconcile poll → SUCCEEDED)--> SUCCEEDED (terminal)
            --(tick T3)--> no-op (already terminal)
 
-Crucially this is the FREE path: no ledger entry is ever written, and the
-terminal reconcile does NOT realize a spend. The paid path and the
-failure/recovery invariants are exercised by the Task-8 invariant suite.
+Crucially this is the FREE path: no cost is tracked, and the
+terminal reconcile is a pure state transition.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.state.store import Store, open_store
+from omnirun.state.store import open_store
 from tests.fakes import FakeProvider
 
 UTC = timezone.utc
@@ -71,12 +70,6 @@ def _free_slot() -> Slot:
         cost=Cost(),  # per_hour None → free
         capacity=1,
     )
-
-
-def _no_ledger_rows(store: Store) -> bool:
-    """True iff the ledger table has no rows for the tested window."""
-    led = store.load_ledger("day", cap=None, now=T3)
-    return led.entries == []
 
 
 def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:
@@ -115,9 +108,8 @@ def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:
         assert placed.placement.handle == {"id": job_id}
         # The provider was actually driven exactly once for place.
         assert provider.place_calls == [job_id]
-        # FREE slot → nothing committed to the ledger.
+        # FREE slot → no cost tracked.
         assert placed.placement.cost_actual is None
-        assert _no_ledger_rows(store)
 
         # --- tick T1: reconcile polls → RUNNING; no new place (converged) -----
         decisions = control.run_tick(T1)
@@ -139,8 +131,6 @@ def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:
         assert done.placement is not None
         assert done.placement.ended_at == T2
         assert done.placement.state is JobStatus.SUCCEEDED
-        # FREE job → no realize; ledger still empty.
-        assert _no_ledger_rows(store)
         assert provider.poll_calls == [job_id, job_id]  # polled at T1 and T2
 
         # --- tick T3: idempotent no-op (terminal job is skipped) --------------
@@ -178,109 +168,6 @@ def test_submit_persists_queued_record(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Regression tests for the Phase-3 Control driver adversarial-review bugs.
 # ---------------------------------------------------------------------------
-
-T4 = T0 + timedelta(minutes=4)
-
-_HOUR = timedelta(hours=1)
-
-
-def _paid_spec(job_id: str = "paid-000001") -> JobSpec:
-    """A job with a known 1h runtime so a paid slot's cost is knowable ($X)."""
-    return JobSpec(
-        job_id=job_id,
-        name="paid",
-        command="echo hi",
-        repo=_REPO,
-        resources=ResourceSpec(time=_HOUR),
-    )
-
-
-def _paid_slot() -> Slot:
-    """A PAID, capacity-1 slot at $2/hr (⇒ $2.00 for the 1h job)."""
-    return Slot(
-        provider_name="paid",
-        capabilities=Capabilities(),
-        cost=Cost(per_hour=2.0),
-        capacity=1,
-    )
-
-
-def _committed_rows(store: Store) -> list[float]:
-    """Amounts of the still-``committed`` ledger rows in the tested window."""
-    led = store.load_ledger("day", cap=None, now=T4)
-    return [e.amount for e in led.entries if e.kind == "committed"]
-
-
-def _active_placements(store: Store) -> list[JobRecord]:
-    """Records currently holding a (non-terminal) placement — an ACTIVE launch."""
-    return [
-        r
-        for r in store.list_jobs()
-        if r.placement is not None
-        and r.placement.ended_at is None
-        and not r.state.terminal
-    ]
-
-
-def test_c1_paid_ledger_not_double_counted_on_requeue(tmp_path: Path) -> None:
-    """C1: a PAID job that is LOST and re-placed must be charged $X once, not 2·X.
-
-    Reproduces the double-count: place writes a ``committed`` $X row; a LOST poll
-    requeues (voiding that commitment to $0) and the same tick re-places (a second
-    ``committed`` $X row); the terminal realize converts only the earliest
-    committed row. Without the void in ``_requeue`` the first row lingers as a
-    live commitment forever, so the in-window total is 2·X for one run.
-    """
-    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
-    try:
-        spec = _paid_spec()
-        # poll: T1 → LOST (requeue + re-place same tick); T2 → SUCCEEDED (terminal).
-        provider = FakeProvider(
-            "paid",
-            slots=[_paid_slot()],
-            poll_script={spec.job_id: [JobStatus.LOST, JobStatus.SUCCEEDED]},
-        )
-        control = Control(store, {"paid": provider}, budget_cap=100.0)
-
-        control.submit(spec, now=T0)
-
-        # --- T0: place → RUNNING; exactly one committed $2 row ----------------
-        control.run_tick(T0)
-        placed = store.load_job(spec.job_id)
-        assert placed is not None
-        assert placed.state is JobState.RUNNING
-        assert placed.placement is not None
-        assert placed.placement.cost_actual == 2.0
-        assert _committed_rows(store) == [2.0]
-        assert len(_active_placements(store)) == 1
-
-        # --- T1: reconcile polls LOST → requeue (void) → re-place same tick ---
-        control.run_tick(T1)
-        reran = store.load_job(spec.job_id)
-        assert reran is not None
-        assert reran.state is JobState.RUNNING  # re-placed within the tick
-        assert reran.attempts == 1  # one requeue
-        # Still exactly ONE active placement (the re-placement), never two.
-        assert len(_active_placements(store)) == 1
-        # The abandoned commitment was voided → exactly one live committed row.
-        assert _committed_rows(store) == [2.0]
-        # Window total so far = voided $0 + live committed $2 = $2 (NOT $4).
-        assert store.load_ledger("day", cap=None, now=T1).in_window_total(T1) == 2.0
-
-        # --- T2: reconcile polls SUCCEEDED → terminal; realize the live row ---
-        control.run_tick(T2)
-        done = store.load_job(spec.job_id)
-        assert done is not None
-        assert done.state is JobState.SUCCEEDED
-
-        led = store.load_ledger("day", cap=None, now=T4)
-        # The single net charge is $2 — not $4. No committed row survives.
-        assert led.in_window_total(T4) == 2.0
-        assert _committed_rows(store) == []
-        job_rows = [e for e in led.entries if e.job_id == spec.job_id]
-        assert sum(e.amount for e in job_rows) == 2.0  # net charge: a single $X
-    finally:
-        store.close()
 
 
 def _gpu_spec(job_id: str = "held-000001") -> JobSpec:
@@ -393,81 +280,6 @@ def test_m1_resubmit_same_job_id_raises_and_preserves_record(tmp_path: Path) -> 
         assert after.state is JobState.RUNNING
         assert after.placement is not None
         assert after.placement.provider_name == "free"
-    finally:
-        store.close()
-
-
-def _week_committed(store: Store) -> list[float]:
-    """Amounts of the still-``committed`` rows in the WEEK window at T4."""
-    led = store.load_ledger("week", cap=None, now=T4)
-    return [e.amount for e in led.entries if e.kind == "committed"]
-
-
-def test_weekly_cap_gates_paid_place_and_wallet_spans_both_windows(
-    tmp_path: Path,
-) -> None:
-    """The weekly cap blocks a paid place that would exceed it (job stays QUEUED,
-    provider.place never called), lifts to place it, and the ONE paid wallet is
-    materialized in BOTH the day and week windows and realized in lockstep.
-
-    This exercises the correctness the store's per-window partitioning forces: a
-    committed row written only under ``day`` is invisible to ``load_ledger("week")``,
-    so ``Control`` maintains a parallel ``week`` row (kept in step on realize) when
-    a weekly cap is active — enforcing the same wallet against both ceilings.
-    """
-    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
-    try:
-        spec = _paid_spec()  # 1h job ⇒ $2 on the paid slot
-        # First reconcile poll after placement returns SUCCEEDED (the job is
-        # placed a tick late due to the initial weekly block, so a single-element
-        # script keeps the terminal reconcile at T2).
-        provider = FakeProvider(
-            "paid",
-            slots=[_paid_slot()],
-            poll_script={spec.job_id: [JobStatus.SUCCEEDED]},
-        )
-        # Day cap generous ($100); weekly cap TIGHT ($1) ⇒ the $2 job cannot fit
-        # the week window and must NOT place.
-        control = Control(store, {"paid": provider}, budget_cap=100.0, week_cap=1.0)
-        control.submit(spec, now=T0)
-
-        # --- T0: weekly gate blocks the paid place; job stays QUEUED ----------
-        control.run_tick(T0)
-        blocked = store.load_job(spec.job_id)
-        assert blocked is not None
-        assert blocked.state is JobState.QUEUED  # not placed: over the weekly cap
-        assert blocked.placement is None
-        assert provider.place_calls == []  # provider.place never called
-        assert _week_committed(store) == []  # nothing committed anywhere
-        assert _committed_rows(store) == []
-
-        # --- lift the weekly cap live (meta wins over the ctor default) -------
-        control.budget("week", 100.0)
-
-        # --- T1: now affordable ⇒ placed; wallet lands in BOTH windows --------
-        control.run_tick(T1)
-        placed = store.load_job(spec.job_id)
-        assert placed is not None
-        assert placed.state is JobState.RUNNING
-        assert placed.placement is not None
-        assert placed.placement.cost_actual == 2.0
-        assert provider.place_calls == [spec.job_id]
-        # ONE wallet, one committed row per enforced window (day for the tick,
-        # week for the gate) — same $2 in each, never double-counted within a
-        # window.
-        assert _committed_rows(store) == [2.0]
-        assert _week_committed(store) == [2.0]
-
-        # --- T2: terminal ⇒ realize in lockstep; no committed row lingers -----
-        control.run_tick(T2)
-        done = store.load_job(spec.job_id)
-        assert done is not None
-        assert done.state is JobState.SUCCEEDED
-        assert _committed_rows(store) == []  # day realized
-        assert _week_committed(store) == []  # week realized in lockstep
-        # Net charge is a single $2 in each window (no over-count).
-        assert store.load_ledger("day", cap=None, now=T4).in_window_total(T4) == 2.0
-        assert store.load_ledger("week", cap=None, now=T4).in_window_total(T4) == 2.0
     finally:
         store.close()
 

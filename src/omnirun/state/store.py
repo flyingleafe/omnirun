@@ -29,7 +29,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from omnirun.budget import BudgetLedger, LedgerEntry
 from omnirun.models import JobRecord, Placement, ProviderFacts, Slot, StatusReport
 from omnirun.models import JobState as _JobState
 from omnirun.models import JobStatus as _JobStatus
@@ -38,7 +37,6 @@ from omnirun.state.schema import (
     ALL_TABLES,
     facts,
     jobs,
-    ledger,
     meta,
     metadata,
     queue,
@@ -51,10 +49,11 @@ from omnirun.state.schema import (
 _ACTIVE_QUEUE_STATES = tuple(s.value for s in QueueState if not s.terminal)
 
 # SQL era. The DB carries its own meta(schema_version) row.
-# v3 (Phase 3): adds the ``ledger`` table and reuses the jobs ``backend``+``state``
+# v3 (Phase 3): added the ``ledger`` table and reused the jobs ``backend``+``state``
 # columns for the scheduler capacity view (see ``save_job``). Additive — an
-# existing v2 DB gets ``ledger`` on next ``open_store``.
-STATE_SCHEMA_VERSION = 3
+# existing v2 DB got ``ledger`` on next ``open_store``.
+# v4: drops the ``ledger`` table (budget tracking removed).
+STATE_SCHEMA_VERSION = 4
 
 # Scheduler states that occupy a provider slot (the #12 capacity guard counts
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
@@ -149,12 +148,7 @@ class Store:
         return int(row)
 
     def get_meta(self, key: str) -> str | None:
-        """Return the ``meta`` value for *key*, or ``None`` if unset.
-
-        The generic key/value accessor backing runtime settings the scheduler
-        reads live each tick (e.g. ``budget.day`` set by ``omnirun budget``).
-        Mirrors ``schema_version``'s read pattern.
-        """
+        """Return the ``meta`` value for *key*, or ``None`` if unset."""
         with self._engine.connect() as conn:
             row = conn.execute(
                 select(meta.c.value).where(meta.c.key == key)
@@ -402,105 +396,6 @@ class Store:
             return True
 
     # ------------------------------------------------------------------
-    # Budget ledger persistence (Phase 3). The pure ops live in budget.py;
-    # these three methods bridge the ledger table to BudgetLedger/LedgerEntry.
-    # ------------------------------------------------------------------
-
-    def ledger_add(self, window: str, entry: LedgerEntry) -> None:
-        """Append one ``LedgerEntry`` row for *window* to the ledger table."""
-        with self.transaction() as conn:
-            conn.execute(
-                insert(ledger).values(
-                    window=window,
-                    job_id=entry.job_id,
-                    provider=entry.provider,
-                    amount=entry.amount,
-                    kind=entry.kind,
-                    at=entry.at.isoformat(),
-                )
-            )
-
-    def ledger_realize(
-        self, window: str, job_id: str, actual: float, now: datetime
-    ) -> None:
-        """Turn the earliest ``committed`` row for (*window*, *job_id*) into a
-        ``spent`` row of *actual* cost, keeping its original ``at`` (so the spend
-        stays attributed to the window it was committed in). If no committed row
-        exists, insert a fresh ``spent`` row at *now*. Mirrors
-        ``BudgetLedger.realize``.
-        """
-        with self.transaction() as conn:
-            earliest = conn.execute(
-                select(ledger.c.id)
-                .where(ledger.c.window == window)
-                .where(ledger.c.job_id == job_id)
-                .where(ledger.c.kind == "committed")
-                .order_by(ledger.c.at, ledger.c.id)
-                .limit(1)
-            ).fetchone()
-            if earliest is None:
-                conn.execute(
-                    insert(ledger).values(
-                        window=window,
-                        job_id=job_id,
-                        provider="",
-                        amount=actual,
-                        kind="spent",
-                        at=now.isoformat(),
-                    )
-                )
-                return
-            conn.execute(
-                update(ledger)
-                .where(ledger.c.id == earliest[0])
-                .values(kind="spent", amount=actual)
-            )
-
-    def load_ledger(
-        self, window: str, cap: float | None, now: datetime
-    ) -> BudgetLedger:
-        """Build a ``BudgetLedger`` from the in-window rows for *window*.
-
-        A row is in-window when its ``at`` falls in the SAME window as *now*,
-        determined exactly as ``BudgetLedger.in_window_total`` does: same UTC
-        calendar date for ``"day"``, same ISO (year, week) for ``"week"``. The
-        equality predicate (``.date()`` / ``.isocalendar()[:2]``) is not a plain
-        range, so we load the window's candidate rows and filter in Python with
-        the same rule the pure ledger uses.
-        """
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                select(
-                    ledger.c.job_id,
-                    ledger.c.provider,
-                    ledger.c.amount,
-                    ledger.c.kind,
-                    ledger.c.at,
-                )
-                .where(ledger.c.window == window)
-                .order_by(ledger.c.at, ledger.c.id)
-            ).fetchall()
-        entries: list[LedgerEntry] = []
-        for job_id, provider, amount, kind, at in rows:
-            at_dt = datetime.fromisoformat(at)
-            if not _in_ledger_window(window, at_dt, now):
-                continue
-            entries.append(
-                LedgerEntry(
-                    job_id=job_id,
-                    provider=provider,
-                    amount=amount,
-                    kind=kind,
-                    at=at_dt,
-                )
-            )
-        # pydantic validates ``window`` against the Literal["day","week"] field
-        # (raising for any other value), narrowing the ``str`` parameter safely.
-        return BudgetLedger.model_validate(
-            {"window": window, "cap": cap, "entries": entries}
-        )
-
-    # ------------------------------------------------------------------
     # Wait-history CRUD
     # ------------------------------------------------------------------
 
@@ -694,18 +589,6 @@ class Store:
                 )
             )
             return True
-
-
-def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:
-    """Whether *at* is in the same *window* as *now* — the SAME rule as
-    ``BudgetLedger._in_window``: same UTC calendar date for ``"day"``, same ISO
-    (year, week) for ``"week"``. Any other window value matches nothing.
-    """
-    if window == "day":
-        return at.date() == now.date()
-    if window == "week":
-        return at.isocalendar()[:2] == now.isocalendar()[:2]
-    return False
 
 
 def _ensure_sqlite_parent(url: str) -> None:

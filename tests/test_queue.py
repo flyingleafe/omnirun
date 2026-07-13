@@ -5,12 +5,11 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+
 from pathlib import Path
 
 from omnirun.backends.base import Backend, ProvisioningSink
-from omnirun.budget import LedgerEntry
-from omnirun.config import BackendConfig, BudgetConfig, Config, DaemonConfig
+from omnirun.config import BackendConfig, Config, DaemonConfig
 from omnirun.daemon import Daemon, daemon_address, send_request
 from omnirun.models import (
     CancelMode,
@@ -201,129 +200,6 @@ def test_only_backend_restriction(tmp_path: Path) -> None:
     [entry] = daemon._store.load_entries()
     assert entry.state is QueueState.RUNNING
     assert entry.backend == "b"
-
-
-def test_budget_cap_blocks_paid_escalation(tmp_path: Path) -> None:
-    """A paid-only backend at a zero daily cap: the tick's escalation to the paid
-    slot is unaffordable, so the job stays PENDING (unplaced) and is never
-    submitted. The cap is set live via meta (dynamic-cap path)."""
-    submitted: list[str] = []
-    daemon = make_daemon(tmp_path, {"paid": 1}, submitted=submitted, cost_per_hour=2.0)
-    daemon._store.set_meta("budget.day", "0.0")  # no room for any paid job today
-    spec = make_spec("pricey").model_copy(
-        update={"resources": ResourceSpec(time=timedelta(hours=1))}
-    )
-    daemon._store.save_entry(QueueEntry.new(spec))
-
-    for _ in range(5):
-        daemon._tick()
-
-    [entry] = daemon._store.load_entries()
-    assert entry.state is QueueState.PENDING  # never placed: over budget
-    assert submitted == []  # backend.submit was never called
-
-    # Lifting the cap lets the very next tick place it (proving it was the cap,
-    # not an unfit job, that blocked placement).
-    daemon._store.set_meta("budget.day", "100.0")
-    daemon._tick()
-    [entry] = daemon._store.load_entries()
-    assert entry.state is QueueState.RUNNING
-    assert submitted == [spec.job_id]
-
-
-def _paid_free_daemon(tmp_path: Path, submitted: list[str]) -> Daemon:
-    """A daemon with a PAID backend ($2/h) and a FREE backend, sharing one
-    ``submitted`` recorder so a test can assert which (if any) actually ran."""
-    cfg = Config(
-        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
-        backends={
-            "paid": BackendConfig(type="fake", max_parallel=1),
-            "free": BackendConfig(type="fake", max_parallel=1),
-        },
-    )
-
-    def factory(name: str, bcfg: BackendConfig) -> FakeBackend:
-        return FakeBackend(
-            name,
-            bcfg,
-            runs_before_done=3,
-            submitted=submitted,
-            cost_per_hour=2.0 if name == "paid" else None,
-        )
-
-    return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
-
-
-def test_weekly_budget_cap_blocks_paid_while_free_proceeds(tmp_path: Path) -> None:
-    """The WEEKLY cap is genuinely enforced (not just settable/displayed).
-
-    With NO day cap but a low weekly cap already near its limit (seeded via a
-    committed ``week`` ledger row), a paid placement is BLOCKED (job stays
-    PENDING, backend.submit never called) while a free placement proceeds. Lifting
-    the weekly cap lets the very next tick place the paid job — proving it was the
-    weekly ceiling, not an unfit job, that held it back.
-    """
-    submitted: list[str] = []
-    daemon = _paid_free_daemon(tmp_path, submitted)
-
-    # Weekly cap $3, already $2 committed this ISO week → only $1 of headroom.
-    # (No day cap set: the day window stays unbounded, so ONLY the week gate can
-    # block the $2/h paid job.)
-    now = datetime.now(timezone.utc)
-    daemon._store.set_meta("budget.week", "3.0")
-    daemon._store.ledger_add(
-        "week",
-        LedgerEntry(
-            job_id="prior", provider="paid", amount=2.0, kind="committed", at=now
-        ),
-    )
-
-    # A 1h paid job ($2) does NOT fit the $1 weekly headroom → must be pinned to
-    # the paid backend so it cannot silently fall back to free.
-    paid_spec = make_spec("pricey").model_copy(
-        update={"resources": ResourceSpec(time=timedelta(hours=1))}
-    )
-    daemon._store.save_entry(QueueEntry.new(paid_spec, only_backend="paid"))
-    # A free job pinned to the free backend must still place (free never touches
-    # the ledger, so the week cap is irrelevant to it).
-    free_spec = make_spec("gratis")
-    daemon._store.save_entry(QueueEntry.new(free_spec, only_backend="free"))
-
-    for _ in range(5):
-        daemon._tick()
-
-    entries = {e.spec.job_id: e for e in daemon._store.load_entries()}
-    assert entries[paid_spec.job_id].state is QueueState.PENDING  # blocked: over week
-    # The free job placed (and, given runs_before_done=3 over 5 ticks, ran to
-    # completion) — either way it left PENDING and its backend.submit was called.
-    assert entries[free_spec.job_id].state is not QueueState.PENDING
-    assert submitted == [free_spec.job_id]  # only free ran; paid.submit never called
-
-    # Lift the weekly cap: the paid job now places on the very next tick.
-    daemon._store.set_meta("budget.week", "100.0")
-    daemon._tick()
-    entries = {e.spec.job_id: e for e in daemon._store.load_entries()}
-    assert entries[paid_spec.job_id].state is QueueState.RUNNING
-    assert paid_spec.job_id in submitted
-
-
-def test_daemon_control_built_with_config_budget_caps(tmp_path: Path) -> None:
-    """A ``[budget]`` config with daily+weekly flows into the daemon's ``Control``
-    as the day cap AND the weekly cap (both windows are enforced from config)."""
-    cfg = Config(
-        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.01),
-        budget=BudgetConfig(daily=25.0, weekly=100.0),
-        backends={"a": BackendConfig(type="fake", max_parallel=1)},
-    )
-    daemon = Daemon(
-        cfg,
-        state_dir=tmp_path,
-        backend_factory=lambda name, bcfg: FakeBackend(name, bcfg),
-    )
-    control = daemon._get_control()
-    assert control._budget_cap == 25.0
-    assert control._week_cap == 100.0
-    assert control._budget_window == "day"
 
 
 def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:

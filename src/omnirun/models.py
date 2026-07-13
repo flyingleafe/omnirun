@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -190,19 +190,8 @@ class RepoRef(BaseModel):
     local_root: str | None = None
 
 
-class Deadline(BaseModel):
-    """Optional window in which a job must start and/or finish."""
-
-    start_by: datetime | None = None
-    finish_by: datetime | None = None
-
-
 class JobPolicy(BaseModel):
     """Request-level scheduling policy; travels with the spec via serialization."""
-
-    deadline: Deadline | None = None
-    max_cost: float | None = None  # USD ceiling for a single job run
-    priority: int = 0  # higher = scheduled sooner; reprioritizable after submission
 
 
 class JobSpec(BaseModel):
@@ -344,38 +333,6 @@ class JobRecord(BaseModel):
     attempts: int = 0  # number of placement attempts so far
     state: JobState = JobState.QUEUED  # scheduler-level lifecycle state
     placement: Placement | None = None  # active or most-recent placement
-
-    def urgency(self, now: datetime) -> float:
-        """Higher value = more urgent; used to rank QUEUED jobs within a priority tier.
-
-        If no ``finish_by`` deadline is set, returns 0.0 (no deadline pressure).
-
-        Otherwise computes the latest safe start = ``finish_by`` minus the
-        estimated run time (``spec.resources.time``, defaulting to zero).
-        Urgency = ``-(latest_safe_start - now).total_seconds()``, so:
-
-        * A job whose latest-safe-start is far in the future has a large negative
-          value (low urgency).
-        * A job whose latest-safe-start is at ``now`` has urgency 0.0.
-        * A job whose latest-safe-start has already passed has positive urgency
-          (highest urgency — act immediately).
-
-        Monotonic: less slack ⇒ strictly higher urgency.
-        """
-        deadline = self.spec.policy.deadline
-        if deadline is None or deadline.finish_by is None:
-            return 0.0
-        est_runtime = self.spec.resources.time or timedelta(0)
-        latest_safe_start = deadline.finish_by - est_runtime
-        # Defensive: a naive/aware datetime mix would make subtraction raise
-        # TypeError, which would propagate out of the pure scheduler tick.
-        # If exactly one side is naive, treat the naive one as UTC.
-        if (latest_safe_start.tzinfo is None) != (now.tzinfo is None):
-            if latest_safe_start.tzinfo is None:
-                latest_safe_start = latest_safe_start.replace(tzinfo=timezone.utc)
-            else:
-                now = now.replace(tzinfo=timezone.utc)
-        return -(latest_safe_start - now).total_seconds()
 
 
 # ---------------------------------------------------------------------------
