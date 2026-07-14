@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from omnirun.models import (
     Capabilities,
     Health,
+    JobStatus,
     ProviderFacts,
     ResourceSpec,
     cuda_at_least,
@@ -49,3 +50,31 @@ def test_provider_facts_is_fresh():
     )
     assert facts.is_fresh(now + timedelta(minutes=30))
     assert not facts.is_fresh(now + timedelta(hours=2))
+
+
+def test_lost_is_not_terminal():
+    assert not JobStatus.LOST.terminal
+    for s in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        assert s.terminal
+
+
+def test_capacity_fields_and_freshness():
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    f = ProviderFacts(
+        backend="colab",
+        discovered_at=now,
+        max_parallel=2,
+        active=1,
+        available=1,
+        capacity_at=now,
+    )
+    assert f.available == 1 and f.max_parallel == 2 and f.active == 1
+    assert f.capacity_fresh(now)
+    assert not f.capacity_fresh(now + timedelta(seconds=61))
+
+
+def test_capacity_unknown_by_default():
+    now = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    f = ProviderFacts(backend="ssh", discovered_at=now)
+    assert f.available is None and f.max_parallel is None and f.active == 0
+    assert not f.capacity_fresh(now)  # capacity_at is None

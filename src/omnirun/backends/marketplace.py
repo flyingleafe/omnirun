@@ -451,7 +451,7 @@ class MarketplaceBackend(Backend, ABC):
             self._exec_from_handle(handle), handle.data["job_dir"]
         )
         if (
-            report.status.terminal
+            report.status.settled
             and inst is not None
             and self.config.extra("auto_terminate", True)
         ):

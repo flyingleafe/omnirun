@@ -154,9 +154,24 @@ class ProviderFacts(BaseModel):
     health: Health = Health.OK
     health_detail: str = ""
     budget_state: dict[str, Any] = Field(default_factory=dict)
+    # Live capacity — backend truth, refreshed on a short cadence (self-GC then
+    # count). The chooser reads ``available`` as the sole capacity source.
+    max_parallel: int | None = (
+        None  # auto-probed concurrent-job ceiling; None = unknown/unbounded
+    )
+    active: int = 0  # live reusable sessions counted at discovery
+    available: int | None = None  # max(0, max_parallel - active); None = unknown
+    capacity_at: datetime | None = None
+    capacity_ttl_s: float = 60.0
 
     def is_fresh(self, now: datetime) -> bool:
         return (now - self.discovered_at).total_seconds() < self.ttl_s
+
+    def capacity_fresh(self, now: datetime) -> bool:
+        return (
+            self.capacity_at is not None
+            and (now - self.capacity_at).total_seconds() < self.capacity_ttl_s
+        )
 
 
 class EnvKind(str, enum.Enum):
@@ -223,12 +238,21 @@ class JobStatus(str, enum.Enum):
 
     @property
     def terminal(self) -> bool:
+        # LOST is intentionally absent: it is a transient poll outcome the
+        # reconciler resolves (recover-or-requeue), never a terminal job state.
         return self in (
             JobStatus.SUCCEEDED,
             JobStatus.FAILED,
             JobStatus.CANCELLED,
-            JobStatus.LOST,
         )
+
+    @property
+    def settled(self) -> bool:
+        """Terminal OR lost — 'this job will produce no more output and needs no
+        more waiting'. Used by log-follow / cancel-await / tunnel-teardown loops,
+        which must stop on a lost session too. Distinct from ``terminal``, which
+        gates the durable state transition (a LOST must not stick as terminal)."""
+        return self.terminal or self is JobStatus.LOST
 
 
 class Offer(BaseModel):

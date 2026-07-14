@@ -818,7 +818,7 @@ class KaggleBackend(Backend):
         # the final logs (that API exposes logs only once the kernel completes).
         yield from tunnel_logs(
             lambda: self.ssh_endpoint(handle),
-            lambda: self.status(handle).status.terminal,
+            lambda: self.status(handle).status.settled,
             f"{KAGGLE_ROOT}/jobs/{handle.job_id}",
             follow=follow,
             fallback=lambda: self._final_logs(handle, follow),
@@ -840,7 +840,7 @@ class KaggleBackend(Backend):
                 offset = len(text)
                 self._log_offsets[handle.job_id] = offset
                 yield from new.splitlines()
-            if not follow or report.status.terminal:
+            if not follow or report.status.settled:
                 return
             time.sleep(LOG_POLL_INTERVAL_S)
 

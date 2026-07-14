@@ -689,7 +689,7 @@ class ColabBackend(Backend):
         # if the job finishes before its tunnel came up.
         yield from tunnel_logs(
             lambda: self.ssh_endpoint(handle),
-            lambda: self.status(handle).status.terminal,
+            lambda: self.status(handle).status.settled,
             handle.data["job_dir"],
             follow=follow,
             fallback=lambda: self._session_exec_logs(handle, follow),
@@ -729,7 +729,7 @@ class ColabBackend(Backend):
                     yield from chunk.splitlines()
             if not follow:
                 return
-            if self.status(handle).status.terminal:
+            if self.status(handle).status.settled:
                 return
             time.sleep(LOG_POLL_INTERVAL_S)
 

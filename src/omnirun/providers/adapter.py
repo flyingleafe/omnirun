@@ -219,7 +219,7 @@ class BackendProvider:
         deadline = _now() + self._cancel_grace_s
         while True:
             try:
-                if self._backend.status(handle).status.terminal:
+                if self._backend.status(handle).status.settled:
                     return True
             except Exception:
                 return False
