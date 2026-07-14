@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from omnirun.models import (
     Decision,
@@ -41,6 +42,7 @@ from omnirun.models import (
     JobState,
     JobStatus,
     Placement,
+    ProviderFacts,
     ResourceSpec,
     Slot,
 )
@@ -195,6 +197,7 @@ class Control:
         """
         if reconcile:
             self._reconcile(now)
+            self._refresh_facts(now, only_providers)
         jobs = self._store.list_jobs()
         considered = (
             jobs
@@ -308,6 +311,31 @@ class Control:
         )
 
     # ------------------------------------------------------------------
+    # Step 1b: refresh stale capacity facts (self-GC) before gather
+    # ------------------------------------------------------------------
+
+    def _refresh_facts(self, now: datetime, only_providers: set[str] | None) -> None:
+        """Refresh stale capacity facts before gather, so ``offer`` reads backend
+        truth. A provider whose cached capacity is stale (or absent) is asked to
+        ``discover()`` — the backend self-GCs its dangling sessions (reading a
+        finished job's result before reaping it) and reports its true free
+        ``available``; the result is persisted. A ``discover`` that raises leaves
+        the old facts in place (the tick degrades to last-known capacity, never
+        crashes)."""
+        for name, provider in self._providers.items():
+            if only_providers is not None and name not in only_providers:
+                continue
+            facts = self._store.load_facts(name)
+            if facts is not None and facts.capacity_fresh(now):
+                continue
+            try:
+                self._store.save_facts(provider.discover())
+            except Exception:
+                _log.warning(
+                    "discover raised for %r; keeping stale facts", name, exc_info=True
+                )
+
+    # ------------------------------------------------------------------
     # Step 2: gather slots offered by every provider for the pending reqs
     # ------------------------------------------------------------------
 
@@ -411,7 +439,10 @@ class Control:
                 slot.provider_name,
                 e,
             )
+            # Release FIRST (job → QUEUED) so it is not counted among the live
+            # jobs when LEARN-CAP reads the backend's true ceiling.
             self._release(decision.job_id, rec, count=False)
+            self._learn_cap(slot.provider_name, now)
             return
         except Exception:
             # Backend submit failed: release the reservation so a later tick can
@@ -433,6 +464,29 @@ class Control:
                 update={"state": JobState.RUNNING, "placement": placement}
             )
         )
+
+    def _learn_cap(self, provider_name: str, now: datetime) -> None:
+        """Fail-and-remember (spec P5): a place-time ``CapacityError`` is the
+        backend's real ceiling revealing itself. Record ``available=0`` and
+        ``max_parallel`` = the jobs still live on it, with a fresh ``capacity_at``
+        so the next gather stops offering this provider until it is re-discovered
+        (whose self-GC will restore the true count). A rare race backstop, not the
+        primary capacity signal."""
+        active = self._store.count_active_jobs(provider_name)
+        facts = self._store.load_facts(provider_name)
+        base: dict[str, Any] = (
+            facts.model_dump() if facts is not None else {"backend": provider_name}
+        )
+        base.update(
+            {
+                "discovered_at": now,
+                "max_parallel": active,
+                "active": active,
+                "available": 0,
+                "capacity_at": now,
+            }
+        )
+        self._store.save_facts(ProviderFacts.model_validate(base))
 
     def _release(self, job_id: str, fallback: JobRecord, *, count: bool = True) -> None:
         """Release a reservation: PLACING→QUEUED (no placement).

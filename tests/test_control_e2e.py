@@ -179,6 +179,68 @@ def test_capacity_defer_requeues_without_counting_an_attempt(tmp_path: Path) -> 
         store.close()
 
 
+def test_run_tick_refreshes_stale_capacity_facts(tmp_path: Path) -> None:
+    """run_tick refreshes a provider whose capacity facts are stale/absent by
+    calling discover() (which self-GCs the backend) and persisting the result —
+    so offer reads backend-truth capacity. A fresh cache is NOT re-discovered."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()], discover_available=3)
+        control = Control(store, {"free": provider})
+        control.submit(_spec(), now=T0)
+
+        control.run_tick(T0)
+        assert provider.discover_calls == 1  # absent facts → discovered
+        facts = store.load_facts("free")
+        assert facts is not None and facts.available == 3
+
+        # A second tick with fresh capacity facts must NOT re-discover.
+        control.run_tick(T0)
+        assert provider.discover_calls == 1
+    finally:
+        store.close()
+
+
+def test_capacity_error_learns_cap(tmp_path: Path) -> None:
+    """A place-time CapacityError makes the backend's real ceiling reveal itself:
+    LEARN-CAP records available=0 and max_parallel = jobs still live on it (the
+    just-rejected job is released first, so it is not counted), with a fresh
+    capacity_at so the next gather stops offering until re-discovered."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        # One job already RUNNING on 'free' so count_active_jobs == 1 after release.
+        busy = JobRecord(
+            spec=_spec("busy-000001"),
+            state=JobState.RUNNING,
+            submitted_at=T0,
+            placement=Placement(
+                provider_name="free", job_id="busy-000001", state=JobStatus.RUNNING
+            ),
+        )
+        store.save_job(busy)
+        # A capacity-2 slot so reserve admits our job (1 busy < 2) and place()
+        # actually runs and raises CapacityError — the backend's real cap is 1.
+        cap2 = Slot(
+            provider_name="free", capabilities=Capabilities(), cost=Cost(), capacity=2
+        )
+        provider = FlakyProvider("free", [cap2], mode="capacity")
+        control = Control(store, {"free": provider})
+        control.submit(_spec(), now=T0)
+
+        control.run_tick(T0)
+
+        rec = store.load_job("e2e-000001")
+        assert rec is not None
+        assert rec.state is JobState.QUEUED and rec.attempts == 0
+        facts = store.load_facts("free")
+        assert facts is not None
+        assert facts.available == 0
+        assert facts.max_parallel == 1  # the one still-live 'busy' job
+        assert facts.capacity_at == T0
+    finally:
+        store.close()
+
+
 def test_submit_persists_queued_record(tmp_path: Path) -> None:
     """``submit`` alone persists a QUEUED record with the submitted timestamp."""
     store = open_store(f"sqlite:///{tmp_path / 'state.db'}")

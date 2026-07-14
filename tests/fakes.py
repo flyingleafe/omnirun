@@ -57,11 +57,13 @@ class FakeProvider:
         poll_script: dict[str, list[JobStatus]] | None = None,
         place_state: JobStatus = JobStatus.RUNNING,
         placed_at: datetime | None = None,
+        discover_available: int | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
         self._place_state = place_state
         self._placed_at = placed_at
+        self._discover_available = discover_available
         # Working copies of the scripts so popping does not mutate the caller's.
         self._poll_script: dict[str, list[JobStatus]] = {
             jid: list(seq) for jid, seq in (poll_script or {}).items()
@@ -72,15 +74,20 @@ class FakeProvider:
         self.cancel_calls: list[tuple[str, CancelMode]] = []
         self.collect_calls: list[tuple[str, Path]] = []
         self.gc_calls: int = 0
+        self.discover_calls: int = 0
 
     # -- Provider protocol ------------------------------------------------
 
     def discover(self) -> ProviderFacts:
+        self.discover_calls += 1
+        now = datetime.now(timezone.utc)
         return ProviderFacts(
             backend=self.name,
-            discovered_at=datetime.now(timezone.utc),
+            discovered_at=now,
             capabilities=Capabilities(),
             health=Health.OK,
+            available=self._discover_available,
+            capacity_at=now if self._discover_available is not None else None,
         )
 
     def offer(self, req: ResourceSpec) -> list[Slot]:
