@@ -154,14 +154,6 @@ def _managed_keypair() -> tuple[Path, str]:
     return managed_keypair()
 
 
-def _allocate_port(job_id: str, bore: BoreConfig) -> int:
-    """Allocate a deterministic bore tunnel port for ``job_id`` (monkeypatched
-    in tests)."""
-    from omnirun.transport import allocate
-
-    return allocate(None, job_id, bore.port_min, bore.port_max)
-
-
 def _port_for(job_id: str) -> int | None:
     """Return the port currently allocated to ``job_id``, or None."""
     from omnirun.transport import port_for
@@ -608,21 +600,16 @@ class KaggleBackend(Backend):
                 base64.b64encode(envf.read_text().encode()).decode() if envf else ""
             )
 
-            # bore infra env — injected as os.environ assignments inside run.py;
-            # never touches git or the bundle.  Empty when bore is disabled so the
-            # harness is byte-identical to a non-bore submission.
-            bore = _bore_cfg()
+            # ssh-everywhere is intentionally DISABLED on Kaggle. A Kaggle kernel
+            # that opens a reverse bore/ssh tunnel is cancelled mid-run by Kaggle's
+            # abuse detection — tunneling/proxying violates their ToS. Observed
+            # live: every tunneled kernel went CANCEL_ACKNOWLEDGED ~40s into
+            # training and lost its results, while the byte-identical no-tunnel
+            # harness ran to COMPLETE with the result tar intact. Kaggle's batch
+            # model already delivers logs and the result tar through the kernels
+            # API, so the tunnel is redundant here anyway: `logs` falls back to the
+            # API reader and `ssh_endpoint` returns None (no port is allocated).
             infra_env: dict[str, str] | None = None
-            if bore.enabled:
-                _key_path, pubkey = _managed_keypair()
-                bore_port = _allocate_port(job_id, bore)
-                infra_env = {
-                    "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
-                    "OMNIRUN_BORE_SECRET": bore.secret or "",
-                    "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
-                    "OMNIRUN_SSH_PUBKEY": pubkey,
-                    "OMNIRUN_BORE_PORT": str(bore_port),
-                }
 
             script = generate_bootstrap(
                 notebook_env_spec(spec),

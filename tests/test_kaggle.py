@@ -752,14 +752,14 @@ def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
     return BoreConfig(public_host=host, secret=secret, control_port=7835)
 
 
-def test_submit_with_bore_injects_env_vars_into_harness(
+def test_submit_never_injects_bore_even_when_enabled(
     fake_api, backend, monkeypatch
 ) -> None:
-    """When bore is enabled, the bore env vars (including OMNIRUN_BORE_PORT and
-    OMNIRUN_SSH_PUBKEY) must appear as os.environ assignments in the generated
-    run.py harness.  The vars must be present before the subprocess.Popen call
-    that runs bootstrap.sh, and they must never appear in the git bundle or
-    bootstrap.sh blob."""
+    """Kaggle must NOT open a reverse ssh/bore tunnel, even when bore is globally
+    configured. A tunnelling Kaggle kernel is cancelled mid-run by Kaggle's abuse
+    detection (tunnelling/proxying violates their ToS), which discards the job's
+    results; the no-tunnel harness runs to completion with its result tar intact.
+    So no bore env vars or secrets may appear in the generated run.py harness."""
     from pathlib import Path
 
     bore = _make_bore_cfg()
@@ -769,7 +769,6 @@ def test_submit_with_bore_injects_env_vars_into_harness(
         "_managed_keypair",
         lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test-pubkey"),
     )
-    monkeypatch.setattr(kaggle_mod, "_allocate_port", lambda job_id, bore: 20042)
 
     spec = make_spec(gpu_type="P100")
     offer = backend.probe(spec.resources)[0]
@@ -784,20 +783,12 @@ def test_submit_with_bore_injects_env_vars_into_harness(
         "OMNIRUN_SSH_PUBKEY",
         "OMNIRUN_BORE_PORT",
     ):
-        assert f"os.environ[{var!r}]" in run_py, f"{var!r} not found in run_py"
+        assert f"os.environ[{var!r}]" not in run_py, f"{var!r} leaked into run_py"
 
-    assert "bore.example.com" in run_py
-    assert "s3cr3t" in run_py
-    assert "7835" in run_py
-    assert "test-pubkey" in run_py
-    assert "20042" in run_py
-
-    # The bore vars must NOT appear in the embedded bootstrap.sh
-    m = re.search(r'BOOTSTRAP_B64 = "([A-Za-z0-9+/=]+)"', run_py)
-    assert m
-    bootstrap = base64.b64decode(m.group(1)).decode()
-    assert "s3cr3t" not in bootstrap, "bore secret must not be in bootstrap.sh"
-    assert "test-pubkey" not in bootstrap, "pubkey literal must not be in bootstrap.sh"
+    # Neither the bore server nor its secret may appear anywhere in the harness.
+    assert "bore.example.com" not in run_py
+    assert "s3cr3t" not in run_py
+    assert "test-pubkey" not in run_py
 
 
 def _enable_bore_endpoint(backend, monkeypatch, handle) -> None:
