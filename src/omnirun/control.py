@@ -405,10 +405,15 @@ class Control:
                 continue
             provider = self._providers.get(placement.provider_name)
             if provider is None:
-                _log.warning(
-                    "no provider %r to reconcile job %s",
-                    placement.provider_name,
+                # Expected and benign when this tick's provider set is intentionally
+                # narrowed (e.g. `submit --backend X`): a job already placed on
+                # another backend simply isn't reconciled here — it will be on the
+                # next full tick (`ps`, `serve`). Debug, not a user-facing warning:
+                # surfacing it on stdout reads like an error about the wrong job.
+                _log.debug(
+                    "skipping reconcile of job %s: provider %r not in this tick's set",
                     rec.spec.job_id,
+                    placement.provider_name,
                 )
                 continue
             self._reconcile_one(rec, placement, provider, now)
