@@ -92,8 +92,14 @@ class BackendProvider:
         """
         offers = self._backend.probe(req)
         facts = self._store.load_facts(self.name)
-        active = self._store.count_active_jobs(self.name)
-        capacity = max(0, self._backend.config.max_parallel - active)
+        # Capacity is backend truth: a discovered ``available`` (self-GC'd count
+        # of free slots) wins. Only when a backend has not reported capacity yet
+        # (available is None) do we fall back to omnirun's own active-job count.
+        if facts is not None and facts.available is not None:
+            capacity = facts.available
+        else:
+            active = self._store.count_active_jobs(self.name)
+            capacity = max(0, self._backend.config.max_parallel - active)
         slots: list[Slot] = []
         for offer in offers:
             if not offer.fits:

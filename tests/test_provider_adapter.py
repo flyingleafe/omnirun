@@ -208,6 +208,49 @@ def test_offer_capacity_reduced_by_active_jobs(store: Store) -> None:
     assert slots[0].capacity == 1
 
 
+def test_offer_capacity_prefers_facts_available(store: Store) -> None:
+    # Backend-truth capacity wins over omnirun's own job count: even though NO
+    # jobs are active (count-based would say 2 free), a discovered available=0
+    # (e.g. a leaked Colab session the store doesn't know about) offers nothing.
+    provider, _backend = _provider(store, max_parallel=2)
+    now = datetime.now(timezone.utc)
+    store.save_facts(
+        ProviderFacts(
+            backend="stub",
+            discovered_at=now,
+            capabilities=Capabilities(gpu_types=["T4"]),
+            max_parallel=1,
+            active=1,
+            available=0,
+            capacity_at=now,
+        )
+    )
+
+    slots = provider.offer(ResourceSpec())
+
+    assert len(slots) == 1
+    assert slots[0].capacity == 0
+
+
+def test_offer_capacity_fallback_when_available_unknown(store: Store) -> None:
+    # Facts present but WITHOUT a capacity block (available is None) → the legacy
+    # count-based capacity still applies, so backends that don't yet discover
+    # capacity keep working unchanged.
+    provider, _backend = _provider(store, max_parallel=2)
+    store.save_facts(
+        ProviderFacts(
+            backend="stub",
+            discovered_at=datetime.now(timezone.utc),
+            capabilities=Capabilities(gpu_types=["T4"]),
+        )
+    )
+
+    slots = provider.offer(ResourceSpec())
+
+    assert len(slots) == 1
+    assert slots[0].capacity == 2  # max_parallel(2) - active(0)
+
+
 def test_offer_ready_now_when_no_wait(store: Store) -> None:
     provider, backend = _provider(store)
     backend.offer.wait_estimate_s = None
