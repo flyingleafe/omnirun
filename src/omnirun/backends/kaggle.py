@@ -29,7 +29,6 @@ import os
 import shutil
 import tarfile
 import tempfile
-import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,7 +43,6 @@ from omnirun.backends.base import (
 )
 from omnirun.backends import jobdir, tarsafe
 from omnirun.progress import report
-from omnirun.sshconn import tunnel_logs
 from omnirun.bootstrap import (
     BootstrapParams,
     CodeSource,
@@ -102,7 +100,6 @@ RESULT_TAR = "omnirun-job.tar.gz"
 # small; a *public* repo is cloned by the worker directly (no bundle shipped) and
 # is unaffected by this cap. Override per backend with `max_source_bytes`.
 KAGGLE_MAX_SOURCE_BYTES = 1024 * 1024
-LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
 
 
 def _create_bundle(root: Path, sha: str, dest: Path) -> Path:
@@ -335,7 +332,6 @@ class KaggleBackend(Backend):
         super().__init__(name, config)
         self._api_obj: Any = None
         self._terminal: dict[str, StatusReport] = {}
-        self._log_offsets: dict[str, int] = {}
 
     # ---- api plumbing --------------------------------------------------------
 
@@ -822,38 +818,50 @@ class KaggleBackend(Backend):
         return raw
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
-        # One path for every notebook backend (see sshconn.tunnel_logs): stream
-        # live over the bore tunnel, waiting for a slow-to-start kernel's tunnel to
-        # come up — so `logs -f` is a live tail here just like on ssh/slurm. The
-        # kernel-API reader is used only when the tunnel is unavailable, to fetch
-        # the final logs (that API exposes logs only once the kernel completes).
-        yield from tunnel_logs(
-            lambda: self.ssh_endpoint(handle),
-            lambda: self.status(handle).status.settled,
-            f"{KAGGLE_ROOT}/jobs/{handle.job_id}",
-            follow=follow,
-            fallback=lambda: self._final_logs(handle, follow),
-        )
-
-    def _final_logs(self, handle: JobHandle, follow: bool) -> Iterator[str]:
-        """Best-effort final-log reader over the Kaggle kernel API, used only when
-        the bore tunnel is unavailable (see sshconn.tunnel_logs). The API exposes a
-        kernel's output only once it completes, so mid-run there is nothing to
-        yield — for a followed tail we wait out the run and dump the final log."""
+        """Live-tail the kernel over Kaggle's own midtier logs stream — NOT a
+        tunnel. `kernels_logs_stream` yields each stdout/stderr entry as the kernel
+        produces it (verified live) and the iterator ends when the kernel finishes,
+        so `logs -f` is a real live tail with no reverse tunnel for Kaggle to
+        cancel. A non-follow snapshot returns the buffered final log; Kaggle only
+        materialises that buffered log once the kernel completes, so mid-run a
+        snapshot is empty and we point the user at `-f`."""
         api = self._api()
         ref = handle.data["kernel_ref"]
-        offset = self._log_offsets.get(handle.job_id, 0)
-        while True:
-            report = self.status(handle)
+        if follow:
+            yield from self._stream_logs(api, ref)
+            return
+        text = self._fetch_log_text(api, ref)
+        if text:
+            yield from text.splitlines()
+        else:
+            yield (
+                "OMNIRUN: no buffered log yet (Kaggle exposes it only once the "
+                "kernel completes) — use `omnirun logs -f` for a live tail"
+            )
+
+    def _stream_logs(self, api: Any, ref: str) -> Iterator[str]:
+        """Yield the kernel's log line-by-line from ``kernels_logs_stream`` (the
+        midtier logs endpoint the Kaggle web console uses). The client reconnects
+        internally and terminates the iterator at kernel completion. On a stream
+        error, fall back to the buffered final log so a tail still ends with output."""
+        buf = ""
+        try:
+            for entry in api.kernels_logs_stream(ref):
+                data = entry.get("data", "") if isinstance(entry, dict) else str(entry)
+                if not data:
+                    continue
+                buf += data
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    yield line
+        except Exception as e:
+            yield f"OMNIRUN: live log stream unavailable ({type(e).__name__}); showing final log"
             text = self._fetch_log_text(api, ref)
-            if text is not None and len(text) > offset:
-                new = text[offset:]
-                offset = len(text)
-                self._log_offsets[handle.job_id] = offset
-                yield from new.splitlines()
-            if not follow or report.status.settled:
-                return
-            time.sleep(LOG_POLL_INTERVAL_S)
+            if text:
+                yield from text.splitlines()
+            return
+        if buf:
+            yield buf
 
     # ---- outputs / cancel / gc / check --------------------------------------------
 

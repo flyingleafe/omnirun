@@ -28,7 +28,6 @@ from omnirun.models import (
     JobStatus,
     RepoRef,
     ResourceSpec,
-    StatusReport,
 )
 
 JOB_ID = "train-abc123"
@@ -93,6 +92,10 @@ class FakeKaggleApi:
         self.status_value = "queued"
         self.failure_message = ""
         self.output_files: dict[str, bytes] = {}
+        # kernels_logs_stream: entries yielded live (each {stream_name, data});
+        # set log_stream_error to simulate a broken stream endpoint.
+        self.log_stream_entries: list[dict] = []
+        self.log_stream_error: Exception | None = None
         self.dataset_folders: list[dict] = []
         self.kernel_folders: list[dict] = []
         # weekly GPU quota (real quota_view() shape); default: plenty remaining
@@ -137,6 +140,11 @@ class FakeKaggleApi:
 
     def kernels_status(self, kernel):
         return {"status": self.status_value, "failureMessage": self.failure_message}
+
+    def kernels_logs_stream(self, kernel):
+        if self.log_stream_error:
+            raise self.log_stream_error
+        yield from self.log_stream_entries
 
     def kernels_output(self, kernel, path, **kw) -> None:
         for name, data in self.output_files.items():
@@ -791,147 +799,87 @@ def test_submit_never_injects_bore_even_when_enabled(
     assert "test-pubkey" not in run_py
 
 
-def _enable_bore_endpoint(backend, monkeypatch, handle) -> None:
-    """Wire a live ssh endpoint for ``handle``: bore enabled, key + port present."""
-    from pathlib import Path
-
-    bore = _make_bore_cfg()
-    monkeypatch.setattr(kaggle_mod, "_bore_cfg", lambda: bore)
-    monkeypatch.setattr(
-        kaggle_mod,
-        "_managed_keypair",
-        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test"),
-    )
-    from omnirun import transport
-
-    transport.allocate(None, handle.job_id, bore.port_min, bore.port_max)
-
-
-def test_logs_streams_over_ssh_when_endpoint_reachable(
+def test_logs_follow_streams_live_from_midtier_endpoint(
     fake_api, backend, monkeypatch
 ) -> None:
-    """A running job with a reachable bore endpoint tails bootstrap.log through
-    the SAME shared tunnel path (sshconn.tunnel_logs → tail_logs_over) the
-    ssh-family backends use — never touching the (non-live) kernel-log API."""
-    from omnirun import sshconn
-
+    """logs(follow=True) tails Kaggle's own midtier logs stream
+    (kernels_logs_stream) line by line — NO reverse tunnel. Multi-line and stderr
+    entries are split into individual lines; the buffered log API is not touched
+    while the stream is working."""
     handle = make_handle()
-    _enable_bore_endpoint(backend, monkeypatch, handle)
-    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: True)
-
-    seen: dict[str, object] = {}
-
-    def fake_over(ep, job_dir, *, follow):
-        seen["job_dir"] = job_dir
-        seen["follow"] = follow
-        yield "hello from worker"
-        yield "second line"
-
-    monkeypatch.setattr(sshconn, "tail_logs_over", fake_over)
-
-    def boom(*a, **k):
-        raise AssertionError("kernel-log API must not be used when ssh is reachable")
-
-    monkeypatch.setattr(backend, "_fetch_log_text", boom)
-
-    assert list(backend.logs(handle, follow=False)) == [
-        "hello from worker",
-        "second line",
+    fake_api.log_stream_entries = [
+        {"stream_name": "stdout", "data": "TICK 0\n"},
+        {"stream_name": "stdout", "data": "TICK 1\nTICK 2\n"},
+        {"stream_name": "stderr", "data": "a warning\n"},
     ]
-    assert str(seen["job_dir"]).endswith(f"/jobs/{JOB_ID}")
-    assert kaggle_mod.KAGGLE_ROOT in str(seen["job_dir"])
-    assert seen["follow"] is False
-
-
-def test_logs_follow_over_ssh_streams_and_delegates_termination(
-    fake_api, backend, monkeypatch
-) -> None:
-    """logs(follow=True) over a reachable tunnel is a single live stream via the
-    shared path; the worker's own follower ends it at job time, so the backend
-    does not poll derive_status itself (the old `tail -F` hung because a notebook
-    session lingers)."""
-    from omnirun import sshconn
-
-    handle = make_handle()
-    _enable_bore_endpoint(backend, monkeypatch, handle)
-    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: True)
-
-    captured: dict[str, object] = {}
-
-    def fake_over(ep, job_dir, *, follow):
-        captured["follow"] = follow
-        yield "streamed line"
-
-    monkeypatch.setattr(sshconn, "tail_logs_over", fake_over)
 
     def boom(*a, **k):
-        raise AssertionError("must not poll derive_status; the follower self-ends")
-
-    monkeypatch.setattr(kaggle_mod.jobdir, "derive_status", boom)
-
-    assert list(backend.logs(handle, follow=True)) == ["streamed line"]
-    assert captured["follow"] is True
-
-
-def test_logs_follow_waits_for_tunnel_then_streams(
-    fake_api, backend, monkeypatch
-) -> None:
-    """A followed log whose tunnel is not up yet must WAIT for it (surfacing a
-    connecting notice) and upgrade to the live stream once it comes up — never
-    committing the whole follow to the batch kernel-API dead end. Regression for
-    the Kaggle `logs -f` that showed 'live tail unavailable' during the ~30s
-    kernel start."""
-    from omnirun import sshconn
-
-    handle = make_handle()
-    _enable_bore_endpoint(backend, monkeypatch, handle)
-    # Unreachable for the first two checks (kernel still booting), then up.
-    reach = iter([False, False, True, True])
-    monkeypatch.setattr(
-        sshconn, "endpoint_reachable", lambda ep, **kw: next(reach, True)
-    )
-    monkeypatch.setattr("omnirun.sshconn.time.sleep", lambda _s: None)
-    monkeypatch.setattr(
-        backend, "status", lambda h: StatusReport(status=JobStatus.RUNNING)
-    )
-
-    def fake_over(ep, job_dir, *, follow):
-        yield "live line 1"
-        yield "live line 2"
-
-    monkeypatch.setattr(sshconn, "tail_logs_over", fake_over)
-
-    def boom(*a, **k):
-        raise AssertionError("must not fall back to the kernel API; the tunnel came up")
+        raise AssertionError("must not read the buffered log while the stream works")
 
     monkeypatch.setattr(backend, "_fetch_log_text", boom)
 
-    lines = list(backend.logs(handle, follow=True))
-    assert lines[-2:] == ["live line 1", "live line 2"]
-    assert any("connecting for a live tail" in ln for ln in lines)
+    assert list(backend.logs(handle, follow=True)) == [
+        "TICK 0",
+        "TICK 1",
+        "TICK 2",
+        "a warning",
+    ]
 
 
-def test_logs_falls_back_to_api_when_endpoint_unreachable(
+def test_logs_follow_reassembles_partial_line_entries(fake_api, backend) -> None:
+    """A log line split across two stream entries is reassembled, and a trailing
+    unterminated fragment is still flushed when the stream ends."""
+    handle = make_handle()
+    fake_api.log_stream_entries = [
+        {"stream_name": "stdout", "data": "downloa"},
+        {"stream_name": "stdout", "data": "ding...\nstep 1\n"},
+        {"stream_name": "stdout", "data": "no newline tail"},
+    ]
+    assert list(backend.logs(handle, follow=True)) == [
+        "downloading...",
+        "step 1",
+        "no newline tail",
+    ]
+
+
+def test_logs_follow_falls_back_to_final_log_on_stream_error(
     fake_api, backend, monkeypatch
 ) -> None:
-    """Not following + an endpoint that is not connectable: read the kernel-log
-    API once rather than yielding nothing (no waiting — a single snapshot)."""
-    from omnirun import sshconn
-
+    """If the stream endpoint errors, a followed tail says so and then dumps the
+    buffered final log (kernels API) so the user still sees the outcome."""
     handle = make_handle()
-    _enable_bore_endpoint(backend, monkeypatch, handle)
-    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: False)
+    fake_api.log_stream_error = RuntimeError("midtier down")
+    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: "final a\nfinal b")
+    lines = list(backend.logs(handle, follow=True))
+    assert any("live log stream unavailable" in ln for ln in lines)
+    assert lines[-2:] == ["final a", "final b"]
 
-    def no_ssh(*a, **k):
-        raise AssertionError("must not stream over ssh when unreachable")
 
-    monkeypatch.setattr(sshconn, "tail_logs_over", no_ssh)
-    fake_api.status_value = "complete"
-    monkeypatch.setattr(
-        backend, "_fetch_log_text", lambda api, ref: "api line 1\napi line 2"
-    )
+def test_logs_snapshot_returns_buffered_final_log(
+    fake_api, backend, monkeypatch
+) -> None:
+    """A non-follow snapshot returns the buffered final log (available once the
+    kernel completes) — split into lines, without opening the live stream."""
+    handle = make_handle()
+    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: "line 1\nline 2")
 
-    assert list(backend.logs(handle, follow=False)) == ["api line 1", "api line 2"]
+    def boom(*a, **k):
+        raise AssertionError("a snapshot must not open the live stream")
+
+    monkeypatch.setattr(fake_api, "kernels_logs_stream", boom)
+    assert list(backend.logs(handle, follow=False)) == ["line 1", "line 2"]
+
+
+def test_logs_snapshot_while_running_points_to_follow(
+    fake_api, backend, monkeypatch
+) -> None:
+    """Mid-run there is no buffered log yet (Kaggle only materialises it at
+    completion); a snapshot must point the user at `logs -f`, not hang."""
+    handle = make_handle()
+    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: None)
+    lines = list(backend.logs(handle, follow=False))
+    assert len(lines) == 1
+    assert "logs -f" in lines[0]
 
 
 def test_submit_without_bore_harness_has_no_bore_vars(
@@ -952,29 +900,3 @@ def test_submit_without_bore_harness_has_no_bore_vars(
     assert "OMNIRUN_BORE_PUBLIC_HOST" not in run_py
     assert "OMNIRUN_BORE_SECRET" not in run_py
     assert "OMNIRUN_SSH_PUBKEY" not in run_py
-
-
-# ---- logs (no live tunnel → honest message + final logs) ---------------------
-
-
-def test_logs_follow_no_tunnel_says_unavailable_not_kaggle_limitation(
-    fake_api, backend, monkeypatch
-):
-    """With no bore tunnel, a followed log must say the WORKER TUNNEL is
-    unavailable and then show the final logs — never the old misleading
-    'kaggle exposes run logs only after the kernel completes' message."""
-    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
-    monkeypatch.setattr(
-        backend,
-        "status",
-        lambda h: StatusReport(status=next(statuses, JobStatus.SUCCEEDED)),
-    )
-    texts = iter([None, "final log line\n"])
-    monkeypatch.setattr(backend, "_fetch_log_text", lambda a, r: next(texts, None))
-    monkeypatch.setattr("omnirun.backends.kaggle.time.sleep", lambda _s: None)
-    handle = make_handle()
-    lines = list(backend.logs(handle, follow=True))
-    assert not any("kaggle exposes" in ln.lower() for ln in lines)
-    assert not any("live tail unavailable" in ln for ln in lines)
-    assert any("worker tunnel unavailable" in ln for ln in lines)
-    assert "final log line" in lines
