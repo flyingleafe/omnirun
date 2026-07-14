@@ -10,7 +10,7 @@ interleavings of the scheduler's operations —
 — over the REAL impure :class:`~omnirun.control.Control` driver (which calls the
 pure :func:`~omnirun.scheduler.tick`), a REAL SQLite
 :class:`~omnirun.state.store.Store`, and the deterministic
-:class:`~tests.fakes.FlakyProvider` doubles. After EVERY rule, all six
+:class:`~tests.fakes.FlakyProvider` doubles. After EVERY rule, all seven
 ``@invariant()`` methods run and assert the properties that *are* the
 correctness guarantee (spec §11):
 
@@ -20,6 +20,12 @@ correctness guarantee (spec §11):
 4. cancellation_completeness — a cancelled job has zero live placements + stays cancelled. (#7)
 5. crash_isolation      — a failing provider never crashes the tick nor blocks healthy ones.
 6. tick_convergence     — a second identical tick creates no new placements.
+7. no_stranded_satisfiable_job — a satisfiable job is never left QUEUED after a
+   settled tick (the `?`-limbo fix: daemonless reads advance the same machine).
+
+The FlakyProvider's ``lose_after_place`` / ``succeed_then_lost`` modes drive LOST
+polls through the reconciler, so this suite also exercises the honest-LOST path
+(reap-then-requeue) — a lost job re-queues (inv 3) without freezing or leaking.
 
 The three that are the *definitive* verifiers of the reviewed correctness fixes
 and the #12 guard are called out in their docstrings (inv 3 = C2 run-late /
@@ -427,6 +433,34 @@ class SchedulerInvariants(RuleBasedStateMachine):
             assert rec.attempts != running_after_first[d.job_id], (
                 f"a second identical tick re-placed still-live job {d.job_id} "
                 f"(attempts unchanged at {rec.attempts}) — non-convergence"
+            )
+
+    @invariant()
+    def no_stranded_satisfiable_job(self) -> None:
+        """The `?`-limbo fix (one machine, two drivers): after settling a tick, a
+        job whose requirement a provider can satisfy is NEVER left QUEUED — the
+        tick places it, so a daemonless read advances it exactly as the daemon
+        would; nothing sits stranded with no backend.
+
+        Guarded on all-providers-healthy: a failing provider legitimately leaves a
+        job it just released QUEUED for the next tick, so the property only holds
+        when no provider is misbehaving. Free capacity (64) is never the
+        bottleneck over the step budget, so a satisfiable job always has room."""
+        if any(mode != _OK_MODE for mode in self.provider_modes.values()):
+            return
+        self.control.run_tick(self.now)  # settle
+        for rec in self.store.list_jobs():
+            if rec.state is not JobState.QUEUED:
+                continue
+            req = rec.spec.resources
+            satisfiable = any(
+                not slot.capabilities.satisfies(req)
+                for provider in self.providers.values()
+                for slot in provider.offer(req)
+            )
+            assert not satisfiable, (
+                f"job {rec.spec.job_id} left QUEUED despite a fitting free slot "
+                "(stranded — the tick should have placed it)"
             )
 
     # ------------------------------------------------------------------

@@ -342,7 +342,36 @@ git commit -m "feat(colab): discover() self-GCs finished/dead sessions and repor
 
 ---
 
-### Task 5: Kaggle `discover()` — self-GC + capacity from quota
+> **Execution deviations (2026-07-14) — continued:**
+> - **Task 7 scoped to additive, not destructive.** The `RuleBasedStateMachine`
+>   already encodes the load-bearing invariants and — post-refactor — exercises
+>   the new reap-on-lost reconcile path (its `lose_after_place`/`succeed_then_lost`
+>   modes), staying green. The genuinely-new behaviors (LEARN-CAP, capacity facts,
+>   refresh-facts) live in `test_control_e2e.py`, which the SM structurally cannot
+>   host (it wires `Provider`s directly, bypassing the facts/adapter capacity
+>   path). So `test_control_e2e.py` is NOT retired — doing so would delete new
+>   coverage. Added one high-value SM invariant instead: `no_stranded_satisfiable_job`
+>   (the `?`-limbo fix at the property level). test_scheduler.py's pure-tick
+>   classes are kept (fast, clear regression coverage; no correctness gain from
+>   deleting them). Honest assessment: the suite was already well-factored; the
+>   net non-test-code reduction (cli.py −61) is the deliverable, achieved in Task 6.
+>
+> **Execution deviations (2026-07-14):**
+> - **Task 4 reshaped** to a backend-agnostic *reap-on-lost in reconcile*
+>   (control.py) instead of a Colab `discover()` self-GC: the `colab` CLI has no
+>   session-*list*, so Colab cannot enumerate sessions to self-GC by discovery.
+>   Reaping a lost placement (whose session name we hold) in reconcile — before
+>   `_refresh_facts`/gather — plugs the leak, prevents double-runs, and is per-job
+>   safe on every backend (`jobdir.gc_job` never touches the shared worktree).
+>   Colab then gets truthful capacity via the now-accurate count fallback +
+>   LEARN-CAP. Committed `6daa90b`.
+> - **Task 5 dropped.** Kaggle exposes no concurrent-cap API and *queues* rather
+>   than hard-failing, so a `kernels_list`+`status` concurrency sweep is fragile
+>   and low-value (YAGNI). Task 4 keeps its `count_active_jobs` truthful and
+>   LEARN-CAP backstops; Kaggle's real limit (weekly GPU-hours) is already
+>   discovered and gates offering via `health`.
+
+### Task 5: Kaggle `discover()` — self-GC + capacity from quota (DROPPED — see deviation note above)
 
 **Files:**
 - Modify: `src/omnirun/backends/kaggle.py` (`discover()`)
