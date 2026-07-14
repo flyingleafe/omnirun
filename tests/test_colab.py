@@ -540,10 +540,41 @@ def test_gc_stops_session(cli, backend):
 
 def test_check(cli, backend):
     cli.handlers["version"] = lambda argv, stdin: (0, "colab 0.6.0\n", "")
-    cli.handlers["sessions"] = lambda argv, stdin: (0, "omnirun-x RUNNING\n", "")
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        "[?] m-s-abc | Hardware: CPU | Variant: DEFAULT\n",
+        "",
+    )
     out = backend.check()
     assert out.startswith("ok:")
     assert "colab 0.6.0" in out
+    assert "1 active session(s)" in out
+
+
+def test_check_empty_sessions_reports_zero(cli, backend):
+    """Regression: `colab sessions` prints a single 'No active sessions found'
+    line when empty. That must count as 0 active sessions, not 1 — the old naive
+    line count made an idle Colab look permanently occupied."""
+    cli.handlers["version"] = lambda argv, stdin: (0, "colab 0.6.0\n", "")
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        "[colab] No active sessions found on server.\n",
+        "",
+    )
+    assert "0 active session(s)" in backend.check()
+
+
+def test_count_sessions_helper():
+    from omnirun.backends.colab import _count_sessions
+
+    assert _count_sessions("[colab] No active sessions found on server.\n") == 0
+    assert _count_sessions("") == 0
+    assert _count_sessions("[?] m-s-a | Hardware: CPU | Variant: DEFAULT\n") == 1
+    two = (
+        "[?] m-s-a | Hardware: CPU | Variant: DEFAULT\n"
+        "[✓] m-s-b | Hardware: T4 | Variant: GPU\n"
+    )
+    assert _count_sessions(two) == 2
 
 
 # ---- bore env injection (ssh-everywhere T2) ------------------------------------

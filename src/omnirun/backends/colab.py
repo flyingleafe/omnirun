@@ -281,6 +281,15 @@ def _marker_line(output: str, marker: str) -> str | None:
     return None
 
 
+def _count_sessions(output: str) -> int:
+    """Count active Colab sessions in ``colab sessions`` output. A populated
+    listing is one row per session (``<id> | Hardware: … | Variant: …``); the
+    empty case prints a single ``[colab] No active sessions found`` line — which
+    must count as 0, not 1. Counting every non-empty line (the old behaviour) made
+    an empty Colab always report one session and look permanently occupied."""
+    return sum(1 for ln in output.splitlines() if "Hardware:" in ln)
+
+
 @register("colab")
 class ColabBackend(Backend):
     # A Colab LOST is a confirmed gone/idle session (3 status-exec retries, then
@@ -832,6 +841,5 @@ class ColabBackend(Backend):
     def check(self) -> str:
         version = self._colab("version", timeout=10).strip().splitlines()
         v = version[0] if version else "unknown"
-        sessions = self._colab("sessions", timeout=30)
-        n = len([ln for ln in sessions.splitlines() if ln.strip()])
-        return f"ok: colab CLI {v}; {n} session line(s)"
+        n = _count_sessions(self._colab("sessions", timeout=30))
+        return f"ok: colab CLI {v}; {n} active session(s)"
