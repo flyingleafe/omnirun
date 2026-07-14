@@ -232,6 +232,25 @@ def test_submit_sequence(cli, backend):
     }
 
 
+def test_submit_narrates_progress(cli, backend):
+    """submit() emits progress so the CLI's status line is never silent through
+    the (slow) VM provision + upload + launch steps."""
+    from omnirun.progress import reporting
+
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+
+    messages: list[str] = []
+    with reporting(messages.append):
+        backend.submit(spec, offer)
+
+    joined = " | ".join(messages).lower()
+    assert "provisioning" in joined  # the long VM cold-start wait is announced
+    assert "uploading" in joined
+    assert "launching" in joined
+
+
 def test_submit_bundle_over_upload_guard_fails_fast(cli):
     # bundle path (private repo, per the fake_bundle fixture) + a tiny
     # max_upload_bytes: the guard must reject before uploading the oversized

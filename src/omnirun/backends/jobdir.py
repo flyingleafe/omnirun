@@ -22,6 +22,7 @@ from omnirun.bootstrap import (
 )
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.models import JobSpec, JobStatus, StatusReport
+from omnirun.progress import report
 
 if TYPE_CHECKING:
     from omnirun.config import BackendConfig
@@ -120,6 +121,7 @@ def stage_job(
     object store is created under it and the exact sha pushed there."""
     project_root = params.project_root or project_root_of(root, spec.repo.slug, None)
     git_dir = remote_git_dir(exec_, project_root)
+    report(f"pushing {spec.repo.sha[:12]} to {exec_.describe()}…")
     push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
     job_dir = job_dir_of(root, spec.job_id)
     stage_env_file(exec_, local_repo_root, job_dir)

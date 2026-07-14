@@ -43,6 +43,7 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.backends import jobdir, tarsafe
+from omnirun.progress import report
 from omnirun.sshconn import endpoint_reachable, exec_for_endpoint
 from omnirun.bootstrap import (
     BootstrapParams,
@@ -583,6 +584,7 @@ class KaggleBackend(Backend):
         offer: Offer,
         on_provisioning: ProvisioningSink | None = None,
     ) -> JobHandle:
+        report("kaggle: authenticating…")
         api = self._api()
         user = self._username(api)
         job_id = spec.job_id
@@ -597,6 +599,7 @@ class KaggleBackend(Backend):
             # bundle, materialise the bytes here and embed them (base64 in run.py).
             code = self._code_source(spec, job_id)
             if code.kind == "bundle":
+                report("kaggle: bundling the repo to embed in the kernel…")
                 bundle_path = stage / "bundle.git"
                 _create_bundle(local_root, spec.repo.sha, bundle_path)
                 bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
@@ -663,6 +666,7 @@ class KaggleBackend(Backend):
                 meta["machine_shape"] = shape
             (k_dir / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
+            report("kaggle: pushing the kernel to Kaggle (it then queues to run)…")
             try:
                 resp = api.kernels_push(str(k_dir))
             except Exception as e:

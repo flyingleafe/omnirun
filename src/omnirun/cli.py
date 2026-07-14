@@ -42,6 +42,7 @@ from omnirun.models import (
     ResourceSpec,
     StatusReport,
 )
+from omnirun.progress import report, reporting
 from omnirun.providers import BackendProvider, Provider
 from omnirun.queue import QueueState
 from omnirun.state import Store, open_store
@@ -472,24 +473,24 @@ def submit(
         help="Print the rendered payload for the chosen backend; do not submit.",
     ),
 ) -> None:
-    spec = _build_job_spec(
-        command,
-        name=name,
-        gpus=gpus,
-        gpu_type=gpu_type,
-        vram=vram,
-        time=time,
-        cpus=cpus,
-        mem=mem,
-        disk=disk,
-        min_cuda=min_cuda,
-        outputs=outputs,
-        env=env,
-        push=push,
-    )
-    res = spec.resources
-
     cfg = _load_cfg()
+
+    def _spec() -> JobSpec:
+        return _build_job_spec(
+            command,
+            name=name,
+            gpus=gpus,
+            gpu_type=gpu_type,
+            vram=vram,
+            time=time,
+            cpus=cpus,
+            mem=mem,
+            disk=disk,
+            min_cuda=min_cuda,
+            outputs=outputs,
+            env=env,
+            push=push,
+        )
 
     # --dry-run just renders the payload; when a single backend is named we skip
     # probing entirely so you can preview scripts offline (before creds/access
@@ -497,6 +498,8 @@ def submit(
     if dry_run and backend:
         if backend not in cfg.backends:
             _die(f"unknown backend {backend!r} (see `omnirun config-path`)")
+        spec = _spec()
+        res = spec.resources
         backend_obj = make_backend(backend, cfg.backends[backend])
         synthetic = Offer(
             backend=backend,
@@ -510,6 +513,8 @@ def submit(
     # --dry-run without a named backend: the chooser still selects which backend
     # to preview (display only — nothing is submitted, no Control involved).
     if dry_run:
+        spec = _spec()
+        res = spec.resources
         backends, ranked, unfit = _probe(cfg, res, backend)
         if not ranked:
             console.print(chooser.render_offer_table(ranked, unfit, res))
@@ -522,11 +527,30 @@ def submit(
     # ``Control`` reconciles, reserves atomically, and places on the cheapest
     # offer that fits — the same tick the daemon runs. The chooser remains the
     # engine of ``omnirun offers`` (display only).
-    store = open_store(cfg.state.resolved_url())
-    try:
-        _submit_via_control(store, cfg, spec, backend)
-    finally:
-        store.close()
+    # A submit spends most of its wall-clock inside a backend provisioning a
+    # remote (Colab VM cold start, Kaggle kernel queue, ssh push). Narrate those
+    # steps on a live status line so the command is never silent — backends call
+    # `progress.report(...)` and we render each message here.
+    def _place() -> None:
+        report("resolving repo state…")
+        spec = _spec()
+        store = open_store(cfg.state.resolved_url())
+        try:
+            _submit_via_control(store, cfg, spec, backend)
+        finally:
+            store.close()
+
+    # On a terminal, narrate on one live status line (spinner). When output is
+    # piped / redirected (CI, `nohup`) a Live spinner renders nothing, so print
+    # each step as its own dim line instead — either way the command is never
+    # silent through the slow provisioning steps.
+    if console.is_terminal:
+        with console.status("[cyan]submitting…", spinner="dots") as status:
+            with reporting(lambda msg: status.update(f"[cyan]{msg}")):
+                _place()
+    else:
+        with reporting(lambda msg: console.print(f"[dim]· {msg}[/dim]")):
+            _place()
 
 
 def _submit_via_control(

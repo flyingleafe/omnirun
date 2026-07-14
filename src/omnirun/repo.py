@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from omnirun.models import RepoRef
+from omnirun.progress import report
 
 # scp-style ssh remote, e.g. git@github.com:owner/repo.git (no scheme, host:path)
 _SCP_URL = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
@@ -97,6 +98,7 @@ def capture_repo_state(root: Path, *, auto_push: bool = False) -> RepoRef:
         pushed = contains.returncode == 0 and bool(contains.stdout.strip())
         if not pushed:
             if auto_push:
+                report(f"pushing {branch} to origin…")
                 push = _git(root, "push", "origin", branch)
                 if push.returncode != 0:
                     raise RepoError(

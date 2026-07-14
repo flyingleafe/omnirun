@@ -49,6 +49,7 @@ from omnirun.bootstrap import (
     notebook_env_spec,
 )
 from omnirun.config import BoreConfig
+from omnirun.progress import report
 from omnirun.models import (
     CancelMode,
     JobHandle,
@@ -432,6 +433,10 @@ class ColabBackend(Backend):
         new_args = ["new", "-s", session]
         if gpu_flag:
             new_args += ["--gpu", gpu_flag]
+        report(
+            f"colab: provisioning {gpu_flag or 'CPU'} VM "
+            "(cold start, can take ~30-90s)…"
+        )
         self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
 
         # bore env — generated at submit time; empty when bore is disabled so
@@ -474,6 +479,11 @@ class ColabBackend(Backend):
                 session,
                 stdin=f"import os; os.makedirs({job_dir!r}, exist_ok=True); print('MKDIR_OK')",
                 timeout=EXEC_TIMEOUT_S,
+            )
+            report(
+                "colab: uploading code"
+                + (" bundle" if code.kind == "bundle" else "")
+                + " to the VM…"
             )
             with tempfile.TemporaryDirectory(prefix="omnirun-colab-") as td:
                 local = Path(td)
@@ -520,6 +530,7 @@ class ColabBackend(Backend):
                         timeout=UPLOAD_TIMEOUT_S,
                     )
 
+            report("colab: launching the job on the VM…")
             out = self._colab(
                 "exec",
                 "-s",
