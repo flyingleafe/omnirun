@@ -132,3 +132,20 @@ def test_bore_config_wired_into_top_level_config():
     cfg = Config.model_validate(data)
     assert cfg.bore.public_host == "bore.example.com"
     assert cfg.bore.control_port == 9000
+
+
+# ------------------------------------------------------------------ [budget]
+
+
+def test_budget_section_populates_daily_and_weekly():
+    data = tomllib.loads("[budget]\ndaily = 12.5\nweekly = 60.0\n")
+    cfg = Config.model_validate(data)
+    assert cfg.budget.daily == pytest.approx(12.5)
+    assert cfg.budget.weekly == pytest.approx(60.0)
+
+
+def test_budget_defaults_are_unbounded_when_absent():
+    data = tomllib.loads("[daemon]\nport = 9999\n")  # no [budget] section
+    cfg = Config.model_validate(data)
+    assert cfg.budget.daily is None
+    assert cfg.budget.weekly is None
