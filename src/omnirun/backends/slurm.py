@@ -715,12 +715,7 @@ class SlurmBackend(Backend):
             slurm_err = self.exec_.read_file(f"{job_dir}/slurm-{sid}.err")
             if slurm_err and slurm_err.strip():
                 yield from slurm_err.splitlines()
-            is_terminal = (
-                (lambda: self.status(handle).status.terminal) if follow else None
-            )
-            yield from jobdir.tail_logs(
-                self.exec_, job_dir, follow=follow, is_terminal=is_terminal
-            )
+            yield from jobdir.tail_logs(self.exec_, job_dir, follow=follow)
 
         return gen()
 

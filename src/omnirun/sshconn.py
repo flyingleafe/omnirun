@@ -15,8 +15,8 @@ Design notes:
   the ssh-family backends use, so a notebook worker is driven byte-for-byte
   identically to a plain-ssh box: `logs` (and any other job-dir operation) goes
   through `jobdir.tail_logs`/`derive_status` over this exec, not a bespoke path.
-  A follow stops when `derive_status` sees the job terminal (or the tunnel
-  drops → LOST), never by relying on the connection closing.
+  A followed `logs -f` streams over one persistent `exec.stream` connection whose
+  remote `tail -F` self-terminates at job end, so the follow stops on its own.
 """
 
 from __future__ import annotations
@@ -101,6 +101,9 @@ def exec_for_endpoint(ep: SSHEndpoint) -> SSHExec:
         extra_opts=[
             "-oStrictHostKeyChecking=accept-new",
             "-oUserKnownHostsFile=/dev/null",
+            # `logs -f` polls over this connection; suppress the client-side
+            # GSSAPI negotiation that otherwise adds seconds to each new session.
+            "-oGSSAPIAuthentication=no",
         ],
         login_shell=False,
         batch_mode=True,

@@ -8,8 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,8 +25,6 @@ from omnirun.progress import report
 
 if TYPE_CHECKING:
     from omnirun.config import BackendConfig
-
-POLL_INTERVAL_S = 10.0
 
 
 def _ssh_command(config: "BackendConfig") -> list[str]:
@@ -198,34 +195,61 @@ def _ts(s: str | None) -> datetime | None:
         return None
 
 
-def tail_logs(
-    exec_: Exec,
-    job_dir: str,
-    *,
-    follow: bool = False,
-    is_terminal: Callable[[], bool] | None = None,
-) -> Iterator[str]:
-    """Yield merged bootstrap+stdout+stderr lines; poll-based incremental tail
-    when follow=True (is_terminal: callable deciding when to stop)."""
+def _follow_command(job_dir: str) -> str:
+    """A self-terminating remote follower for `logs -f`: stream the whole merged
+    log live, then stop once the job is terminal so the streaming connection closes
+    on its own — the client never polls for terminal state.
+
+    It ends when result.json appears (with a beat first, so tail flushes the job's
+    final lines and the tail is never truncated) or, if the worker dies mid-run
+    without writing a result, when the heartbeat goes stale. The wait loop runs
+    entirely on the worker (cheap `sleep`s, no ssh round-trips).
+
+    `stdbuf -oL` line-buffers tail's stdout: writing to the ssh channel (a pipe,
+    not a tty) it otherwise block-buffers ~4 KiB, so small log lines would pool on
+    the worker and reach the client only in bursts (or at job end) — the very
+    batching this streaming path exists to kill. `$_lb` is `stdbuf -oL` when
+    present (it ships with tail; both coreutils) and empty otherwise, and prefixes
+    tail directly so `$!` is tail's own pid (stdbuf execs into tail) — the wait
+    loop's `kill "$_t"` must reach tail itself, not a wrapping subshell."""
+    log = shell_quote(f"{job_dir}/logs/bootstrap.log")
+    res = shell_quote(f"{job_dir}/result.json")
+    hb = shell_quote(f"{job_dir}/heartbeat")
+    return (
+        'if command -v stdbuf >/dev/null 2>&1; then _lb="stdbuf -oL"; else _lb=""; fi; '
+        f"$_lb tail -n +1 -F {log} 2>/dev/null & _t=$!; "
+        f'while kill -0 "$_t" 2>/dev/null; do '
+        f"if [ -e {res} ]; then sleep 1; break; fi; "
+        f"if [ -e {hb} ]; then "
+        f"_a=$(( $(date +%s) - $(stat -c %Y {hb} 2>/dev/null || date +%s) )); "
+        f'[ "$_a" -gt {HEARTBEAT_STALE_S} ] && break; '
+        f"fi; sleep 1; done; "
+        f'kill "$_t" 2>/dev/null; wait "$_t" 2>/dev/null || true'
+    )
+
+
+def tail_logs(exec_: Exec, job_dir: str, *, follow: bool = False) -> Iterator[str]:
+    """Yield the merged bootstrap+stdout+stderr log.
+
+    follow=False reads the whole log once. follow=True streams it live over one
+    persistent connection (`exec_.stream` of a self-terminating remote `tail -F`),
+    so a followed log arrives line-by-line instead of in round-trip-latency
+    batches, and `logs -f` exits cleanly when the worker marks the job terminal.
+    Every backend follows identically through this one path.
+    """
     # bootstrap.log is the canonical merged log: the bootstrap's diagnostics PLUS
     # the command's stdout+stderr (the run step tees both streams back through
     # fd 1/2, which the top-level `exec >> bootstrap.log` captures in real order).
     # Read only it — also reading stdout/stderr.log would double every command
     # line. Those per-stream files stay on disk for `pull`, and the Kaggle harness
     # tails this same single file, so every backend's `logs` view is consistent.
-    files = [f"{job_dir}/logs/bootstrap.log"]
-    offsets = dict.fromkeys(files, 0)
-    while True:
-        for f in files:
-            chunk = exec_.run(f"tail -c +{offsets[f] + 1} {shell_quote(f)} 2>/dev/null")
-            if chunk.ok and chunk.stdout:
-                offsets[f] += len(chunk.stdout.encode())
-                yield from chunk.stdout.splitlines()
-        if not follow:
-            return
-        if is_terminal is not None and is_terminal():
-            return
-        time.sleep(POLL_INTERVAL_S)
+    if not follow:
+        log = shell_quote(f"{job_dir}/logs/bootstrap.log")
+        chunk = exec_.run(f"tail -n +1 {log} 2>/dev/null")
+        if chunk.ok and chunk.stdout:
+            yield from chunk.stdout.splitlines()
+        return
+    yield from exec_.stream(_follow_command(job_dir))
 
 
 def pull_outputs(exec_: Exec, job_dir: str, dest: Path) -> list[Path]:

@@ -802,7 +802,7 @@ def test_logs_streams_over_ssh_when_endpoint_reachable(
 
     seen: dict[str, object] = {}
 
-    def fake_tail(ex, job_dir, *, follow, is_terminal):
+    def fake_tail(ex, job_dir, *, follow):
         seen["ex"] = ex
         seen["job_dir"] = job_dir
         seen["follow"] = follow
@@ -826,12 +826,13 @@ def test_logs_streams_over_ssh_when_endpoint_reachable(
     assert seen["follow"] is False
 
 
-def test_logs_follow_over_ssh_stops_when_job_terminal(
+def test_logs_follow_over_ssh_streams_and_delegates_termination(
     fake_api, backend, monkeypatch
 ) -> None:
-    """logs(follow=True) over the tunnel stops as soon as derive_status — read
-    over the SAME exec — reports terminal, rather than relying on the tunnel
-    dropping (the old `tail -F` hung because a notebook session lingers)."""
+    """logs(follow=True) over the tunnel is a single live stream via
+    jobdir.tail_logs; the worker's own follower ends it at job time, so the
+    backend does not poll derive_status itself (the old `tail -F` hung because a
+    notebook session lingers)."""
     handle = make_handle()
     _enable_bore_endpoint(backend, monkeypatch, handle)
     monkeypatch.setattr(kaggle_mod, "endpoint_reachable", lambda ep, **kw: True)
@@ -839,23 +840,19 @@ def test_logs_follow_over_ssh_stops_when_job_terminal(
 
     captured: dict[str, object] = {}
 
-    def fake_tail(ex, job_dir, *, follow, is_terminal):
-        captured["is_terminal"] = is_terminal
-        return iter(())
+    def fake_tail(ex, job_dir, *, follow):
+        captured["follow"] = follow
+        yield "streamed line"
 
     monkeypatch.setattr(kaggle_mod.jobdir, "tail_logs", fake_tail)
-    statuses = iter([JobStatus.RUNNING, JobStatus.SUCCEEDED])
-    monkeypatch.setattr(
-        kaggle_mod.jobdir,
-        "derive_status",
-        lambda ex, job_dir: StatusReport(status=next(statuses)),
-    )
 
-    list(backend.logs(handle, follow=True))
-    is_terminal = captured["is_terminal"]
-    assert callable(is_terminal)
-    assert is_terminal() is False  # RUNNING
-    assert is_terminal() is True  # SUCCEEDED -> follow loop would return
+    def boom(*a, **k):
+        raise AssertionError("must not poll derive_status; the follower self-ends")
+
+    monkeypatch.setattr(kaggle_mod.jobdir, "derive_status", boom)
+
+    assert list(backend.logs(handle, follow=True)) == ["streamed line"]
+    assert captured["follow"] is True
 
 
 def test_logs_falls_back_to_api_when_endpoint_unreachable(

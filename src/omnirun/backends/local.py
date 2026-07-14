@@ -175,12 +175,7 @@ class LocalBackend(Backend):
         return report
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
-        yield from jobdir.tail_logs(
-            self.exec,
-            handle.data["job_dir"],
-            follow=follow,
-            is_terminal=lambda: self.status(handle).status.terminal,
-        )
+        yield from jobdir.tail_logs(self.exec, handle.data["job_dir"], follow=follow)
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sig = "KILL" if mode is CancelMode.FORCE else "TERM"

@@ -7,7 +7,9 @@ without a network.
 
 from __future__ import annotations
 
+import subprocess
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +45,17 @@ class Exec(ABC):
     ) -> ExecResult:
         """Run `command` through bash. check=True raises ExecError on rc != 0."""
         ...
+
+    def stream(self, command: str, *, timeout: float | None = None) -> Iterator[str]:
+        """Run `command`, yielding stdout lines as they are produced.
+
+        This is how `logs -f` follows a job: the caller passes a self-terminating
+        remote `tail -F` and consumes lines live over one persistent connection.
+        The default here is a non-live fallback (run once, then split) so fakes and
+        exotic transports still work; transports that can stream (ssh, local)
+        override it. The iterator ends when the remote command exits.
+        """
+        yield from self.run(command, timeout=timeout).stdout.splitlines()
 
     @abstractmethod
     def put(self, local: Path, remote: str) -> None:
@@ -95,3 +108,33 @@ def shell_quote(s: str) -> str:
     import shlex
 
     return shlex.quote(s)
+
+
+def stream_lines(argv: list[str]) -> Iterator[str]:
+    """Popen `argv` and yield its stdout lines live, tearing the child down when
+    the caller stops iterating (e.g. `logs -f` interrupted, or the generator is
+    closed). stderr is discarded — a follow streams a log file, not diagnostics;
+    stdin is /dev/null so a child (ssh) never grabs the caller's terminal. Both
+    `\\r` and `\\n` are stripped so a line keeps no trailing carriage return.
+    Shared by SSHExec/LocalExec so every transport streams identically."""
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    stdout = proc.stdout
+    try:
+        if stdout is not None:
+            for line in stdout:
+                yield line.rstrip("\r\n")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        proc.wait()

@@ -52,6 +52,18 @@ def test_bootstrap_records_pgid(job_spec: JobSpec) -> None:
     assert "$JOB_DIR/pgid" in script
 
 
+def test_bootstrap_streams_command_output_live(job_spec: JobSpec) -> None:
+    """The run step must not let output sit in buffers until the process exits
+    (so `logs -f` streams): default PYTHONUNBUFFERED and line-buffer the tees."""
+    script = generate_bootstrap(job_spec)
+    assert "${PYTHONUNBUFFERED:=1}" in script
+    assert "export PYTHONUNBUFFERED" in script
+    # tee is wrapped in the stdbuf line-buffer prefix, not called bare
+    assert "stdbuf -oL" in script
+    assert '$_lb tee "$JOB_DIR/logs/stdout.log"' in script
+    assert '$_lb tee "$JOB_DIR/logs/stderr.log"' in script
+
+
 def test_script_passes_bash_syntax_check(job_spec: JobSpec, tmp_path: Path) -> None:
     script = tmp_path / "bootstrap.sh"
     script.write_text(generate_bootstrap(job_spec))

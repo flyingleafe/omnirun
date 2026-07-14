@@ -93,8 +93,9 @@ def test_logs_follow_exits_when_job_finished(
             f"job did not finish: {final.status} ({final.detail})"
         )
         # The session is intentionally NOT reaped yet (that is the lingering-VM
-        # case). follow must still terminate, driven by derive_status over the
-        # tunnel — never by the connection dropping.
+        # case). A terminal job has no live tunnel, so this follow runs the
+        # kernel-API fallback; it must still return promptly (its own terminal
+        # check), never hang waiting on a session that lingers past job end.
         lines: list[str] = []
         done = threading.Event()
 

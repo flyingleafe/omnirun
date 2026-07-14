@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
-from omnirun.execlayer.base import Exec, ExecError, ExecResult
+from omnirun.execlayer.base import Exec, ExecError, ExecResult, stream_lines
 
 
 def _text(data: str | bytes | None) -> str:
@@ -50,6 +51,11 @@ class LocalExec(Exec):
                 result,
             )
         return result
+
+    def stream(self, command: str, *, timeout: float | None = None) -> Iterator[str]:
+        # Local follows stream live too (Popen line-by-line), so a `logs -f` on a
+        # local job behaves the same as over ssh — one code path, one behavior.
+        yield from stream_lines(["bash", "-c", command])
 
     def put(self, local: Path, remote: str) -> None:
         src = Path(local)

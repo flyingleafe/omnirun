@@ -303,10 +303,7 @@ class SshBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
-        is_terminal = (lambda: self.status(handle).status.terminal) if follow else None
-        return jobdir.tail_logs(
-            self.exec_, job_dir, follow=follow, is_terminal=is_terminal
-        )
+        return jobdir.tail_logs(self.exec_, job_dir, follow=follow)
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         sig = "KILL" if mode is CancelMode.FORCE else "TERM"

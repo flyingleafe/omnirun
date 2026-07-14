@@ -128,6 +128,11 @@ PermitRootLogin prohibit-password
 AuthenticationMethods publickey
 UsePAM no
 PrintMotd no
+# Keep every connection fast: no reverse-DNS on the client IP and no GSSAPI
+# negotiation. `logs -f` opens a connection per poll, so a multi-second login
+# here turns a live tail into ~10s-batched output.
+UseDNS no
+GSSAPIAuthentication no
 SSHD_EOF
     /usr/sbin/sshd -f /tmp/omnirun-sshd.conf
     # --- install bore (static musl binary, v0.6.0) if not already present ---
@@ -486,12 +491,22 @@ trap 'kill "$HB_PID" 2>/dev/null' EXIT
 # ---- run -----------------------------------------------------------------------
 status running
 STARTED_AT=$(now)
+# Stream the command's output live. Two things otherwise hold it back until the
+# process exits (so `logs -f` shows nothing, then everything at once):
+#   1. Python (and most runtimes) block-buffer stdout when it is a pipe, not a
+#      tty. Default PYTHONUNBUFFERED so print() flushes per line; the user's own
+#      env still wins (:= only sets it when unset).
+#   2. tee block-buffers its writes to a file. Line-buffer it with stdbuf so each
+#      line reaches bootstrap.log (what `logs` tails) as produced, not in ~8 KiB
+#      blocks. stdbuf is coreutils; fall back to plain tee where it is absent.
+: "${{PYTHONUNBUFFERED:=1}}"; export PYTHONUNBUFFERED
+if command -v stdbuf >/dev/null 2>&1; then _lb="stdbuf -oL"; else _lb=""; fi
 set +e
 run_cmd() {{
 {_command_block(spec.command)}}}
 # run in a subshell: a bare `exit N` in the user command must not kill
 # bootstrap.sh itself (result.json would never be written -> job shows LOST)
-( run_cmd ) > >(tee "$JOB_DIR/logs/stdout.log") 2> >(tee "$JOB_DIR/logs/stderr.log" >&2)
+( run_cmd ) > >($_lb tee "$JOB_DIR/logs/stdout.log") 2> >($_lb tee "$JOB_DIR/logs/stderr.log" >&2)
 EXIT_CODE=$?
 set -u
 

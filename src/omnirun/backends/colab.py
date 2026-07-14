@@ -675,22 +675,14 @@ class ColabBackend(Backend):
         job_dir = handle.data["job_dir"]
         # Prefer the bore tunnel: drive the worker through the exact same
         # `SSHExec` + `jobdir.tail_logs` the ssh-family backends use, so a
-        # notebook job's `logs` behaves identically — including stopping cleanly
-        # when `derive_status` (read over the same tunnel) sees the job terminal
-        # or the tunnel drops (LOST). Fall back to the session-exec poll below
-        # only when the endpoint is absent or not (yet) connectable, so a
-        # slow-to-provision worker never duplicates output across both paths.
+        # notebook job's `logs` behaves identically — a live streaming tail that
+        # the worker itself stops at job end (or when the tunnel drops). Fall back
+        # to the session-exec poll below only when the endpoint is absent or not
+        # (yet) connectable, so a slow-to-provision worker never duplicates output.
         ep = self.ssh_endpoint(handle)
         if ep is not None and endpoint_reachable(ep):
             ex = exec_for_endpoint(ep)
-            is_terminal = (
-                (lambda: jobdir.derive_status(ex, job_dir).status.terminal)
-                if follow
-                else None
-            )
-            yield from jobdir.tail_logs(
-                ex, job_dir, follow=follow, is_terminal=is_terminal
-            )
+            yield from jobdir.tail_logs(ex, job_dir, follow=follow)
             return
         # Read only bootstrap.log — the canonical merged log (diagnostics + the
         # command's stdout+stderr, which the run step tees back through fd 1/2).

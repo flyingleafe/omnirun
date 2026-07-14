@@ -17,10 +17,16 @@ import posixpath
 import shlex
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from omnirun.execlayer.base import Exec, ExecError, ExecResult, shell_quote
+from omnirun.execlayer.base import (
+    Exec,
+    ExecError,
+    ExecResult,
+    shell_quote,
+    stream_lines,
+)
 
 # stderr fragments (lowercased) that mean the transport itself failed —
 # distinguished from a remote command exiting 255.
@@ -192,6 +198,25 @@ class SSHExec(Exec):
                 result,
             )
         return result
+
+    def stream(self, command: str, *, timeout: float | None = None) -> Iterator[str]:
+        # One persistent ssh process over the reused ControlMaster: the remote
+        # command (a self-terminating `tail -F`) streams lines back live, so a
+        # followed log arrives line-by-line instead of in the round-trip-latency
+        # batches polling produced. No PTY: a plain pipe streams live once the
+        # remote line-buffers its stdout (the follower's `stdbuf -oL tail`), and a
+        # pipe preserves log bytes exactly (a tty would map \n→\r\n and could
+        # expand tabs). Verified live over the bore tunnel.
+        self._ensure_control_dir()
+        argv = [
+            *self._batch_ssh_argv(),
+            "--",
+            self.target,
+            "bash",
+            "-lc" if self.login_shell else "-c",
+            shell_quote(command),
+        ]
+        yield from stream_lines(argv)
 
     @staticmethod
     def _transport_failed(stderr: str) -> bool:

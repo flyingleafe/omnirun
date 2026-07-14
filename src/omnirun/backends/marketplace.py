@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -465,15 +465,7 @@ class MarketplaceBackend(Backend, ABC):
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         ex = self._exec_from_handle(handle)
         job_dir = handle.data["job_dir"]
-        is_terminal: Callable[[], bool] | None = None
-        if follow:
-
-            def _terminal() -> bool:
-                return jobdir.derive_status(ex, job_dir).status.terminal
-
-            is_terminal = _terminal
-
-        return jobdir.tail_logs(ex, job_dir, follow=follow, is_terminal=is_terminal)
+        return jobdir.tail_logs(ex, job_dir, follow=follow)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         ex = self._exec_from_handle(handle)
