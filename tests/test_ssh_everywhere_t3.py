@@ -34,7 +34,9 @@ from omnirun.models import (
     JobHandle,
     JobRecord,
     JobSpec,
+    JobState,
     JobStatus,
+    Placement,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -533,8 +535,18 @@ def _make_job_record(
     backend_name: str = "colab",
 ) -> JobRecord:
     spec = make_spec()
-    handle = JobHandle(backend=backend_name, job_id=job_id, data={})
-    return JobRecord(spec=spec, handle=handle)
+    # A scheduler-placed job: the lifecycle commands derive the handle from the
+    # placement (the single source of truth), not a legacy mirrored handle.
+    return JobRecord(
+        spec=spec,
+        state=JobState.RUNNING,
+        placement=Placement(
+            provider_name=backend_name,
+            job_id=job_id,
+            handle={"job_id": job_id},
+            state=JobStatus.RUNNING,
+        ),
+    )
 
 
 class TestOmnirunSshCommand:

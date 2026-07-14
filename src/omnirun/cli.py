@@ -29,7 +29,6 @@ from omnirun.config import (
 )
 from omnirun.control import Control
 from omnirun.models import (
-    CancelMode,
     EnvSpec,
     Health,
     JobHandle,
@@ -37,10 +36,8 @@ from omnirun.models import (
     JobRecord,
     JobSpec,
     JobState,
-    JobStatus,
     Offer,
     ResourceSpec,
-    StatusReport,
 )
 from omnirun.progress import report, reporting
 from omnirun.providers import BackendProvider, Provider
@@ -64,12 +61,13 @@ console = Console(highlight=False)
 
 _state: dict[str, Any] = {"config_path": None}
 
-_STATUS_STYLE = {
-    JobStatus.SUCCEEDED: "green",
-    JobStatus.RUNNING: "cyan",
-    JobStatus.FAILED: "red",
-    JobStatus.LOST: "red",
-    JobStatus.CANCELLED: "yellow",
+_STATE_STYLE = {
+    JobState.SUCCEEDED: "green",
+    JobState.RUNNING: "cyan",
+    JobState.PLACING: "cyan",
+    JobState.FAILED: "red",
+    JobState.CANCELLED: "yellow",
+    JobState.HELD: "yellow",
 }
 
 
@@ -285,75 +283,27 @@ def _backend_for(cfg: Config, name: str) -> Backend:
     return make_backend(name, bcfg)
 
 
-def _effective_handle(rec: JobRecord) -> JobHandle | None:
-    """The backend handle the daemonless lifecycle commands should act on.
+def _control(cfg: Config, store: Store, backend: str | None = None) -> Control:
+    """Build the ONE state-machine driver over *store* and the enabled backends.
 
-    A daemonless ``submit`` mirrors a placement onto the legacy ``rec.handle`` via
-    ``_bridge_placement``. A DAEMON-placed job, however, only ever gets a
-    scheduler ``Placement`` written to its record (``handle`` stays ``None``) — so
-    ``logs``/``cancel``/``pull``/``status``/``gc`` must reconstruct the handle from
-    the placement to reach a job the daemon launched. Prefer the already-mirrored
-    ``rec.handle`` when present; otherwise derive it from the live ``placement``
-    exactly as ``BackendProvider.place`` built the handle it submitted with
-    (``backend`` = the placement's provider, ``data`` = the placement's handle
-    blob). Returns ``None`` only when the job was never placed anywhere (no handle,
-    no placement), which the callers treat as "never submitted".
-    """
-    if rec.handle is not None:
-        return rec.handle
-    p = rec.placement
-    if p is not None:
-        return JobHandle(backend=p.provider_name, job_id=p.job_id, data=p.handle)
-    return None
+    Every lifecycle command (``submit``/``ps``/``status``/``cancel``/``gc``) drives
+    this same ``Control.run_tick`` — the daemon differs only in cadence, never in
+    what a transition means. ``backend`` narrows the provider set (``--backend``)."""
+    backends, _broken = _make_backends(cfg, backend)
+    providers: dict[str, Provider] = {
+        name: BackendProvider(be, store) for name, be in backends.items()
+    }
+    return Control(store, providers)
 
 
-def _bridge_placement(store: Store, rec: JobRecord) -> None:
-    """Project a scheduler ``placement`` onto the legacy ``handle``/``offer`` view.
-
-    The scheduler persists a job's live target as a :class:`Placement`; the
-    daemonless lifecycle commands (``ps``/``status``/``logs``/``cancel``/``pull``/
-    ``gc``) still speak the ``JobHandle``/``Offer``/``last_status`` vocabulary. To
-    keep both working off one record we mirror a placed record's placement into
-    those fields (additively — the placement stays authoritative for the
-    scheduler's capacity view). A record with no real placement is left untouched.
-    Persists in place; a no-op when there is nothing to bridge.
-    """
+def _handle_of(rec: JobRecord) -> JobHandle | None:
+    """The backend handle for the live-I/O commands (``logs``/``pull``/``ssh``),
+    derived from the job's ``placement`` — the single source of truth. ``None``
+    when the job was never placed anywhere."""
     p = rec.placement
     if p is None or not p.handle:
-        return
-    rec.handle = JobHandle(
-        backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle
-    )
-    if rec.offer is None:
-        rec.offer = Offer(
-            backend=p.provider_name,
-            label=f"{p.provider_name}: {p.state.value}",
-            gpu_type=rec.spec.resources.gpu_type,
-            gpus=rec.spec.resources.effective_gpus(),
-        )
-    # NB: last_status is intentionally left as-is (usually None right after a
-    # place): the lifecycle commands refresh it live via the backend, matching
-    # the pre-scheduler UX where a just-submitted job shows "?" until refreshed.
-    store.save_job(rec)
-
-
-def _refresh_status(
-    store: Store, cfg: Config, rec: JobRecord, cache: dict[str, Backend]
-) -> StatusReport | None:
-    """Refresh a non-terminal record's status via its backend; persist it.
-    Returns the (possibly stale) best-known report, None if never had one."""
-    st = rec.last_status
-    if rec.handle is None or (st is not None and st.status.terminal):
-        return st
-    try:
-        name = rec.handle.backend
-        if name not in cache:
-            cache[name] = _backend_for(cfg, name)
-        report = cache[name].status(rec.handle)
-    except Exception:
-        return st  # tolerate: unreachable backend must not break `ps`
-    store.update_job_status(rec.spec.job_id, report)
-    return report
+        return None
+    return JobHandle(backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle)
 
 
 def _ago(dt: datetime | None, now: datetime) -> str:
@@ -574,13 +524,11 @@ def _submit_via_control(
     rec = store.load_job(job_id)
     if rec is None:  # pragma: no cover — we just wrote it
         _die(f"job {job_id} vanished after submit")
-    _bridge_placement(store, rec)
 
     if rec.placement is not None and rec.placement.handle:
-        label = (
-            rec.offer.label if rec.offer is not None else rec.placement.provider_name
+        console.print(
+            f"[green]submitted[/green] {job_id} -> {rec.placement.provider_name}"
         )
-        console.print(f"[green]submitted[/green] {job_id} -> {label}")
         console.print(f"follow logs with: omnirun logs -f {job_id}")
         return
     if rec.state is JobState.HELD:
@@ -799,18 +747,22 @@ def _queue_wait(host: str, port: int) -> None:
 # --------------------------------------------------------------------------- ps & co
 
 
-@app.command(help="List all known jobs with refreshed statuses.")
+@app.command(help="List all known jobs, advancing each by one scheduler tick.")
 @friendly_errors
 def ps() -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
+    # Drive the one state machine: reconcile live placements, self-GC stale
+    # sessions, and place any queued job onto a free backend — so a daemonless
+    # `ps` gives the same answer a running daemon would (no frozen `lost`, no
+    # stranded job). A backend that is momentarily unreachable degrades the tick,
+    # never crashes it.
+    _control(cfg, store).run_tick(datetime.now(timezone.utc))
     records = store.list_jobs()
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
-    cache: dict[str, Backend] = {}
     now = datetime.now(timezone.utc)
-
     table = Table()
     table.add_column("job")
     table.add_column("backend")
@@ -818,17 +770,13 @@ def ps() -> None:
     table.add_column("submitted")
     table.add_column("command")
     for rec in records:
-        st = _refresh_status(store, cfg, rec, cache)
-        if st is None:
-            status_txt = "?"
-        else:
-            style = _STATUS_STYLE.get(st.status)
-            status_txt = (
-                f"[{style}]{st.status.value}[/{style}]" if style else st.status.value
-            )
+        style = _STATE_STYLE.get(rec.state)
+        status_txt = (
+            f"[{style}]{rec.state.value}[/{style}]" if style else rec.state.value
+        )
         table.add_row(
             rec.spec.job_id,
-            rec.handle.backend if rec.handle else "-",
+            rec.placement.provider_name if rec.placement else "-",
             status_txt,
             _ago(rec.submitted_at, now),
             _truncate(rec.spec.command),
@@ -836,40 +784,38 @@ def ps() -> None:
     console.print(table)
 
 
-@app.command(help="Refresh and show one job's details (accepts a unique id prefix).")
+@app.command(help="Advance and show one job's details (accepts a unique id prefix).")
 @friendly_errors
 def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
-    handle = _effective_handle(rec)
+    # Same machine as `ps`/the daemon — one tick reconciles this job's live state.
+    _control(cfg, store).run_tick(datetime.now(timezone.utc))
+    rec = store.load_job(rec.spec.job_id) or rec
     st = rec.last_status
-    if handle is not None and (st is None or not st.status.terminal):
-        be = _backend_for(cfg, handle.backend)
-        st = be.status(handle)
-        store.update_job_status(rec.spec.job_id, st)
-
+    backend = rec.placement.provider_name if rec.placement else "-"
     rows: list[tuple[str, str]] = [
         ("job", rec.spec.job_id),
         ("name", rec.spec.name),
         ("command", rec.spec.command),
-        ("backend", handle.backend if handle else "-"),
-        ("offer", rec.offer.label if rec.offer else "-"),
+        ("backend", backend),
+        ("state", rec.state.value),
         (
             "repo",
             f"{rec.spec.repo.remote_url} @ {rec.spec.repo.sha[:12]} ({rec.spec.repo.branch})",
         ),
-        ("status", st.status.value if st else "?"),
     ]
-    if st is not None:
-        if st.exit_code is not None:
-            rows.append(("exit code", str(st.exit_code)))
-        if st.detail:
-            rows.append(("detail", st.detail))
-        if st.started_at:
-            rows.append(("started", st.started_at.isoformat()))
-        if st.finished_at:
-            rows.append(("finished", st.finished_at.isoformat()))
+    if st is not None and st.exit_code is not None:
+        rows.append(("exit code", str(st.exit_code)))
+    if st is not None and st.detail:
+        rows.append(("detail", st.detail))
+    if rec.placement is not None and rec.placement.placed_at is not None:
+        rows.append(("started", rec.placement.placed_at.isoformat()))
+    if rec.placement is not None and rec.placement.ended_at is not None:
+        rows.append(("ended", rec.placement.ended_at.isoformat()))
+    for link in rec.placement.links if rec.placement else []:
+        rows.append((link.label, link.url))
     if rec.submitted_at:
         rows.append(("submitted", rec.submitted_at.isoformat()))
     if rec.outputs_pulled_to:
@@ -888,7 +834,7 @@ def logs(
 ) -> None:
     cfg = _load_cfg()
     rec = open_store(cfg.state.resolved_url()).resolve_job(job)
-    handle = _effective_handle(rec)
+    handle = _handle_of(rec)
     if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
     be = _backend_for(cfg, handle.backend)
@@ -907,16 +853,14 @@ def cancel(
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
-    handle = _effective_handle(rec)
-    if handle is None:
+    if _handle_of(rec) is None and rec.placement is None:
         raise BackendError(
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
-    be = _backend_for(cfg, handle.backend)
-    be.cancel(handle, CancelMode.FORCE if force else CancelMode.GRACEFUL)
-    store.update_job_status(
-        rec.spec.job_id,
-        StatusReport(status=JobStatus.CANCELLED, detail="cancelled by user"),
+    # One machine: Control.cancel reaps the placement (graceful→force→gc) and
+    # marks the job CANCELLED — the same path the daemon uses.
+    _control(cfg, store, rec.placement.provider_name if rec.placement else None).cancel(
+        rec.spec.job_id, datetime.now(timezone.utc), force=force
     )
     console.print(f"cancelled {rec.spec.job_id}")
 
@@ -932,7 +876,7 @@ def pull(
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     rec = store.resolve_job(job)
-    handle = _effective_handle(rec)
+    handle = _handle_of(rec)
     if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
     dest = dest or Path("omnirun-outputs") / rec.spec.job_id
@@ -947,39 +891,34 @@ def pull(
 @friendly_errors
 def gc(
     all_: bool = typer.Option(
-        False, "--all", help="Also gc non-terminal jobs (they are marked LOST)."
+        False, "--all", help="Also reap non-terminal jobs (cancels them first)."
     ),
 ) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
+    control = _control(cfg, store)
+    now = datetime.now(timezone.utc)
+    # A tick first: reconcile advances lost sessions (which are reaped in the
+    # process) and settles terminal states before we reap their leftovers.
+    control.run_tick(now)
     cleaned = failed = skipped = 0
     for rec in store.list_jobs():
-        st = rec.last_status
-        terminal = st is not None and st.status.terminal
-        handle = _effective_handle(rec)
+        handle = _handle_of(rec)
         if handle is None:
             continue
-        if not terminal and not all_:
-            skipped += 1
-            continue
         try:
-            be = _backend_for(cfg, handle.backend)
-            if not terminal:
-                try:  # best-effort: stop a still-live job before reaping it
-                    be.cancel(handle)
-                except Exception:
-                    pass
-            be.gc(handle)
+            if rec.state.terminal:
+                _backend_for(cfg, handle.backend).gc(handle)
+            elif all_:
+                control.cancel(rec.spec.job_id, now, force=True)  # cancels + reaps
+            else:
+                skipped += 1
+                continue
         except Exception as e:
             failed += 1
             console.print(f"[yellow]warn:[/yellow] gc of {rec.spec.job_id} failed: {e}")
             continue
         cleaned += 1
-        if not terminal:
-            store.update_job_status(
-                rec.spec.job_id,
-                StatusReport(status=JobStatus.LOST, detail="reaped by gc --all"),
-            )
     console.print(
         f"gc done: {cleaned} cleaned, {failed} failed, {skipped} skipped (non-terminal)"
     )
@@ -1095,7 +1034,7 @@ def ssh(
     """
     cfg = _load_cfg()
     rec = open_store(cfg.state.resolved_url()).resolve_job(job)
-    handle = _effective_handle(rec)
+    handle = _handle_of(rec)
     if handle is None:
         _die(f"job {rec.spec.job_id} was never submitted; cannot ssh into it")
     be = _backend_for(cfg, handle.backend)

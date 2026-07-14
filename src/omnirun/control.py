@@ -45,6 +45,7 @@ from omnirun.models import (
     ProviderFacts,
     ResourceSpec,
     Slot,
+    StatusReport,
 )
 from omnirun.providers.base import CancelMode, CapacityError, Provider
 from omnirun.scheduler import SchedPolicy, tick
@@ -153,7 +154,15 @@ class Control:
                 update={"ended_at": now, "state": JobStatus.CANCELLED}
             )
         self._store.save_job(
-            rec.model_copy(update={"state": JobState.CANCELLED, "placement": placement})
+            rec.model_copy(
+                update={
+                    "state": JobState.CANCELLED,
+                    "placement": placement,
+                    "last_status": StatusReport(
+                        status=JobStatus.CANCELLED, detail="cancelled by user"
+                    ),
+                }
+            )
         )
 
     # ------------------------------------------------------------------
@@ -286,20 +295,38 @@ class Control:
             self._requeue(rec, now)
             return
 
+        # Persist the poll's backend detail (exit code, reason) as the record's
+        # last_status — reconcile is the SOLE writer, so a read command renders
+        # rich status from the record without a second live poll.
+        report = StatusReport(
+            status=status.state, exit_code=status.exit_code, detail=status.detail
+        )
         new_state = _STATUS_TO_STATE[status.state]
         if new_state.terminal:
             updated = placement.model_copy(
                 update={"ended_at": now, "state": status.state}
             )
             self._store.save_job(
-                rec.model_copy(update={"state": new_state, "placement": updated})
+                rec.model_copy(
+                    update={
+                        "state": new_state,
+                        "placement": updated,
+                        "last_status": report,
+                    }
+                )
             )
             return
 
         # Still active: keep RUNNING, refresh the backend-level placement state.
         updated = placement.model_copy(update={"state": status.state})
         self._store.save_job(
-            rec.model_copy(update={"state": JobState.RUNNING, "placement": updated})
+            rec.model_copy(
+                update={
+                    "state": JobState.RUNNING,
+                    "placement": updated,
+                    "last_status": report,
+                }
+            )
         )
 
     def _reap(self, placement: Placement) -> None:

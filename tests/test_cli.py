@@ -79,6 +79,10 @@ class StubBackend(Backend):
     def status(self, handle: JobHandle) -> StatusReport:
         if self.config.extra("status_error"):
             raise BackendError("status endpoint down")
+        # A cancelled job reports terminal, so the graceful cancel await returns
+        # immediately (no force escalation, no 30s wait) — realistic and fast.
+        if handle.job_id in type(self).cancelled:
+            return StatusReport(status=JobStatus.CANCELLED)
         return StatusReport(status=JobStatus.RUNNING)
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
@@ -196,6 +200,7 @@ probe_timeout_s = 2.0
 
 [backends.stub]
 type = "stub"
+cancel_grace_s = 0
 
 [backends.offline]
 type = "unreachable"
@@ -306,8 +311,9 @@ def test_submit_happy_path(env):
 
     rec = _store().load_job(job_id)
     assert rec is not None
-    assert rec.handle is not None and rec.handle.data["token"] == f"t-{job_id}"
-    assert rec.offer is not None and rec.offer.backend == "stub"
+    assert rec.placement is not None
+    assert rec.placement.handle["token"] == f"t-{job_id}"
+    assert rec.placement.provider_name == "stub"
     assert rec.submitted_at is not None
     assert rec.spec.command == "python train.py"
     assert rec.spec.resources.gpus == 1
@@ -478,10 +484,11 @@ def test_ps_tolerates_status_failures(env):
     env.config_file.write_text(
         BASE_CONFIG.replace('type = "stub"', 'type = "stub"\nstatus_error = true')
     )
+    # ps drives a tick; a backend whose status endpoint is down must degrade the
+    # tick (requeue the unpollable job), never crash the command.
     result = runner.invoke(app, ["ps"])
     assert result.exit_code == 0, result.output
     assert job_id in result.output
-    assert "?" in result.output  # never had a status, refresh failed
 
 
 def test_status_accepts_prefix(env):
@@ -537,6 +544,7 @@ def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
     job_id = submit_one()
     result = runner.invoke(app, ["cancel", "--force", job_id])
     assert result.exit_code == 0, result.output
+    # --force skips the graceful window entirely: only a FORCE cancel is issued.
     assert modes == [CancelMode.FORCE]
 
 
@@ -550,7 +558,8 @@ def test_cli_cancel_default_is_graceful(env, monkeypatch):
     job_id = submit_one()
     result = runner.invoke(app, ["cancel", job_id])
     assert result.exit_code == 0, result.output
-    assert modes == [CancelMode.GRACEFUL]
+    # Graceful-first: a GRACEFUL cancel is issued before any force escalation.
+    assert modes[0] is CancelMode.GRACEFUL
 
 
 def test_pull_outputs(env, tmp_path):
@@ -597,29 +606,52 @@ def _seed_daemon_placed_job(job_id: str = "daemon-placed-01") -> JobRecord:
     return rec
 
 
-def test_effective_handle_reconstructs_from_placement(env):
-    """The read-side bridge derives the backend handle from a placement when the
-    legacy ``handle`` is None (a daemon-placed job) and returns None only for a
-    truly never-placed job."""
-    from omnirun.cli import _effective_handle
+def test_ps_places_a_stranded_queued_job(env):
+    """The incident's `?` fix: a job stranded QUEUED (e.g. released after a
+    capacity race with no daemon running) is PLACED by `ps` driving one tick —
+    daemonless reads advance the same machine the daemon would."""
+    stranded = JobRecord(
+        spec=JobSpec(
+            job_id="stranded-01",
+            name="stranded",
+            command="python train.py",
+            resources=ResourceSpec(),
+            repo=RepoRef(
+                remote_url="git@example.com:me/proj.git",
+                sha="c" * 40,
+                branch="main",
+                slug="proj",
+            ),
+        ),
+        state=JobState.QUEUED,
+        submitted_at=datetime.now(timezone.utc),
+    )
+    _store().save_job(stranded)
+
+    result = runner.invoke(app, ["ps"])
+    assert result.exit_code == 0, result.output
+
+    rec = _store().load_job("stranded-01")
+    assert rec is not None
+    assert rec.state is JobState.RUNNING  # ps placed it (no `?` limbo)
+    assert rec.placement is not None and rec.placement.provider_name == "stub"
+
+
+def test_handle_of_derives_from_placement(env):
+    """The live-I/O commands derive the backend handle from the job's placement —
+    the single source of truth — and get None only for a never-placed job."""
+    from omnirun.cli import _handle_of
 
     rec = _seed_daemon_placed_job()
-    handle = _effective_handle(rec)
+    handle = _handle_of(rec)
     assert handle is not None
     assert handle.backend == "stub"
     assert handle.job_id == rec.spec.job_id
     assert handle.data == {"token": f"t-{rec.spec.job_id}"}
 
-    # A record with neither handle nor placement stays unreachable (None).
-    bare = rec.model_copy(update={"placement": None, "handle": None})
-    assert _effective_handle(bare) is None
-
-    # An already-mirrored handle wins verbatim over the placement.
-    mirrored = rec.model_copy(
-        update={"handle": JobHandle(backend="other", job_id="x", data={"k": "v"})}
-    )
-    got = _effective_handle(mirrored)
-    assert got is not None and got.backend == "other" and got.data == {"k": "v"}
+    # A record with no placement is unreachable (None) — never submitted.
+    bare = rec.model_copy(update={"placement": None})
+    assert _handle_of(bare) is None
 
 
 def test_daemon_placed_job_reachable_by_lifecycle_commands(env):
@@ -665,18 +697,18 @@ def test_gc_skips_non_terminal_unless_all(env):
     result = runner.invoke(app, ["gc", "--all"])
     assert result.exit_code == 0, result.output
     assert "1 cleaned" in result.output
-    # a still-live job is cancelled (best-effort) before its resources are reaped
+    # a still-live job is cancelled (which reaps it) under --all
     assert StubBackend.cancelled == [job_id]
     rec = _store().load_job(job_id)
-    assert rec is not None and rec.last_status is not None
-    assert rec.last_status.status is JobStatus.LOST
+    assert rec is not None
+    assert rec.state is JobState.CANCELLED
 
 
 def test_gc_all_tolerates_cancel_failure(env, monkeypatch):
     job_id = submit_one()
     runner.invoke(app, ["ps"])
 
-    def boom(self, handle):
+    def boom(self, handle, mode=CancelMode.GRACEFUL):
         raise BackendError("cancel endpoint down")
 
     monkeypatch.setattr(StubBackend, "cancel", boom)
@@ -684,8 +716,9 @@ def test_gc_all_tolerates_cancel_failure(env, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "1 cleaned" in result.output  # gc proceeded despite the failed cancel
     rec = _store().load_job(job_id)
-    assert rec is not None and rec.last_status is not None
-    assert rec.last_status.status is JobStatus.LOST
+    assert rec is not None
+    # cancel is best-effort; the job is still marked CANCELLED despite the failure
+    assert rec.state is JobState.CANCELLED
 
 
 def test_backends_check_green(env):
