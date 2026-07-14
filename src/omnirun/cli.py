@@ -72,12 +72,27 @@ _STATE_STYLE = {
 }
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        from omnirun import __version__
+
+        console.print(f"omnirun {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def main(
     config: Path | None = typer.Option(
         None,
         "--config",
         help="Config file (default: $OMNIRUN_CONFIG or ~/.config/omnirun/config.toml).",
+    ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the omnirun version and exit.",
     ),
 ) -> None:
     _state["config_path"] = config
@@ -87,7 +102,12 @@ def main(
 
 
 def _user_error_types() -> tuple[type[BaseException], ...]:
-    types: list[type[BaseException]] = [BackendError, ConfigError, KeyError]
+    types: list[type[BaseException]] = [
+        BackendError,
+        ConfigError,
+        KeyError,
+        ConnectionError,  # daemon unreachable / timed out (friendly, not a trace)
+    ]
     try:
         from omnirun.repo import RepoError
 
@@ -845,7 +865,15 @@ def _queue_wait(host: str, port: int) -> None:
 # --------------------------------------------------------------------------- ps & co
 
 
-@app.command(help="List all known jobs, advancing each by one scheduler tick.")
+@app.command(
+    help="List all known jobs, advancing each by one scheduler tick.",
+    name="ps",
+)
+@app.command(
+    name="list",
+    hidden=True,
+    help="Alias for `ps` (list all known jobs).",
+)
 @friendly_errors
 def ps() -> None:
     cfg = _load_cfg()

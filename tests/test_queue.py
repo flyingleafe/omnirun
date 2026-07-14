@@ -290,3 +290,22 @@ def test_socket_protocol(tmp_path: Path) -> None:
 
 def test_daemon_address_absent(tmp_path: Path) -> None:
     assert daemon_address(tmp_path) is None
+
+
+def test_send_request_timeout_raises_friendly_connection_error() -> None:
+    """A server that accepts the connection but never replies must surface a
+    ConnectionError with a clear message — not a raw socket TimeoutError (M-6)."""
+    import socket as _socket
+
+    import pytest
+
+    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    host, port = srv.getsockname()
+    try:
+        with pytest.raises(ConnectionError, match="did not respond"):
+            send_request(host, port, {"cmd": "list"}, timeout=0.3)
+    finally:
+        srv.close()

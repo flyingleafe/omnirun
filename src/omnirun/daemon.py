@@ -120,6 +120,13 @@ def send_request(
             f"cannot reach omnirun daemon at {host}:{port} "
             "(is it running? start it with `omnirun serve`)"
         ) from e
+    except (TimeoutError, socket.timeout) as e:
+        # The daemon is up but did not answer within the window (a long reconcile
+        # / probe holding the handler). Surface a friendly line, not a traceback.
+        raise ConnectionError(
+            f"omnirun daemon at {host}:{port} did not respond within {timeout:g}s "
+            "(it may be busy — retry, or check `omnirun serve`)"
+        ) from e
     if not buf:
         raise ConnectionError(f"daemon at {host}:{port} closed the connection")
     return json.loads(bytes(buf).decode())

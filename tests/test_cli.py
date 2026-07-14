@@ -1015,3 +1015,40 @@ def test_daemonless_submit_control_built_with_config_budget_caps(env, monkeypatc
     assert control._budget_cap == 7.0
     assert control._week_cap == 40.0
     assert control._budget_window == "day"
+
+
+# ------------------------------------------------------------------ regression: CLI ergonomics
+
+
+def test_version_flag_prints_version(env):
+    """`--version` prints the version and exits 0 (M-10: was 'No such option')."""
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert "omnirun" in result.output
+    import omnirun
+
+    assert omnirun.__version__ in result.output
+
+
+def test_list_is_an_alias_for_ps(env):
+    """`omnirun list` works as an alias of `ps` (M-11: was 'No such command')."""
+    job_id = submit_one()
+    result = runner.invoke(app, ["list"])
+    assert result.exit_code == 0, result.output
+    assert job_id in result.output
+
+
+def test_queue_daemon_timeout_is_friendly_not_traceback(env, monkeypatch):
+    """A daemon that accepts the connection but never answers must yield a red
+    one-liner, never a raw traceback (M-6). `send_request` converts the socket
+    timeout to a ConnectionError, which `friendly_errors` renders."""
+    monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
+
+    def _raise(*a, **k):
+        raise ConnectionError("omnirun daemon at 127.0.0.1:9 did not respond")
+
+    monkeypatch.setattr("omnirun.cli.send_request", _raise)
+    result = runner.invoke(app, ["queue"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "did not respond" in result.output
