@@ -555,6 +555,8 @@ def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
     assert result.exit_code == 0, result.output
     # --force skips the graceful window entirely: only a FORCE cancel is issued.
     assert modes == [CancelMode.FORCE]
+    # No graceful wait, so no "waiting…" heads-up line.
+    assert "graceful shutdown" not in result.output
 
 
 def test_cli_cancel_default_is_graceful(env, monkeypatch):
@@ -569,6 +571,8 @@ def test_cli_cancel_default_is_graceful(env, monkeypatch):
     assert result.exit_code == 0, result.output
     # Graceful-first: a GRACEFUL cancel is issued before any force escalation.
     assert modes[0] is CancelMode.GRACEFUL
+    # The graceful wait is announced so cancel is never silent while it blocks.
+    assert "graceful shutdown" in result.output
 
 
 def test_pull_outputs(env, tmp_path):

@@ -237,6 +237,10 @@ def test_capacity_error_learns_cap(tmp_path: Path) -> None:
         assert facts.available == 0
         assert facts.max_parallel == 1  # the one still-live 'busy' job
         assert facts.capacity_at == T0
+        # The defer is surfaced (never silent): a read command shows why the job
+        # is still QUEUED rather than leaving it a mystery.
+        events = control.take_events()
+        assert any("e2e-000001" in e and "at capacity" in e for e in events), events
     finally:
         store.close()
 

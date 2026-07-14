@@ -862,6 +862,14 @@ def cancel(
         )
     # One machine: Control.cancel reaps the placement (graceful→force→gc) and
     # marks the job CANCELLED — the same path the daemon uses.
+    if not force:
+        # The graceful path polls the backend until the job stops (up to the
+        # per-backend grace window), so warn before the wait — otherwise cancel
+        # can block for tens of seconds with no output.
+        console.print(
+            f"[dim]asking {rec.spec.job_id} to stop; "
+            f"waiting for graceful shutdown…[/dim]"
+        )
     _control(cfg, store, rec.placement.provider_name if rec.placement else None).cancel(
         rec.spec.job_id, datetime.now(timezone.utc), force=force
     )

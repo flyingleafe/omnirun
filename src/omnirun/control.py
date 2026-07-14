@@ -513,6 +513,14 @@ class Control:
             # jobs when LEARN-CAP reads the backend's true ceiling.
             self._release(decision.job_id, rec, count=False)
             self._learn_cap(slot.provider_name, now)
+            # Surface the defer so the backoff is never silent: a read command
+            # otherwise shows the job stuck QUEUED with no visible reason.
+            facts = self._store.load_facts(slot.provider_name)
+            backoff = facts.capacity_ttl_s if facts is not None else 0.0
+            self._tick_events.append(
+                f"deferred {decision.job_id}: {slot.provider_name} at capacity; "
+                f"backing off {backoff:.0f}s before retry"
+            )
             return
         except Exception:
             # Backend submit failed: release the reservation so a later tick can
