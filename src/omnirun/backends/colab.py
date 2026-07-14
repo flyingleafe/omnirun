@@ -36,6 +36,7 @@ from omnirun.backends import jobdir, tarsafe
 from omnirun.backends.base import (
     Backend,
     BackendError,
+    CapacityError,
     ProvisioningSink,
     SSHEndpoint,
     register,
@@ -308,6 +309,15 @@ class ColabBackend(Backend):
             raise BackendError(f"colab {args[0]} timed out after {timeout:.0f}s") from e
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
+            # Colab caps concurrent sessions (free tier ≈ 1). `colab new` then
+            # fails the assign with a 412 / TooManyAssignments — capacity, not a
+            # defect: surface it concisely as CapacityError so the scheduler defers
+            # and retries instead of dumping a traceback and failing the job.
+            if "TooManyAssignments" in err or "Precondition Failed" in err:
+                raise CapacityError(
+                    "Colab is at its concurrent-session limit (free tier allows ~1); "
+                    "stop an existing session or wait — the job will place on a later tick"
+                )
             raise BackendError(
                 f"colab {' '.join(args)} failed (rc={proc.returncode}): {err[:500]}"
             )

@@ -288,6 +288,27 @@ def test_place_submits_and_returns_placement(store: Store) -> None:
     assert backend.status_calls == []  # place() must not call status()
 
 
+def test_place_translates_backend_capacity_error_to_seam(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend at capacity (Colab's session cap) raises the backend-level
+    CapacityError; the adapter must re-raise the SEAM CapacityError so the pure
+    scheduler — which never imports backends — can catch it and defer."""
+    from omnirun.backends.base import CapacityError as BackendCapacityError
+    from omnirun.providers.base import CapacityError as SeamCapacityError
+
+    provider, backend = _provider(store)
+    slot = provider.offer(ResourceSpec())[0]
+
+    def _at_capacity(spec, offer, on_provisioning=None):
+        raise BackendCapacityError("colab at its concurrent-session limit")
+
+    monkeypatch.setattr(backend, "submit", _at_capacity)
+
+    with pytest.raises(SeamCapacityError, match="concurrent-session"):
+        provider.place(_record("j1"), slot)
+
+
 def test_place_lifts_url_handle_keys_into_links(store: Store) -> None:
     provider, backend = _provider(store)
     slot = provider.offer(ResourceSpec())[0]

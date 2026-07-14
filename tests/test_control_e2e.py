@@ -35,7 +35,7 @@ from omnirun.models import (
     Slot,
 )
 from omnirun.state.store import open_store
-from tests.fakes import FakeProvider
+from tests.fakes import FakeProvider, FlakyProvider
 
 UTC = timezone.utc
 T0 = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
@@ -144,6 +144,37 @@ def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:
         assert final.placement.ended_at == T2  # unchanged
         # Terminal job is not reconciled again — no further poll.
         assert provider.poll_calls == polls_before
+    finally:
+        store.close()
+
+
+def test_capacity_defer_requeues_without_counting_an_attempt(tmp_path: Path) -> None:
+    """A provider with no room right now raises CapacityError (Colab's session
+    cap). The job must stay QUEUED and retry on later ticks, and NEVER bump
+    ``attempts`` or fail — a wait for a slot is not a failed placement."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        spec = _spec()
+        provider = FlakyProvider("free", [_free_slot()], mode="capacity")
+        control = Control(store, {"free": provider})
+        job_id = control.submit(spec, now=T0)
+
+        # tick T0: place attempted → CapacityError → deferred back to QUEUED.
+        control.run_tick(T0)
+        rec = store.load_job(job_id)
+        assert rec is not None
+        assert rec.state is JobState.QUEUED
+        assert rec.placement is None
+        assert rec.attempts == 0  # a capacity defer is NOT a failed attempt
+        assert provider.place_calls == [job_id]  # it really tried
+
+        # tick T1: still no room → tries again, still QUEUED, attempts still 0.
+        control.run_tick(T1)
+        rec2 = store.load_job(job_id)
+        assert rec2 is not None
+        assert rec2.state is JobState.QUEUED
+        assert rec2.attempts == 0
+        assert provider.place_calls == [job_id, job_id]  # retried, never gave up
     finally:
         store.close()
 

@@ -34,6 +34,13 @@ class BackendError(RuntimeError):
     """Raised for backend-level failures with a user-actionable message."""
 
 
+class CapacityError(BackendError):
+    """Raised by ``submit`` when the backend has no room to place a job *right
+    now* — a concurrent-session / quota cap (e.g. Colab's free-tier one-session
+    limit), not a defect. It is transient and expected: the caller should release
+    the reservation and retry on a later tick rather than fail the job."""
+
+
 @dataclass
 class SSHEndpoint:
     """SSH connection parameters for ``omnirun ssh <job>``.

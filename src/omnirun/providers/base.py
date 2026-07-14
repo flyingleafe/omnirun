@@ -29,6 +29,13 @@ from omnirun.models import (
 )
 
 
+class CapacityError(RuntimeError):
+    """``place`` raises this when the provider has no room to run the job *right
+    now* (a concurrent-session / quota cap, not a defect). It is transient and
+    expected: the scheduler releases the reservation and retries on a later tick,
+    logging it quietly — no traceback, the job is not failed."""
+
+
 class Provider(Protocol):
     """Runtime execution target the pure scheduler drives.
 
@@ -47,7 +54,12 @@ class Provider(Protocol):
         ...
 
     def place(self, rec: JobRecord, slot: Slot) -> Placement:
-        """Run *rec* on *slot* and return the resulting ``Placement``."""
+        """Run *rec* on *slot* and return the resulting ``Placement``.
+
+        Raises ``CapacityError`` when the provider turns out to have no room right
+        now (a cap that ``offer`` could not foresee); the scheduler defers and
+        retries. Any other exception is treated as a genuine placement fault.
+        """
         ...
 
     def poll(self, p: Placement) -> Status:

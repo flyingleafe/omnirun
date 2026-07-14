@@ -42,7 +42,7 @@ from omnirun.models import (
     Slot,
     Status,
 )
-from omnirun.providers import BackendProvider, CancelMode, Provider
+from omnirun.providers import BackendProvider, CancelMode, CapacityError, Provider
 from omnirun.queue import QueueEntry, QueueState
 from omnirun.state import Store, default_store_dir, open_store
 
@@ -535,6 +535,12 @@ class _RecordingProvider:
     def place(self, rec: JobRecord, slot: Slot) -> Placement:
         try:
             placement = self._inner.place(rec, slot)
+        except CapacityError:
+            # A capacity defer is not a place failure — don't record it as a queue
+            # error. Recording it would satisfy the terminalize gate (attempts cap
+            # + a recorded error) and FAIL a job that is merely waiting for a slot.
+            self._errors.pop(rec.spec.job_id, None)
+            raise
         except Exception as e:
             self._errors[rec.spec.job_id] = str(e)
             raise

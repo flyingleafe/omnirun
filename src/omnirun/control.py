@@ -44,7 +44,7 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.providers.base import CancelMode, Provider
+from omnirun.providers.base import CancelMode, CapacityError, Provider
 from omnirun.scheduler import SchedPolicy, tick
 from omnirun.state.store import Store
 
@@ -400,6 +400,19 @@ class Control:
             return
         try:
             placement = provider.place(rec, slot)
+        except CapacityError as e:
+            # Provider had no room right now (a cap `offer` could not foresee, e.g.
+            # Colab's concurrent-session limit). Expected and transient — release
+            # the reservation and retry next tick, logged as one quiet line (no
+            # traceback, job not failed).
+            _log.info(
+                "deferring job %s: %s has no capacity now (%s); will retry next tick",
+                decision.job_id,
+                slot.provider_name,
+                e,
+            )
+            self._release(decision.job_id, rec, count=False)
+            return
         except Exception:
             # Backend submit failed: release the reservation so a later tick can
             # retry (spec §7b — misbehaving provider degraded, tick not crashed).
@@ -421,14 +434,19 @@ class Control:
             )
         )
 
-    def _release(self, job_id: str, fallback: JobRecord) -> None:
-        """Release a reservation: PLACING→QUEUED (``attempts+1``, no placement)."""
+    def _release(self, job_id: str, fallback: JobRecord, *, count: bool = True) -> None:
+        """Release a reservation: PLACING→QUEUED (no placement).
+
+        ``count`` bumps ``attempts`` (a genuine failed placement). A capacity
+        defer passes ``count=False``: the job did not fail to place, it is just
+        waiting for a slot, so it must not creep toward the attempts cap.
+        """
         rec = self._store.load_job(job_id) or fallback
         self._store.save_job(
             rec.model_copy(
                 update={
                     "state": JobState.QUEUED,
-                    "attempts": rec.attempts + 1,
+                    "attempts": rec.attempts + (1 if count else 0),
                     "placement": None,
                 }
             )

@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from omnirun.backends.base import Backend, ProvisioningSink
+from omnirun.backends.base import Backend, CapacityError, ProvisioningSink
 from omnirun.models import (
     Availability,
     Capabilities,
@@ -46,6 +46,7 @@ from omnirun.models import (
     Status,
 )
 from omnirun.providers.base import CancelMode
+from omnirun.providers.base import CapacityError as SeamCapacityError
 from omnirun.state.store import Store
 
 _sleep = time.sleep  # test seam
@@ -153,9 +154,14 @@ class BackendProvider:
         reconcile poll.  STARTING never triggers a requeue.
         """
         offer = Offer.model_validate(slot.provider_ref["offer"])
-        handle = self._backend.submit(
-            rec.spec, offer, on_provisioning=self._persist_partial(rec)
-        )
+        try:
+            handle = self._backend.submit(
+                rec.spec, offer, on_provisioning=self._persist_partial(rec)
+            )
+        except CapacityError as e:
+            # Backend was at capacity (e.g. Colab's concurrent-session cap). Re-raise
+            # as the seam's transient signal so the scheduler defers quietly.
+            raise SeamCapacityError(str(e)) from e
         links: list[Link] = []
         for key, value in handle.data.items():
             if isinstance(value, str) and any(

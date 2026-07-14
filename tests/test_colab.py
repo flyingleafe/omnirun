@@ -92,6 +92,21 @@ def beacon(**kw) -> tuple[int, str, str]:
     return (0, "OMNIRUN_STATUS " + json.dumps(blob) + "\n", "")
 
 
+def test_colab_new_at_session_cap_raises_capacity_error(cli, backend) -> None:
+    """Colab's concurrent-session cap surfaces as `colab new` failing the assign
+    with 412 / TooManyAssignments. `_colab` must raise CapacityError (transient →
+    the scheduler defers and retries), never a generic BackendError dumping the
+    whole colab-cli traceback."""
+    cli.handlers["new"] = lambda argv, stdin: (
+        1,
+        "",
+        "TooManyAssignmentsError: Failed to issue request POST .../assign: "
+        "Precondition Failed",
+    )
+    with pytest.raises(colab_mod.CapacityError):
+        backend._colab("new", "-s", "omnirun-x")
+
+
 @pytest.fixture
 def cli(monkeypatch) -> FakeColabCLI:
     fake = FakeColabCLI()

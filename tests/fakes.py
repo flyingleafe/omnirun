@@ -31,7 +31,7 @@ from omnirun.models import (
     Slot,
     Status,
 )
-from omnirun.providers.base import CancelMode
+from omnirun.providers.base import CancelMode, CapacityError
 
 
 class FakeProvider:
@@ -141,6 +141,9 @@ class FlakyProvider(FakeProvider):
       failed → the driver must release the reservation back to QUEUED).
     * ``"timeout"`` — ``place`` raises ``TimeoutError`` (a submit that hangs;
       same release-and-retry contract as ``raise_on_place``).
+    * ``"capacity"`` — ``place`` raises ``CapacityError`` (no room right now, e.g.
+      Colab's session cap): a transient defer, NOT a failed attempt — the driver
+      must re-queue without bumping ``attempts`` or ever terminalizing the job.
     * ``"drop"`` — ``place`` succeeds but ``poll`` never leaves RUNNING (the job
       is dropped/stuck; it must not spuriously terminate).
     * ``"lose_after_place"`` — ``place`` succeeds, then ``poll`` returns LOST
@@ -168,6 +171,9 @@ class FlakyProvider(FakeProvider):
         if self._mode == "timeout":
             self.place_calls.append(job_id)
             raise TimeoutError(f"flaky place timed out for {job_id}")
+        if self._mode == "capacity":
+            self.place_calls.append(job_id)
+            raise CapacityError(f"no capacity for {job_id} right now")
         placement = super().place(rec, slot)
         if self._mode == "garble":
             placement = placement.model_copy(
