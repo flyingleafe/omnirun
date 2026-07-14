@@ -241,6 +241,45 @@ def test_capacity_error_learns_cap(tmp_path: Path) -> None:
         store.close()
 
 
+def test_reconcile_reaps_lost_session_before_requeue(tmp_path: Path) -> None:
+    """A RUNNING job whose poll returns LOST must have its abandoned placement
+    REAPED (force-cancel + gc, freeing the leaked session/instance) BEFORE being
+    requeued — so a dangling Colab session cannot keep eating the concurrent-
+    session cap, and a maybe-alive worker cannot double-run alongside the retry.
+    No slot is offered, so the requeued job stays QUEUED (isolates the reap)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "free", slots=[], poll_script={"lost-000001": [JobStatus.LOST]}
+        )
+        control = Control(store, {"free": provider})
+        store.save_job(
+            JobRecord(
+                spec=_spec("lost-000001"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="free",
+                    job_id="lost-000001",
+                    handle={"id": "lost-000001"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.run_tick(T0)
+
+        after = store.load_job("lost-000001")
+        assert after is not None
+        assert after.state is JobState.QUEUED
+        assert after.attempts == 1
+        assert after.placement is None
+        # The lost placement was reaped (force) before requeue.
+        assert provider.cancel_calls == [("lost-000001", CancelMode.FORCE)]
+    finally:
+        store.close()
+
+
 def test_submit_persists_queued_record(tmp_path: Path) -> None:
     """``submit`` alone persists a QUEUED record with the submitted timestamp."""
     store = open_store(f"sqlite:///{tmp_path / 'state.db'}")

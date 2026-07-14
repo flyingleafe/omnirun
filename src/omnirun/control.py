@@ -278,6 +278,11 @@ class Control:
             return
 
         if status.state is JobStatus.LOST:
+            # The placement is abandoned. Reap it FIRST (free the leaked session /
+            # instance and prevent a maybe-alive worker double-running alongside
+            # the retry), THEN requeue. poll already tried the durable result read
+            # (result.json wins over LOST), so nothing recoverable is discarded.
+            self._reap(placement)
             self._requeue(rec, now)
             return
 
@@ -296,6 +301,26 @@ class Control:
         self._store.save_job(
             rec.model_copy(update={"state": JobState.RUNNING, "placement": updated})
         )
+
+    def _reap(self, placement: Placement) -> None:
+        """Tear down an abandoned placement (force-cancel + gc) — best-effort.
+
+        Frees the leaked worker resource (a dangling Colab session, a billed
+        marketplace instance) the moment a job stops needing its placement, so it
+        cannot keep consuming the provider's capacity. Per-job safe on every
+        backend: ``gc`` removes only the job dir, never the shared worktree/venv."""
+        provider = self._providers.get(placement.provider_name)
+        if provider is None:
+            return
+        try:
+            provider.cancel(placement, CancelMode.FORCE)
+        except Exception:
+            _log.warning(
+                "reap of lost placement %s on %s raised; continuing",
+                placement.job_id,
+                placement.provider_name,
+                exc_info=True,
+            )
 
     def _requeue(self, rec: JobRecord, now: datetime) -> None:
         """Return a lost/failed-to-poll job to QUEUED (``attempts+1``, no placement)."""
