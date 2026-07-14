@@ -727,7 +727,16 @@ class KaggleBackend(Backend):
 
         report: StatusReport
         if "cancel" in s:
-            report = StatusReport(status=JobStatus.CANCELLED, detail=str(raw))
+            # A cancelled kernel that ALREADY finished (wrote result.json before
+            # the reap) must report its true verdict — the durable result wins
+            # over the transient cancel status (spec: recover-before-requeue).
+            # Kaggle reaps a completed kernel's session, so a successful run whose
+            # slot was reclaimed would otherwise mis-report as CANCELLED. Only a
+            # kernel with NO durable result (cancelled mid-run) is truly CANCELLED.
+            durable = self._try_durable_result(api, ref)
+            report = durable or StatusReport(
+                status=JobStatus.CANCELLED, detail=str(raw)
+            )
         elif "error" in s:
             report = StatusReport(status=JobStatus.FAILED, detail=str(fail_msg or raw))
         elif "complete" in s:
@@ -745,22 +754,40 @@ class KaggleBackend(Backend):
         return report
 
     def _result_from_output(self, api: Any, kernel_ref: str) -> StatusReport:
-        """Kernel completed; the real verdict lives in result.json inside the tar."""
+        """Kernel completed; the real verdict lives in result.json inside the tar.
+
+        Used by the ``complete`` status branch: a completed kernel with NO durable
+        result means the harness/bootstrap crashed before writing it → FAILED.
+        """
+        durable = self._try_durable_result(api, ref=kernel_ref)
+        if durable is not None:
+            return durable
+        return StatusReport(
+            status=JobStatus.FAILED,
+            detail=f"kernel completed without a usable {RESULT_TAR}/result.json "
+            "(harness or bootstrap crashed before writing results)",
+        )
+
+    def _try_durable_result(self, api: Any, ref: str) -> StatusReport | None:
+        """Read the durable ``result.json`` verdict from the kernel's output tar.
+
+        Returns the terminal ``StatusReport`` (SUCCEEDED/FAILED per ``exit_code``,
+        or FAILED for a corrupt result) when a result.json is present; a LOST
+        report when the output DOWNLOAD fails transiently (retry); and ``None``
+        when the download succeeds but there is genuinely no durable result yet
+        (no tar / no result.json) — so the caller can decide the fallback
+        (CANCELLED for a cancelled kernel, FAILED for a 'complete' one)."""
         with tempfile.TemporaryDirectory(prefix="omnirun-kaggle-out-") as td:
             try:
-                api.kernels_output(kernel_ref, path=td)
+                api.kernels_output(ref, path=td)
             except Exception as e:
                 return StatusReport(
                     status=JobStatus.LOST,
-                    detail=f"kernel complete but output download failed: {e}",
+                    detail=f"kernel output download failed: {e}",
                 )
             tar = Path(td) / RESULT_TAR
             if not tar.exists():
-                return StatusReport(
-                    status=JobStatus.FAILED,
-                    detail=f"kernel completed without {RESULT_TAR} "
-                    "(harness or bootstrap crashed before writing results)",
-                )
+                return None
             try:
                 with tarfile.open(tar) as tf:
                     member = tf.extractfile("result.json")
@@ -768,10 +795,7 @@ class KaggleBackend(Backend):
             except (tarfile.TarError, KeyError, OSError):
                 result_raw = ""
             if not result_raw:
-                return StatusReport(
-                    status=JobStatus.FAILED,
-                    detail="kernel completed but result.json missing from output tar",
-                )
+                return None
             try:
                 res = json.loads(result_raw)
             except json.JSONDecodeError:

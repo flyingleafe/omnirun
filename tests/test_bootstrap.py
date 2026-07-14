@@ -417,3 +417,20 @@ def test_bore_snippet_has_ssh_keygen_A_before_sshd(job_spec: JobSpec) -> None:
     assert keygen_idx is not None, "ssh-keygen -A not found in script"
     assert sshd_idx is not None, "/usr/sbin/sshd not found in script"
     assert keygen_idx < sshd_idx, "ssh-keygen -A must appear before /usr/sbin/sshd"
+
+
+def test_bootstrap_tears_down_tunnel_on_exit(job_spec: JobSpec) -> None:
+    """LIVE-FOUND (kaggle): the ssh-everywhere sshd+bore tunnel runs in the
+    background; if it outlives the job the platform cancels the kernel on exit
+    (Kaggle → CANCEL_ACKNOWLEDGED, output tar discarded). The generated bootstrap
+    must tear the tunnel down in its EXIT trap so the kernel ends clean."""
+    script = generate_bootstrap(job_spec)
+    # The tunnel launch records its pid so the trap can kill it.
+    assert "/tmp/omnirun-bore.pid" in script
+    # The teardown fn kills bore + sshd and is wired into the EXIT trap.
+    assert "_omnirun_tunnel_down" in script
+    assert "pkill -f /tmp/omnirun-sshd.conf" in script
+    trap_line = next(
+        ln for ln in script.splitlines() if ln.startswith("trap ") and "EXIT" in ln
+    )
+    assert "_omnirun_tunnel_down" in trap_line

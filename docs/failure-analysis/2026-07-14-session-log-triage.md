@@ -57,6 +57,32 @@ goes in `tests/live/`, verified in Phase C).
 | FM-12 | colab `--time ≥ 12h` blocked, undocumented | colab | UNIT | surface the cap in `backends`/message. |
 | FM-14 | offers table truncates the rejection reason | cli | UNIT | don't truncate the notes/reason column (or `--verbose`). |
 
+## Live-run findings (Phase C, 2026-07-14)
+
+Driving titanic on **Kaggle CPU** end-to-end surfaced a real, reproducible defect
+(matches FM-6 / M-4):
+
+- **Kaggle cancels the batch session at script completion and discards
+  `/kaggle/working`.** The kernel runs to completion (exit 0, nbconvert emits
+  `__results__.html`), yet `kernels_status` reports `CANCEL_ACKNOWLEDGED` and
+  `kernels_output` returns only the notebook `.log` — the `omnirun-job.tar.gz`
+  result tar is gone. Verified with THREE runs, including one monitored **only**
+  via the raw Kaggle API (no omnirun tick), which still cancelled → the cause is
+  Kaggle-side, not omnirun's reconcile. Predates this session's changes (the very
+  first run cancelled identically).
+- **Fixes landed** (correct hardening, don't fully solve the platform quirk):
+  1. `kaggle.status`: the durable `result.json` verdict now WINS over a transient
+     `cancel` status (`_try_durable_result`) — so a completed-then-reaped kernel
+     whose tar DOES survive reports SUCCEEDED/FAILED, never CANCELLED.
+  2. `bootstrap`: the ssh-everywhere sshd+bore tunnel is now torn down in the
+     EXIT trap so the kernel process tree ends clean (a lingering tunnel is one
+     way a platform cancels a session).
+- **Remaining (deferred):** when Kaggle destroys `/kaggle/working` on cancel, the
+  durable result is unrecoverable via the API. The robust fix is to pull results
+  over the ssh tunnel omnirun already opens (or push to a durable sink) BEFORE the
+  session dies. Tracked as a follow-up; the live proof pivots to Colab/Vast where
+  the full submit→monitor→pull loop works cleanly.
+
 ## Phase-B plan
 
 Fix + regression-test the **UNIT** rows now (CLI ergonomics, error handling,

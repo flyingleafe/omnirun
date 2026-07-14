@@ -145,6 +145,7 @@ SSHD_EOF
       ${{OMNIRUN_BORE_SECRET:+--secret "${{OMNIRUN_BORE_SECRET}}"}} \\
       --port "${{OMNIRUN_BORE_PORT}}" \\
       > /tmp/omnirun-bore.log 2>&1 &
+    echo $! > /tmp/omnirun-bore.pid  # so the exit trap can tear the tunnel down
     # --- wait up to 30s for bore to announce the assigned port ---
     _bore_line=""
     for _i in $(seq 1 30); do
@@ -483,10 +484,21 @@ set +a
 {pre_run}
 
 {_bore_tunnel_block()}\
+# ---- tunnel teardown ----------------------------------------------------------
+# The ssh-everywhere sshd + bore tunnel run in the BACKGROUND and would outlive
+# the job, keeping the notebook session "active" — so the platform cancels the
+# kernel on exit (Kaggle marks it CANCEL_ACKNOWLEDGED and DISCARDS the output
+# tar, losing results). Tear them down on EXIT so the kernel ends cleanly as
+# complete. A no-op when ssh-everywhere is disabled (no pidfile / no match).
+_omnirun_tunnel_down() {{
+  [ -f /tmp/omnirun-bore.pid ] && kill "$(cat /tmp/omnirun-bore.pid)" 2>/dev/null
+  pkill -f /tmp/omnirun-sshd.conf 2>/dev/null
+  return 0
+}}
 # ---- heartbeat ----------------------------------------------------------------
 ( while true; do now > "$JOB_DIR/heartbeat"; sleep {HEARTBEAT_INTERVAL_S}; done ) &
 HB_PID=$!
-trap 'kill "$HB_PID" 2>/dev/null' EXIT
+trap 'kill "$HB_PID" 2>/dev/null; _omnirun_tunnel_down' EXIT
 
 # ---- run -----------------------------------------------------------------------
 status running

@@ -522,6 +522,35 @@ def test_status_terminal_results_are_cached(fake_api, backend):
     assert backend.status(handle).status == JobStatus.SUCCEEDED
 
 
+def test_status_cancelled_but_completed_reports_true_verdict(fake_api, backend):
+    """LIVE-FOUND: a kernel that FINISHED (wrote result.json, exit 0) and then had
+    its session reaped shows Kaggle status CANCEL_ACKNOWLEDGED. The durable result
+    must win — the job succeeded, so status is SUCCEEDED, never CANCELLED."""
+    fake_api.status_value = "CANCEL_ACKNOWLEDGED"
+    fake_api.output_files = {"omnirun-job.tar.gz": make_result_tar(0)}
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.SUCCEEDED
+    assert report.exit_code == 0
+
+
+def test_status_cancelled_completed_with_failure_reports_failed(fake_api, backend):
+    """A cancelled-after-completion kernel whose result.json is a nonzero exit is
+    FAILED (the true verdict), not CANCELLED."""
+    fake_api.status_value = "CANCEL_ACKNOWLEDGED"
+    fake_api.output_files = {"omnirun-job.tar.gz": make_result_tar(3)}
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.FAILED
+    assert report.exit_code == 3
+
+
+def test_status_cancelled_before_completion_is_cancelled(fake_api, backend):
+    """A kernel cancelled MID-RUN (no durable result.json) is genuinely CANCELLED."""
+    fake_api.status_value = "CANCEL_ACKNOWLEDGED"
+    fake_api.output_files = {}  # no output tar → no durable result
+    report = backend.status(make_handle())
+    assert report.status == JobStatus.CANCELLED
+
+
 # ---- outputs / cancel ----------------------------------------------------------
 
 
