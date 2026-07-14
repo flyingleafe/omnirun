@@ -87,6 +87,15 @@ class Backend(ABC):
     #: registry type name, set by @register
     type_name: str = ""
 
+    #: Whether a ``LOST`` poll for this backend means "a reclaimable resource is
+    #: still allocated, and reaping a possibly-still-alive one is acceptable" — so
+    #: the reconciler may force-reap the placement before requeue. TRUE only for
+    #: backends whose LOST is a confirmed gone/idle *session* worth reclaiming
+    #: (notebooks: a dangling Colab VM eats the concurrent-session cap). FALSE for
+    #: transport-based backends (ssh/slurm/local), where LOST is often just a
+    #: momentary unreachable poll and reaping would force-kill a live job.
+    reap_lost_placements: bool = False
+
     def __init__(self, name: str, config: "BackendConfig") -> None:
         self.name = name  # config key, e.g. "uni"
         self.config = config

@@ -73,6 +73,11 @@ class BackendProvider:
         self.name = backend.name
         self._backend = backend
         self._store = store
+        # Surface the backend's reap-on-lost policy to the seam so the reconciler
+        # only force-reaps a lost placement where LOST means a reclaimable session
+        # (notebooks), never on a transport-blip LOST (ssh/slurm) that would kill
+        # a live job.
+        self.reap_lost = backend.reap_lost_placements
         # Per-backend override wins over the constructor default when configured.
         self._cancel_grace_s = float(
             backend.config.extra("cancel_grace_s", cancel_grace_s)

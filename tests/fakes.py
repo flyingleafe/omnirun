@@ -75,6 +75,9 @@ class FakeProvider:
         self.collect_calls: list[tuple[str, Path]] = []
         self.gc_calls: int = 0
         self.discover_calls: int = 0
+        # Reap-on-lost policy the reconciler reads (real backends set this per
+        # type: notebooks True, transport backends False). Tests flip it on.
+        self.reap_lost: bool = False
 
     # -- Provider protocol ------------------------------------------------
 

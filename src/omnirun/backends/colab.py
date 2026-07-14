@@ -283,6 +283,12 @@ def _marker_line(output: str, marker: str) -> str | None:
 
 @register("colab")
 class ColabBackend(Backend):
+    # A Colab LOST is a confirmed gone/idle session (3 status-exec retries, then
+    # a heartbeat-stale or session-terminated verdict). The session is a real VM
+    # holding the concurrent-session cap, so reaping it on LOST reclaims capacity
+    # fast (and a stop on an already-gone session is a harmless no-op).
+    reap_lost_placements = True
+
     def __init__(self, name: str, config: Any) -> None:
         super().__init__(name, config)
         self._terminal: dict[str, StatusReport] = {}

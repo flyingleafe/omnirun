@@ -18,6 +18,7 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.cli import app
+from omnirun.config import BackendConfig
 from omnirun.models import (
     CancelMode,
     Capabilities as _Capabilities,
@@ -52,6 +53,12 @@ class StubBackend(Backend):
 
     submitted: ClassVar[dict[str, tuple[JobSpec, Offer]]] = {}
     cancelled: ClassVar[list[str]] = []
+
+    def __init__(self, name: str, config: BackendConfig) -> None:
+        super().__init__(name, config)
+        # Opt-in per test config: stands in for a notebook backend where a LOST
+        # session is a reclaimable leak the reconciler should force-reap.
+        self.reap_lost_placements = bool(config.extra("reap_lost", False))
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
         return [
@@ -613,7 +620,9 @@ def test_ps_surfaces_reaped_lost_session(env):
     reclaim so a capacity leak being cleaned up is visible (never silent)."""
     job_id = submit_one()  # RUNNING on the stub
     env.config_file.write_text(
-        BASE_CONFIG.replace('type = "stub"', 'type = "stub"\nlost = true')
+        BASE_CONFIG.replace(
+            'type = "stub"', 'type = "stub"\nlost = true\nreap_lost = true'
+        )
     )
     result = runner.invoke(app, ["ps"])
     assert result.exit_code == 0, result.output

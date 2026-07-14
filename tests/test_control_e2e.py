@@ -252,6 +252,9 @@ def test_reconcile_reaps_lost_session_before_requeue(tmp_path: Path) -> None:
         provider = FakeProvider(
             "free", slots=[], poll_script={"lost-000001": [JobStatus.LOST]}
         )
+        provider.reap_lost = (
+            True  # a notebook-style backend: LOST session is reclaimable
+        )
         control = Control(store, {"free": provider})
         store.save_job(
             JobRecord(

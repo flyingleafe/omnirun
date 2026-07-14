@@ -291,11 +291,21 @@ class Control:
             return
 
         if status.state is JobStatus.LOST:
-            # The placement is abandoned. Reap it FIRST (free the leaked session /
-            # instance and prevent a maybe-alive worker double-running alongside
-            # the retry), THEN requeue. poll already tried the durable result read
-            # (result.json wins over LOST), so nothing recoverable is discarded.
-            self._reap(placement)
+            # A LOST placement is requeued for retry (attempts+1) — the state
+            # machine's contract (see the `lose_after_place` invariant). Whether we
+            # also force-reap the old placement first depends on the backend:
+            #   * reap_lost=True (notebooks): a LOST is a confirmed-gone/idle session
+            #     still holding the concurrent cap, so force-cancel + gc it before
+            #     retrying — reclaims the leaked slot and prevents a double-run.
+            #   * reap_lost=False (ssh/slurm/local): a LOST is often just a momentary
+            #     unreachable poll of a *live* job. Force-killing it would destroy a
+            #     healthy run, so we only requeue; the retry runs a fresh placement
+            #     and the (rare) transient-blip duplicate is the accepted cost of not
+            #     killing a possibly-alive job.
+            # poll already tried the durable result read (result.json wins over LOST),
+            # so a genuinely finished job never reaches this branch.
+            if getattr(provider, "reap_lost", False):
+                self._reap(placement)
             self._requeue(rec, now)
             return
 
