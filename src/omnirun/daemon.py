@@ -194,6 +194,8 @@ class Daemon:
                 self._control = Control(
                     self._store,
                     self._get_providers(),
+                    budget_cap=self.cfg.budget.daily,
+                    week_cap=self.cfg.budget.weekly,
                 )
             return self._control
 

@@ -17,6 +17,7 @@ from omnirun.backends.base import (
     ProvisioningSink,
     register,
 )
+from omnirun.budget import LedgerEntry as _LedgerEntry
 from omnirun.cli import app
 from omnirun.config import BackendConfig
 from omnirun.models import (
@@ -883,3 +884,134 @@ def test_cli_state_path() -> None:
     result = runner.invoke(app, ["state", "path"])
     assert result.exit_code == 0, result.output
     assert "omnirun.db" in result.output
+
+
+# ------------------------------------------------------------------ budget/policy
+
+
+def test_submit_policy_flags_reach_persisted_spec(env):
+    job_id = submit_one(
+        "--priority", "7", "--max-cost", "3.5", "--finish-by", "+2h", "--time", "30m"
+    )
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    pol = rec.spec.policy
+    assert pol.priority == 7
+    assert pol.max_cost == 3.5
+    assert pol.deadline is not None and pol.deadline.finish_by is not None
+    now = datetime.now(timezone.utc)
+    assert pol.deadline.finish_by > now + timedelta(minutes=110)
+    assert pol.deadline.start_by is None
+
+
+def test_submit_start_by_absolute_iso(env):
+    job_id = submit_one("--start-by", "2999-01-02T03:04:05+00:00")
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.deadline is not None
+    assert rec.spec.policy.deadline.start_by == datetime(
+        2999, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+    )
+
+
+def test_submit_rejects_bad_deadline(env):
+    result = runner.invoke(
+        app, ["submit", "--finish-by", "not-a-date", "--", "python", "x.py"]
+    )
+    assert result.exit_code == 1
+    assert "bad deadline" in result.output
+
+
+def test_reprioritize_changes_priority_and_deadline(env):
+    job_id = submit_one("--priority", "1")
+    result = runner.invoke(
+        app, ["reprioritize", job_id, "--priority", "9", "--finish-by", "+3h"]
+    )
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    assert rec.spec.policy.priority == 9
+    assert rec.spec.policy.deadline is not None
+    assert rec.spec.policy.deadline.finish_by is not None
+
+
+def test_reprioritize_free_only_and_allow_paid_flip_max_cost(env):
+    job_id = submit_one()
+    result = runner.invoke(app, ["reprioritize", job_id, "--free-only"])
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.max_cost == 0.0
+
+    result = runner.invoke(app, ["reprioritize", job_id, "--allow-paid"])
+    assert result.exit_code == 0, result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.spec.policy.max_cost is None
+
+
+def test_reprioritize_terminal_job_errors(env):
+    job_id = submit_one()
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    rec.state = JobState.SUCCEEDED
+    _store().save_job(rec)
+    result = runner.invoke(app, ["reprioritize", job_id, "--priority", "5"])
+    assert result.exit_code == 1
+    assert "finished job" in result.output
+
+
+def test_reprioritize_unknown_job_errors(env):
+    result = runner.invoke(app, ["reprioritize", "nope", "--priority", "5"])
+    assert result.exit_code == 1
+    assert "no job matching" in result.output
+
+
+def test_budget_set_daily_then_show_roundtrips(env):
+    result = runner.invoke(app, ["budget", "--daily", "12.5"])
+    assert result.exit_code == 0, result.output
+    assert "budget updated" in result.output
+    assert _store().get_meta("budget.day") == repr(12.5)
+
+    result = runner.invoke(app, ["budget"])
+    assert result.exit_code == 0, result.output
+    assert "12.5" in result.output
+
+
+def test_budget_show_reads_ledger_spend(env):
+    now = datetime.now(timezone.utc)
+    _store().set_meta("budget.day", repr(20.0))
+    _store().ledger_add(
+        "day",
+        _LedgerEntry(job_id="j1", provider="stub", amount=8.0, kind="spent", at=now),
+    )
+    result = runner.invoke(app, ["budget"])
+    assert result.exit_code == 0, result.output
+    assert "8" in result.output  # spent
+    assert "20" in result.output  # cap
+
+
+def test_daemonless_submit_control_built_with_config_budget_caps(env, monkeypatch):
+    """A ``[budget]`` config with daily+weekly is threaded into the daemonless
+    ``submit`` path's ``Control`` as the day cap AND the weekly cap."""
+    from omnirun.control import Control as _Control
+    from omnirun.providers import Provider as _Provider
+
+    env.config_file.write_text(BASE_CONFIG + "\n[budget]\ndaily = 7.0\nweekly = 40.0\n")
+    built: list[_Control] = []
+
+    class RecordingControl(_Control):
+        def __init__(
+            self,
+            store: Store,
+            providers: dict[str, _Provider],
+            **kwargs: object,
+        ) -> None:
+            super().__init__(store, providers, **kwargs)  # pyright: ignore[reportArgumentType]
+            built.append(self)
+
+    monkeypatch.setattr("omnirun.cli.Control", RecordingControl)
+    result = runner.invoke(app, ["submit", "--", "python", "train.py"])
+    assert result.exit_code == 0, result.output
+    assert built, "submit did not build a Control"
+    control = built[0]
+    assert control._budget_cap == 7.0
+    assert control._week_cap == 40.0
+    assert control._budget_window == "day"

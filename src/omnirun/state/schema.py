@@ -76,4 +76,23 @@ queue = Table(
     Column("data", JSON, nullable=False),
 )
 
-ALL_TABLES = (meta, jobs, wait_samples, facts, queue)
+# Budget ledger (DESIGN §7). Append-only log of committed/spent cost per job,
+# keyed by rolling window ("day"/"week"). ``at`` is ISO-8601. The (window, at)
+# index serves the window-scoped range scan in ``load_ledger``. There is NO
+# ``placements`` table: a job's ``Placement`` lives on the jobs ``data`` blob,
+# and the indexed jobs ``backend``+``state`` columns drive the per-provider
+# active count.
+ledger = Table(
+    "ledger",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("window", Text),
+    Column("job_id", Text),
+    Column("provider", Text),
+    Column("amount", REAL),
+    Column("kind", Text),
+    Column("at", Text),
+    Index("ix_ledger_window_at", "window", "at"),
+)
+
+ALL_TABLES = (meta, jobs, wait_samples, facts, queue, ledger)

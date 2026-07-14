@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from sqlalchemy import inspect, select, text
 
+from omnirun.budget import LedgerEntry
 from omnirun.models import (
     Capabilities,
     Health,
@@ -30,9 +31,9 @@ from omnirun.state.store import Store
 def test_open_store_creates_schema(tmp_path: Path) -> None:
     store = open_store(f"sqlite:///{tmp_path / 't.db'}")
     names = set(inspect(store._engine).get_table_names())
-    assert {"meta", "jobs", "wait_samples", "facts", "queue"} <= names
-    assert store.schema_version() == 4  # STATE_SCHEMA_VERSION
-    assert STATE_SCHEMA_VERSION == 4
+    assert {"meta", "jobs", "wait_samples", "facts", "queue", "ledger"} <= names
+    assert store.schema_version() == 5  # STATE_SCHEMA_VERSION
+    assert STATE_SCHEMA_VERSION == 5
     store.close()
 
 
@@ -596,3 +597,90 @@ def test_reserve_race_single_winner(tmp_path: Path) -> None:
         assert len(queued) == 1
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Budget ledger persistence
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_add_and_load(store: Store) -> None:
+    now = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
+    store.ledger_add(
+        "day",
+        LedgerEntry(job_id="j1", provider="p", amount=2.5, kind="committed", at=now),
+    )
+    led = store.load_ledger("day", cap=10.0, now=now)
+    assert led.window == "day"
+    assert led.cap == 10.0
+    assert len(led.entries) == 1
+    e = led.entries[0]
+    assert e.job_id == "j1"
+    assert e.provider == "p"
+    assert e.amount == 2.5
+    assert e.kind == "committed"
+    assert led.in_window_total(now) == 2.5
+
+
+def test_ledger_realize_committed_to_spent_keeps_window(store: Store) -> None:
+    committed_at = datetime(2026, 7, 11, 8, tzinfo=timezone.utc)
+    later = datetime(2026, 7, 11, 20, tzinfo=timezone.utc)
+    store.ledger_add(
+        "day",
+        LedgerEntry(
+            job_id="j1", provider="p", amount=3.0, kind="committed", at=committed_at
+        ),
+    )
+    store.ledger_realize("day", "j1", actual=2.0, now=later)
+
+    led = store.load_ledger("day", cap=None, now=later)
+    assert len(led.entries) == 1
+    e = led.entries[0]
+    assert e.kind == "spent"
+    assert e.amount == 2.0
+    assert e.at == committed_at  # original window attribution preserved
+
+
+def test_ledger_realize_without_committed_inserts_spent(store: Store) -> None:
+    now = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
+    store.ledger_realize("day", "orphan", actual=1.5, now=now)
+    led = store.load_ledger("day", cap=None, now=now)
+    assert len(led.entries) == 1
+    assert led.entries[0].kind == "spent"
+    assert led.entries[0].amount == 1.5
+
+
+def test_load_ledger_window_filters_out_of_window(store: Store) -> None:
+    now = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
+    in_win = LedgerEntry(
+        job_id="in", provider="p", amount=1.0, kind="committed", at=now
+    )
+    out_win = LedgerEntry(
+        job_id="out",
+        provider="p",
+        amount=9.0,
+        kind="committed",
+        at=now - timedelta(days=2),  # different UTC date
+    )
+    store.ledger_add("day", in_win)
+    store.ledger_add("day", out_win)
+
+    led = store.load_ledger("day", cap=None, now=now)
+    assert [e.job_id for e in led.entries] == ["in"]
+    assert led.in_window_total(now) == 1.0
+
+
+def test_load_ledger_week_window(store: Store) -> None:
+    now = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)  # ISO week 28 of 2026
+    same_week = now - timedelta(days=1)  # still week 28
+    other_week = now - timedelta(days=10)  # earlier ISO week
+    store.ledger_add(
+        "week",
+        LedgerEntry(job_id="a", provider="p", amount=1.0, kind="spent", at=same_week),
+    )
+    store.ledger_add(
+        "week",
+        LedgerEntry(job_id="b", provider="p", amount=5.0, kind="spent", at=other_week),
+    )
+    led = store.load_ledger("week", cap=None, now=now)
+    assert [e.job_id for e in led.entries] == ["a"]
