@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
-from omnirun.backends.base import SSHEndpoint
+import pytest
+
 from omnirun import sshconn
+from omnirun.backends.base import SSHEndpoint
 
 
 def _ep() -> SSHEndpoint:
@@ -95,3 +98,100 @@ def test_endpoint_reachable_false_on_timeout(monkeypatch) -> None:
 
     monkeypatch.setattr(sshconn.subprocess, "run", boom)
     assert sshconn.endpoint_reachable(_ep()) is False
+
+
+# ---- tunnel_logs: the shared notebook `logs` path ------------------------------
+
+
+def _fallback() -> Iterator[str]:
+    yield "FALLBACK"
+
+
+def _capture_over(follows: list[bool]):
+    def over(ep, job_dir, *, follow):
+        follows.append(follow)
+        yield "STREAMED"
+
+    return over
+
+
+def test_tunnel_logs_reachable_streams_over_tunnel(monkeypatch) -> None:
+    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: True)
+    follows: list[bool] = []
+    monkeypatch.setattr(sshconn, "tail_logs_over", _capture_over(follows))
+    out = list(
+        sshconn.tunnel_logs(
+            lambda: _ep(), lambda: False, "/j", follow=True, fallback=_fallback
+        )
+    )
+    assert out == ["STREAMED"]
+    assert follows == [True]  # follow threaded through to the live stream
+
+
+def test_tunnel_logs_no_endpoint_goes_straight_to_fallback(monkeypatch) -> None:
+    """ep is None (bore disabled / job terminal): don't wait for a tunnel that
+    will never come — say the tunnel is unavailable (following) and fall back to
+    final logs immediately. Never the misleading per-backend 'live tail' message."""
+    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: False)
+    monkeypatch.setattr(
+        sshconn.time,
+        "sleep",
+        lambda _s: pytest.fail("must not wait without an endpoint"),
+    )
+    out = list(
+        sshconn.tunnel_logs(
+            lambda: None, lambda: False, "/j", follow=True, fallback=_fallback
+        )
+    )
+    assert out == [
+        "OMNIRUN: worker tunnel unavailable — showing final logs only",
+        "FALLBACK",
+    ]
+    assert not any("live tail unavailable" in ln for ln in out)
+
+
+def test_tunnel_logs_not_following_unreachable_uses_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: False)
+    out = list(
+        sshconn.tunnel_logs(
+            lambda: _ep(), lambda: False, "/j", follow=False, fallback=_fallback
+        )
+    )
+    assert out == ["FALLBACK"]
+
+
+def test_tunnel_logs_follow_waits_then_upgrades_to_stream(monkeypatch) -> None:
+    reach = iter([False, False, True])
+    monkeypatch.setattr(
+        sshconn, "endpoint_reachable", lambda ep, **kw: next(reach, True)
+    )
+    monkeypatch.setattr(sshconn.time, "sleep", lambda _s: None)
+    follows: list[bool] = []
+    monkeypatch.setattr(sshconn, "tail_logs_over", _capture_over(follows))
+    out = list(
+        sshconn.tunnel_logs(
+            lambda: _ep(), lambda: False, "/j", follow=True, fallback=_fallback
+        )
+    )
+    assert "OMNIRUN: worker starting — connecting for a live tail…" in out
+    assert out[-1] == "STREAMED"  # upgraded once the tunnel came up
+    assert "FALLBACK" not in out
+
+
+def test_tunnel_logs_follow_terminal_before_tunnel_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda ep, **kw: False)
+    monkeypatch.setattr(sshconn.time, "sleep", lambda _s: None)
+    terminal = iter([False, True])
+    out = list(
+        sshconn.tunnel_logs(
+            lambda: _ep(),
+            lambda: next(terminal, True),
+            "/j",
+            follow=True,
+            fallback=_fallback,
+        )
+    )
+    assert "OMNIRUN: worker starting — connecting for a live tail…" in out
+    assert "OMNIRUN: worker tunnel unavailable — showing final logs only" in out
+    assert out[-1] == "FALLBACK"
+    assert not any("live tail unavailable" in ln for ln in out)

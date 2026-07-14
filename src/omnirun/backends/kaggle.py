@@ -44,7 +44,7 @@ from omnirun.backends.base import (
 )
 from omnirun.backends import jobdir, tarsafe
 from omnirun.progress import report
-from omnirun.sshconn import endpoint_reachable, exec_for_endpoint
+from omnirun.sshconn import tunnel_logs
 from omnirun.bootstrap import (
     BootstrapParams,
     CodeSource,
@@ -103,10 +103,6 @@ RESULT_TAR = "omnirun-job.tar.gz"
 # is unaffected by this cap. Override per backend with `max_source_bytes`.
 KAGGLE_MAX_SOURCE_BYTES = 1024 * 1024
 LOG_POLL_INTERVAL_S = 30.0  # poll etiquette: >=30s against the kaggle API
-LIVE_TAIL_NOTE = (
-    "OMNIRUN: kaggle exposes run logs only after the kernel completes; "
-    "live tail unavailable mid-run"
-)
 
 
 def _create_bundle(root: Path, sha: str, dest: Path) -> Path:
@@ -815,22 +811,27 @@ class KaggleBackend(Backend):
         return raw
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
-        # Prefer the bore tunnel: drive the worker through the exact same
-        # `SSHExec` + `jobdir.tail_logs` the ssh-family backends use, so a kernel
-        # job's `logs` behaves identically — a live streaming tail that the worker
-        # itself stops at job end (or when the tunnel drops). Fall back to the
-        # kernel-API path (final snapshot only) when the endpoint is absent or not
-        # (yet) connectable, so a slow-to-start kernel never duplicates output.
-        ep = self.ssh_endpoint(handle)
-        if ep is not None and endpoint_reachable(ep):
-            job_dir = f"{KAGGLE_ROOT}/jobs/{handle.job_id}"
-            ex = exec_for_endpoint(ep)
-            yield from jobdir.tail_logs(ex, job_dir, follow=follow)
-            return
+        # One path for every notebook backend (see sshconn.tunnel_logs): stream
+        # live over the bore tunnel, waiting for a slow-to-start kernel's tunnel to
+        # come up — so `logs -f` is a live tail here just like on ssh/slurm. The
+        # kernel-API reader is used only when the tunnel is unavailable, to fetch
+        # the final logs (that API exposes logs only once the kernel completes).
+        yield from tunnel_logs(
+            lambda: self.ssh_endpoint(handle),
+            lambda: self.status(handle).status.terminal,
+            f"{KAGGLE_ROOT}/jobs/{handle.job_id}",
+            follow=follow,
+            fallback=lambda: self._final_logs(handle, follow),
+        )
+
+    def _final_logs(self, handle: JobHandle, follow: bool) -> Iterator[str]:
+        """Best-effort final-log reader over the Kaggle kernel API, used only when
+        the bore tunnel is unavailable (see sshconn.tunnel_logs). The API exposes a
+        kernel's output only once it completes, so mid-run there is nothing to
+        yield — for a followed tail we wait out the run and dump the final log."""
         api = self._api()
         ref = handle.data["kernel_ref"]
         offset = self._log_offsets.get(handle.job_id, 0)
-        noted = False
         while True:
             report = self.status(handle)
             text = self._fetch_log_text(api, ref)
@@ -839,10 +840,6 @@ class KaggleBackend(Backend):
                 offset = len(text)
                 self._log_offsets[handle.job_id] = offset
                 yield from new.splitlines()
-            elif follow and not noted and not report.status.terminal:
-                # Batch API: no mid-run log. Say so once, honestly (issue #4).
-                noted = True
-                yield LIVE_TAIL_NOTE
             if not follow or report.status.terminal:
                 return
             time.sleep(LOG_POLL_INTERVAL_S)

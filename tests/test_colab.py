@@ -433,30 +433,31 @@ def test_logs_incremental_offsets(cli, backend):
 
 
 def test_logs_over_ssh_uses_shared_exec_and_streams(backend, monkeypatch):
-    """With a reachable bore endpoint, colab logs go through the exact same
-    SSHExec + jobdir.tail_logs the ssh-family uses — a single live stream that the
-    worker's own follower ends at job time (not a lingering session, the bug that
-    left `logs -f` hanging)."""
+    """With a reachable bore endpoint, colab logs stream over the shared tunnel
+    path (sshconn.tunnel_logs → tail_logs_over) — identical to the ssh family, and
+    never touching the session-exec fallback."""
+    from omnirun import sshconn
     from omnirun.backends.base import SSHEndpoint
 
     ep = SSHEndpoint(host="t.example.com", port=20001, user="root", key_path=Path("/k"))
     monkeypatch.setattr(backend, "ssh_endpoint", lambda h: ep)
-    monkeypatch.setattr(colab_mod, "endpoint_reachable", lambda e, **kw: True)
-    sentinel_exec = object()
-    monkeypatch.setattr(colab_mod, "exec_for_endpoint", lambda e: sentinel_exec)
+    monkeypatch.setattr(sshconn, "endpoint_reachable", lambda e, **kw: True)
 
     seen: dict[str, object] = {}
 
-    def fake_tail(ex, job_dir, *, follow):
-        seen["ex"] = ex
+    def fake_over(e, job_dir, *, follow):
+        seen["ep"] = e
         seen["job_dir"] = job_dir
         seen["follow"] = follow
         yield "worker line"
 
-    monkeypatch.setattr(colab_mod.jobdir, "tail_logs", fake_tail)
+    monkeypatch.setattr(sshconn, "tail_logs_over", fake_over)
+    monkeypatch.setattr(
+        backend, "_session_exec_logs", lambda *a, **k: iter(("FALLBACK",))
+    )
 
     assert list(backend.logs(make_handle(), follow=True)) == ["worker line"]
-    assert seen["ex"] is sentinel_exec
+    assert seen["ep"] is ep
     assert seen["job_dir"] == JOB_DIR
     assert seen["follow"] is True
 

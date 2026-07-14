@@ -40,7 +40,7 @@ from omnirun.backends.base import (
     SSHEndpoint,
     register,
 )
-from omnirun.sshconn import endpoint_reachable, exec_for_endpoint
+from omnirun.sshconn import tunnel_logs
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
@@ -672,22 +672,26 @@ class ColabBackend(Backend):
     # ---- logs -------------------------------------------------------------------
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
+        # One path for every notebook backend (see sshconn.tunnel_logs): stream
+        # live over the bore tunnel, waiting for a slow-to-provision VM's tunnel to
+        # come up before falling back — so `logs -f` is a live tail here just like
+        # on ssh/slurm. The session-exec reader is used only when not following, or
+        # if the job finishes before its tunnel came up.
+        yield from tunnel_logs(
+            lambda: self.ssh_endpoint(handle),
+            lambda: self.status(handle).status.terminal,
+            handle.data["job_dir"],
+            follow=follow,
+            fallback=lambda: self._session_exec_logs(handle, follow),
+        )
+
+    def _session_exec_logs(self, handle: JobHandle, follow: bool) -> Iterator[str]:
+        """Fallback log reader over the Colab session kernel (`colab exec`), used
+        when the bore tunnel never came up. Reads only bootstrap.log — the
+        canonical merged log (diagnostics + the command's stdout+stderr, which the
+        run step tees back through fd 1/2); also reading stdout/stderr.log would
+        double every command line (those stay on disk for `pull`)."""
         job_dir = handle.data["job_dir"]
-        # Prefer the bore tunnel: drive the worker through the exact same
-        # `SSHExec` + `jobdir.tail_logs` the ssh-family backends use, so a
-        # notebook job's `logs` behaves identically — a live streaming tail that
-        # the worker itself stops at job end (or when the tunnel drops). Fall back
-        # to the session-exec poll below only when the endpoint is absent or not
-        # (yet) connectable, so a slow-to-provision worker never duplicates output.
-        ep = self.ssh_endpoint(handle)
-        if ep is not None and endpoint_reachable(ep):
-            ex = exec_for_endpoint(ep)
-            yield from jobdir.tail_logs(ex, job_dir, follow=follow)
-            return
-        # Read only bootstrap.log — the canonical merged log (diagnostics + the
-        # command's stdout+stderr, which the run step tees back through fd 1/2).
-        # Also reading stdout/stderr.log would double every command line; they
-        # stay on disk for `pull`. Matches jobdir.tail_logs and the Kaggle harness.
         files = [f"{job_dir}/logs/bootstrap.log"]
         offsets = self._log_offsets.setdefault(handle.job_id, dict.fromkeys(files, 0))
         while True:

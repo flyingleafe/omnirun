@@ -22,9 +22,15 @@ Design notes:
 from __future__ import annotations
 
 import subprocess
+import time
+from collections.abc import Callable, Iterator
 
 from omnirun.backends.base import SSHEndpoint
 from omnirun.execlayer.ssh import SSHExec
+
+# How often a followed `logs -f` re-checks whether a slow-to-start worker's
+# tunnel has come up yet. Colab VMs connect in ~20-30s, Kaggle kernels in ~30s.
+TUNNEL_WAIT_POLL_S = 3.0
 
 
 def ssh_argv(
@@ -108,3 +114,61 @@ def exec_for_endpoint(ep: SSHEndpoint) -> SSHExec:
         login_shell=False,
         batch_mode=True,
     )
+
+
+def tunnel_logs(
+    endpoint_fn: Callable[[], SSHEndpoint | None],
+    is_terminal_fn: Callable[[], bool],
+    job_dir: str,
+    *,
+    follow: bool,
+    fallback: Callable[[], Iterator[str]],
+    poll_s: float = TUNNEL_WAIT_POLL_S,
+) -> Iterator[str]:
+    """The one `logs` path every notebook backend uses, so a Colab/Kaggle job's
+    logs behave exactly like an ssh-family job's whenever the worker is reachable.
+
+    When the bore tunnel is up, stream the merged log live over it (identical to
+    ssh/slurm). The catch a notebook adds: the worker takes ~30s to boot, so its
+    tunnel is not up the instant `logs -f` is called. So a followed log WAITS for
+    the tunnel to come up (surfacing one 'connecting' line) and upgrades to the
+    live stream as soon as it does. `fallback` fetches whatever final logs exist
+    and is used ONLY when there is no live tunnel — not following (a one-shot
+    snapshot), or a followed job whose tunnel never came up. In that followed case
+    we say so plainly ("worker tunnel unavailable") rather than blaming the
+    backend: the tunnel is how live logs work everywhere, full stop.
+    """
+    ep = endpoint_fn()
+    if ep is not None and endpoint_reachable(ep):
+        yield from tail_logs_over(ep, job_dir, follow=follow)
+        return
+    # Wait for the tunnel only when an endpoint EXISTS but is not up yet — a
+    # slow-to-start worker whose tunnel is still coming online. If there is no
+    # endpoint at all (bore disabled, or the job already terminal), there is
+    # nothing to wait for; go straight to the final-log reader.
+    if follow and ep is not None:
+        noted = False
+        while not is_terminal_fn():
+            if not noted:
+                noted = True
+                yield "OMNIRUN: worker starting — connecting for a live tail…"
+            time.sleep(poll_s)
+            ep = endpoint_fn()
+            if ep is not None and endpoint_reachable(ep):
+                yield from tail_logs_over(ep, job_dir, follow=follow)
+                return
+    # Reached only when there is no live tunnel to tail (bore off, or a followed
+    # job whose tunnel never came up). For a followed tail, be honest about why —
+    # never blame the backend — then hand off to the final-log reader.
+    if follow:
+        yield "OMNIRUN: worker tunnel unavailable — showing final logs only"
+    yield from fallback()
+
+
+def tail_logs_over(ep: SSHEndpoint, job_dir: str, *, follow: bool) -> Iterator[str]:
+    """Stream a worker's merged log over its tunnel — the shared `jobdir.tail_logs`
+    driven through `exec_for_endpoint(ep)`. Imported locally to avoid a module
+    import cycle (jobdir → backends → sshconn)."""
+    from omnirun.backends.jobdir import tail_logs
+
+    yield from tail_logs(exec_for_endpoint(ep), job_dir, follow=follow)
