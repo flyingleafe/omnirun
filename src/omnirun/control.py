@@ -85,6 +85,9 @@ class Control:
         self._store = store
         self._providers = providers
         self._policy = policy
+        # User-facing events accumulated during the current tick (e.g. a leaked
+        # session reaped) — drained by the CLI to surface what the machine did.
+        self._tick_events: list[str] = []
 
     # ------------------------------------------------------------------
     # Submission
@@ -205,6 +208,7 @@ class Control:
         reverted to QUEUED, preventing double-launch of a billed instance.
         """
         if reconcile:
+            self._tick_events = []
             self._reconcile(now)
             self._refresh_facts(now, only_providers)
         jobs = self._store.list_jobs()
@@ -341,6 +345,10 @@ class Control:
             return
         try:
             provider.cancel(placement, CancelMode.FORCE)
+            self._tick_events.append(
+                f"reaped lost session for {placement.job_id} on "
+                f"{placement.provider_name}; reclaimed 1 slot"
+            )
         except Exception:
             _log.warning(
                 "reap of lost placement %s on %s raised; continuing",
@@ -561,6 +569,14 @@ class Control:
     # ------------------------------------------------------------------
     # Thin read helpers for CLI wiring
     # ------------------------------------------------------------------
+
+    def take_events(self) -> list[str]:
+        """Drain the user-facing events from the last tick (e.g. reaped leaked
+        sessions), surfaced by the CLI so a capacity leak being cleaned up is
+        visible — an invisible leak is how the split-brain bug hid."""
+        events = self._tick_events
+        self._tick_events = []
+        return events
 
     def ps(self) -> list[JobRecord]:
         """All job records (submitted-order), for a ``ps``-style listing."""

@@ -79,6 +79,8 @@ class StubBackend(Backend):
     def status(self, handle: JobHandle) -> StatusReport:
         if self.config.extra("status_error"):
             raise BackendError("status endpoint down")
+        if self.config.extra("lost"):
+            return StatusReport(status=JobStatus.LOST)
         # A cancelled job reports terminal, so the graceful cancel await returns
         # immediately (no force escalation, no 30s wait) — realistic and fast.
         if handle.job_id in type(self).cancelled:
@@ -604,6 +606,19 @@ def _seed_daemon_placed_job(job_id: str = "daemon-placed-01") -> JobRecord:
     )
     _store().save_job(rec)
     return rec
+
+
+def test_ps_surfaces_reaped_lost_session(env):
+    """When `ps` drives a tick that reaps a leaked/lost session, it surfaces the
+    reclaim so a capacity leak being cleaned up is visible (never silent)."""
+    job_id = submit_one()  # RUNNING on the stub
+    env.config_file.write_text(
+        BASE_CONFIG.replace('type = "stub"', 'type = "stub"\nlost = true')
+    )
+    result = runner.invoke(app, ["ps"])
+    assert result.exit_code == 0, result.output
+    assert "reaped lost session" in result.output
+    assert job_id in result.output
 
 
 def test_ps_places_a_stranded_queued_job(env):

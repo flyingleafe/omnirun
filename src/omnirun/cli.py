@@ -757,7 +757,10 @@ def ps() -> None:
     # `ps` gives the same answer a running daemon would (no frozen `lost`, no
     # stranded job). A backend that is momentarily unreachable degrades the tick,
     # never crashes it.
-    _control(cfg, store).run_tick(datetime.now(timezone.utc))
+    control = _control(cfg, store)
+    control.run_tick(datetime.now(timezone.utc))
+    for event in control.take_events():
+        console.print(f"[dim]· {event}[/dim]")
     records = store.list_jobs()
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
@@ -901,6 +904,8 @@ def gc(
     # A tick first: reconcile advances lost sessions (which are reaped in the
     # process) and settles terminal states before we reap their leftovers.
     control.run_tick(now)
+    for event in control.take_events():
+        console.print(f"[dim]· {event}[/dim]")
     cleaned = failed = skipped = 0
     for rec in store.list_jobs():
         handle = _handle_of(rec)
