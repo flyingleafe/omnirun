@@ -15,6 +15,7 @@ terminal reconcile is a pure state transition.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -884,5 +885,197 @@ def test_success_after_failure_clears_last_error(tmp_path: Path) -> None:
         assert placed is not None
         assert placed.state is JobState.RUNNING
         assert placed.last_error is None
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# P2: parallel reconcile — I/O in threads, transitions on the main thread
+# ---------------------------------------------------------------------------
+
+
+def _running(job_id: str, provider_name: str) -> JobRecord:
+    """A RUNNING record placed on *provider_name* (a real launched handle)."""
+    return JobRecord(
+        spec=_spec(job_id),
+        state=JobState.RUNNING,
+        submitted_at=T0,
+        placement=Placement(
+            provider_name=provider_name,
+            job_id=job_id,
+            handle={"id": job_id},
+            state=JobStatus.RUNNING,
+        ),
+    )
+
+
+def test_reconcile_polls_providers_in_parallel(tmp_path: Path) -> None:
+    """Three providers, each with a slow (0.3s) poll and one RUNNING job: the
+    reconcile polls them concurrently, so run_tick's wall time stays well under
+    the serial 0.9s sum, and all three jobs' transitions are applied."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        providers: dict[str, FakeProvider] = {}
+        for name in ("p1", "p2", "p3"):
+            job_id = f"{name}-job"
+            providers[name] = FakeProvider(
+                name,
+                slots=[],
+                poll_script={job_id: [JobStatus.SUCCEEDED]},
+                poll_delay_s=0.3,
+            )
+            store.save_job(_running(job_id, name))
+        control = Control(store, dict(providers))
+
+        started = time.monotonic()
+        control.run_tick(T1)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.8, f"reconcile did not run in parallel (took {elapsed:.2f}s)"
+        for name in ("p1", "p2", "p3"):
+            rec = store.load_job(f"{name}-job")
+            assert rec is not None
+            assert rec.state is JobState.SUCCEEDED
+    finally:
+        store.close()
+
+
+def test_reconcile_skips_a_poll_that_exceeds_the_timeout(tmp_path: Path) -> None:
+    """A provider whose poll blocks past ``poll_timeout_s`` is SKIPPED for the
+    tick: its job keeps its last-known RUNNING state and same placement, no
+    attempts bump; the other providers' jobs reconcile normally."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        slow = FakeProvider(
+            "slow",
+            slots=[],
+            poll_script={"slow-job": [JobStatus.SUCCEEDED]},
+            poll_delay_s=5.0,
+        )
+        fast = FakeProvider(
+            "fast",
+            slots=[],
+            poll_script={"fast-job": [JobStatus.SUCCEEDED]},
+        )
+        store.save_job(_running("slow-job", "slow"))
+        store.save_job(_running("fast-job", "fast"))
+        control = Control(store, {"slow": slow, "fast": fast}, poll_timeout_s=0.2)
+
+        control.run_tick(T1)
+
+        skipped = store.load_job("slow-job")
+        assert skipped is not None
+        assert skipped.state is JobState.RUNNING  # untouched — kept last-known state
+        assert skipped.placement is not None
+        assert skipped.placement.provider_name == "slow"
+        assert skipped.attempts == 0  # a skip is NOT a failed attempt
+
+        done = store.load_job("fast-job")
+        assert done is not None
+        assert done.state is JobState.SUCCEEDED  # the fast provider still reconciled
+    finally:
+        store.close()
+
+
+def test_refresh_facts_gated_on_pending_work(tmp_path: Path) -> None:
+    """_refresh_facts returns immediately when nothing is QUEUED/HELD (a running
+    job's reconcile does not need capacity facts), and discovers only the stale
+    providers when a job IS pending."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()], discover_available=2)
+        control = Control(store, {"free": provider})
+        # A single RUNNING job — nothing pending. run_tick reconciles it terminal
+        # but must NOT discover (no capacity facts needed).
+        store.save_job(
+            JobRecord(
+                spec=_spec("run-1"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="free",
+                    job_id="run-1",
+                    handle={"id": "run-1"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+        control.run_tick(T1)
+        assert provider.discover_calls == 0  # gated: no pending job
+
+        # Now submit a QUEUED job → the pending gate opens → the stale provider is
+        # discovered exactly once.
+        control.submit(_spec("q-1"), now=T0)
+        control.run_tick(T1)
+        assert provider.discover_calls == 1
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# P2 §5: cancel --no-wait — detached cancel finished by the catch-up path
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_no_wait_signals_then_next_tick_reaps(tmp_path: Path) -> None:
+    """cancel(wait=False) sends ONE best-effort cancel signal and marks the job
+    CANCELLED with reaped=False, keeping the placement. The next run_tick's
+    terminal catch-up force-cancels + gcs it, marks reaped=True, and emits a
+    'released cancelled placement' tick event."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()])
+        control = Control(store, {"free": provider})
+        control.submit(_spec("nw-1"), now=T0)
+        control.run_tick(T0)  # place it (RUNNING)
+
+        control.cancel("nw-1", T1, wait=False)
+
+        signalled = store.load_job("nw-1")
+        assert signalled is not None
+        assert signalled.state is JobState.CANCELLED
+        assert signalled.reaped is False  # not yet reaped — next tick finishes it
+        assert signalled.placement is not None  # placement kept for the catch-up
+        # Exactly ONE cancel call so far, and it was the no-wait (wait=False) one.
+        assert provider.cancel_calls == [("nw-1", CancelMode.GRACEFUL)]
+        assert provider.cancel_waits == [False]
+
+        control.run_tick(T2)  # terminal catch-up escalates + reaps
+
+        after = store.load_job("nw-1")
+        assert after is not None
+        assert after.state is JobState.CANCELLED
+        assert after.reaped is True
+        # The catch-up force-cancelled the still-held placement.
+        assert ("nw-1", CancelMode.FORCE) in provider.cancel_calls
+        assert any(
+            "nw-1" in e and "released cancelled placement" in e
+            for e in control.take_events()
+        )
+    finally:
+        store.close()
+
+
+def test_cancel_wait_true_reaps_inline_no_catch_up(tmp_path: Path) -> None:
+    """cancel(wait=True) (the default) reaps inline and marks reaped=True, so a
+    later tick's catch-up never touches the placement again."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()])
+        control = Control(store, {"free": provider})
+        control.submit(_spec("w-1"), now=T0)
+        control.run_tick(T0)
+
+        control.cancel("w-1", T1)  # wait defaults True
+
+        rec = store.load_job("w-1")
+        assert rec is not None
+        assert rec.state is JobState.CANCELLED
+        assert rec.reaped is True
+        assert provider.cancel_waits == [True]
+        calls_before = list(provider.cancel_calls)
+
+        control.run_tick(T2)  # catch-up must NOT revisit a reaped placement
+        assert provider.cancel_calls == calls_before
     finally:
         store.close()

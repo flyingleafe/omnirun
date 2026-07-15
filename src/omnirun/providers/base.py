@@ -72,8 +72,13 @@ class Provider(Protocol):
         """Current status of the placed job."""
         ...
 
-    def cancel(self, p: Placement, mode: CancelMode) -> None:
-        """Cancel the placed job (``mode`` best-effort in Phase 3)."""
+    def cancel(self, p: Placement, mode: CancelMode, *, wait: bool = True) -> None:
+        """Cancel the placed job (``mode`` best-effort in Phase 3).
+
+        ``wait=True`` (default) drives the full teardown (graceful grace-loop as
+        applicable, then reap). ``wait=False`` sends a single best-effort cancel
+        signal and returns immediately — no grace loop, no poll, no gc; the
+        caller's next reconcile finishes the teardown."""
         ...
 
     def stream_logs(self, p: Placement) -> Iterator[str]:

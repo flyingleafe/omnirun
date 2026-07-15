@@ -15,6 +15,7 @@ and methods with matching signatures. No I/O, no wall-clock beyond an injected
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,9 +65,13 @@ class FakeProvider:
         place_error_script: list[Exception | None] | None = None,
         place_hook: Callable[[JobRecord], None] | None = None,
         reap: ReapPolicy | None = None,
+        poll_delay_s: float = 0.0,
     ) -> None:
         self.name = name
         self._slots = slots
+        # A wall-clock sleep at the TOP of ``poll`` — lets a test make a provider
+        # slow so the parallel reconcile / poll-timeout skip paths are exercised.
+        self._poll_delay_s = poll_delay_s
         # A hook fired at the START of every ``place`` (after recording the call,
         # before returning the placement) — lets a test mutate the store MID-place
         # to exercise the cancel-vs-place resurrection race.
@@ -91,6 +96,9 @@ class FakeProvider:
         self.place_calls: list[str] = []
         self.poll_calls: list[str] = []
         self.cancel_calls: list[tuple[str, CancelMode]] = []
+        # Parallel list to cancel_calls recording the ``wait`` kwarg of each call
+        # (so a no-wait cancel test can assert a single wait=False signal).
+        self.cancel_waits: list[bool] = []
         self.collect_calls: list[tuple[str, Path]] = []
         self.gc_calls: int = 0
         self.discover_calls: int = 0
@@ -138,13 +146,16 @@ class FakeProvider:
         )
 
     def poll(self, p: Placement) -> Status:
+        if self._poll_delay_s:
+            time.sleep(self._poll_delay_s)
         self.poll_calls.append(p.job_id)
         state = self._next_status(p.job_id)
         exit_code = 0 if state is JobStatus.SUCCEEDED else None
         return Status(state=state, exit_code=exit_code)
 
-    def cancel(self, p: Placement, mode: CancelMode) -> None:
+    def cancel(self, p: Placement, mode: CancelMode, *, wait: bool = True) -> None:
         self.cancel_calls.append((p.job_id, mode))
+        self.cancel_waits.append(wait)
 
     def stream_logs(self, p: Placement) -> Iterator[str]:
         yield f"fake log for {p.job_id}"

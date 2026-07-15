@@ -194,7 +194,7 @@ class BackendProvider:
         r = self._backend.status(h)
         return Status(state=r.status, exit_code=r.exit_code, detail=r.detail)
 
-    def cancel(self, p: Placement, mode: CancelMode) -> None:
+    def cancel(self, p: Placement, mode: CancelMode, *, wait: bool = True) -> None:
         """Cancel the placed job and reap its billable/worker resource.
 
         Uniform across every backend (spec §8, invariant 5):
@@ -210,8 +210,15 @@ class BackendProvider:
         backend is swallowed) but the reap always runs, so after ``cancel`` returns
         there is no live placement/instance. Idempotent: on an already-terminal job
         the first poll is terminal, so it goes straight to the reap.
+
+        ``wait=False`` is the detached path (``cancel --no-wait``): send the single
+        ``mode`` cancel signal and return — no grace loop, no poll, no gc. The
+        caller's next reconcile catch-up escalates + reaps.
         """
         handle = JobHandle(backend=self.name, job_id=p.job_id, data=p.handle)
+        if not wait:
+            self._try(lambda: self._backend.cancel(handle, mode))
+            return
         if mode is CancelMode.GRACEFUL:
             self._try(lambda: self._backend.cancel(handle, CancelMode.GRACEFUL))
             if not self._await_terminal(handle):

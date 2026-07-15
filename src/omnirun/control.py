@@ -31,10 +31,11 @@ is adopted rather than reverted) is already present via ``_reconcile``.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from omnirun.models import (
     Deadline,
@@ -48,6 +49,7 @@ from omnirun.models import (
     ProviderFacts,
     ResourceSpec,
     Slot,
+    Status,
     StatusReport,
 )
 from omnirun.budget import LedgerEntry
@@ -56,6 +58,9 @@ from omnirun.scheduler import SchedPolicy, tick
 from omnirun.state.store import Store
 
 _log = logging.getLogger("omnirun.control")
+
+_ItemT = TypeVar("_ItemT")
+_ResultT = TypeVar("_ResultT")
 
 
 def resolve_meta_cap(store: Store, window: str, default: float | None) -> float | None:
@@ -128,6 +133,8 @@ class Control:
         budget_cap: float | None = None,
         week_cap: float | None = None,
         outputs_dir: Path | None = None,
+        poll_timeout_s: float = 30.0,
+        max_poll_workers: int = 8,
     ) -> None:
         self._store = store
         self._providers = providers
@@ -135,6 +142,13 @@ class Control:
         self._budget_window = budget_window
         self._budget_cap = budget_cap
         self._week_cap = week_cap
+        # Parallel-I/O tuning for the reconcile/refresh/gather phases: each fans
+        # provider calls out across a ThreadPoolExecutor (I/O only — every store
+        # write stays on the main thread) and waits at most ``poll_timeout_s`` for
+        # the batch. A straggler is SKIPPED for the tick (last-known state kept),
+        # never allowed to hang a read command.
+        self._poll_timeout_s = poll_timeout_s
+        self._max_poll_workers = max_poll_workers
         # Durable local cache the reconciler collects a terminal job's outputs
         # into BEFORE releasing its held resource (the resource's disk is gone
         # once released). ``pull`` then serves from here. ``None`` disables the
@@ -270,7 +284,9 @@ class Control:
     # deepens this to graceful→force→reap with confirmation.
     # ------------------------------------------------------------------
 
-    def cancel(self, job_id: str, now: datetime, *, force: bool = False) -> None:
+    def cancel(
+        self, job_id: str, now: datetime, *, force: bool = False, wait: bool = True
+    ) -> None:
         """Cancel *job_id*, then mark it CANCELLED — idempotent and complete.
 
         Delegates to the placement provider's ``cancel``: with ``force=False`` (the
@@ -278,6 +294,17 @@ class Control:
         SIGTERM→poll-until-terminal-or-grace→SIGKILL→reap; with ``force=True`` a
         ``FORCE`` cancel (immediate hard kill + reap). Either way no held resource
         is left running (invariant 5).
+
+        ``wait`` controls how thoroughly the placement is torn down HERE:
+
+        * ``wait=True`` (default) — the full graceful/force reap runs inline and
+          the record is saved ``reaped=True`` (the held resource is gone, so
+          reconcile's terminal catch-up must not revisit it).
+        * ``wait=False`` — a single best-effort ``cancel(wait=False)`` signal is
+          sent (no grace loop, no reap), then the record is saved CANCELLED with
+          ``reaped=False`` and the placement KEPT. The next tick's
+          ``_catch_up_terminal`` finishes the teardown (force-cancel + gc). This
+          keeps a ``cancel --no-wait`` from blocking up to the grace window.
 
         Idempotent and best-effort: an unknown or already-terminal job is a no-op;
         a provider that raises is swallowed (crash isolation — the job is still
@@ -293,7 +320,7 @@ class Control:
             provider = self._providers.get(rec.placement.provider_name)
             if provider is not None:
                 try:
-                    provider.cancel(rec.placement, mode)
+                    provider.cancel(rec.placement, mode, wait=wait)
                 except Exception:
                     _log.warning(
                         "cancel raised for job %s on %s; marking cancelled anyway",
@@ -314,10 +341,12 @@ class Control:
                     "last_status": StatusReport(
                         status=JobStatus.CANCELLED, detail="cancelled by user"
                     ),
-                    # cancel() already force-reaps the placement above, so the
-                    # held resource is gone — mark it reaped so reconcile's terminal
+                    # wait=True force-reaps the placement above, so the held
+                    # resource is gone — mark it reaped so reconcile's terminal
                     # catch-up doesn't try to collect from a released placement.
-                    "reaped": True,
+                    # wait=False only signalled: keep reaped=False so the next
+                    # tick's _catch_up_terminal completes the teardown.
+                    "reaped": wait,
                 }
             )
         )
@@ -356,24 +385,80 @@ class Control:
         return decisions
 
     # ------------------------------------------------------------------
+    # Parallel-I/O helper (I/O in threads, store writes on the main thread)
+    # ------------------------------------------------------------------
+
+    def _parallel(
+        self,
+        items: list[_ItemT],
+        fn: Callable[[_ItemT], _ResultT],
+        describe: Callable[[_ItemT], str],
+    ) -> list[tuple[_ItemT, _ResultT | Exception]]:
+        """Run ``fn(item)`` for every *item* in a thread pool, bounded by
+        ``poll_timeout_s`` wall time and ``max_poll_workers`` threads.
+
+        Returns ``(item, outcome)`` pairs for every future that FINISHED within
+        the budget, where ``outcome`` is the return value OR the exception ``fn``
+        raised. A future still running at the wall timeout is DROPPED from the
+        result (its item is skipped this tick, last-known state kept) and one
+        warning line is logged via *describe*; the executor is shut down with
+        ``wait=False`` so stragglers finish in daemon threads and are discarded.
+
+        The caller stays entirely on the main thread when it consumes the result,
+        so no store write ever happens off-thread (threads-invariant)."""
+        if not items:
+            return []
+        workers = min(self._max_poll_workers, len(items))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        future_to_item = {executor.submit(fn, item): item for item in items}
+        done, not_done = concurrent.futures.wait(
+            future_to_item, timeout=self._poll_timeout_s
+        )
+        results: list[tuple[_ItemT, _ResultT | Exception]] = []
+        for future in done:
+            item = future_to_item[future]
+            exc = future.exception()
+            if isinstance(exc, Exception):
+                results.append((item, exc))
+            elif exc is not None:
+                # A BaseException (KeyboardInterrupt/SystemExit) is not a
+                # provider fault — re-raise it rather than swallow it as a poll error.
+                raise exc
+            else:
+                results.append((item, future.result()))
+        for future in not_done:
+            item = future_to_item[future]
+            _log.warning(
+                "poll of %s did not finish within %.0fs; keeping last-known state",
+                describe(item),
+                self._poll_timeout_s,
+            )
+        # Stragglers are abandoned to daemon threads; do not block on them.
+        executor.shutdown(wait=False)
+        return results
+
+    # ------------------------------------------------------------------
     # Step 1: reconcile provider statuses into job states
     # ------------------------------------------------------------------
 
     def _reconcile(self, now: datetime) -> None:
         """Fold each in-flight placement's live provider status into its job.
 
-        For every PLACING/RUNNING job with a placement:
+        Three phases keep every store write on the main thread while polling
+        happens in parallel:
 
-        * A PLACING job whose placement has an EMPTY handle is a crash between
-          ``reserve`` (which writes the stub placement) and ``place`` — revert
-          it to QUEUED (``attempts+1``) so it is retried, never stranded.
-        * A PLACING job whose placement has a PARTIAL handle (carrying a
-          ``"provisioning"`` marker) is a live rented resource: adopt it by
-          polling, never revert (would orphan the billed instance).
-        * Otherwise ``poll`` the provider. A terminal backend status stamps the
-          job terminal; ``LOST`` re-queues the job (no silent loss); an active
-          status keeps it RUNNING.
+        * **Collect** (main thread): walk ``list_jobs()``; handle the terminal
+          catch-up branch and the empty-handle PLACING revert inline (pure store
+          work); each remaining PLACING/RUNNING job with a pollable provider is
+          appended to a poll list.
+        * **Poll** (threads): ``provider.poll(placement)`` for every listed item,
+          fanned out with a per-tick wall budget. A straggler is skipped (state
+          kept) so a slow backend can never hang ``ps`` nor requeue a healthy job.
+        * **Apply** (main thread): ``_apply_poll`` runs the transition for each
+          finished item — an Exception takes the poll-raised requeue path, a
+          ``Status`` the LOST/terminal/active paths.
         """
+        to_poll: list[tuple[JobRecord, Placement, Provider]] = []
         for rec in self._store.list_jobs():
             if rec.state not in (JobState.PLACING, JobState.RUNNING):
                 # Catch-up the daemon would already have done: a terminal job on a
@@ -413,27 +498,41 @@ class Control:
                     placement.provider_name,
                 )
                 continue
-            self._reconcile_one(rec, placement, provider, now)
+            to_poll.append((rec, placement, provider))
 
-    def _reconcile_one(
+        # Poll phase: fan the polls out; skipped stragglers keep last-known state.
+        outcomes = self._parallel(
+            to_poll,
+            lambda item: item[2].poll(item[1]),
+            lambda item: f"{item[0].spec.job_id} on {item[1].provider_name}",
+        )
+        # Apply phase (main thread, serial): enact each finished poll's transition.
+        for (rec, placement, provider), outcome in outcomes:
+            self._apply_poll(rec, placement, provider, outcome, now)
+
+    def _apply_poll(
         self,
         rec: JobRecord,
         placement: Placement,
         provider: Provider,
+        outcome: Status | Exception,
         now: datetime,
     ) -> None:
-        """Poll *provider* for *placement* and persist the resulting transition."""
-        try:
-            status = provider.poll(placement)
-        except Exception:
+        """Persist the transition for one polled placement (main thread).
+
+        *outcome* is either the ``Status`` ``poll`` returned or the ``Exception``
+        it raised. An exception takes the poll-raised requeue path; a ``Status``
+        takes the existing LOST / terminal / active paths."""
+        if isinstance(outcome, Exception):
             _log.warning(
                 "poll raised for job %s on %s; requeueing",
                 rec.spec.job_id,
                 placement.provider_name,
-                exc_info=True,
+                exc_info=(type(outcome), outcome, outcome.__traceback__),
             )
             self._requeue(rec, now)
             return
+        status = outcome
 
         if status.state is JobStatus.LOST:
             # A LOST placement is requeued for retry (attempts+1) — the state
@@ -538,14 +637,30 @@ class Control:
     def _catch_up_terminal(
         self, rec: JobRecord, placement: Placement, now: datetime
     ) -> None:
-        """Revisit a terminal-but-unreaped job: if its provider holds a reclaimable
-        resource, collect-then-release it now (``give_up=True`` — a revisit means
-        the transition tick's collect already failed once, so free the slot even if
-        collect fails again). A no-op for providers that hold nothing."""
+        """Revisit a terminal-but-unreaped job and finish releasing its placement.
+
+        * ``hold_on_terminal`` provider: collect-then-release now (``give_up=True``
+          — a revisit means the transition tick's collect already failed once, so
+          free the slot even if collect fails again).
+        * else a CANCELLED record: this is a ``cancel --no-wait`` that only
+          signalled the backend — force-cancel + gc now (the escalation the
+          no-wait cancel skipped), mark ``reaped=True``, and emit a tick event.
+        * any other terminal state on a non-holding provider: nothing to release
+          (a plain SUCCEEDED/FAILED job holds no capacity) — leave it exactly as
+          before (no save)."""
         provider = self._providers.get(placement.provider_name)
-        if provider is None or not provider.reap.hold_on_terminal:
+        if provider is None:
             return
-        self._collect_and_reap(rec, placement, provider, now, give_up=True)
+        if provider.reap.hold_on_terminal:
+            self._collect_and_reap(rec, placement, provider, now, give_up=True)
+            return
+        if rec.state is JobState.CANCELLED:
+            self._reap(placement)
+            self._store.save_job(rec.model_copy(update={"reaped": True}))
+            self._tick_events.append(
+                f"released cancelled placement of {rec.spec.job_id} on "
+                f"{placement.provider_name}"
+            )
 
     def _collect_and_reap(
         self,
@@ -648,17 +763,39 @@ class Control:
         a finished job's result before releasing it) and reports its true free
         ``available``; the result is persisted. A ``discover`` that raises leaves
         the old facts in place (the tick degrades to last-known capacity, never
-        crashes)."""
-        for name, provider in self._providers.items():
-            facts = self._store.load_facts(name)
-            if facts is not None and facts.capacity_fresh(now):
-                continue
-            try:
-                self._store.save_facts(provider.discover())
-            except Exception:
+        crashes).
+
+        Gated on pending work: capacity facts only matter when a job needs
+        placing, so with nothing QUEUED/HELD we return immediately (the reap
+        catch-up does not read facts). Stale providers' ``discover()`` calls run
+        in parallel; ``save_facts`` for each finished result happens serially on
+        the main thread afterward. A raised or timed-out discover keeps the old
+        facts."""
+        pending = any(
+            r.state in (JobState.QUEUED, JobState.HELD) for r in self._store.list_jobs()
+        )
+        if not pending:
+            return
+        stale = [
+            (name, provider)
+            for name, provider in self._providers.items()
+            if (facts := self._store.load_facts(name)) is None
+            or not facts.capacity_fresh(now)
+        ]
+        outcomes = self._parallel(
+            stale,
+            lambda item: item[1].discover(),
+            lambda item: f"discover of {item[0]}",
+        )
+        for (name, _provider), outcome in outcomes:
+            if isinstance(outcome, Exception):
                 _log.warning(
-                    "discover raised for %r; keeping stale facts", name, exc_info=True
+                    "discover raised for %r; keeping stale facts",
+                    name,
+                    exc_info=(type(outcome), outcome, outcome.__traceback__),
                 )
+                continue
+            self._store.save_facts(outcome)
 
     # ------------------------------------------------------------------
     # Step 2: gather slots offered by every provider for the pending reqs
@@ -710,17 +847,44 @@ class Control:
             else:
                 _add(pin, r.spec.resources)
 
-        slots: list[Slot] = []
-        for name, provider in self._providers.items():
+        # One task per provider (its reqs served serially inside the task,
+        # returning that provider's slots). Tasks run in parallel with the same
+        # timeout/skip budget; a timed-out provider contributes nothing this tick.
+        # Slot order across providers does not matter to the pure tick.
+        targeted = [
+            (name, provider)
+            for name, provider in self._providers.items()
+            if reqs_by_provider[name]
+        ]
+
+        def _offer_all(item: tuple[str, Provider]) -> list[Slot]:
+            name, provider = item
+            out: list[Slot] = []
             for req in reqs_by_provider[name]:
-                try:
-                    slots.extend(provider.offer(req))
-                except Exception:
-                    _log.warning(
-                        "offer raised for provider %r; skipping this tick",
-                        provider.name,
-                        exc_info=True,
-                    )
+                out.extend(provider.offer(req))
+            return out
+
+        outcomes = self._parallel(
+            targeted, _offer_all, lambda item: f"offer of {item[0]}"
+        )
+        # Reassemble in provider-config order (``targeted``'s order), not the
+        # thread-completion order: the pure tick breaks a free-slot tie by picking
+        # the FIRST minimum, so a stable, config-derived slot order keeps placement
+        # deterministic (a job with two equal free backends lands on the earlier
+        # one every run, matching the pre-parallel serial gather).
+        by_name: dict[str, list[Slot]] = {}
+        for (name, _provider), outcome in outcomes:
+            if isinstance(outcome, Exception):
+                _log.warning(
+                    "offer raised for provider %r; skipping this tick",
+                    name,
+                    exc_info=(type(outcome), outcome, outcome.__traceback__),
+                )
+                continue
+            by_name[name] = outcome
+        slots: list[Slot] = []
+        for name, _provider in targeted:
+            slots.extend(by_name.get(name, []))
         return slots
 
     # ------------------------------------------------------------------
