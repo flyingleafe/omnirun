@@ -49,6 +49,11 @@ class FakeProvider:
         place_state: The backend ``JobStatus`` stamped on a fresh ``Placement``.
         placed_at: The ``placed_at`` timestamp stamped on a fresh ``Placement``
             (defaults to ``datetime.now(timezone.utc)`` when ``None``).
+        discover_available_script: Per-``discover`` sequence of ``available``
+            counts popped in order; once exhausted the last value sticks. Lets a
+            provider's reported free capacity OSCILLATE across ticks (a value of
+            ``None`` reports unknown capacity). When given, it takes precedence
+            over the fixed ``discover_available``.
     """
 
     def __init__(
@@ -67,6 +72,7 @@ class FakeProvider:
         reap: ReapPolicy | None = None,
         poll_delay_s: float = 0.0,
         cancel_error: Exception | None = None,
+        discover_available_script: list[int | None] | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
@@ -80,6 +86,14 @@ class FakeProvider:
         self._place_state = place_state
         self._placed_at = placed_at
         self._discover_available = discover_available
+        # A per-``discover`` sequence of ``available`` counts (last sticks) so a
+        # provider's reported free capacity can oscillate across ticks. Working
+        # copy so popping does not mutate the caller's list.
+        self._discover_available_script: list[int | None] | None = (
+            list(discover_available_script)
+            if discover_available_script is not None
+            else None
+        )
         self._collect_error = collect_error
         # ``place`` failure injection. ``place_error`` (when set) is raised on
         # EVERY place. ``place_error_script`` is a per-call sequence popped in
@@ -118,13 +132,14 @@ class FakeProvider:
     def discover(self) -> ProviderFacts:
         self.discover_calls += 1
         now = datetime.now(timezone.utc)
+        available = self._next_discover_available()
         return ProviderFacts(
             backend=self.name,
             discovered_at=now,
             capabilities=Capabilities(),
             health=Health.OK,
-            available=self._discover_available,
-            capacity_at=now if self._discover_available is not None else None,
+            available=available,
+            capacity_at=now if available is not None else None,
         )
 
     def offer(self, req: ResourceSpec) -> list[Slot]:
@@ -202,6 +217,19 @@ class FakeProvider:
             return seq.pop(0)
         return seq[0]
 
+    def _next_discover_available(self) -> int | None:
+        """The ``available`` count this ``discover`` call reports.
+
+        A ``discover_available_script`` (when set) is popped in order, the last
+        entry sticking once exhausted, so capacity can oscillate across ticks.
+        Otherwise the fixed ``discover_available`` is returned."""
+        seq = self._discover_available_script
+        if seq is None:
+            return self._discover_available
+        if len(seq) > 1:
+            return seq.pop(0)
+        return seq[0]
+
 
 class FlakyProvider(FakeProvider):
     """A ``FakeProvider`` that misbehaves in one deterministic *mode*.
@@ -224,6 +252,11 @@ class FlakyProvider(FakeProvider):
     * ``"garble"`` — ``place`` returns a valid ``Placement`` with an odd handle
       (extra junk keys); poll then succeeds normally (robustness to noisy
       handles).
+    * ``"flapping_place"`` — ``offer`` succeeds normally but ``place`` raises
+      ``RuntimeError("flap")`` on EVERY call: a backend whose submit endpoint is
+      persistently down. The driver releases the reservation each time
+      (``last_error`` set), so a job hitting it three times reaches the
+      attempts-cap FAILED terminal (verified by ``liveness_no_silent_loss``).
     """
 
     def __init__(self, name: str, slots: list[Slot], *, mode: str) -> None:
@@ -245,6 +278,9 @@ class FlakyProvider(FakeProvider):
         if self._mode == "capacity":
             self.place_calls.append(job_id)
             raise CapacityError(f"no capacity for {job_id} right now")
+        if self._mode == "flapping_place":
+            self.place_calls.append(job_id)
+            raise RuntimeError("flap")
         placement = super().place(rec, slot)
         if self._mode == "garble":
             placement = placement.model_copy(

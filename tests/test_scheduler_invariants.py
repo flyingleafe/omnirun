@@ -150,6 +150,7 @@ _FAIL_MODES = [
     "lose_after_place",
     "succeed_then_lost",
     "garble",
+    "flapping_place",
 ]
 
 # The benign mode: a FlakyProvider whose mode is NOT a misbehaviour behaves
@@ -167,7 +168,9 @@ class SchedulerInvariants(RuleBasedStateMachine):
         # class across examples, so the Store must be created here). The temp
         # dir is left for the OS to reap — no shared state escapes an instance.
         self._tmpdir = Path(tempfile.mkdtemp(prefix="omnirun-inv-"))
-        self.store: Store = open_store(f"sqlite:///{self._tmpdir / 'state.db'}")
+        # Keep the db url on self so ``restart_driver`` can reopen the SAME DB.
+        self._db_url = f"sqlite:///{self._tmpdir / 'state.db'}"
+        self.store: Store = open_store(self._db_url)
 
         # Two providers with KNOWN, honest slots. Both start in the benign "ok"
         # mode. ``provider_fails`` swaps a provider for a same-name/same-slots one
@@ -191,6 +194,13 @@ class SchedulerInvariants(RuleBasedStateMachine):
         # Control holds the providers dict BY REFERENCE, so swapping an entry in
         # ``self.providers`` is seen by the driver on the next tick.
         self.control = Control(self.store, self.providers)
+
+        # A SECOND Control instance, modelling a CLI tick racing the daemon over
+        # the SAME store + providers. Built lazily on first ``second_driver_tick``
+        # and REBUILT whenever ``provider_fails`` swaps a provider (so it never
+        # holds a stale provider reference — the dict is shared by reference, but
+        # a rebuilt Control re-reads it fresh, matching the primary).
+        self.control2: Control | None = None
 
         self.now: datetime = BASE_NOW
         self._seq = 0  # monotonically unique job-id suffix
@@ -259,6 +269,10 @@ class SchedulerInvariants(RuleBasedStateMachine):
         slot = _free_slot() if which == "free" else _paid_slot()
         self.providers[which] = FlakyProvider(which, [slot], mode=mode)
         self.provider_modes[which] = mode
+        # Drop the lazily-built second driver so its NEXT use rebuilds over the
+        # freshly-swapped providers dict (mirrors the primary re-reading the
+        # shared dict by reference).
+        self.control2 = None
 
     @precondition(lambda self: bool(self._cancellable_job_ids()))
     @rule(data=st.data())
@@ -273,6 +287,38 @@ class SchedulerInvariants(RuleBasedStateMachine):
     def advance_time(self, seconds: int) -> None:
         """Move ``now`` forward (bounded so a run never rolls past the UTC day)."""
         self.now = self.now + timedelta(seconds=seconds)
+
+    @rule()
+    def restart_driver(self) -> None:
+        """Model a daemon crash/redeploy mid-run: close the store, REOPEN it over
+        the SAME db url, and rebuild ``Control`` over the reopened store and the
+        SAME providers dict.
+
+        Every invariant must hold across the restart with NO new allowances —
+        that is the point: the durable store is the only state that survives a
+        process death, so a job's fate is decided entirely by what is persisted.
+        Reopening also re-runs the migration runner, which must be a no-op — this
+        rule implicitly regression-tests migration idempotency under Hypothesis.
+        """
+        self.store.close()
+        self.store = open_store(self._db_url)
+        self.control = Control(self.store, self.providers)
+        # The second driver referenced the now-closed store; drop it so its next
+        # use rebuilds over the reopened one.
+        self.control2 = None
+
+    @rule()
+    def second_driver_tick(self) -> None:
+        """Model a CLI tick racing the daemon at command granularity: a SECOND
+        ``Control`` over the SAME store + providers runs one ``run_tick``.
+
+        Interleaved single-thread execution is the model here (true
+        thread-parallelism is the soak test's job). The second driver is built
+        lazily and rebuilt after ``provider_fails``/``restart_driver`` so it never
+        holds a stale provider or a closed store."""
+        if self.control2 is None:
+            self.control2 = Control(self.store, self.providers)
+        self.control2.run_tick(self.now)
 
     # ------------------------------------------------------------------
     # Invariants (spec §11). Each reads fresh Store state and asserts a REAL,
