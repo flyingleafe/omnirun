@@ -887,17 +887,27 @@ def queue(
     cancel: str | None = typer.Option(
         None, "--cancel", help="Cancel a job (id prefix, or 'all')."
     ),
+    all_projects: bool = typer.Option(
+        False,
+        "--all-projects",
+        "-A",
+        help="Show/cancel jobs from every project, not just the current repo.",
+    ),
 ) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
+    scope = None if all_projects else _current_project()
     try:
         if cancel is not None:
-            _queue_cancel(cfg, store, cancel)
+            _queue_cancel(cfg, store, cancel, scope=scope)
             return
         if wait:
             _queue_wait(store)
             return
-        console.print(_queue_table(store.list_jobs()))
+        records = store.list_jobs(project=scope)
+        console.print(_queue_table(records, show_project=scope is None))
+        if scope is not None:
+            console.print(f"[dim]project: {scope} (use -A for all)[/dim]")
     finally:
         store.close()
 
@@ -949,9 +959,23 @@ def _live_daemon(cfg: Config) -> tuple[str, int] | None:
     return addr if resp.get("ok") else None
 
 
-def _queue_table(records: list[JobRecord]) -> Table:
+def _current_project() -> str | None:
+    """The slug of the repo enclosing cwd, or ``None`` outside one.
+
+    Delegates to ``repo.current_project_slug`` so ps/queue/gc scope by the same
+    slug ``submit`` stamps on a job (``RepoRef.slug``). Cheap and never raises."""
+    from omnirun import repo as repo_mod
+
+    return repo_mod.current_project_slug()
+
+
+def _queue_table(records: list[JobRecord], *, show_project: bool = False) -> Table:
     table = Table()
-    for col in ("job", "state", "backend", "name", "command"):
+    cols = ["job", "state", "backend"]
+    if show_project:
+        cols.append("project")
+    cols += ["name", "command"]
+    for col in cols:
         table.add_column(col)
     for rec in records:
         style = _STATE_STYLE.get(rec.state)
@@ -960,23 +984,30 @@ def _queue_table(records: list[JobRecord]) -> Table:
         )
         if rec.state is JobState.QUEUED and rec.last_error:
             state_txt += f"\n[dim]last error: {_truncate(rec.last_error)}[/dim]"
-        table.add_row(
+        cells = [
             rec.spec.job_id,
             state_txt,
             rec.placement.provider_name if rec.placement else "-",
-            rec.spec.name,
-            _truncate(rec.spec.command),
-        )
+        ]
+        if show_project:
+            cells.append(rec.spec.repo.slug)
+        cells += [rec.spec.name, _truncate(rec.spec.command)]
+        table.add_row(*cells)
     return table
 
 
-def _queue_cancel(cfg: Config, store: Store, ref: str) -> None:
+def _queue_cancel(
+    cfg: Config, store: Store, ref: str, *, scope: str | None = None
+) -> None:
     """Cancel a job (id prefix) or every non-terminal job (``all``) directly over
     the store — works with or without a daemon; the control cancel-vs-place race
-    fix makes it safe against a concurrent daemon tick."""
+    fix makes it safe against a concurrent daemon tick.
+
+    ``all`` is scoped to *scope* (the current project, unless ``-A``); an explicit
+    id prefix is never scoped (job ids are globally unique)."""
     now = datetime.now(timezone.utc)
     if ref == "all":
-        targets = [r for r in store.list_jobs() if not r.state.terminal]
+        targets = [r for r in store.list_jobs(project=scope) if not r.state.terminal]
     else:
         targets = [store.resolve_job(ref)]
     cancelled = 0
@@ -1025,7 +1056,14 @@ def _queue_wait(store: Store) -> None:
     help="Alias for `ps` (list all known jobs).",
 )
 @friendly_errors
-def ps() -> None:
+def ps(
+    all_projects: bool = typer.Option(
+        False,
+        "--all-projects",
+        "-A",
+        help="List jobs from every project, not just the current repo.",
+    ),
+) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
     # When a daemon is alive it already keeps the store caught up (it IS the
@@ -1040,15 +1078,19 @@ def ps() -> None:
         control.run_tick(datetime.now(timezone.utc))
         for event in control.take_events():
             console.print(f"[dim]· {event}[/dim]")
-    records = store.list_jobs()
+    scope = None if all_projects else _current_project()
+    records = store.list_jobs(project=scope)
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
     now = datetime.now(timezone.utc)
+    show_project = scope is None
     table = Table()
     table.add_column("job")
     table.add_column("backend")
     table.add_column("status")
+    if show_project:
+        table.add_column("project")
     table.add_column("submitted")
     table.add_column("command")
     for rec in records:
@@ -1061,14 +1103,18 @@ def ps() -> None:
         # rides its status detail, shown by `status`).
         if rec.state is JobState.QUEUED and rec.last_error:
             status_txt += f"\n[dim]last error: {_truncate(rec.last_error)}[/dim]"
-        table.add_row(
+        cells = [
             rec.spec.job_id,
             rec.placement.provider_name if rec.placement else "-",
             status_txt,
-            _ago(rec.submitted_at, now),
-            _truncate(rec.spec.command),
-        )
+        ]
+        if show_project:
+            cells.append(rec.spec.repo.slug)
+        cells += [_ago(rec.submitted_at, now), _truncate(rec.spec.command)]
+        table.add_row(*cells)
     console.print(table)
+    if scope is not None:
+        console.print(f"[dim]project: {scope} (use -A for all)[/dim]")
 
 
 @app.command(help="Advance and show one job's details (accepts a unique id prefix).")
@@ -1323,6 +1369,12 @@ def gc(
     all_: bool = typer.Option(
         False, "--all", help="Also reap non-terminal jobs (cancels them first)."
     ),
+    all_projects: bool = typer.Option(
+        False,
+        "--all-projects",
+        "-A",
+        help="Walk jobs from every project, not just the current repo.",
+    ),
 ) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
@@ -1333,8 +1385,9 @@ def gc(
     control.run_tick(now)
     for event in control.take_events():
         console.print(f"[dim]· {event}[/dim]")
+    scope = None if all_projects else _current_project()
     cleaned = failed = skipped = 0
-    for rec in store.list_jobs():
+    for rec in store.list_jobs(project=scope):
         handle = _handle_of(rec)
         if handle is None:
             continue

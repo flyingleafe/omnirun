@@ -250,6 +250,11 @@ def env(tmp_path, monkeypatch):
         "omnirun.repo.capture_repo_state",
         lambda root, *, auto_push=False: ref,
     )
+    # ps/queue/gc scope to the current project; in tests the "current" repo is the
+    # stubbed submit repo, so its slug matches the jobs submit_one creates.
+    monkeypatch.setattr(
+        "omnirun.repo.current_project_slug", lambda start=None: ref.slug
+    )
     StubBackend.submitted.clear()
     StubBackend.cancelled.clear()
     yield types.SimpleNamespace(
@@ -1150,6 +1155,85 @@ def test_queue_cancel_cancels_through_the_store(env):
     assert result.exit_code == 0, result.output
     assert "cancelled 1 job" in result.output
     rec = _store().load_job(job_id)
+    assert rec is not None and rec.state is JobState.CANCELLED
+
+
+def _seed_other_project_running_job(job_id: str = "other-proj-01") -> JobRecord:
+    """Persist a RUNNING job belonging to a DIFFERENT repo (slug ``other``), so
+    project-scoping tests can prove one project never touches another's jobs."""
+    rec = JobRecord(
+        spec=JobSpec(
+            job_id=job_id,
+            name="other",
+            command="python other.py",
+            resources=ResourceSpec(),
+            repo=RepoRef(
+                remote_url="git@example.com:me/other.git",
+                sha="c" * 40,
+                branch="main",
+                slug="other",
+            ),
+        ),
+        state=JobState.RUNNING,
+        submitted_at=datetime.now(timezone.utc),
+        placement=Placement(
+            provider_name="stub",
+            job_id=job_id,
+            handle={"token": f"t-{job_id}"},
+            state=JobStatus.RUNNING,
+        ),
+    )
+    _store().save_job(rec)
+    return rec
+
+
+def test_ps_scopes_to_current_project(env):
+    """ps inside a repo shows only that project's jobs and prints the scope line;
+    -A shows every project with a PROJECT column."""
+    mine = submit_one()  # slug "proj" (the stubbed current repo)
+    _seed_other_project_running_job()
+
+    scoped = runner.invoke(app, ["ps"])
+    assert scoped.exit_code == 0, scoped.output
+    assert mine in scoped.output
+    assert "other-proj-01" not in scoped.output
+    assert "project: proj (use -A for all)" in scoped.output
+
+    everything = runner.invoke(app, ["ps", "-A"])
+    assert everything.exit_code == 0, everything.output
+    assert mine in everything.output
+    assert "other-proj-01" in everything.output
+    assert "project" in everything.output  # the PROJECT column header
+    assert "other" in everything.output  # the other project's slug cell
+
+
+def test_queue_cancel_all_is_project_scoped(env):
+    """queue --cancel all cancels only the current project's non-terminal jobs;
+    the other project's running job is left alone. With -A it cancels both."""
+    mine = submit_one()  # RUNNING, slug "proj"
+    other = _seed_other_project_running_job()  # RUNNING, slug "other"
+
+    scoped = runner.invoke(app, ["queue", "--cancel", "all"])
+    assert scoped.exit_code == 0, scoped.output
+    assert "cancelled 1 job" in scoped.output
+    mine_rec = _store().load_job(mine)
+    other_rec = _store().load_job(other.spec.job_id)
+    assert mine_rec is not None and mine_rec.state is JobState.CANCELLED
+    assert other_rec is not None and other_rec.state is JobState.RUNNING
+
+    allp = runner.invoke(app, ["queue", "--cancel", "all", "-A"])
+    assert allp.exit_code == 0, allp.output
+    other_rec = _store().load_job(other.spec.job_id)
+    assert other_rec is not None and other_rec.state is JobState.CANCELLED
+
+
+def test_queue_cancel_by_id_is_not_project_scoped(env):
+    """Cancelling by explicit id prefix works across projects (ids are global)."""
+    other = _seed_other_project_running_job()
+    result = runner.invoke(app, ["queue", "--cancel", other.spec.job_id])
+    assert result.exit_code == 0, result.output
+    assert "cancelled 1 job" in result.output
+    rec = _store().load_job(other.spec.job_id)
     assert rec is not None and rec.state is JobState.CANCELLED
 
 

@@ -56,6 +56,29 @@ def repo_slug(remote_url: str | None, root: Path) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip("-.") or "repo"
 
 
+def current_project_slug(start: Path | None = None) -> str | None:
+    """The project slug of the repo enclosing *start* (default: cwd), or ``None``.
+
+    Derives the slug EXACTLY as ``capture_repo_state`` does — ``repo_slug`` over
+    the origin remote url (or the repo dir name when there is no origin) — so the
+    two never disagree. Cheap (one ``rev-parse`` + one ``remote get-url``) and
+    never raises: outside a git repo, or on any git error, it returns ``None``.
+    """
+    start = start or Path.cwd()
+    try:
+        r = _git(start, "rev-parse", "--show-toplevel")
+        if r.returncode != 0:
+            return None
+        root = Path(r.stdout.strip())
+        origin = _git(root, "remote", "get-url", "origin")
+        remote_url = origin.stdout.strip() if origin.returncode == 0 else ""
+        return repo_slug(remote_url or None, root)
+    except (OSError, subprocess.SubprocessError):
+        # git binary missing / cwd gone / subprocess timeout — scoping degrades
+        # to "all projects", never a crash.
+        return None
+
+
 def capture_repo_state(root: Path, *, auto_push: bool = False) -> RepoRef:
     """Snapshot the repo state a job will run against, enforcing the submit-time
     invariants: a clean working tree and, when an origin remote exists, HEAD

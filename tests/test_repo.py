@@ -10,6 +10,7 @@ from omnirun.repo import (
     RepoError,
     capture_repo_state,
     create_bundle,
+    current_project_slug,
     find_repo_root,
     remote_clone_plan,
     repo_slug,
@@ -54,6 +55,28 @@ def test_slug_from_dir_name(tmp_path: Path) -> None:
     root.mkdir()
     assert repo_slug(None, root) == "My-Project"
     assert repo_slug("", root) == "My-Project"
+
+
+# --- current_project_slug -----------------------------------------------------
+
+
+def test_current_project_slug_matches_capture(sample_repo: Path) -> None:
+    """The scoping slug must equal the one capture_repo_state stamps on a job."""
+    assert current_project_slug(sample_repo) == capture_repo_state(sample_repo).slug
+
+
+def test_current_project_slug_uses_origin(sample_repo: Path, tmp_path: Path) -> None:
+    """With an origin remote, the slug derives from its url basename."""
+    bare = tmp_path / "myrepo.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    git(sample_repo, "remote", "add", "origin", str(bare))
+    assert current_project_slug(sample_repo) == "myrepo"
+
+
+def test_current_project_slug_outside_repo_is_none(tmp_path: Path) -> None:
+    lonely = tmp_path / "no-repo"
+    lonely.mkdir()
+    assert current_project_slug(lonely) is None
 
 
 # --- clean / dirty ------------------------------------------------------------
