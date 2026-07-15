@@ -203,6 +203,7 @@ class Daemon:
                     self._get_providers(),
                     budget_cap=self.cfg.budget.daily,
                     week_cap=self.cfg.budget.weekly,
+                    outputs_dir=default_store_dir() / "outputs",
                 )
             return self._control
 
@@ -534,6 +535,12 @@ class _RecordingProvider:
         self.name = inner.name
         self._inner = inner
         self._errors = errors
+        # Delegate the reap policies the reconciler reads off the provider, so the
+        # daemon path behaves identically to the CLI (one state machine, two
+        # drivers). Without this the wrapper hid them and the daemon silently never
+        # reaped lost/terminal sessions.
+        self.reap_lost = getattr(inner, "reap_lost", False)
+        self.reap_on_terminal = getattr(inner, "reap_on_terminal", False)
 
     def discover(self) -> ProviderFacts:
         return self._inner.discover()

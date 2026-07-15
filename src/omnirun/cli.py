@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 import os
 import shlex
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -44,6 +45,7 @@ from omnirun.progress import report, reporting
 from omnirun.providers import BackendProvider, Provider
 from omnirun.queue import QueueState
 from omnirun.state import Store, open_store
+from omnirun.state.store import default_store_dir
 
 app = typer.Typer(
     name="omnirun",
@@ -363,6 +365,7 @@ def _control(cfg: Config, store: Store, backend: str | None = None) -> Control:
         providers,
         budget_cap=cfg.budget.daily,
         week_cap=cfg.budget.weekly,
+        outputs_dir=default_store_dir() / "outputs",
     )
 
 
@@ -1121,8 +1124,22 @@ def pull(
     if handle is None:
         raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
     dest = dest or Path("omnirun-outputs") / rec.spec.job_id
-    be = _backend_for(cfg, handle.backend)
-    paths = be.pull_outputs(handle, dest)
+    if rec.outputs_cached_to:
+        # The reconciler already collected these outputs into a durable cache and
+        # reaped the (notebook) session — so the live backend can no longer serve
+        # them. Copy from the cache instead of hitting a stopped session.
+        cache = Path(rec.outputs_cached_to)
+        if not cache.is_dir():
+            raise BackendError(
+                f"cached outputs for {rec.spec.job_id} are missing at {cache} "
+                "(session already reaped, nothing to re-fetch)"
+            )
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(cache, dest, dirs_exist_ok=True)
+        paths = sorted(p for p in dest.rglob("*") if p.is_file())
+    else:
+        be = _backend_for(cfg, handle.backend)
+        paths = be.pull_outputs(handle, dest)
     rec.outputs_pulled_to = str(dest)
     store.save_job(rec)
     console.print(f"pulled {len(paths)} path(s) to {dest}")

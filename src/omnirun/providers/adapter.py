@@ -78,6 +78,10 @@ class BackendProvider:
         # (notebooks), never on a transport-blip LOST (ssh/slurm) that would kill
         # a live job.
         self.reap_lost = backend.reap_lost_placements
+        # ...and the reap-on-terminal policy: a backend whose finished job leaves a
+        # capacity-holding session (Colab) is collected-then-reaped by the
+        # reconciler at terminal, mirroring what the daemon does at completion.
+        self.reap_on_terminal = backend.reap_on_terminal
         # Per-backend override wins over the constructor default when configured.
         self._cancel_grace_s = float(
             backend.config.extra("cancel_grace_s", cancel_grace_s)

@@ -363,6 +363,14 @@ class JobRecord(BaseModel):
     submitted_at: datetime | None = None
     last_status: StatusReport | None = None
     outputs_pulled_to: str | None = None
+    # Where reconcile auto-collected a durable copy of the outputs before reaping
+    # an ephemeral (notebook) session — the daemon-equivalent catch-up. Once set,
+    # ``pull`` serves from here because the session no longer exists.
+    outputs_cached_to: str | None = None
+    # Post-terminal housekeeping done: the held session (notebook VM) has been
+    # collected + reaped, so reconcile must not revisit it. Distinct from the
+    # terminal STATUS — a job can be SUCCEEDED yet still hold a leaked session.
+    reaped: bool = False
     schema_version: int = 0  # 0 = written before state versioning; Store.save_job stamps the current version
     # --- scheduler runtime state (Task 2) ---
     attempts: int = 0  # number of placement attempts so far

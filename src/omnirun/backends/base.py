@@ -96,6 +96,18 @@ class Backend(ABC):
     #: momentary unreachable poll and reaping would force-kill a live job.
     reap_lost_placements: bool = False
 
+    #: Whether a job reaching a TERMINAL state on this backend leaves a held,
+    #: capacity-occupying session that must be collected-then-reaped. TRUE only for
+    #: notebook backends whose worker is a live VM that lingers after the job ends
+    #: (Colab: the session keeps burning the ~1-session cap until stopped). For
+    #: such backends the reconciler collects the outputs to a durable local cache
+    #: and then stops the session — exactly what a running daemon would do at
+    #: completion — so back-to-back jobs stop blocking each other. FALSE where the
+    #: worker self-terminates (Kaggle's batch kernel) or persists cheaply and
+    #: holds no concurrent cap (ssh/slurm/local); their outputs stay retrievable
+    #: without a pre-emptive collect.
+    reap_on_terminal: bool = False
+
     def __init__(self, name: str, config: "BackendConfig") -> None:
         self.name = name  # config key, e.g. "uni"
         self.config = config

@@ -297,6 +297,12 @@ class ColabBackend(Backend):
     # holding the concurrent-session cap, so reaping it on LOST reclaims capacity
     # fast (and a stop on an already-gone session is a harmless no-op).
     reap_lost_placements = True
+    # A finished Colab job leaves its VM running (it lingers until ~idle reclaim),
+    # occupying the ~1-session cap and blocking the next `colab new`. So on TERMINAL
+    # the reconciler collects outputs then stops the session — the same collect+reap
+    # a daemon would do at completion. Without this, back-to-back Colab submits
+    # 412-defer against a session the previous (already finished) job never freed.
+    reap_on_terminal = True
 
     def __init__(self, name: str, config: Any) -> None:
         super().__init__(name, config)

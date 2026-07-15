@@ -287,6 +287,141 @@ def test_reconcile_reaps_lost_session_before_requeue(tmp_path: Path) -> None:
         store.close()
 
 
+def test_terminal_notebook_session_collected_then_reaped(tmp_path: Path) -> None:
+    """A job finishing on a ``reap_on_terminal`` backend (notebook) must, on the
+    SAME tick it goes terminal, have its outputs collected to the durable cache
+    and its session reaped — the daemon-equivalent catch-up. Collect MUST precede
+    reap (the session's disk is gone once stopped), and the record is marked so a
+    later tick never revisits it."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "nb",
+            slots=[_free_slot()],
+            poll_script={"nb-000001": [JobStatus.SUCCEEDED]},
+        )
+        provider.reap_on_terminal = True  # a notebook-style held session
+        outputs_dir = tmp_path / "cache"
+        control = Control(store, {"nb": provider}, outputs_dir=outputs_dir)
+        store.save_job(
+            JobRecord(
+                spec=_spec("nb-000001"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="nb",
+                    job_id="nb-000001",
+                    handle={"id": "nb-000001"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.run_tick(T0)
+
+        after = store.load_job("nb-000001")
+        assert after is not None
+        assert after.state is JobState.SUCCEEDED
+        assert after.reaped is True
+        assert after.outputs_cached_to == str(outputs_dir / "nb-000001")
+        # collect happened, and the session was force-reaped (collect-before-reap).
+        assert provider.collect_calls == [("nb-000001", outputs_dir / "nb-000001")]
+        assert provider.cancel_calls == [("nb-000001", CancelMode.FORCE)]
+        events = control.take_events()
+        assert any("nb-000001" in e and "reclaimed 1 slot" in e for e in events), events
+    finally:
+        store.close()
+
+
+def test_terminal_reap_is_idempotent_across_ticks(tmp_path: Path) -> None:
+    """Once a terminal job is collected+reaped, later ticks must NOT collect or
+    reap it again — ``reaped`` gates the revisit, so a series of CLI calls doesn't
+    re-tar a stopped session every time."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "nb",
+            slots=[],
+            poll_script={"nb-000003": [JobStatus.SUCCEEDED]},
+        )
+        provider.reap_on_terminal = True
+        control = Control(store, {"nb": provider}, outputs_dir=tmp_path / "cache")
+        store.save_job(
+            JobRecord(
+                spec=_spec("nb-000003"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="nb",
+                    job_id="nb-000003",
+                    handle={"id": "nb-000003"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.run_tick(T0)  # transition → collect + reap
+        control.run_tick(T1)  # revisit must be a no-op
+        control.run_tick(T2)
+
+        assert provider.collect_calls == [
+            ("nb-000003", tmp_path / "cache" / "nb-000003")
+        ]
+        assert provider.cancel_calls == [("nb-000003", CancelMode.FORCE)]
+    finally:
+        store.close()
+
+
+def test_terminal_reap_retries_when_collect_fails(tmp_path: Path) -> None:
+    """Collect-before-reap integrity: if the transition-tick collect FAILS, the job
+    is left un-reaped (outputs not sacrificed to an eager reap) and a later tick's
+    revisit force-reaps to guarantee the slot is freed within two ticks."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "nb",
+            slots=[],
+            poll_script={"nb-000002": [JobStatus.SUCCEEDED]},
+            collect_error=RuntimeError("session hiccup"),
+        )
+        provider.reap_on_terminal = True
+        control = Control(store, {"nb": provider}, outputs_dir=tmp_path / "cache")
+        store.save_job(
+            JobRecord(
+                spec=_spec("nb-000002"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="nb",
+                    job_id="nb-000002",
+                    handle={"id": "nb-000002"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        # Transition tick: collect fails → NOT reaped, session untouched.
+        control.run_tick(T0)
+        mid = store.load_job("nb-000002")
+        assert mid is not None
+        assert mid.state is JobState.SUCCEEDED
+        assert mid.reaped is False
+        assert provider.collect_calls == [
+            ("nb-000002", tmp_path / "cache" / "nb-000002")
+        ]
+        assert provider.cancel_calls == []  # collect-before-reap: no eager reap
+
+        # Revisit tick: collect fails again → give up, force-reap anyway.
+        control.run_tick(T1)
+        after = store.load_job("nb-000002")
+        assert after is not None
+        assert after.reaped is True
+        assert after.outputs_cached_to is None  # outputs were lost (logged)
+        assert provider.cancel_calls == [("nb-000002", CancelMode.FORCE)]
+    finally:
+        store.close()
+
+
 def test_submit_persists_queued_record(tmp_path: Path) -> None:
     """``submit`` alone persists a QUEUED record with the submitted timestamp."""
     store = open_store(f"sqlite:///{tmp_path / 'state.db'}")

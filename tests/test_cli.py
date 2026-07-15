@@ -586,6 +586,51 @@ def test_pull_outputs(env, tmp_path):
     assert rec is not None and rec.outputs_pulled_to == str(dest)
 
 
+def test_pull_serves_from_cache_when_session_reaped(env, tmp_path, monkeypatch):
+    """When reconcile already collected a terminal notebook job's outputs into the
+    durable cache and reaped its session, ``pull`` must copy from that cache — NOT
+    hit the (now-stopped) backend session. Proven by seeding a cache the backend
+    would never produce and asserting pull_outputs is never called."""
+
+    def _boom(self, handle, dest):  # backend must not be touched
+        raise AssertionError("pull must serve from cache, not the reaped session")
+
+    monkeypatch.setattr(StubBackend, "pull_outputs", _boom)
+
+    cache = tmp_path / "cache" / "reaped-01"
+    cache.mkdir(parents=True)
+    (cache / "model.pt").write_text("weights")
+
+    store = _store()
+    rec = JobRecord(
+        spec=JobSpec(
+            job_id="reaped-01",
+            name="nb",
+            command="python train.py",
+            resources=ResourceSpec(),
+            repo=env.ref,
+        ),
+        state=JobState.SUCCEEDED,
+        submitted_at=datetime.now(timezone.utc),
+        reaped=True,
+        outputs_cached_to=str(cache),
+        placement=Placement(
+            provider_name="stub",
+            job_id="reaped-01",
+            handle={"token": "gone"},
+            state=JobStatus.SUCCEEDED,
+        ),
+    )
+    store.save_job(rec)
+
+    dest = tmp_path / "downloads"
+    result = runner.invoke(app, ["pull", "reaped-01", str(dest)])
+    assert result.exit_code == 0, result.output
+    assert (dest / "model.pt").read_text() == "weights"
+    after = store.load_job("reaped-01")
+    assert after is not None and after.outputs_pulled_to == str(dest)
+
+
 # ------------------------------------- daemon-placed jobs (placement, handle=None)
 
 

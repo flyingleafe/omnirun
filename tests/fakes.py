@@ -58,12 +58,14 @@ class FakeProvider:
         place_state: JobStatus = JobStatus.RUNNING,
         placed_at: datetime | None = None,
         discover_available: int | None = None,
+        collect_error: Exception | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
         self._place_state = place_state
         self._placed_at = placed_at
         self._discover_available = discover_available
+        self._collect_error = collect_error
         # Working copies of the scripts so popping does not mutate the caller's.
         self._poll_script: dict[str, list[JobStatus]] = {
             jid: list(seq) for jid, seq in (poll_script or {}).items()
@@ -78,6 +80,9 @@ class FakeProvider:
         # Reap-on-lost policy the reconciler reads (real backends set this per
         # type: notebooks True, transport backends False). Tests flip it on.
         self.reap_lost: bool = False
+        # Reap-on-terminal policy (a held notebook session collected-then-reaped
+        # when its job finishes). Tests flip it on to exercise the catch-up.
+        self.reap_on_terminal: bool = False
 
     # -- Provider protocol ------------------------------------------------
 
@@ -126,6 +131,8 @@ class FakeProvider:
 
     def collect_outputs(self, p: Placement, dest: Path) -> None:
         self.collect_calls.append((p.job_id, dest))
+        if self._collect_error is not None:
+            raise self._collect_error
 
     def gc(self) -> None:
         self.gc_calls += 1

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from omnirun.models import (
@@ -126,6 +127,7 @@ class Control:
         budget_window: str = "day",
         budget_cap: float | None = None,
         week_cap: float | None = None,
+        outputs_dir: Path | None = None,
     ) -> None:
         self._store = store
         self._providers = providers
@@ -133,6 +135,12 @@ class Control:
         self._budget_window = budget_window
         self._budget_cap = budget_cap
         self._week_cap = week_cap
+        # Durable local cache the reconciler collects a terminal notebook job's
+        # outputs into BEFORE reaping its session (the session's disk is gone once
+        # stopped). ``pull`` then serves from here. ``None`` disables the eager
+        # collect-then-reap (unit tests that don't exercise it); the CLI/daemon
+        # always pass a real dir under the state dir.
+        self._outputs_dir = outputs_dir
         # User-facing events accumulated during the current tick (e.g. a leaked
         # session reaped) — drained by the CLI to surface what the machine did.
         self._tick_events: list[str] = []
@@ -306,6 +314,10 @@ class Control:
                     "last_status": StatusReport(
                         status=JobStatus.CANCELLED, detail="cancelled by user"
                     ),
+                    # cancel() already force-reaps the placement above, so the
+                    # session is gone — mark it reaped so reconcile's terminal
+                    # catch-up doesn't try to collect from a stopped session.
+                    "reaped": True,
                 }
             )
         )
@@ -387,6 +399,14 @@ class Control:
         """
         for rec in self._store.list_jobs():
             if rec.state not in (JobState.PLACING, JobState.RUNNING):
+                # Catch-up the daemon would already have done: a terminal job on a
+                # session-holding backend (notebook) still needs its outputs
+                # collected and its session reaped. Doing it here on every tick is
+                # what makes a series of CLI calls converge to the daemon's state
+                # (the daemonless catch-up invariant). Everything else terminal has
+                # nothing to reap and is left alone.
+                if rec.state.terminal and not rec.reaped and rec.placement is not None:
+                    self._catch_up_terminal(rec, rec.placement, now)
                 continue
             placement = rec.placement
             if placement is None:
@@ -452,8 +472,11 @@ class Control:
             #     killing a possibly-alive job.
             # poll already tried the durable result read (result.json wins over LOST),
             # so a genuinely finished job never reaches this branch.
-            if getattr(provider, "reap_lost", False):
-                self._reap(placement)
+            if getattr(provider, "reap_lost", False) and self._reap(placement):
+                self._tick_events.append(
+                    f"reaped lost session for {placement.job_id} on "
+                    f"{placement.provider_name}; reclaimed 1 slot"
+                )
             self._requeue(rec, now)
             return
 
@@ -468,15 +491,14 @@ class Control:
             updated = placement.model_copy(
                 update={"ended_at": now, "state": status.state}
             )
-            self._store.save_job(
-                rec.model_copy(
-                    update={
-                        "state": new_state,
-                        "placement": updated,
-                        "last_status": report,
-                    }
-                )
+            terminal_rec = rec.model_copy(
+                update={
+                    "state": new_state,
+                    "placement": updated,
+                    "last_status": report,
+                }
             )
+            self._store.save_job(terminal_rec)
             # Realize a committed (paid) placement into a spend, in every enforced
             # window the commit was written to (day always; week when weekly
             # enforcement is active). Free jobs carry cost_actual None and never
@@ -486,6 +508,15 @@ class Control:
                     self._store.ledger_realize(
                         window, rec.spec.job_id, placement.cost_actual, now
                     )
+            # Collect-then-reap a held session (notebook) the instant its job
+            # finishes — the happy-path, one-tick case. ``give_up=False`` so a
+            # transient collect failure leaves the job un-reaped for a later
+            # tick's revisit (via ``_catch_up_terminal``) rather than losing the
+            # outputs to an over-eager reap.
+            if getattr(provider, "reap_on_terminal", False):
+                self._collect_and_reap(
+                    terminal_rec, updated, provider, now, give_up=False
+                )
             return
 
         # Still active: keep RUNNING, refresh the backend-level placement state.
@@ -500,28 +531,101 @@ class Control:
             )
         )
 
-    def _reap(self, placement: Placement) -> None:
+    def _reap(self, placement: Placement) -> bool:
         """Tear down an abandoned placement (force-cancel + gc) — best-effort.
 
         Frees the leaked worker resource (a dangling Colab session, a billed
         marketplace instance) the moment a job stops needing its placement, so it
         cannot keep consuming the provider's capacity. Per-job safe on every
-        backend: ``gc`` removes only the job dir, never the shared worktree/venv."""
+        backend: ``gc`` removes only the job dir, never the shared worktree/venv.
+
+        Returns True if the reap call completed without raising (the caller emits
+        the user-facing event, since the wording differs between a lost-session
+        reap and a terminal collect-then-reap)."""
         provider = self._providers.get(placement.provider_name)
         if provider is None:
-            return
+            return False
         try:
             provider.cancel(placement, CancelMode.FORCE)
-            self._tick_events.append(
-                f"reaped lost session for {placement.job_id} on "
-                f"{placement.provider_name}; reclaimed 1 slot"
-            )
+            return True
         except Exception:
             _log.warning(
-                "reap of lost placement %s on %s raised; continuing",
+                "reap of placement %s on %s raised; continuing",
                 placement.job_id,
                 placement.provider_name,
                 exc_info=True,
+            )
+            return False
+
+    def _catch_up_terminal(
+        self, rec: JobRecord, placement: Placement, now: datetime
+    ) -> None:
+        """Revisit a terminal-but-unreaped job: if its backend holds a reclaimable
+        session, collect-then-reap it now (``give_up=True`` — a revisit means the
+        transition tick's collect already failed once, so free the slot even if
+        collect fails again). A no-op for backends that hold nothing."""
+        provider = self._providers.get(placement.provider_name)
+        if provider is None or not getattr(provider, "reap_on_terminal", False):
+            return
+        self._collect_and_reap(rec, placement, provider, now, give_up=True)
+
+    def _collect_and_reap(
+        self,
+        rec: JobRecord,
+        placement: Placement,
+        provider: Provider,
+        now: datetime,
+        *,
+        give_up: bool,
+    ) -> None:
+        """Collect a terminal job's outputs to the durable cache, THEN reap its
+        held session — the exact catch-up a running daemon performs at completion.
+
+        Collect-before-reap is mandatory: reaping stops the VM and its disk (and
+        thus the uncollected outputs) is gone. ``give_up`` chooses the failure
+        policy:
+
+        * ``give_up=False`` (the terminal-transition tick): a failed collect
+          leaves the job un-reaped so a later tick retries — never trade the
+          outputs for an eager reap on the first try.
+        * ``give_up=True`` (a later revisit): force the reap regardless, so the
+          slot is guaranteed freed within two ticks. A *live* session always
+          collects successfully, so a persistently failing collect means the
+          session is already gone (nothing leaked) — reaping is then a harmless
+          no-op and the (already lost) outputs cost nothing more.
+
+        Idempotent via ``rec.reaped``: once set, ``_reconcile`` never revisits."""
+        if self._outputs_dir is None:
+            # No durable cache configured (a unit Control): we cannot collect-
+            # before-reap safely, so leave the session for `gc`/`cancel` to reap.
+            return
+        cached_to = rec.outputs_cached_to
+        if cached_to is None:
+            dest = self._outputs_dir / rec.spec.job_id
+            try:
+                provider.collect_outputs(placement, dest)
+                cached_to = str(dest)
+            except Exception:
+                _log.warning(
+                    "collecting outputs for terminal job %s on %s raised",
+                    rec.spec.job_id,
+                    placement.provider_name,
+                    exc_info=True,
+                )
+                if not give_up:
+                    return  # retry on a later tick before touching the session
+                self._tick_events.append(
+                    f"could not collect outputs for {rec.spec.job_id}; reaping "
+                    f"{placement.provider_name} session anyway to free the slot"
+                )
+        reaped = self._reap(placement)
+        self._store.save_job(
+            rec.model_copy(update={"reaped": True, "outputs_cached_to": cached_to})
+        )
+        if cached_to is not None and reaped:
+            self._tick_events.append(
+                f"collected outputs and reaped {placement.provider_name} session "
+                f"for {rec.spec.job_id}; reclaimed 1 slot"
             )
 
     def _requeue(self, rec: JobRecord, now: datetime) -> None:
