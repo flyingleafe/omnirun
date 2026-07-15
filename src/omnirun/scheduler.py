@@ -7,8 +7,11 @@ and the current time, and returns a list of :class:`~omnirun.models.Decision`s
 * no I/O, no wall-clock (``now`` is a parameter), no randomness;
 * imports only :mod:`omnirun.models`, :mod:`omnirun.budget`, and stdlib —
   never ``omnirun.state`` / ``omnirun.backends`` / ``omnirun.providers``;
-* no backend names and no ``if provider == …`` — fit is decided *solely* by
-  ``slot.capabilities.satisfies(req)`` / ``slot.fits(req)``.
+* no backend names and no ``if provider == …`` — fit is decided by
+  ``slot.capabilities.satisfies(req)`` / ``slot.fits(req)`` plus, for a job
+  pinned to a provider (``spec.only_backend``), a provider-NAME equality check.
+  A pin is a plain string match on ``slot.provider_name``, not backend-specific
+  logic: the tick stays slot-blind about *what* a provider is.
 
 The caller (the impure ``Control`` driver) reconciles provider statuses into
 the job states *before* calling ``tick`` (spec §7 step 1), then enacts the
@@ -85,6 +88,14 @@ def _wait_key(slot: Slot) -> float:
 
 def _is_free(slot: Slot) -> bool:
     return slot.cost.per_hour is None
+
+
+def _pinned_slots(rec: JobRecord, slots: list[Slot]) -> list[Slot]:
+    """The slots this job may use: all of them, or only its pinned provider's."""
+    pin = rec.spec.only_backend
+    if pin is None:
+        return slots
+    return [s for s in slots if s.provider_name == pin]
 
 
 def _rank_key(rec: JobRecord, now: datetime) -> tuple[int, float, float]:
@@ -187,16 +198,20 @@ def tick(
     decisions: list[Decision] = []
     admittable: list[JobRecord] = []
 
-    # Step 2: admit / hold. A job holds iff slots exist AND none of their
-    # capabilities can satisfy the requirement (capabilities ONLY — ignoring
-    # capacity/availability/cost). With no slots we can't prove impossibility.
+    # Step 2: admit / hold. A job holds iff ELIGIBLE slots exist AND none of
+    # their capabilities can satisfy the requirement (capabilities ONLY —
+    # ignoring capacity/availability/cost). "Eligible" restricts a pinned job to
+    # its provider's slots: with no eligible slots we can't prove impossibility,
+    # so the job is admittable (it waits) — other providers' unsatisfying slots
+    # must never hold a job pinned to a provider that is simply offering nothing.
     for rec in pending:
         req = rec.spec.resources
-        if not slots:
+        eligible = _pinned_slots(rec, slots)
+        if not eligible:
             # Can't prove impossible; not held, just not placed this tick.
             admittable.append(rec)
             continue
-        unfit_reasons = [slot.capabilities.satisfies(req) for slot in slots]
+        unfit_reasons = [slot.capabilities.satisfies(req) for slot in eligible]
         if any(not reasons for reasons in unfit_reasons):
             admittable.append(rec)  # at least one slot's caps fit
             continue
@@ -224,11 +239,25 @@ def tick(
     for rec in admittable:
         req = rec.spec.resources
 
-        # Candidate slots: fit (capabilities) AND local remaining capacity > 0.
+        # A pinned job may only land on its provider's slots. Compute the set of
+        # eligible GLOBAL slot indices (all when unpinned) so the candidate
+        # filter can restrict by index while still keying capacity off the shared
+        # ``remaining`` list — pinned and unpinned jobs contend for the same slot.
+        pin = rec.spec.only_backend
+        eligible_idx = (
+            None
+            if pin is None
+            else {idx for idx, s in enumerate(slots) if s.provider_name == pin}
+        )
+
+        # Candidate slots: fit (capabilities), local remaining capacity > 0, and
+        # (when pinned) in the job's eligible provider set.
         candidates = [
             (idx, slot)
             for idx, slot in enumerate(slots)
-            if remaining[idx] > 0 and slot.fits(req)
+            if remaining[idx] > 0
+            and slot.fits(req)
+            and (eligible_idx is None or idx in eligible_idx)
         ]
 
         chosen: tuple[int, Slot] | None = None

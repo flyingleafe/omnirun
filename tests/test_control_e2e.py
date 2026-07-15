@@ -149,6 +149,52 @@ def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:
         store.close()
 
 
+def test_pinned_job_placed_on_its_backend_by_one_unscoped_tick(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: two providers, a job pinned to the SECOND. A single unscoped
+    ``run_tick`` (no scoping args exist anymore) places it on the pinned provider
+    even though the first provider also fits; a second, unpinned job lands
+    wherever it fits (the first provider)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        prov_a = FakeProvider(
+            "a",
+            slots=[Slot(provider_name="a", capabilities=Capabilities(), cost=Cost())],
+            poll_script={},
+        )
+        prov_b = FakeProvider(
+            "b",
+            slots=[Slot(provider_name="b", capabilities=Capabilities(), cost=Cost())],
+            poll_script={},
+        )
+        control = Control(store, {"a": prov_a, "b": prov_b})
+
+        pinned = _spec(job_id="pinned-000001").model_copy(update={"only_backend": "b"})
+        unpinned = _spec(job_id="unpinned-000001")
+        control.submit(pinned, now=T0)
+        control.submit(unpinned, now=T0)
+
+        control.run_tick(T0)
+
+        placed_pinned = store.load_job("pinned-000001")
+        assert placed_pinned is not None
+        assert placed_pinned.state is JobState.RUNNING
+        assert placed_pinned.placement is not None
+        assert placed_pinned.placement.provider_name == "b"
+        # The pinned job was driven on 'b' and never on 'a'.
+        assert prov_b.place_calls == ["pinned-000001"]
+        assert "pinned-000001" not in prov_a.place_calls
+
+        placed_unpinned = store.load_job("unpinned-000001")
+        assert placed_unpinned is not None
+        assert placed_unpinned.state is JobState.RUNNING
+        assert placed_unpinned.placement is not None
+        assert placed_unpinned.placement.provider_name == "a"
+    finally:
+        store.close()
+
+
 def test_capacity_defer_requeues_without_counting_an_attempt(tmp_path: Path) -> None:
     """A provider with no room right now raises CapacityError (Colab's session
     cap). The job must stay QUEUED and retry on later ticks, and NEVER bump

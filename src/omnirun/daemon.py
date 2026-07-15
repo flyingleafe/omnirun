@@ -341,7 +341,10 @@ class Daemon:
         with self._lock:
             for _ in range(max(1, count)):
                 job_spec = spec.model_copy(
-                    update={"job_id": JobSpec.make_job_id(spec.name)}
+                    update={
+                        "job_id": JobSpec.make_job_id(spec.name),
+                        "only_backend": only_backend,
+                    }
                 )
                 entry = QueueEntry.new(job_spec, only_backend=only_backend)
                 self._store.save_entry(entry)
@@ -427,56 +430,16 @@ class Daemon:
                 self._store.save_entry(entry)
 
     def _run_scheduler(self, now: datetime) -> None:
-        """Drive the pure ``tick`` through ``Control``, honoring ``only_backend``.
+        """Drive the pure ``tick`` through ``Control`` — ONE unscoped round.
 
-        The pure tick is slot-blind, so a job pinned to one backend cannot be
-        expressed as a capability. Instead we run one scoped ``run_tick`` per
-        restriction group over the ONE shared ``Store`` (so ``Store.reserve``
-        still enforces every backend's cap globally and atomically): the
-        unrestricted jobs may place on any provider; each ``only_backend`` group
-        may place only on its provider. Reconcile is global and runs on the FIRST
-        call only, so an in-flight placement is polled exactly once per tick.
+        A job pinned to one backend rides ``spec.only_backend`` (baked in by
+        ``_cmd_enqueue``, mirrored onto its ``JobRecord`` by ``_sync_jobs``);
+        the pure ``tick`` honors the pin as a provider-NAME match, so a single
+        ``run_tick`` over the ONE shared ``Store`` places every job — pinned and
+        unpinned — correctly, ``Store.reserve`` still enforcing each backend's
+        cap globally and atomically.
         """
-        control = self._get_control()
-        groups = self._restriction_groups()
-        if not groups:
-            control.run_tick(now)  # nothing pending; still reconcile in-flight jobs
-            return
-        for i, (providers, job_ids) in enumerate(groups):
-            control.run_tick(
-                now,
-                only_providers=providers,
-                only_job_ids=job_ids,
-                reconcile=(i == 0),
-            )
-
-    def _restriction_groups(
-        self,
-    ) -> list[tuple[set[str] | None, set[str] | None]]:
-        """Partition pending queue entries into ``(only_providers, only_job_ids)``.
-
-        The unrestricted group (all providers, ``None`` job filter) comes first so
-        it carries the single global reconcile; then one group per distinct
-        ``only_backend`` value, each scoped to that provider and its job ids.
-        Returns an empty list when nothing is pending.
-        """
-        pending = [
-            e
-            for e in self._store.load_entries()
-            if e.state in (QueueState.PENDING, QueueState.PLACING)
-        ]
-        unrestricted = [e for e in pending if e.only_backend is None]
-        by_backend: dict[str, set[str]] = {}
-        for e in pending:
-            if e.only_backend is not None:
-                by_backend.setdefault(e.only_backend, set()).add(e.spec.job_id)
-
-        groups: list[tuple[set[str] | None, set[str] | None]] = []
-        if unrestricted:
-            groups.append((None, {e.spec.job_id for e in unrestricted}))
-        for backend, job_ids in by_backend.items():
-            groups.append(({backend}, job_ids))
-        return groups
+        self._get_control().run_tick(now)
 
     def _project(self, now: datetime) -> None:
         """Mirror each job's scheduler state back onto its queue entry.

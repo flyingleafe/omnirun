@@ -610,12 +610,21 @@ def _submit_via_control(
 
     Daemonless: ``Control`` does its own single tick here — no background process
     is required (a placed job then runs on the backend while the laptop is free).
-    ``--backend`` narrows the provider set the scheduler may place onto.
+    ``--backend`` pins the job to that provider via ``spec.only_backend``; the
+    pure tick honors the pin, so ``Control`` still sees ALL enabled backends
+    (a full reconcile of any other in-flight job runs unimpeded).
     """
+    if backend is not None:
+        if backend not in cfg.backends:
+            known = ", ".join(sorted(cfg.backends)) or "none configured"
+            raise BackendError(
+                f"backend {backend!r} is not configured (known: {known})"
+            )
+        spec = spec.model_copy(update={"only_backend": backend})
     # Same driver as every other lifecycle command (so a submit's reconcile also
     # performs the daemon-equivalent catch-up — collecting + reaping a prior
     # terminal notebook session before placing this job).
-    control = _control(cfg, store, backend)
+    control = _control(cfg, store)
     now = datetime.now(timezone.utc)
     job_id = control.submit(spec, now=now)
     control.run_tick(now)

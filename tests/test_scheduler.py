@@ -49,6 +49,7 @@ def _spec(
     job_id: str | None = None,
     resources: ResourceSpec | None = None,
     policy: JobPolicy | None = None,
+    only_backend: str | None = None,
 ) -> JobSpec:
     return JobSpec(
         job_id=job_id or JobSpec.make_job_id("test"),
@@ -57,6 +58,7 @@ def _spec(
         repo=_REPO,
         resources=resources or ResourceSpec(),
         policy=policy or JobPolicy(),
+        only_backend=only_backend,
     )
 
 
@@ -67,9 +69,15 @@ def _rec(
     policy: JobPolicy | None = None,
     state: JobState = JobState.QUEUED,
     submitted_at: datetime | None = None,
+    only_backend: str | None = None,
 ) -> JobRecord:
     return JobRecord(
-        spec=_spec(job_id=job_id, resources=resources, policy=policy),
+        spec=_spec(
+            job_id=job_id,
+            resources=resources,
+            policy=policy,
+            only_backend=only_backend,
+        ),
         state=state,
         submitted_at=submitted_at,
     )
@@ -946,3 +954,121 @@ class TestUrgencyTzSafety:
         naive_now = datetime(2026, 7, 11, 12, 0, 0)  # tz-naive
         val = rec.urgency(naive_now)
         assert isinstance(val, float)
+
+
+# ---------------------------------------------------------------------------
+# Backend pinning — spec.only_backend as a provider-NAME match (P1.2)
+# ---------------------------------------------------------------------------
+
+
+class TestBackendPinning:
+    def test_pinned_job_places_only_on_matching_provider(self) -> None:
+        """A pin routes to the named provider even when another provider offers a
+        cheaper/faster fitting slot (the pin wins over cost/availability)."""
+        rec = _rec(job_id="p", only_backend="b")
+        # 'a' is free and ready NOW (the availability an unpinned job prefers);
+        # 'b' is free but slower — yet the pin sends the job to 'b' regardless.
+        a = _slot(
+            provider_name="a", cost=Cost(), availability=Availability(kind="ready_now")
+        )
+        b = _slot(
+            provider_name="b",
+            cost=Cost(),
+            availability=Availability(kind="queued", wait_s=60.0),
+        )
+        out = tick([rec], [a, b], BudgetLedger(cap=1000.0), NOW)
+        places = _places(out)
+        assert len(places) == 1
+        assert _placed_on(places[0]) == "b"
+
+    def test_pinned_job_with_no_matching_slot_emits_nothing(self) -> None:
+        """No slot from the pinned provider → the job stays QUEUED (no place, no
+        hold) even though other providers' slots would fit."""
+        rec = _rec(job_id="p", only_backend="b")
+        a = _slot(provider_name="a")  # fits, but wrong provider
+        out = tick([rec], [a], BudgetLedger(), NOW)
+        assert _places(out) == []
+        assert _holds(out) == []
+
+    def test_pinned_hold_ignores_other_providers_unfit_slots(self) -> None:
+        """A pinned job must NOT be held because some OTHER provider's slots can't
+        satisfy it: with the pinned provider offering nothing, it just waits."""
+        gpu_rec = _rec(
+            job_id="g", resources=ResourceSpec(gpu_type="H100"), only_backend="b"
+        )
+        # Only provider 'a' offers slots, and its caps don't satisfy H100. Since
+        # the job is pinned to 'b' (which offers nothing), it must not hold.
+        a_t4 = _slot(
+            provider_name="a",
+            capabilities=Capabilities(gpu_types=["T4"], max_vram_gb=16),
+        )
+        out = tick([gpu_rec], [a_t4], BudgetLedger(), NOW)
+        assert _holds(out) == []
+        assert _places(out) == []
+
+    def test_pinned_holds_when_own_provider_cannot_satisfy(self) -> None:
+        """A pinned job DOES hold when its provider offers slots but none of them
+        satisfy the requirement (impossibility is provable within the pin)."""
+        gpu_rec = _rec(
+            job_id="g", resources=ResourceSpec(gpu_type="H100"), only_backend="b"
+        )
+        b_t4 = _slot(
+            provider_name="b",
+            capabilities=Capabilities(gpu_types=["T4"], max_vram_gb=16),
+        )
+        # A capable slot on 'a' must not rescue a job pinned to 'b'.
+        a_h100 = _slot(
+            provider_name="a",
+            capabilities=Capabilities(gpu_types=["H100"], max_vram_gb=80),
+        )
+        out = tick([gpu_rec], [b_t4, a_h100], BudgetLedger(), NOW)
+        holds = _holds(out)
+        assert len(holds) == 1
+        assert holds[0].job_id == "g"
+        assert _places(out) == []
+
+    def test_unpinned_job_unaffected_by_pins(self) -> None:
+        """An unpinned job still places on the best fitting slot regardless of
+        another job's pin — pins are per-job, not global."""
+        pinned = _rec(job_id="p", only_backend="b", submitted_at=NOW)
+        free = _rec(job_id="f", submitted_at=NOW)
+        a = _slot(provider_name="a", capacity=1)
+        b = _slot(provider_name="b", capacity=1)
+        out = tick([pinned, free], [a, b], BudgetLedger(), NOW)
+        placed = {d.job_id: _placed_on(d) for d in _places(out)}
+        assert placed == {"p": "b", "f": "a"}
+
+    def test_pinned_job_consumes_shared_capacity(self) -> None:
+        """Pinned and unpinned jobs share the SAME slot capacity in one tick: a
+        pinned job taking the last unit of provider 'b' leaves the unpinned job
+        to fall back to 'a' (capacity accounting is global, not per-partition)."""
+        # Provider 'b' has exactly one unit; 'a' has one too. The pinned job must
+        # take b's only unit; the unpinned job (ranked after by submitted_at) then
+        # cannot use b and lands on a.
+        pinned = _rec(job_id="p", only_backend="b", submitted_at=NOW)
+        later = _rec(job_id="f", submitted_at=NOW + timedelta(seconds=1))
+        # 'b' first in the slot list: an unpinned earliest-wait pick would prefer
+        # it, so this proves the pinned job actually reserved b's single unit.
+        b = _slot(provider_name="b", capacity=1)
+        a = _slot(provider_name="a", capacity=1)
+        out = tick([pinned, later], [b, a], BudgetLedger(), NOW)
+        placed = {d.job_id: _placed_on(d) for d in _places(out)}
+        assert placed == {"p": "b", "f": "a"}
+
+    def test_unpinned_taking_last_unit_starves_pinned(self) -> None:
+        """The reverse: when the unpinned job ranks first and grabs the pinned
+        provider's only unit, the pinned job gets nothing this tick (it may not
+        spill to another provider)."""
+        # Unpinned ranks first (earlier submitted_at) and 'b' is first in the slot
+        # list, so it takes b's only unit; the pinned-to-b job is then starved.
+        unpinned = _rec(job_id="u", submitted_at=NOW)
+        pinned = _rec(
+            job_id="p", only_backend="b", submitted_at=NOW + timedelta(seconds=1)
+        )
+        b = _slot(provider_name="b", capacity=1)
+        a = _slot(provider_name="a", capacity=1)
+        out = tick([unpinned, pinned], [b, a], BudgetLedger(), NOW)
+        placed = {d.job_id: _placed_on(d) for d in _places(out)}
+        assert placed.get("u") == "b"
+        assert "p" not in placed  # pinned job starved; stays QUEUED
+        assert _holds(out) == []

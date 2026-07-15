@@ -193,13 +193,24 @@ def test_spreads_across_two_backends(tmp_path: Path) -> None:
 
 
 def test_only_backend_restriction(tmp_path: Path) -> None:
+    # An `--backend b`-pinned enqueue must place on b even when a (which the
+    # scheduler would otherwise pick, iterating providers in order) is free too.
+    # Drive it through the real _cmd_enqueue so the pin is baked into the spec
+    # and honored by the plain tick — no scoped run_tick anymore.
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    daemon._store.save_entry(QueueEntry.new(make_spec("j"), only_backend="b"))
+    resp = daemon._cmd_enqueue(
+        {"spec": make_spec("j").model_dump(mode="json"), "backend": "b"}
+    )
+    assert resp["ok"] is True
     daemon._tick()
     _drain(daemon)
     [entry] = daemon._store.load_entries()
     assert entry.state is QueueState.RUNNING
     assert entry.backend == "b"
+    # The mirrored JobRecord carries the pin the scheduler actually read.
+    assert entry.only_backend == "b"
+    rec = daemon._store.load_job(entry.spec.job_id)
+    assert rec is not None and rec.spec.only_backend == "b"
 
 
 def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:

@@ -230,6 +230,8 @@ class JobSpec(BaseModel):
     repo: RepoRef
     env_vars: dict[str, str] = Field(default_factory=dict)  # forwarded to the job
     policy: JobPolicy = Field(default_factory=JobPolicy)
+    # Pin placement to this provider name (config key); None = any fitting provider.
+    only_backend: str | None = None
 
     @staticmethod
     def make_job_id(name: str) -> str:

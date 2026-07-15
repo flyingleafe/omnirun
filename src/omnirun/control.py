@@ -326,54 +326,31 @@ class Control:
     # The tick loop (spec §7)
     # ------------------------------------------------------------------
 
-    def run_tick(
-        self,
-        now: datetime,
-        *,
-        only_providers: set[str] | None = None,
-        only_job_ids: set[str] | None = None,
-        reconcile: bool = True,
-    ) -> list[Decision]:
-        """Run one scheduling round: reconcile → gather → tick → enact.
+    def run_tick(self, now: datetime) -> list[Decision]:
+        """Run one scheduling round: reconcile → refresh facts → gather → tick → enact.
 
         Returns the decisions produced by ``tick`` (already enacted). Reconcile
         runs *first* so any capacity freed by a job that just finished/was lost
         is visible when the tick matches this round's pending jobs.
 
-        The optional scoping arguments exist ONLY for the daemon's per-restriction
-        placement (a job pinned to one backend via ``only_backend``): the pure
-        ``tick`` is slot-blind and cannot express per-job provider affinity, so the
-        daemon instead runs one scoped tick per restriction group over ONE shared
-        ``Store``. With every argument at its default this method behaves exactly
-        as the daemonless ``submit`` and the invariant suite expect — full
-        reconcile, all providers offer, all pending jobs considered.
-
-        * ``only_providers`` — gather slots only from these providers (a
-          restriction group's allowed backend).
-        * ``only_job_ids`` — consider only these jobs for holding/placement (so a
-          group's tick never places another group's job on the wrong provider).
-        * ``reconcile`` — set ``False`` on the secondary grouped calls within one
-          daemon tick so the global reconcile poll runs exactly once (no double
-          poll of the same placement).
+        A job pinned to one backend (``spec.only_backend``) needs no scoping here:
+        the pure ``tick`` honors the pin as a provider-NAME match, so ONE tick
+        over ALL providers places every job — pinned and unpinned — correctly.
+        ``_gather_slots`` still skips providers no pending job can target, so a
+        pinned submit never probes every backend.
 
         The place/persist seam is **at-least-once** (see module docstring).
         Orphan-recovery (I2) is present: a PLACING placement with a partial handle
         carrying a ``"provisioning"`` marker is adopted (polled) rather than
         reverted to QUEUED, preventing double-launch of a billed instance.
         """
-        if reconcile:
-            self._tick_events = []
-            self._reconcile(now)
-            self._refresh_facts(now, only_providers)
+        self._tick_events = []
+        self._reconcile(now)
+        self._refresh_facts(now)
         jobs = self._store.list_jobs()
-        considered = (
-            jobs
-            if only_job_ids is None
-            else [j for j in jobs if j.spec.job_id in only_job_ids]
-        )
-        slots = self._gather_slots(considered, only_providers)
+        slots = self._gather_slots(jobs)
         ledger = self._store.load_ledger(self._budget_window, self._resolve_cap(), now)
-        decisions = tick(considered, slots, ledger, now, policy=self._policy)
+        decisions = tick(jobs, slots, ledger, now, policy=self._policy)
         for decision in decisions:
             self._enact(decision, now)
         return decisions
@@ -425,13 +402,13 @@ class Control:
                 continue
             provider = self._providers.get(placement.provider_name)
             if provider is None:
-                # Expected and benign when this tick's provider set is intentionally
-                # narrowed (e.g. `submit --backend X`): a job already placed on
-                # another backend simply isn't reconciled here — it will be on the
-                # next full tick (`ps`, `serve`). Debug, not a user-facing warning:
+                # The job is placed on a backend that was REMOVED from config (or
+                # this Control was built over a narrower provider set, e.g. the
+                # `cancel` path that only wires the job's own provider): we can't
+                # poll a provider we don't have. Debug, not a user-facing warning:
                 # surfacing it on stdout reads like an error about the wrong job.
                 _log.debug(
-                    "skipping reconcile of job %s: provider %r not in this tick's set",
+                    "skipping reconcile of job %s: provider %r not available",
                     rec.spec.job_id,
                     placement.provider_name,
                 )
@@ -664,7 +641,7 @@ class Control:
     # Step 1b: refresh stale capacity facts (self-GC) before gather
     # ------------------------------------------------------------------
 
-    def _refresh_facts(self, now: datetime, only_providers: set[str] | None) -> None:
+    def _refresh_facts(self, now: datetime) -> None:
         """Refresh stale capacity facts before gather, so ``offer`` reads provider
         truth. A provider whose cached capacity is stale (or absent) is asked to
         ``discover()`` — the provider self-GCs its dangling held resources (reading
@@ -673,8 +650,6 @@ class Control:
         the old facts in place (the tick degrades to last-known capacity, never
         crashes)."""
         for name, provider in self._providers.items():
-            if only_providers is not None and name not in only_providers:
-                continue
             facts = self._store.load_facts(name)
             if facts is not None and facts.capacity_fresh(now):
                 continue
@@ -689,35 +664,55 @@ class Control:
     # Step 2: gather slots offered by every provider for the pending reqs
     # ------------------------------------------------------------------
 
-    def _gather_slots(
-        self, jobs: list[JobRecord], only_providers: set[str] | None
-    ) -> list[Slot]:
-        """Ask each provider to ``offer`` slots for every distinct pending req.
+    def _gather_slots(self, jobs: list[JobRecord]) -> list[Slot]:
+        """Ask each USABLE provider to ``offer`` slots for the reqs it can serve.
 
-        Only QUEUED/HELD jobs among *jobs* need slots; their DISTINCT
-        ``ResourceSpec``s are the reqs we ask about. No dedup of the returned
-        slots — ``reserve`` is the atomic capacity truth, so an over-emitted
-        place simply fails reserve gracefully. A provider whose ``offer`` raises
-        is treated as offering nothing this tick (circuit-breaker-lite) rather
-        than crashing the tick. ``only_providers`` (daemon restriction groups)
-        narrows which providers are asked; ``None`` asks them all.
+        Only QUEUED/HELD jobs among *jobs* need slots. A provider is usable only
+        if at least one pending job may target it: a job with
+        ``only_backend=None`` makes ALL providers usable; a pinned job makes only
+        its provider usable. A provider no pending job can target is never asked
+        (so a pinned submit does not probe every backend); nothing pending → the
+        req sets are all empty → nobody is asked.
+
+        Per provider we offer only the DISTINCT reqs of the jobs that may target
+        it — a pinned job's req is never posed to a provider it cannot land on.
+        No dedup of the returned slots — ``reserve`` is the atomic capacity
+        truth, so an over-emitted place simply fails reserve gracefully. A
+        provider whose ``offer`` raises is treated as offering nothing this tick
+        (circuit-breaker-lite) rather than crashing the tick.
         """
         pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
-        # Distinct reqs by their JSON shape (ResourceSpec is a pydantic model;
-        # it is not hashable, so dedup on a canonical serialization).
-        reqs: list[ResourceSpec] = []
-        seen: set[str] = set()
+
+        # Distinct reqs each provider must be asked about. A job with no pin
+        # contributes its req to EVERY provider; a pinned job only to its
+        # provider's set. ResourceSpec is a pydantic model (not hashable), so we
+        # dedup on a canonical JSON serialization and keep one spec per shape.
+        reqs_by_provider: dict[str, list[ResourceSpec]] = {
+            name: [] for name in self._providers
+        }
+        seen_by_provider: dict[str, set[str]] = {
+            name: set() for name in self._providers
+        }
+
+        def _add(name: str, req: ResourceSpec) -> None:
+            if name not in reqs_by_provider:
+                return
+            key = req.model_dump_json()
+            if key not in seen_by_provider[name]:
+                seen_by_provider[name].add(key)
+                reqs_by_provider[name].append(req)
+
         for r in pending:
-            key = r.spec.resources.model_dump_json()
-            if key not in seen:
-                seen.add(key)
-                reqs.append(r.spec.resources)
+            pin = r.spec.only_backend
+            if pin is None:
+                for name in self._providers:
+                    _add(name, r.spec.resources)
+            else:
+                _add(pin, r.spec.resources)
 
         slots: list[Slot] = []
         for name, provider in self._providers.items():
-            if only_providers is not None and name not in only_providers:
-                continue
-            for req in reqs:
+            for req in reqs_by_provider[name]:
                 try:
                     slots.extend(provider.offer(req))
                 except Exception:
