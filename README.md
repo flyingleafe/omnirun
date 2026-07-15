@@ -86,14 +86,18 @@ requirement: single submits never touch it.
 
 omnirun stores all state in a SQLite database
 (`~/.local/share/omnirun/omnirun.db`). The `[state]` config section lets you
-relocate it (a Postgres backend for a shared daemon is a planned Tier-2
-addition, not yet shipped):
+relocate it, or point it at a PostgreSQL server for a shared always-on daemon
+(see [docs/deploy.md](docs/deploy.md)):
 
 ```toml
 [state]
 # path = "/custom/omnirun.db"                 # explicit SQLite path
 # url  = "sqlite:////abs/path/omnirun.db"     # explicit SQLite URL (wins over path)
+# url  = "postgresql+psycopg://omnirun@localhost/omnirun"  # shared Postgres store
 ```
+
+The schema is created and migrated automatically on first open — multiple CLI
+processes and the daemon can share one database safely.
 
 **Migrating from an earlier omnirun version** (if you have JSON state files):
 
@@ -125,6 +129,14 @@ never double-book a backend), backfills as running jobs finish, and retries a
 failed placement (up to 3 attempts) on another backend before giving up.
 Minimizing provisioning cost by reusing warm workers is a planned next phase,
 not yet implemented — every placement is still a plain one-shot `submit`.
+
+## Deploying the daemon
+
+To run the scheduler permanently on a VPS — under systemd, backed by a shared
+PostgreSQL store, serving jobs from any number of repos — see
+[docs/deploy.md](docs/deploy.md). It has a reference systemd unit, the Postgres
+setup, and how project scoping (`ps`/`queue` default to the current repo, `-A`
+for the whole fleet) works across projects.
 
 ## Install
 
