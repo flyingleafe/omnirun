@@ -1142,6 +1142,11 @@ def cancel(
     force: bool = typer.Option(
         False, "--force", "-f", help="Skip the graceful window; hard-kill immediately."
     ),
+    no_wait: bool = typer.Option(
+        False,
+        "--no-wait",
+        help="Signal the cancel and return; the next tick (or daemon) releases it.",
+    ),
 ) -> None:
     cfg = _load_cfg()
     store = open_store(cfg.state.resolved_url())
@@ -1152,7 +1157,7 @@ def cancel(
         )
     # One machine: Control.cancel reaps the placement (graceful→force→gc) and
     # marks the job CANCELLED — the same path the daemon uses.
-    if not force:
+    if not force and not no_wait:
         # The graceful path polls the backend until the job stops (up to the
         # per-backend grace window), so warn before the wait — otherwise cancel
         # can block for tens of seconds with no output.
@@ -1161,9 +1166,15 @@ def cancel(
             f"waiting for graceful shutdown…[/dim]"
         )
     _control(cfg, store, rec.placement.provider_name if rec.placement else None).cancel(
-        rec.spec.job_id, datetime.now(timezone.utc), force=force
+        rec.spec.job_id, datetime.now(timezone.utc), force=force, wait=not no_wait
     )
-    console.print(f"cancelled {rec.spec.job_id}")
+    if no_wait:
+        console.print(
+            "cancel signalled; resources are released on the next tick "
+            "(or by the daemon)"
+        )
+    else:
+        console.print(f"cancelled {rec.spec.job_id}")
 
 
 @app.command(help="Change a queued/running job's scheduling policy.")

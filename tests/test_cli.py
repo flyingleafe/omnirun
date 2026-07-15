@@ -1162,6 +1162,37 @@ def test_queue_wait_requires_a_running_daemon(env, monkeypatch):
     assert "no omnirun daemon running" in result.output
 
 
+# ------------------------------------------------------------------ P2: cancel --no-wait
+
+
+def test_cli_cancel_no_wait_signals_then_next_read_reaps(env):
+    """`cancel --no-wait` sends ONE cancel signal, marks the job CANCELLED with
+    reaped=False (placement kept), and prints the deferred-release line. A later
+    read (`ps`, which drives a tick daemonlessly) force-reaps it via the terminal
+    catch-up."""
+    job_id = submit_one()  # RUNNING on the stub
+
+    result = runner.invoke(app, ["cancel", "--no-wait", job_id])
+    assert result.exit_code == 0, result.output
+    assert "cancel signalled" in result.output
+    assert "graceful shutdown" not in result.output  # no grace wait
+
+    signalled = _store().load_job(job_id)
+    assert signalled is not None
+    assert signalled.state is JobState.CANCELLED
+    assert signalled.reaped is False  # not yet reaped — next tick finishes it
+    assert signalled.placement is not None
+    assert StubBackend.cancelled == [job_id]  # exactly one cancel signal so far
+
+    # A daemonless `ps` drives a tick whose terminal catch-up force-reaps it.
+    result = runner.invoke(app, ["ps"])
+    assert result.exit_code == 0, result.output
+    assert "released cancelled placement" in result.output
+    after = _store().load_job(job_id)
+    assert after is not None
+    assert after.reaped is True
+
+
 # ------------------------------------------------------------------ P2: daemon-aware fast paths
 
 
