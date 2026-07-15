@@ -27,6 +27,7 @@ from omnirun.models import (
     Link,
     Placement,
     ProviderFacts,
+    ReapPolicy,
     ResourceSpec,
     Slot,
     Status,
@@ -59,6 +60,7 @@ class FakeProvider:
         placed_at: datetime | None = None,
         discover_available: int | None = None,
         collect_error: Exception | None = None,
+        reap: ReapPolicy | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
@@ -77,12 +79,10 @@ class FakeProvider:
         self.collect_calls: list[tuple[str, Path]] = []
         self.gc_calls: int = 0
         self.discover_calls: int = 0
-        # Reap-on-lost policy the reconciler reads (real backends set this per
-        # type: notebooks True, transport backends False). Tests flip it on.
-        self.reap_lost: bool = False
-        # Reap-on-terminal policy (a held notebook session collected-then-reaped
-        # when its job finishes). Tests flip it on to exercise the catch-up.
-        self.reap_on_terminal: bool = False
+        # The teardown contract the reconciler reads off the provider (real
+        # backends declare it per type). Tests pass one in to exercise the
+        # collect-then-release and lost-release paths.
+        self.reap: ReapPolicy = reap if reap is not None else ReapPolicy()
 
     # -- Provider protocol ------------------------------------------------
 

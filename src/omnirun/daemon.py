@@ -535,12 +535,10 @@ class _RecordingProvider:
         self.name = inner.name
         self._inner = inner
         self._errors = errors
-        # Delegate the reap policies the reconciler reads off the provider, so the
-        # daemon path behaves identically to the CLI (one state machine, two
-        # drivers). Without this the wrapper hid them and the daemon silently never
-        # reaped lost/terminal sessions.
-        self.reap_lost = getattr(inner, "reap_lost", False)
-        self.reap_on_terminal = getattr(inner, "reap_on_terminal", False)
+        # A wrapper must forward the FULL Provider surface, including the reap
+        # policy the reconciler reads, so the daemon path behaves identically to
+        # the CLI (one state machine, two drivers).
+        self.reap = inner.reap
 
     def discover(self) -> ProviderFacts:
         return self._inner.discover()

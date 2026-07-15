@@ -23,6 +23,7 @@ from omnirun.models import (
     JobRecord,
     Placement,
     ProviderFacts,
+    ReapPolicy,
     ResourceSpec,
     Slot,
     Status,
@@ -44,6 +45,11 @@ class Provider(Protocol):
     """
 
     name: str
+
+    #: The teardown contract the reconciler reads: whether a terminal placement
+    #: holds a capacity-occupying resource that must be collected-then-released,
+    #: and whether a LOST placement is safe to force-release to reclaim its slot.
+    reap: ReapPolicy
 
     def discover(self) -> ProviderFacts:
         """Gather live capability/health facts (cached with a TTL by callers)."""

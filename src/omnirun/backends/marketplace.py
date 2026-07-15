@@ -69,11 +69,13 @@ from omnirun.models import (
     JobSpec,
     JobStatus,
     Offer,
+    ReapPolicy,
     ResourceSpec,
     StatusReport,
 )
 
 if TYPE_CHECKING:
+    from omnirun.config import BackendConfig
     from omnirun.execlayer.ssh import SSHExec as _SSHExecClass
 
 SSHExec: type[_SSHExecClass] | None
@@ -137,6 +139,18 @@ class MarketplaceBackend(Backend, ABC):
     default_key_env: str = ""
     #: short provider tag stored in Instance.provider
     provider: str = ""
+
+    def __init__(self, name: str, config: "BackendConfig") -> None:
+        super().__init__(name, config)
+        # A finished or abandoned instance must not keep billing: with
+        # auto_terminate (the default) a terminal job is collected to the durable
+        # cache and then the instance is released, and a LOST placement is
+        # force-released — both on the next reconcile tick. ``auto_terminate=false``
+        # opts out of ALL automatic teardown (fully manual control). The existing
+        # auto-terminate in pull_outputs/cancel/gc stays as an idempotent second
+        # guard (the ``_get_instance`` check makes double-terminate safe).
+        auto = bool(self.config.extra("auto_terminate", True))
+        self.reap = ReapPolicy(hold_on_terminal=auto, release_lost=auto)
 
     # ---- provider primitives (subclass surface) -------------------------------
 

@@ -32,6 +32,7 @@ from omnirun.models import (
     Offer,
     Placement,
     ProviderFacts as _ProviderFacts,
+    ReapPolicy,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -57,9 +58,9 @@ class StubBackend(Backend):
 
     def __init__(self, name: str, config: BackendConfig) -> None:
         super().__init__(name, config)
-        # Opt-in per test config: stands in for a notebook backend where a LOST
-        # session is a reclaimable leak the reconciler should force-reap.
-        self.reap_lost_placements = bool(config.extra("reap_lost", False))
+        # Opt-in per test config: stands in for a backend where a LOST placement
+        # is a reclaimable leak the reconciler should force-release.
+        self.reap = ReapPolicy(release_lost=bool(config.extra("reap_lost", False)))
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
         return [
@@ -666,8 +667,8 @@ def _seed_daemon_placed_job(job_id: str = "daemon-placed-01") -> JobRecord:
 
 
 def test_ps_surfaces_reaped_lost_session(env):
-    """When `ps` drives a tick that reaps a leaked/lost session, it surfaces the
-    reclaim so a capacity leak being cleaned up is visible (never silent)."""
+    """When `ps` drives a tick that releases a leaked/lost placement, it surfaces
+    the reclaim so a capacity leak being cleaned up is visible (never silent)."""
     job_id = submit_one()  # RUNNING on the stub
     env.config_file.write_text(
         BASE_CONFIG.replace(
@@ -676,7 +677,7 @@ def test_ps_surfaces_reaped_lost_session(env):
     )
     result = runner.invoke(app, ["ps"])
     assert result.exit_code == 0, result.output
-    assert "reaped lost session" in result.output
+    assert "released lost placement" in result.output
     assert job_id in result.output
 
 

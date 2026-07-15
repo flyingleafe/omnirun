@@ -30,6 +30,7 @@ from omnirun.models import (
     JobState,
     JobStatus,
     Placement,
+    ReapPolicy,
     RepoRef,
     ResourceSpec,
     Slot,
@@ -254,10 +255,10 @@ def test_reconcile_reaps_lost_session_before_requeue(tmp_path: Path) -> None:
     store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
     try:
         provider = FakeProvider(
-            "free", slots=[], poll_script={"lost-000001": [JobStatus.LOST]}
-        )
-        provider.reap_lost = (
-            True  # a notebook-style backend: LOST session is reclaimable
+            "free",
+            slots=[],
+            poll_script={"lost-000001": [JobStatus.LOST]},
+            reap=ReapPolicy(release_lost=True),  # LOST is a reclaimable placement
         )
         control = Control(store, {"free": provider})
         store.save_job(
@@ -299,8 +300,8 @@ def test_terminal_notebook_session_collected_then_reaped(tmp_path: Path) -> None
             "nb",
             slots=[_free_slot()],
             poll_script={"nb-000001": [JobStatus.SUCCEEDED]},
+            reap=ReapPolicy(hold_on_terminal=True),  # a held resource
         )
-        provider.reap_on_terminal = True  # a notebook-style held session
         outputs_dir = tmp_path / "cache"
         control = Control(store, {"nb": provider}, outputs_dir=outputs_dir)
         store.save_job(
@@ -343,8 +344,8 @@ def test_terminal_reap_is_idempotent_across_ticks(tmp_path: Path) -> None:
             "nb",
             slots=[],
             poll_script={"nb-000003": [JobStatus.SUCCEEDED]},
+            reap=ReapPolicy(hold_on_terminal=True),
         )
-        provider.reap_on_terminal = True
         control = Control(store, {"nb": provider}, outputs_dir=tmp_path / "cache")
         store.save_job(
             JobRecord(
@@ -383,8 +384,8 @@ def test_terminal_reap_retries_when_collect_fails(tmp_path: Path) -> None:
             slots=[],
             poll_script={"nb-000002": [JobStatus.SUCCEEDED]},
             collect_error=RuntimeError("session hiccup"),
+            reap=ReapPolicy(hold_on_terminal=True),
         )
-        provider.reap_on_terminal = True
         control = Control(store, {"nb": provider}, outputs_dir=tmp_path / "cache")
         store.save_job(
             JobRecord(

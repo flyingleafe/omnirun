@@ -22,6 +22,7 @@ from omnirun.models import (
     JobSpec,
     Offer,
     ProviderFacts,
+    ReapPolicy,
     ResourceSpec,
     StatusReport,
 )
@@ -87,26 +88,14 @@ class Backend(ABC):
     #: registry type name, set by @register
     type_name: str = ""
 
-    #: Whether a ``LOST`` poll for this backend means "a reclaimable resource is
-    #: still allocated, and reaping a possibly-still-alive one is acceptable" — so
-    #: the reconciler may force-reap the placement before requeue. TRUE only for
-    #: backends whose LOST is a confirmed gone/idle *session* worth reclaiming
-    #: (notebooks: a dangling Colab VM eats the concurrent-session cap). FALSE for
-    #: transport-based backends (ssh/slurm/local), where LOST is often just a
-    #: momentary unreachable poll and reaping would force-kill a live job.
-    reap_lost_placements: bool = False
-
-    #: Whether a job reaching a TERMINAL state on this backend leaves a held,
-    #: capacity-occupying session that must be collected-then-reaped. TRUE only for
-    #: notebook backends whose worker is a live VM that lingers after the job ends
-    #: (Colab: the session keeps burning the ~1-session cap until stopped). For
-    #: such backends the reconciler collects the outputs to a durable local cache
-    #: and then stops the session — exactly what a running daemon would do at
-    #: completion — so back-to-back jobs stop blocking each other. FALSE where the
-    #: worker self-terminates (Kaggle's batch kernel) or persists cheaply and
-    #: holds no concurrent cap (ssh/slurm/local); their outputs stay retrievable
-    #: without a pre-emptive collect.
-    reap_on_terminal: bool = False
+    #: The teardown contract this backend hands the core reconciler: whether a
+    #: terminal job still holds a capacity-occupying resource that must be
+    #: collected-then-released, and whether a LOST placement is safe to
+    #: force-release. Backends override it — as a class attribute for a fixed
+    #: policy, or per-instance in ``__init__`` when it depends on config. The
+    #: default (all-False) is the plain transport case: nothing lingers to
+    #: reclaim, and a LOST poll may be a transient blip on a live job.
+    reap: ReapPolicy = ReapPolicy()
 
     def __init__(self, name: str, config: "BackendConfig") -> None:
         self.name = name  # config key, e.g. "uni"

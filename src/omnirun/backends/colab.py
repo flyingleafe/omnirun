@@ -57,6 +57,7 @@ from omnirun.models import (
     JobSpec,
     JobStatus,
     Offer,
+    ReapPolicy,
     ResourceSpec,
     StatusReport,
     normalize_gpu_type,
@@ -293,16 +294,15 @@ def _count_sessions(output: str) -> int:
 @register("colab")
 class ColabBackend(Backend):
     # A Colab LOST is a confirmed gone/idle session (3 status-exec retries, then
-    # a heartbeat-stale or session-terminated verdict). The session is a real VM
-    # holding the concurrent-session cap, so reaping it on LOST reclaims capacity
-    # fast (and a stop on an already-gone session is a harmless no-op).
-    reap_lost_placements = True
-    # A finished Colab job leaves its VM running (it lingers until ~idle reclaim),
-    # occupying the ~1-session cap and blocking the next `colab new`. So on TERMINAL
-    # the reconciler collects outputs then stops the session — the same collect+reap
-    # a daemon would do at completion. Without this, back-to-back Colab submits
+    # a heartbeat-stale or session-terminated verdict): a real VM holding the
+    # concurrent-session cap, so it is safe to force-release on LOST to reclaim
+    # capacity fast (and a stop on an already-gone session is a harmless no-op).
+    # A finished Colab job also leaves its VM running (it lingers until ~idle
+    # reclaim), occupying the ~1-session cap and blocking the next `colab new`, so
+    # a terminal job must be collected-then-released — the same collect+reap a
+    # daemon would do at completion. Without this, back-to-back Colab submits
     # 412-defer against a session the previous (already finished) job never freed.
-    reap_on_terminal = True
+    reap = ReapPolicy(hold_on_terminal=True, release_lost=True)
 
     def __init__(self, name: str, config: Any) -> None:
         super().__init__(name, config)

@@ -135,14 +135,14 @@ class Control:
         self._budget_window = budget_window
         self._budget_cap = budget_cap
         self._week_cap = week_cap
-        # Durable local cache the reconciler collects a terminal notebook job's
-        # outputs into BEFORE reaping its session (the session's disk is gone once
-        # stopped). ``pull`` then serves from here. ``None`` disables the eager
-        # collect-then-reap (unit tests that don't exercise it); the CLI/daemon
-        # always pass a real dir under the state dir.
+        # Durable local cache the reconciler collects a terminal job's outputs
+        # into BEFORE releasing its held resource (the resource's disk is gone
+        # once released). ``pull`` then serves from here. ``None`` disables the
+        # eager collect-then-release (unit tests that don't exercise it); the
+        # CLI/daemon always pass a real dir under the state dir.
         self._outputs_dir = outputs_dir
         # User-facing events accumulated during the current tick (e.g. a leaked
-        # session reaped) — drained by the CLI to surface what the machine did.
+        # placement released) — drained by the CLI to surface what the machine did.
         self._tick_events: list[str] = []
 
     # ------------------------------------------------------------------
@@ -276,8 +276,8 @@ class Control:
         Delegates to the placement provider's ``cancel``: with ``force=False`` (the
         default) a ``GRACEFUL`` cancel, which the adapter drives as
         SIGTERM→poll-until-terminal-or-grace→SIGKILL→reap; with ``force=True`` a
-        ``FORCE`` cancel (immediate hard kill + reap). Either way no backend
-        instance/session is left running (invariant 5).
+        ``FORCE`` cancel (immediate hard kill + reap). Either way no held resource
+        is left running (invariant 5).
 
         Idempotent and best-effort: an unknown or already-terminal job is a no-op;
         a provider that raises is swallowed (crash isolation — the job is still
@@ -315,8 +315,8 @@ class Control:
                         status=JobStatus.CANCELLED, detail="cancelled by user"
                     ),
                     # cancel() already force-reaps the placement above, so the
-                    # session is gone — mark it reaped so reconcile's terminal
-                    # catch-up doesn't try to collect from a stopped session.
+                    # held resource is gone — mark it reaped so reconcile's terminal
+                    # catch-up doesn't try to collect from a released placement.
                     "reaped": True,
                 }
             )
@@ -400,11 +400,11 @@ class Control:
         for rec in self._store.list_jobs():
             if rec.state not in (JobState.PLACING, JobState.RUNNING):
                 # Catch-up the daemon would already have done: a terminal job on a
-                # session-holding backend (notebook) still needs its outputs
-                # collected and its session reaped. Doing it here on every tick is
-                # what makes a series of CLI calls converge to the daemon's state
-                # (the daemonless catch-up invariant). Everything else terminal has
-                # nothing to reap and is left alone.
+                # provider that holds a capacity-occupying resource still needs its
+                # outputs collected and that resource released. Doing it here on
+                # every tick is what makes a series of CLI calls converge to the
+                # daemon's state (the daemonless catch-up invariant). Everything
+                # else terminal has nothing to release and is left alone.
                 if rec.state.terminal and not rec.reaped and rec.placement is not None:
                     self._catch_up_terminal(rec, rec.placement, now)
                 continue
@@ -461,20 +461,21 @@ class Control:
         if status.state is JobStatus.LOST:
             # A LOST placement is requeued for retry (attempts+1) — the state
             # machine's contract (see the `lose_after_place` invariant). Whether we
-            # also force-reap the old placement first depends on the backend:
-            #   * reap_lost=True (notebooks): a LOST is a confirmed-gone/idle session
-            #     still holding the concurrent cap, so force-cancel + gc it before
-            #     retrying — reclaims the leaked slot and prevents a double-run.
-            #   * reap_lost=False (ssh/slurm/local): a LOST is often just a momentary
-            #     unreachable poll of a *live* job. Force-killing it would destroy a
-            #     healthy run, so we only requeue; the retry runs a fresh placement
-            #     and the (rare) transient-blip duplicate is the accepted cost of not
+            # also force-release the old placement first depends on the provider's
+            # declared policy:
+            #   * release_lost=True: a LOST is a defunct held resource still holding
+            #     a capacity-occupying slot, so force-release it before retrying —
+            #     reclaims the leaked slot and prevents a double-run.
+            #   * release_lost=False: a LOST is often just a momentary unreachable
+            #     poll of a *live* job. Force-releasing it would destroy a healthy
+            #     run, so we only requeue; the retry runs a fresh placement and the
+            #     (rare) transient-blip duplicate is the accepted cost of not
             #     killing a possibly-alive job.
-            # poll already tried the durable result read (result.json wins over LOST),
-            # so a genuinely finished job never reaches this branch.
-            if getattr(provider, "reap_lost", False) and self._reap(placement):
+            # poll already tried the durable result read, so a genuinely finished
+            # job never reaches this branch.
+            if provider.reap.release_lost and self._reap(placement):
                 self._tick_events.append(
-                    f"reaped lost session for {placement.job_id} on "
+                    f"released lost placement of {placement.job_id} on "
                     f"{placement.provider_name}; reclaimed 1 slot"
                 )
             self._requeue(rec, now)
@@ -508,12 +509,12 @@ class Control:
                     self._store.ledger_realize(
                         window, rec.spec.job_id, placement.cost_actual, now
                     )
-            # Collect-then-reap a held session (notebook) the instant its job
-            # finishes — the happy-path, one-tick case. ``give_up=False`` so a
-            # transient collect failure leaves the job un-reaped for a later
-            # tick's revisit (via ``_catch_up_terminal``) rather than losing the
-            # outputs to an over-eager reap.
-            if getattr(provider, "reap_on_terminal", False):
+            # Collect-then-release a held resource the instant its job finishes —
+            # the happy-path, one-tick case. ``give_up=False`` so a transient
+            # collect failure leaves the placement un-released for a later tick's
+            # revisit (via ``_catch_up_terminal``) rather than losing the outputs
+            # to an over-eager release.
+            if provider.reap.hold_on_terminal:
                 self._collect_and_reap(
                     terminal_rec, updated, provider, now, give_up=False
                 )
@@ -534,14 +535,14 @@ class Control:
     def _reap(self, placement: Placement) -> bool:
         """Tear down an abandoned placement (force-cancel + gc) — best-effort.
 
-        Frees the leaked worker resource (a dangling Colab session, a billed
-        marketplace instance) the moment a job stops needing its placement, so it
-        cannot keep consuming the provider's capacity. Per-job safe on every
-        backend: ``gc`` removes only the job dir, never the shared worktree/venv.
+        Frees the leaked held resource the moment a job stops needing its
+        placement, so it cannot keep consuming the provider's capacity. Per-job
+        safe on every provider: ``gc`` removes only the job dir, never the shared
+        worktree/venv.
 
         Returns True if the reap call completed without raising (the caller emits
-        the user-facing event, since the wording differs between a lost-session
-        reap and a terminal collect-then-reap)."""
+        the user-facing event, since the wording differs between a lost-placement
+        release and a terminal collect-then-release)."""
         provider = self._providers.get(placement.provider_name)
         if provider is None:
             return False
@@ -560,12 +561,12 @@ class Control:
     def _catch_up_terminal(
         self, rec: JobRecord, placement: Placement, now: datetime
     ) -> None:
-        """Revisit a terminal-but-unreaped job: if its backend holds a reclaimable
-        session, collect-then-reap it now (``give_up=True`` — a revisit means the
-        transition tick's collect already failed once, so free the slot even if
-        collect fails again). A no-op for backends that hold nothing."""
+        """Revisit a terminal-but-unreaped job: if its provider holds a reclaimable
+        resource, collect-then-release it now (``give_up=True`` — a revisit means
+        the transition tick's collect already failed once, so free the slot even if
+        collect fails again). A no-op for providers that hold nothing."""
         provider = self._providers.get(placement.provider_name)
-        if provider is None or not getattr(provider, "reap_on_terminal", False):
+        if provider is None or not provider.reap.hold_on_terminal:
             return
         self._collect_and_reap(rec, placement, provider, now, give_up=True)
 
@@ -578,26 +579,26 @@ class Control:
         *,
         give_up: bool,
     ) -> None:
-        """Collect a terminal job's outputs to the durable cache, THEN reap its
-        held session — the exact catch-up a running daemon performs at completion.
+        """Collect a terminal job's outputs to the durable cache, THEN release its
+        held resource — the exact catch-up a running daemon performs at completion.
 
-        Collect-before-reap is mandatory: reaping stops the VM and its disk (and
-        thus the uncollected outputs) is gone. ``give_up`` chooses the failure
-        policy:
+        Collect-before-release is mandatory: releasing frees the resource and its
+        disk (and thus the uncollected outputs) is gone. ``give_up`` chooses the
+        failure policy:
 
         * ``give_up=False`` (the terminal-transition tick): a failed collect
-          leaves the job un-reaped so a later tick retries — never trade the
-          outputs for an eager reap on the first try.
-        * ``give_up=True`` (a later revisit): force the reap regardless, so the
-          slot is guaranteed freed within two ticks. A *live* session always
+          leaves the placement un-released so a later tick retries — never trade
+          the outputs for an eager release on the first try.
+        * ``give_up=True`` (a later revisit): force the release regardless, so the
+          slot is guaranteed freed within two ticks. A *live* resource always
           collects successfully, so a persistently failing collect means the
-          session is already gone (nothing leaked) — reaping is then a harmless
+          resource is already gone (nothing leaked) — releasing is then a harmless
           no-op and the (already lost) outputs cost nothing more.
 
         Idempotent via ``rec.reaped``: once set, ``_reconcile`` never revisits."""
         if self._outputs_dir is None:
             # No durable cache configured (a unit Control): we cannot collect-
-            # before-reap safely, so leave the session for `gc`/`cancel` to reap.
+            # before-release safely, so leave the resource for `gc`/`cancel`.
             return
         cached_to = rec.outputs_cached_to
         if cached_to is None:
@@ -606,21 +607,21 @@ class Control:
                 provider.collect_outputs(placement, dest)
                 cached_to = str(dest)
             except Exception as e:
-                # Expected when the session is already gone (reclaimed) — a concise
-                # line, no traceback: on a revisit we reap anyway (the tick-event
+                # Expected when the resource is already gone (reclaimed) — a concise
+                # line, no traceback: on a revisit we release anyway (the tick-event
                 # below is the user-facing signal), on the transition tick we retry.
                 _log.warning(
                     "could not collect outputs for terminal job %s on %s (%s); %s",
                     rec.spec.job_id,
                     placement.provider_name,
                     e,
-                    "reaping session anyway" if give_up else "will retry next tick",
+                    "releasing placement anyway" if give_up else "will retry next tick",
                 )
                 if not give_up:
-                    return  # retry on a later tick before touching the session
+                    return  # retry on a later tick before touching the resource
                 self._tick_events.append(
-                    f"could not collect outputs for {rec.spec.job_id}; reaping "
-                    f"{placement.provider_name} session anyway to free the slot"
+                    f"could not collect outputs for {rec.spec.job_id}; releasing "
+                    f"{placement.provider_name} placement anyway to free the slot"
                 )
         reaped = self._reap(placement)
         self._store.save_job(
@@ -628,8 +629,8 @@ class Control:
         )
         if cached_to is not None and reaped:
             self._tick_events.append(
-                f"collected outputs and reaped {placement.provider_name} session "
-                f"for {rec.spec.job_id}; reclaimed 1 slot"
+                f"collected outputs and released {placement.provider_name} "
+                f"placement of {rec.spec.job_id}; reclaimed 1 slot"
             )
 
     def _requeue(self, rec: JobRecord, now: datetime) -> None:
@@ -664,10 +665,10 @@ class Control:
     # ------------------------------------------------------------------
 
     def _refresh_facts(self, now: datetime, only_providers: set[str] | None) -> None:
-        """Refresh stale capacity facts before gather, so ``offer`` reads backend
+        """Refresh stale capacity facts before gather, so ``offer`` reads provider
         truth. A provider whose cached capacity is stale (or absent) is asked to
-        ``discover()`` — the backend self-GCs its dangling sessions (reading a
-        finished job's result before reaping it) and reports its true free
+        ``discover()`` — the provider self-GCs its dangling held resources (reading
+        a finished job's result before releasing it) and reports its true free
         ``available``; the result is persisted. A ``discover`` that raises leaves
         the old facts in place (the tick degrades to last-known capacity, never
         crashes)."""
@@ -792,10 +793,10 @@ class Control:
         try:
             placement = provider.place(rec, slot)
         except CapacityError as e:
-            # Provider had no room right now (a cap `offer` could not foresee, e.g.
-            # Colab's concurrent-session limit). Expected and transient — release
-            # the reservation and retry next tick, logged as one quiet line (no
-            # traceback, job not failed).
+            # Provider had no room right now (a concurrency/quota cap `offer` could
+            # not foresee). Expected and transient — release the reservation and
+            # retry next tick, logged as one quiet line (no traceback, job not
+            # failed).
             _log.info(
                 "deferring job %s: %s has no capacity now (%s); will retry next tick",
                 decision.job_id,
@@ -902,8 +903,8 @@ class Control:
     # ------------------------------------------------------------------
 
     def take_events(self) -> list[str]:
-        """Drain the user-facing events from the last tick (e.g. reaped leaked
-        sessions), surfaced by the CLI so a capacity leak being cleaned up is
+        """Drain the user-facing events from the last tick (e.g. released leaked
+        placements), surfaced by the CLI so a capacity leak being cleaned up is
         visible — an invisible leak is how the split-brain bug hid."""
         events = self._tick_events
         self._tick_events = []

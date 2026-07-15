@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Normalized GPU type names used across all backends. Backend configs map these
 # to site-/provider-specific identifiers (gres strings, RunPod gpuTypeIds, ...).
@@ -494,3 +494,26 @@ class CancelMode(str, enum.Enum):
 
     GRACEFUL = "graceful"
     FORCE = "force"
+
+
+class ReapPolicy(BaseModel):
+    """How the core reconciler must treat a job's placement after the job no
+    longer needs it. Declared by each backend; the core never knows WHY — only
+    what to do.
+
+    Attributes:
+        hold_on_terminal: A terminal job still holds a capacity-occupying,
+            billable-or-quota-consuming resource whose local disk (and thus any
+            uncollected outputs) disappears when released. The reconciler must
+            collect outputs to the durable cache FIRST, then release the
+            resource (collect-then-release).
+        release_lost: A LOST placement is a defunct held resource that is safe
+            to force-release to reclaim its slot. ``False`` means a LOST poll
+            may be a transient blip on a still-alive job that must never be
+            killed from here.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    hold_on_terminal: bool = False
+    release_lost: bool = False

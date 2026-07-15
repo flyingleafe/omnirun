@@ -24,6 +24,7 @@ from omnirun.models import (
     JobHandle,
     JobSpec,
     JobStatus,
+    ReapPolicy,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -132,6 +133,14 @@ def cli(monkeypatch) -> FakeColabCLI:
 @pytest.fixture
 def backend(cli) -> ColabBackend:
     return ColabBackend("colab", BackendConfig(type="colab"))
+
+
+def test_colab_declares_full_reap_contract():
+    """A Colab session is a live VM that lingers after the job ends and eats the
+    concurrent-session cap: its terminal placement must be collected-then-released
+    and a LOST placement is safe to force-release."""
+    backend = ColabBackend("colab", BackendConfig(type="colab"))
+    assert backend.reap == ReapPolicy(hold_on_terminal=True, release_lost=True)
 
 
 @pytest.fixture(autouse=True)

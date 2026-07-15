@@ -33,6 +33,7 @@ from omnirun.models import (
     JobSpec,
     JobStatus,
     Offer,
+    ReapPolicy,
     RepoRef,
     ResourceSpec,
     StatusReport,
@@ -161,6 +162,27 @@ GPU_TYPES_RESPONSE = {
         ]
     }
 }
+
+# ------------------------------------------------------- reap policy ---
+
+
+@pytest.mark.parametrize("make", [runpod_backend, vast_backend, thunder_backend])
+def test_marketplace_default_reap_holds_and_releases(make):
+    """With the default config (auto_terminate on) a marketplace backend declares
+    the full teardown contract: a terminal instance is collected-then-released and
+    a LOST placement is force-released — so a finished/abandoned instance cannot
+    keep billing."""
+    backend = make()
+    assert backend.reap == ReapPolicy(hold_on_terminal=True, release_lost=True)
+
+
+@pytest.mark.parametrize("make", [runpod_backend, vast_backend, thunder_backend])
+def test_marketplace_auto_terminate_false_disables_reap(make):
+    """``auto_terminate=false`` opts out of ALL automatic teardown: the reap
+    policy is the inert default, so the core never releases the instance."""
+    backend = make(auto_terminate=False)
+    assert backend.reap == ReapPolicy()
+
 
 # ------------------------------------------------------------------ runpod ---
 

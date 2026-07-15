@@ -26,6 +26,7 @@ from omnirun.models import (
     JobHandle,
     JobSpec,
     JobStatus,
+    ReapPolicy,
     RepoRef,
     ResourceSpec,
 )
@@ -198,6 +199,14 @@ def fake_api(monkeypatch) -> FakeKaggleApi:
 @pytest.fixture
 def backend(fake_api) -> KaggleBackend:
     return KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+
+
+def test_kaggle_uses_default_reap_contract():
+    """A Kaggle batch kernel self-terminates and holds no concurrent cap after the
+    job ends, so it inherits the inert default teardown policy — the core never
+    force-releases it on terminal or on a LOST poll."""
+    backend = KaggleBackend("kaggle", BackendConfig(type="kaggle"))
+    assert backend.reap == ReapPolicy()
 
 
 # ---- probe -----------------------------------------------------------------

@@ -56,8 +56,10 @@ _DEFAULT_CANCEL_GRACE_S = 30.0
 _log = logging.getLogger("omnirun.providers.adapter")
 
 # JobHandle.data keys whose (case-insensitive) name contains any of these are
-# surfaced as display Links on a Placement (notebook/kernel/dashboard URLs).
-_LINK_KEY_HINTS = ("url", "notebook", "kernel", "dashboard")
+# surfaced as display Links on a Placement — a backend names a display URL key
+# with a ``url`` marker (e.g. ``*_url``), so matching that one generic token
+# keeps this bridge free of any backend-specific display vocabulary.
+_LINK_KEY_HINTS = ("url",)
 
 
 class BackendProvider:
@@ -73,15 +75,10 @@ class BackendProvider:
         self.name = backend.name
         self._backend = backend
         self._store = store
-        # Surface the backend's reap-on-lost policy to the seam so the reconciler
-        # only force-reaps a lost placement where LOST means a reclaimable session
-        # (notebooks), never on a transport-blip LOST (ssh/slurm) that would kill
-        # a live job.
-        self.reap_lost = backend.reap_lost_placements
-        # ...and the reap-on-terminal policy: a backend whose finished job leaves a
-        # capacity-holding session (Colab) is collected-then-reaped by the
-        # reconciler at terminal, mirroring what the daemon does at completion.
-        self.reap_on_terminal = backend.reap_on_terminal
+        # Surface the backend's teardown contract to the seam so the reconciler
+        # knows whether a terminal placement must be collected-then-released and
+        # whether a LOST placement is safe to force-release.
+        self.reap = backend.reap
         # Per-backend override wins over the constructor default when configured.
         self._cancel_grace_s = float(
             backend.config.extra("cancel_grace_s", cancel_grace_s)
@@ -163,8 +160,8 @@ class BackendProvider:
         ``offer``), submits it, and lifts any display URLs off the handle into
         ``Link``s.  The initial state is set optimistically to ``STARTING``:
         submit() succeeded so the job is launching, and querying status immediately
-        after submit is unreliable (Slurm jobs aren't in squeue yet; marketplace
-        instances are still provisioning) — a premature LOST/absent result would
+        after submit is unreliable (a queued job may not be visible yet; a rented
+        instance may still be provisioning) — a premature LOST/absent result would
         trigger a spurious requeue.  The true state is resolved by the next
         reconcile poll.  STARTING never triggers a requeue.
         """
@@ -174,8 +171,8 @@ class BackendProvider:
                 rec.spec, offer, on_provisioning=self._persist_partial(rec)
             )
         except CapacityError as e:
-            # Backend was at capacity (e.g. Colab's concurrent-session cap). Re-raise
-            # as the seam's transient signal so the scheduler defers quietly.
+            # Backend was at capacity (a concurrency/quota cap). Re-raise as the
+            # seam's transient signal so the scheduler defers quietly.
             raise SeamCapacityError(str(e)) from e
         links: list[Link] = []
         for key, value in handle.data.items():
@@ -202,18 +199,17 @@ class BackendProvider:
 
         Uniform across every backend (spec §8, invariant 5):
 
-        * ``GRACEFUL`` — ask the job to stop (``Backend.cancel`` GRACEFUL = SIGTERM
-          to the run pgid / ``scancel`` / stop the kernel), then poll the backend
-          until it reports terminal OR ``cancel_grace_s`` elapses, then hard-kill
-          (``Backend.cancel`` FORCE = SIGKILL).
+        * ``GRACEFUL`` — ask the job to stop (``Backend.cancel`` GRACEFUL, the
+          backend's soft-stop signal), then poll the backend until it reports
+          terminal OR ``cancel_grace_s`` elapses, then hard-kill (``Backend.cancel``
+          FORCE = SIGKILL).
         * ``FORCE`` — skip the grace window; hard-kill immediately.
 
-        Finally REAP: ``Backend.gc`` terminates the marketplace instance / removes
-        the job dir so no instance or session keeps billing. Every stage is
-        best-effort (a raising backend is swallowed) but the reap always runs, so
-        after ``cancel`` returns there is no live placement/instance. Idempotent:
-        on an already-terminal job the first poll is terminal, so it goes straight
-        to the reap.
+        Finally REAP: ``Backend.gc`` releases the held resource / removes the job
+        dir so no instance keeps billing. Every stage is best-effort (a raising
+        backend is swallowed) but the reap always runs, so after ``cancel`` returns
+        there is no live placement/instance. Idempotent: on an already-terminal job
+        the first poll is terminal, so it goes straight to the reap.
         """
         handle = JobHandle(backend=self.name, job_id=p.job_id, data=p.handle)
         if mode is CancelMode.GRACEFUL:
