@@ -52,21 +52,19 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   - **Mocked integration**: SSH exec (fake ssh binary), Slurm (canned
     sbatch/squeue/sacct output), Kaggle (fake `KaggleApi`), Colab (fake `colab`
     subprocess), marketplaces (respx HTTP mocks).
-  - **Dialect-compile (Postgres, serverless)**: `tests/test_state_postgres.py`
-    compiles representative Store SQL against `sqlalchemy.dialects.postgresql`
-    and asserts `ON CONFLICT`, `FOR UPDATE`, and the advisory-lock form are
-    correct — runs in CI without any server.
+  - **Postgres (live-dialect, opt-in)**: `tests/test_store_postgres.py` runs the
+    Store against a REAL PostgreSQL server when `OMNIRUN_TEST_PG_URL` points at a
+    disposable database (skipped otherwise) — dispatched upsert, the
+    `SELECT … FOR UPDATE` reserve path under real thread contention
+    (`test_reserve_race_single_winner`), ledger/meta, and migration
+    idempotency + newer-version refusal.
 - **SQL state layer — VERIFIED**:
-  - **SQLite**: unit tests + a real-threads race test (`test_reserve_entry_race_single_winner`
+  - **SQLite**: unit tests + a real-threads race test (`test_reserve_race_single_winner`
     in `tests/test_state_store.py`) confirm BEGIN IMMEDIATE serialization prevents
-    over-booking with concurrent `reserve_entry` calls. Passes with 0 flakes.
-  - **Postgres**: dialect-compile tests run in CI (no server). The over-book
-    regression (`test_pg_reserve_no_overbook` in `tests/test_state_postgres.py`,
-    K=8 threads × 10 rounds) is opt-in via `OMNIRUN_TEST_POSTGRES_URL`. The
-    `pg_advisory_xact_lock` guard was **live-verified** during code review on
-    PG 18.1: the raw-psycopg reproduction (`pg_overbook_raw.py`) showed 25/25
-    over-books without the guard → 0/15 after adding it. Full CI-integrated
-    Postgres is deferred to Phase 5 / VPS provisioning.
+    over-booking with concurrent `reserve` calls. Passes with 0 flakes.
+  - **Postgres**: the live-dialect suite above is opt-in via `OMNIRUN_TEST_PG_URL`
+    and has NOT yet run against a real server — scheduled for the deploy-env
+    acceptance pass (`docs/deploy-acceptance.md` step 3).
 - **LIVE-VERIFIED this session** (real jobs, real outputs pulled back):
   - **local** — the no-network e2e above, run for real.
   - **uni Slurm** — on QMUL's Apocrita cluster (account `acw592`, partition
