@@ -185,6 +185,85 @@ def test_list_jobs_project_filter(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Corrupt-row tolerance (reads never crash; writes stay strict)
+# ---------------------------------------------------------------------------
+
+
+def _insert_corrupt_job_row(store: Store, job_id: str) -> None:
+    """Insert a jobs row whose ``data`` column is not valid JSON, via a raw
+    connection (bypassing the strict save path)."""
+    with store._engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO jobs (job_id, name, backend, state, project, "
+                "submitted_at, schema_version, data) VALUES "
+                "(:jid, :jid, NULL, 'queued', 'proj', NULL, 6, 'not json')"
+            ),
+            {"jid": job_id},
+        )
+
+
+def test_list_jobs_skips_corrupt_row(tmp_path: Path) -> None:
+    """A corrupt row is skipped (not raised) by list_jobs; the good jobs remain."""
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        store.save_job(make_record("good-1"))
+        store.save_job(make_record("good-2"))
+        _insert_corrupt_job_row(store, "bad-1")
+        got = sorted(r.spec.job_id for r in store.list_jobs())
+        assert got == ["good-1", "good-2"]
+    finally:
+        store.close()
+
+
+def test_load_job_corrupt_row_is_none(tmp_path: Path) -> None:
+    """load_job on a corrupt row returns None (caller treats as unknown), and
+    resolve_job raises KeyError rather than asserting."""
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        _insert_corrupt_job_row(store, "bad-1")
+        assert store.load_job("bad-1") is None
+        with pytest.raises(KeyError):
+            store.resolve_job("bad-1")
+    finally:
+        store.close()
+
+
+def test_load_facts_corrupt_row_is_none(tmp_path: Path) -> None:
+    """load_facts on a corrupt facts row returns None (re-discover), not a raise."""
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        with store._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO facts (backend, discovered_at, ttl_s, health, "
+                    "data) VALUES ('flap', NULL, NULL, 'ok', 'not json')"
+                )
+            )
+        assert store.load_facts("flap") is None
+    finally:
+        store.close()
+
+
+def test_run_tick_over_corrupt_row_completes(tmp_path: Path) -> None:
+    """A run_tick over a store holding a corrupt row completes (lists skip it)."""
+    from datetime import datetime, timezone
+
+    from omnirun.control import Control
+
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        store.save_job(make_record("good-1"))
+        _insert_corrupt_job_row(store, "bad-1")
+        control = Control(store, {})
+        # No provider needed: the corrupt row must not crash the reconcile/list.
+        control.run_tick(datetime(2026, 7, 11, tzinfo=timezone.utc))
+        assert [r.spec.job_id for r in store.list_jobs()] == ["good-1"]
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # Helpers shared across Task-2 tests
 # ---------------------------------------------------------------------------
 

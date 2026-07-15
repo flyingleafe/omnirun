@@ -12,6 +12,7 @@ UPDATE`` row locks instead).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -24,6 +25,8 @@ from sqlalchemy import (
     Connection,
     Engine,
     Table,
+    Text,
+    cast,
     create_engine,
     delete,
     event,
@@ -51,6 +54,8 @@ from omnirun.state.schema import (
     metadata,
     wait_samples,
 )
+
+_log = logging.getLogger("omnirun.state.store")
 
 # The store speaks these two SQLAlchemy dialects. Both provide an
 # ``insert(...).on_conflict_do_update(index_elements=…, set_=…)`` and, for
@@ -311,14 +316,18 @@ class Store:
             self._upsert(conn, jobs, ["job_id"], values)
 
     def load_job(self, job_id: str) -> JobRecord | None:
-        """Return the ``JobRecord`` for *job_id*, or ``None`` if not found."""
+        """Return the ``JobRecord`` for *job_id*, or ``None`` if not found.
+
+        A row whose JSON fails to parse/validate is treated as UNKNOWN (warned +
+        ``None``) rather than raising — a single corrupt row must never crash a
+        read (``resolve_job``, which delegates here, inherits this tolerance)."""
         with self._engine.connect() as conn:
             row = conn.execute(
-                select(jobs.c.data).where(jobs.c.job_id == job_id)
+                select(cast(jobs.c.data, Text)).where(jobs.c.job_id == job_id)
             ).fetchone()
         if row is None:
             return None
-        return JobRecord.model_validate(row[0])
+        return _validate_job_row(job_id, row[0])
 
     def resolve_job(self, ref: str) -> JobRecord:
         """Resolve *ref* to a ``JobRecord`` — exact job_id, unique prefix, or unique substring.
@@ -335,9 +344,11 @@ class Store:
             # Substring fallback
             matches = [j for j in all_ids if ref in j]
         if len(matches) == 1:
-            rec = self.load_job(matches[0])
-            assert rec is not None
-            return rec
+            # A corrupt match loads as None (warned in load_job); treat it as
+            # unknown rather than crashing the resolve.
+            if (rec := self.load_job(matches[0])) is not None:
+                return rec
+            raise KeyError(f"no job matching {ref!r}")
         if not matches:
             raise KeyError(f"no job matching {ref!r}")
         raise KeyError(f"ambiguous job ref {ref!r}: {', '.join(sorted(matches))}")
@@ -355,13 +366,20 @@ class Store:
 
         When *project* is given, only jobs whose ``project`` column equals it are
         returned (the multi-project scoping filter for ps/queue/gc).
+
+        A row whose JSON fails to parse/validate is SKIPPED with one warning —
+        never an exception out of a read. One corrupt row must not blind ``ps``
+        or wedge a ``run_tick`` (which lists every round) to the healthy rows.
         """
-        stmt = select(jobs.c.data)
+        stmt = select(jobs.c.job_id, cast(jobs.c.data, Text))
         if project is not None:
             stmt = stmt.where(jobs.c.project == project)
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()
-        recs = [JobRecord.model_validate(row[0]) for row in rows]
+        recs: list[JobRecord] = []
+        for job_id, data in rows:
+            if (rec := _validate_job_row(job_id, data)) is not None:
+                recs.append(rec)
         recs.sort(
             key=lambda r: r.submitted_at or datetime.max.replace(tzinfo=timezone.utc)
         )
@@ -532,14 +550,21 @@ class Store:
             self._upsert(conn, facts, ["backend"], values)
 
     def load_facts(self, backend: str) -> ProviderFacts | None:
-        """Return ``ProviderFacts`` for *backend*, or ``None`` if not found."""
+        """Return ``ProviderFacts`` for *backend*, or ``None`` if not found.
+
+        A corrupt facts row is warned + treated as absent (``None``) rather than
+        raising — the caller re-discovers, same as a stale/missing fact."""
         with self._engine.connect() as conn:
             row = conn.execute(
-                select(facts.c.data).where(facts.c.backend == backend)
+                select(cast(facts.c.data, Text)).where(facts.c.backend == backend)
             ).fetchone()
         if row is None:
             return None
-        return ProviderFacts.model_validate(row[0])
+        try:
+            return ProviderFacts.model_validate(_decode_json_column(row[0]))
+        except (ValueError, TypeError) as e:
+            _log.warning("skipping corrupt facts row %s: %s", backend, e)
+            return None
 
     def list_facts(self) -> list[ProviderFacts]:
         """Return all ``ProviderFacts`` sorted by backend name."""
@@ -647,6 +672,33 @@ class Store:
         return BudgetLedger.model_validate(
             {"window": window, "cap": cap, "entries": entries}
         )
+
+
+def _decode_json_column(raw: Any) -> Any:
+    """Turn a ``data`` column value read AS TEXT back into a Python object.
+
+    The read paths ``cast(... , Text)`` the JSON column so a corrupt row cannot
+    raise at fetch time inside the DBAPI (a bare ``'not json'`` would raise a
+    ``JSONDecodeError`` before any tolerance code runs). We therefore always get
+    the raw JSON string and decode it here, where the caller can catch the
+    ``ValueError`` and skip the row. A non-str (defensive) is returned as-is."""
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+def _validate_job_row(job_id: str, raw: Any) -> JobRecord | None:
+    """Validate a stored job ``data`` blob (read as text) into a ``JobRecord``.
+
+    Corrupt-row tolerance for the READ paths: a row whose JSON fails to
+    decode/validate is warned once (via *job_id*) and skipped/None rather than
+    crashing the read. Write paths stay strict (they never round-trip a read),
+    so a corrupt row is never propagated further."""
+    try:
+        return JobRecord.model_validate(_decode_json_column(raw))
+    except (ValueError, TypeError) as e:
+        _log.warning("skipping corrupt job row %s: %s", job_id, e)
+        return None
 
 
 def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:
