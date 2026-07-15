@@ -5,8 +5,11 @@ filter/sort on, and a ``data`` JSON column carrying the full pydantic
 ``model_dump(mode="json")`` of the domain object. Pydantic stays the
 serialization source of truth, so later field growth needs no schema change.
 
-SQLite-only: zero-setup, the tested-for-real default. The ``JSON`` column is
-portable SQLite JSON; no Postgres dialect variant is needed.
+Dialect-portable: SQLite (zero-setup, the tested-for-real default) or
+PostgreSQL (the production daemon store). The ``JSON`` column and every type
+used here are portable across both dialects; ``store.py`` dispatches the only
+dialect-specific bits (upsert, the SQLite write-lock shim). Its ``JSON``
+serializes to SQLite JSON1 and to Postgres ``JSON`` with no schema variant.
 """
 
 from __future__ import annotations
@@ -38,9 +41,15 @@ jobs = Table(
     Column("name", Text),
     Column("backend", Text, nullable=True),
     Column("state", Text, nullable=True),
+    # ``project`` is the submitting repo's slug (``RepoRef.slug``). It scopes
+    # ``ps``/``queue``/``gc`` so one daemon can serve several repos without one
+    # project's ``--cancel all`` touching another's jobs. Fresh DBs get it here;
+    # legacy DBs get it via migration 0→6 (add + backfill from the record JSON).
+    Column("project", Text, nullable=True),
     Column("submitted_at", Text, nullable=True),
     Column("schema_version", Integer, nullable=False),
     Column("data", JSON, nullable=False),
+    Index("ix_jobs_project", "project"),
 )
 
 wait_samples = Table(

@@ -23,15 +23,20 @@ from omnirun.models import (
 )
 from omnirun.state import STATE_SCHEMA_VERSION, open_store
 from omnirun.state.schema import jobs
-from omnirun.state.store import Store
+from omnirun.state.store import Store, StoreError
 
 
 def test_open_store_creates_schema(tmp_path: Path) -> None:
     store = open_store(f"sqlite:///{tmp_path / 't.db'}")
     names = set(inspect(store._engine).get_table_names())
     assert {"meta", "jobs", "wait_samples", "facts", "ledger"} <= names
-    assert store.schema_version() == 5  # STATE_SCHEMA_VERSION
-    assert STATE_SCHEMA_VERSION == 5
+    assert store.schema_version() == 6  # STATE_SCHEMA_VERSION
+    assert STATE_SCHEMA_VERSION == 6
+    # Fresh DBs carry the ``project`` column + its index natively.
+    cols = {c["name"] for c in inspect(store._engine).get_columns("jobs")}
+    assert "project" in cols
+    idx = {ix["name"] for ix in inspect(store._engine).get_indexes("jobs")}
+    assert "ix_jobs_project" in idx
     store.close()
 
 
@@ -58,6 +63,124 @@ def test_transaction_opens_write_lock_on_sqlite(tmp_path: Path) -> None:
             assert blocked, "transaction() did not hold the SQLite write lock"
     finally:
         other.close()
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema migration (0/legacy → current)
+# ---------------------------------------------------------------------------
+
+
+def _write_legacy_db(path: Path) -> None:
+    """Create a DB with the OLD ``jobs`` shape (no ``project`` column), a leftover
+    ``queue`` table, and two job rows written via raw SQL/JSON."""
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE jobs ("
+            "job_id TEXT PRIMARY KEY, name TEXT, backend TEXT, state TEXT, "
+            "submitted_at TEXT, schema_version INTEGER NOT NULL, data JSON NOT NULL)"
+        )
+        conn.execute("CREATE TABLE queue (qid TEXT)")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        for job_id, slug in (("a-1", "alpha"), ("b-2", "beta")):
+            data = {
+                "spec": {
+                    "job_id": job_id,
+                    "name": job_id,
+                    "command": "echo hi",
+                    "repo": {
+                        "remote_url": "",
+                        "sha": "a" * 40,
+                        "branch": "main",
+                        "slug": slug,
+                    },
+                },
+                "state": "queued",
+            }
+            conn.execute(
+                "INSERT INTO jobs (job_id, name, backend, state, submitted_at, "
+                "schema_version, data) VALUES (?, ?, NULL, 'queued', NULL, 0, ?)",
+                (job_id, job_id, json.dumps(data)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migration_from_legacy_db(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(db)
+
+    store = open_store(f"sqlite:///{db}")
+    try:
+        insp = inspect(store._engine)
+        # project column added + index created
+        cols = {c["name"] for c in insp.get_columns("jobs")}
+        assert "project" in cols
+        assert "ix_jobs_project" in {ix["name"] for ix in insp.get_indexes("jobs")}
+        # backfilled from each spec's slug
+        with store._engine.connect() as conn:
+            rows = conn.execute(select(jobs.c.job_id, jobs.c.project)).fetchall()
+        got = {r[0]: r[1] for r in rows}
+        assert got == {"a-1": "alpha", "b-2": "beta"}
+        # dead queue table dropped
+        assert "queue" not in set(insp.get_table_names())
+        # version stamped
+        assert store.schema_version() == STATE_SCHEMA_VERSION
+        # and the filter works post-migration
+        assert [r.spec.job_id for r in store.list_jobs(project="alpha")] == ["a-1"]
+    finally:
+        store.close()
+
+
+def test_migration_is_idempotent(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.db"
+    _write_legacy_db(db)
+    open_store(f"sqlite:///{db}").close()
+    # Second open must not fail and must leave the backfill intact.
+    store = open_store(f"sqlite:///{db}")
+    try:
+        assert store.schema_version() == STATE_SCHEMA_VERSION
+        with store._engine.connect() as conn:
+            rows = conn.execute(select(jobs.c.job_id, jobs.c.project)).fetchall()
+        got = {r[0]: r[1] for r in rows}
+        assert got == {"a-1": "alpha", "b-2": "beta"}
+    finally:
+        store.close()
+
+
+def test_newer_schema_version_refused(tmp_path: Path) -> None:
+    db = tmp_path / "future.db"
+    store = open_store(f"sqlite:///{db}")
+    future = STATE_SCHEMA_VERSION + 1
+    store.set_meta("schema_version", str(future))
+    store.close()
+
+    with pytest.raises(StoreError) as exc:
+        open_store(f"sqlite:///{db}")
+    msg = str(exc.value)
+    assert str(future) in msg
+    assert str(STATE_SCHEMA_VERSION) in msg
+
+
+def test_list_jobs_project_filter(tmp_path: Path) -> None:
+    store = open_store(f"sqlite:///{tmp_path / 't.db'}")
+    try:
+        rec_a = make_record("a-1")
+        rec_a.spec.repo.slug = "alpha"
+        rec_b = make_record("b-2")
+        rec_b.spec.repo.slug = "beta"
+        store.save_job(rec_a)
+        store.save_job(rec_b)
+        assert [r.spec.job_id for r in store.list_jobs(project="alpha")] == ["a-1"]
+        assert [r.spec.job_id for r in store.list_jobs(project="beta")] == ["b-2"]
+        assert len(store.list_jobs()) == 2
+        assert store.list_jobs(project="ghost") == []
+    finally:
         store.close()
 
 

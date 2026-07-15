@@ -1,11 +1,17 @@
 """The SQL ``Store`` — one portable state repository over SQLAlchemy Core 2.0.
 
-SQLite only: zero-setup, the tested-for-real default. The SQLite file lives at
-``$OMNIRUN_STATE_DIR/omnirun.db`` by default (``default_db_url``).
+Dialect-portable: SQLite (zero-setup, the tested-for-real default; the file
+lives at ``$OMNIRUN_STATE_DIR/omnirun.db`` by default, ``default_db_url``) and
+PostgreSQL (the production daemon store, ``postgresql+psycopg://…``). The only
+dialect-specific code lives here: the upsert helper dispatches on
+``engine.dialect.name`` and the ``BEGIN IMMEDIATE`` write-lock shim is
+sqlite-only (Postgres serializes ``reserve`` with native ``SELECT … FOR
+UPDATE`` row locks instead).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -23,10 +29,13 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    inspect,
     make_url,
     select,
+    text,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnirun.budget import BudgetLedger, LedgerEntry
@@ -43,14 +52,26 @@ from omnirun.state.schema import (
     wait_samples,
 )
 
-# SQL era. The DB carries its own meta(schema_version) row.
+# The store speaks these two SQLAlchemy dialects. Both provide an
+# ``insert(...).on_conflict_do_update(index_elements=…, set_=…)`` and, for
+# ``reserve``, a serialization primitive (sqlite: a database-level write lock via
+# ``BEGIN IMMEDIATE``; postgres: ``SELECT … FOR UPDATE`` row locks). Any other
+# dialect is rejected at ``open_store`` time.
+_SUPPORTED_DIALECTS = ("sqlite", "postgresql")
+
+# SQL era. The DB carries its own meta(schema_version) row; ``open_store`` runs
+# the migration runner (``_migrate``) against it.
 # v3 (Phase 3): added the ``ledger`` table and reused the jobs ``backend``+``state``
 # columns for the scheduler capacity view (see ``save_job``). Additive — an
 # existing v2 DB got ``ledger`` on next ``open_store``.
 # v4: dropped the ``ledger`` table (budget tracking removed).
 # v5: re-adds the ``ledger`` table (budget re-add). Additive — an existing v4 DB
 # gets ``ledger`` back on next ``open_store`` (create_all is idempotent).
-STATE_SCHEMA_VERSION = 5
+# v6: multi-project scoping — a ``project`` column (+ ``ix_jobs_project`` index)
+# on ``jobs``, backfilled from each record's ``repo.slug``; and the dead ``queue``
+# table (old dual model) is dropped. Fresh DBs get the column from ``schema.py``;
+# legacy DBs get it via the 0→6 migration, which is idempotent (safe to re-run).
+STATE_SCHEMA_VERSION = 6
 
 # Scheduler states that occupy a provider slot (the #12 capacity guard counts
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
@@ -97,7 +118,12 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
     contending ``BEGIN IMMEDIATE`` wait for the holder to commit rather than fail
     immediately, so the concurrency-loser in ``reserve`` serializes and
     returns False instead of hitting "database is locked".
+
+    No-op on any non-sqlite dialect: Postgres needs no shim — ``reserve``'s
+    ``SELECT … FOR UPDATE`` row locks serialize it natively.
     """
+    if engine.dialect.name != "sqlite":
+        return
 
     @event.listens_for(engine, "connect")
     def _disable_implicit_begin(
@@ -117,18 +143,54 @@ class Store:
         _install_sqlite_write_lock(engine)
 
     def create_all(self) -> None:
-        metadata.create_all(self._engine, tables=list(ALL_TABLES))
-        self._stamp_schema_version()
+        """Create the current-shape tables (idempotent) then migrate.
 
-    def _stamp_schema_version(self) -> None:
-        value = str(STATE_SCHEMA_VERSION)
+        ``metadata.create_all`` is a no-op for tables that already exist, so on a
+        legacy DB it leaves the old ``jobs`` shape untouched (no ``project``
+        column) — the migration runner adds it. On a fresh DB it creates ``jobs``
+        with ``project`` already present, and the migration's guarded ADD COLUMN
+        is skipped.
+        """
+        metadata.create_all(self._engine, tables=list(ALL_TABLES))
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring the DB schema up to ``STATE_SCHEMA_VERSION`` in ONE write txn.
+
+        The whole check-and-migrate runs inside a single ``transaction()`` — on
+        sqlite that BEGIN IMMEDIATE takes the database write lock up front, on
+        postgres the ``meta`` row-level lock below serializes it — and the stored
+        version is re-read INSIDE the transaction, so two racing processes
+        serialize: the loser sees the winner's already-bumped version and does
+        nothing.
+
+        - version absent → fresh DB or a pre-versioning one: run all migrations
+          from 0 (each idempotent), then stamp CURRENT.
+        - stored == CURRENT → nothing.
+        - stored < CURRENT → run the missing migrations in order, stamp CURRENT.
+        - stored > CURRENT → refuse: the DB was written by a NEWER omnirun.
+        """
         with self.transaction() as conn:
-            existing = conn.execute(
-                select(meta.c.value).where(meta.c.key == "schema_version")
+            row = conn.execute(
+                select(meta.c.value)
+                .where(meta.c.key == "schema_version")
+                .with_for_update()
             ).scalar_one_or_none()
-            if existing is None:
+            stored = 0 if row is None else int(row)
+            if stored == STATE_SCHEMA_VERSION:
+                return
+            if stored > STATE_SCHEMA_VERSION:
+                raise StoreError(
+                    "state DB schema version "
+                    f"{stored} is newer than this omnirun understands "
+                    f"({STATE_SCHEMA_VERSION}); upgrade omnirun rather than "
+                    "downgrading the database"
+                )
+            _run_migrations(conn, stored)
+            value = str(STATE_SCHEMA_VERSION)
+            if row is None:
                 conn.execute(insert(meta).values(key="schema_version", value=value))
-            elif existing != value:
+            else:
                 conn.execute(
                     update(meta)
                     .where(meta.c.key == "schema_version")
@@ -173,8 +235,8 @@ class Store:
         self._engine.dispose()
 
     # ------------------------------------------------------------------
-    # SQLite upsert helper — the one place INSERT … ON CONFLICT is built.
-    # Tasks 3–4 reuse this same helper for their tables.
+    # Upsert helper — the one place INSERT … ON CONFLICT is built, dispatched
+    # per dialect. Every table's save reuses this helper.
     # ------------------------------------------------------------------
 
     def _upsert(
@@ -186,12 +248,15 @@ class Store:
     ) -> None:
         """Execute an upsert (INSERT … ON CONFLICT DO UPDATE) for *table*.
 
-        Uses the SQLite dialect-specific insert so that ``.on_conflict_do_update``
-        is available. *pk_cols* names the conflict-target columns (the primary key,
-        or a unique index); *values* is the full row dict, which is also used as
-        the update set.
+        Dispatches on the engine dialect so that ``.on_conflict_do_update`` is
+        available: SQLite and PostgreSQL both provide it (with identical
+        ``index_elements=`` / ``set_=`` kwargs). *pk_cols* names the
+        conflict-target columns (the primary key, or a unique index); *values* is
+        the full row dict, which is also used as the update set.
         """
-        stmt = sqlite_insert(table).values(**values)
+        dialect = self._engine.dialect.name
+        insert_fn = sqlite_insert if dialect == "sqlite" else postgresql_insert
+        stmt = insert_fn(table).values(**values)
         non_pk = {k: v for k, v in values.items() if k not in pk_cols}
         upsert_stmt = stmt.on_conflict_do_update(
             index_elements=pk_cols,
@@ -235,6 +300,9 @@ class Store:
             "name": rec.spec.name,
             "backend": backend,
             "state": state,
+            # ``project`` scopes ps/queue/gc: the submitting repo's slug. Stamped
+            # on every write so scoping and the migration backfill never disagree.
+            "project": rec.spec.repo.slug,
             "submitted_at": submitted_at,
             "schema_version": STATE_SCHEMA_VERSION,
             "data": data,
@@ -282,10 +350,17 @@ class Store:
             ).fetchall()
         return [row[0] for row in rows]
 
-    def list_jobs(self) -> list[JobRecord]:
-        """Return all ``JobRecord``s sorted by ``submitted_at``, ``None`` last."""
+    def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
+        """Return all ``JobRecord``s sorted by ``submitted_at``, ``None`` last.
+
+        When *project* is given, only jobs whose ``project`` column equals it are
+        returned (the multi-project scoping filter for ps/queue/gc).
+        """
+        stmt = select(jobs.c.data)
+        if project is not None:
+            stmt = stmt.where(jobs.c.project == project)
         with self._engine.connect() as conn:
-            rows = conn.execute(select(jobs.c.data)).fetchall()
+            rows = conn.execute(stmt).fetchall()
         recs = [JobRecord.model_validate(row[0]) for row in rows]
         recs.sort(
             key=lambda r: r.submitted_at or datetime.max.replace(tzinfo=timezone.utc)
@@ -330,8 +405,13 @@ class Store:
     def reserve(self, slot: Slot, rec: JobRecord) -> bool:
         """Atomically reserve job *rec* onto *slot* if the provider is under cap.
 
-        The slot-level #12 double-book guard. Inside ONE ``transaction()`` (which holds the SQLite reserved write lock via
-        ``BEGIN IMMEDIATE``) we re-read the job row ``with_for_update()``, and —
+        The slot-level #12 double-book guard. Inside ONE ``transaction()`` we
+        serialize concurrent reservers per dialect: on sqlite the ``BEGIN
+        IMMEDIATE`` database write lock (taken up front by the ``begin`` event
+        handler) blocks any other write transaction; on postgres the
+        ``with_for_update()`` ``SELECT … FOR UPDATE`` row lock blocks any other
+        transaction re-reading the same job row. Under that lock we re-read the
+        job row ``with_for_update()``, and —
         only if the persisted record is still placeable (``QUEUED`` or ``HELD``) and
         ``_count_active_jobs(slot.provider_name) < slot.capacity`` — flip it to
         ``PLACING`` with a fresh ``Placement`` on *slot*'s provider, UPDATEing the
@@ -356,9 +436,10 @@ class Store:
         job_id = rec.spec.job_id
         provider = slot.provider_name
         with self.transaction() as conn:
-            # Re-read under the lock: BEGIN IMMEDIATE (issued in the ``begin``
-            # event handler) already serializes the whole write transaction on
-            # SQLite, so with_for_update() is a no-op but harmless.
+            # Re-read under the lock. On SQLite BEGIN IMMEDIATE (issued in the
+            # ``begin`` event handler) already serializes the whole write
+            # transaction, so with_for_update() is a harmless no-op there; on
+            # Postgres it is the FOR UPDATE row lock that serializes reservers.
             row = conn.execute(
                 select(jobs.c.data).where(jobs.c.job_id == job_id).with_for_update()
             ).fetchone()
@@ -580,6 +661,69 @@ def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:
     return False
 
 
+def _run_migrations(conn: Connection, from_version: int) -> None:
+    """Run every schema migration after *from_version* up to CURRENT, in order.
+
+    Called inside the ``_migrate`` write transaction (on *conn*), so all steps
+    share that transaction's lock. Each step is idempotent — safe on a fresh DB,
+    a pre-versioning DB, or a partially-migrated one.
+    """
+    if from_version < 6:
+        _migrate_to_6(conn)
+
+
+def _migrate_to_6(conn: Connection) -> None:
+    """0/…→6: add the ``project`` column to ``jobs`` (backfilled from each
+    record's ``repo.slug``), create ``ix_jobs_project``, and drop the dead
+    ``queue`` table from the old dual model. Idempotent on both dialects."""
+    inspector = inspect(conn)
+    columns = {c["name"] for c in inspector.get_columns("jobs")}
+    if "project" not in columns:
+        # Plain ALTER TABLE ADD COLUMN works identically on sqlite and postgres.
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN project TEXT"))
+
+    # Backfill: parse each record's JSON, set project = spec.repo.slug. Only rows
+    # still NULL (a re-run leaves already-set rows alone).
+    rows = conn.execute(
+        select(jobs.c.job_id, jobs.c.data).where(jobs.c.project.is_(None))
+    ).fetchall()
+    for job_id, data in rows:
+        slug = _slug_from_record_data(data)
+        if slug is None:
+            continue
+        conn.execute(update(jobs).where(jobs.c.job_id == job_id).values(project=slug))
+
+    indexes = {ix["name"] for ix in inspect(conn).get_indexes("jobs")}
+    if "ix_jobs_project" not in indexes:
+        conn.execute(text("CREATE INDEX ix_jobs_project ON jobs (project)"))
+
+    conn.execute(text("DROP TABLE IF EXISTS queue"))
+
+
+def _slug_from_record_data(data: Any) -> str | None:
+    """Pull ``spec.repo.slug`` out of a stored job ``data`` blob.
+
+    The JSON column round-trips as a ``dict`` on sqlite and postgres, but a
+    legacy sqlite DB may hand back the raw ``str`` if the record was written by a
+    tool that stored text — accept both. Returns ``None`` when the slug is absent
+    or unparseable (the row is left NULL, not crashed on)."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    spec = data.get("spec")
+    if not isinstance(spec, dict):
+        return None
+    repo = spec.get("repo")
+    if not isinstance(repo, dict):
+        return None
+    slug = repo.get("slug")
+    return slug if isinstance(slug, str) else None
+
+
 def _ensure_sqlite_parent(url: str) -> None:
     """Create the parent directory for a SQLite *file* URL so ``create_engine``
     can create the database file. No-op for ``:memory:`` and non-sqlite URLs."""
@@ -596,6 +740,13 @@ def open_store(url: str | None = None) -> Store:
     url = url or default_db_url()
     _ensure_sqlite_parent(url)
     engine = create_engine(url, future=True)
+    if engine.dialect.name not in _SUPPORTED_DIALECTS:
+        engine.dispose()
+        supported = ", ".join(_SUPPORTED_DIALECTS)
+        raise StoreError(
+            f"unsupported state-store dialect {engine.dialect.name!r} "
+            f"(supported: {supported})"
+        )
     store = Store(engine)
     store.create_all()
     return store
