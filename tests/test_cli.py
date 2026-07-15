@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import types
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -10,6 +12,9 @@ from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
+
+from omnirun.config import load_config
+from omnirun.daemon import Daemon, daemon_address, send_request
 
 from omnirun.backends.base import (
     Backend,
@@ -1155,3 +1160,100 @@ def test_queue_wait_requires_a_running_daemon(env, monkeypatch):
     result = runner.invoke(app, ["queue", "--wait"])
     assert result.exit_code == 1
     assert "no omnirun daemon running" in result.output
+
+
+# ------------------------------------------------------------------ P2: daemon-aware fast paths
+
+
+def _spin_daemon(state_dir: Path, config_file: Path) -> tuple[Daemon, threading.Thread]:
+    """Start a real Daemon over the CLI's shared store/state dir in a thread,
+    returning ``(daemon, thread)``. The caller shuts it down. The daemon's DB is
+    ``{state_dir}/omnirun.db`` — the SAME file the CLI opens by default."""
+    cfg = load_config(config_file)
+    cfg.daemon.host = "127.0.0.1"
+    cfg.daemon.port = 0
+    cfg.daemon.poll_interval_s = 0.02
+    daemon = Daemon(cfg, state_dir=state_dir)
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    for _ in range(500):
+        if daemon_address(state_dir) is not None:
+            break
+        time.sleep(0.01)
+    assert daemon_address(state_dir) is not None, "daemon never came up"
+    return daemon, thread
+
+
+def _shutdown_daemon(daemon: Daemon, thread: threading.Thread) -> None:
+    send_request(daemon.host, daemon.port, {"cmd": "shutdown"})
+    thread.join(timeout=5.0)
+
+
+def test_ps_with_live_daemon_skips_the_local_tick(env, monkeypatch):
+    """With a daemon alive, `ps` reads the store directly (the daemon is the
+    catch-up) and does NOT build/drive its own local Control tick. Spying on the
+    CLI-local `_control` factory proves the read process never ticks (the factory
+    is process-local, untouched by the daemon's own reconcile thread)."""
+    import omnirun.cli as cli_mod
+
+    built: list[object] = []
+    real_control = cli_mod._control
+
+    def _spy_control(*args, **kwargs):
+        built.append(1)
+        return real_control(*args, **kwargs)
+
+    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
+    try:
+        job_id = submit_one()  # daemon (alive) places it via the nudge
+        for _ in range(500):
+            rec = _store().load_job(job_id)
+            if rec is not None and rec.state is JobState.RUNNING:
+                break
+            time.sleep(0.01)
+
+        monkeypatch.setattr(cli_mod, "_control", _spy_control)
+        result = runner.invoke(app, ["ps"])
+        assert result.exit_code == 0, result.output
+        assert job_id in result.output
+        # The daemon-alive fast path never built a local Control (no local tick).
+        assert built == []
+    finally:
+        _shutdown_daemon(daemon, thread)
+
+
+def test_submit_with_live_daemon_returns_quickly_and_daemon_places(env):
+    """With a daemon alive, `submit` (no --wait) writes QUEUED, nudges the daemon,
+    and prints the hand-off line — the daemon then places the job."""
+    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
+    try:
+        result = runner.invoke(app, ["submit", "--", "python", "train.py"])
+        assert result.exit_code == 0, result.output
+        assert "a running daemon is placing it" in result.output
+
+        [job_id] = _store().list_job_ids()
+        placed = False
+        for _ in range(500):
+            rec = _store().load_job(job_id)
+            if rec is not None and rec.placement is not None and rec.placement.handle:
+                placed = True
+                break
+            time.sleep(0.01)
+        assert placed, "the daemon did not place the nudged job"
+    finally:
+        _shutdown_daemon(daemon, thread)
+
+
+def test_submit_wait_blocks_until_running(env):
+    """`submit --wait` blocks until the daemon drives the job to RUNNING, then
+    prints the running line and exits 0."""
+    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
+    try:
+        result = runner.invoke(app, ["submit", "--wait", "--", "python", "train.py"])
+        assert result.exit_code == 0, result.output
+        assert "running" in result.output
+        [job_id] = _store().list_job_ids()
+        rec = _store().load_job(job_id)
+        assert rec is not None and rec.state is JobState.RUNNING
+    finally:
+        _shutdown_daemon(daemon, thread)
