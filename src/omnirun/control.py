@@ -869,9 +869,21 @@ class Control:
                             at=now,
                         ),
                     )
-        # Persist the placed record (re-load to keep any concurrent field the
-        # reserve wrote, then overlay the real placement + RUNNING state).
+        # Re-load to keep any concurrent field the reserve wrote. If a cancel()
+        # landed between reserve and here (the CLI cancels directly over the
+        # shared store while a daemon ticks), the fresh record is already
+        # terminal — the just-launched placement must NOT run, and an
+        # unconditional RUNNING save would RESURRECT the cancelled job.
         current = self._store.load_job(decision.job_id) or rec
+        if current.state.terminal:
+            # Void any paid commit rows this place just wrote (same as _requeue),
+            # so a cancelled-mid-place job is never charged, THEN force-release
+            # the fresh placement and keep the terminal record.
+            if placement.cost_actual is not None:
+                for window in self._paid_ledger_windows():
+                    self._store.ledger_realize(window, decision.job_id, 0.0, now)
+            self._reap(placement)
+            return
         self._store.save_job(
             current.model_copy(
                 update={

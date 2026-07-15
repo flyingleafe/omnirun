@@ -15,7 +15,7 @@ and methods with matching signatures. No I/O, no wall-clock beyond an injected
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,10 +62,15 @@ class FakeProvider:
         collect_error: Exception | None = None,
         place_error: Exception | None = None,
         place_error_script: list[Exception | None] | None = None,
+        place_hook: Callable[[JobRecord], None] | None = None,
         reap: ReapPolicy | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
+        # A hook fired at the START of every ``place`` (after recording the call,
+        # before returning the placement) — lets a test mutate the store MID-place
+        # to exercise the cancel-vs-place resurrection race.
+        self._place_hook = place_hook
         self._place_state = place_state
         self._placed_at = placed_at
         self._discover_available = discover_available
@@ -118,6 +123,8 @@ class FakeProvider:
         _ = slot
         job_id = rec.spec.job_id
         self.place_calls.append(job_id)
+        if self._place_hook is not None:
+            self._place_hook(rec)
         err = self._next_place_error()
         if err is not None:
             raise err

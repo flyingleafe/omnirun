@@ -730,6 +730,54 @@ def test_control_cancel_unknown_and_terminal_are_noops(tmp_path: Path) -> None:
     store.close()
 
 
+def test_cancel_mid_place_is_not_resurrected(tmp_path: Path) -> None:
+    """A cancel() landing between reserve and the RUNNING save (the CLI cancelling
+    directly over the shared store while a daemon ticks) must WIN: the fresh
+    placement is force-released, the job stays CANCELLED, and a PAID placement is
+    not charged (the mid-place commit rows are voided)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        # A PAID, capacity-1 slot so place() writes a committed ledger row that
+        # the resurrection guard must void.
+        paid_slot = Slot(
+            provider_name="free",
+            capabilities=Capabilities(),
+            cost=Cost(per_hour=6.0),
+            capacity=1,
+        )
+        spec = _spec("race-1")
+        spec = spec.model_copy(
+            update={"resources": ResourceSpec(time=timedelta(hours=1))}
+        )
+
+        # place() calls this hook mid-flight — cancelling the job through the SAME
+        # Control (reaps nothing yet: the record is still PLACING with a stub
+        # handle) so the reload after place sees CANCELLED.
+        control: Control | None = None
+
+        def _cancel_mid_place(rec: JobRecord) -> None:
+            assert control is not None
+            control.cancel(rec.spec.job_id, T1)
+
+        provider = FakeProvider("free", slots=[paid_slot], place_hook=_cancel_mid_place)
+        control = Control(store, {"free": provider}, budget_cap=1000.0)
+        control.submit(spec, now=T0)
+
+        control.run_tick(T0)
+
+        after = store.load_job("race-1")
+        assert after is not None
+        assert after.state is JobState.CANCELLED  # cancel won, not resurrected
+        # The fresh placement was force-released (a FORCE cancel was recorded for
+        # it in addition to the mid-place graceful cancel of the empty stub).
+        assert (("race-1", CancelMode.FORCE)) in provider.cancel_calls
+        # No spend: the mid-place commit row was voided to $0.
+        spent = store.load_ledger("day", 1000.0, T1).in_window_total(T1)
+        assert spent == 0.0
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------------------
 # Attempts-cap + last_error recorded by Control (one machine, two drivers)
 # ---------------------------------------------------------------------------
