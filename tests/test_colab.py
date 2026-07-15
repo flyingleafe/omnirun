@@ -107,6 +107,21 @@ def test_colab_new_at_session_cap_raises_capacity_error(cli, backend) -> None:
         backend._colab("new", "-s", "omnirun-x")
 
 
+def test_colab_new_gpu_unavailable_raises_capacity_error(cli, backend) -> None:
+    """The assign endpoint returns 503 Service Unavailable when Google has no free
+    accelerator of the requested type (the free-tier T4 lottery). That is transient,
+    NOT a job defect: `_colab` must raise CapacityError so the scheduler DEFERS and
+    retries, never a BackendError that hard-fails the GPU job with a raw traceback."""
+    cli.handlers["new"] = lambda argv, stdin: (
+        1,
+        "",
+        "ColabRequestError: Failed to issue request POST "
+        ".../assign?variant=GPU&accelerator=T4: Service Unavailable",
+    )
+    with pytest.raises(colab_mod.CapacityError):
+        backend._colab("new", "-s", "omnirun-x", "--gpu", "T4")
+
+
 @pytest.fixture
 def cli(monkeypatch) -> FakeColabCLI:
     fake = FakeColabCLI()

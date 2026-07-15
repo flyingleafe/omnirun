@@ -339,6 +339,17 @@ class ColabBackend(Backend):
                     "Colab is at its concurrent-session limit (free tier allows ~1); "
                     "stop an existing session or wait — the job will place on a later tick"
                 )
+            # The assign endpoint returns 503 "Service Unavailable" when Google has
+            # no free accelerator of the requested type right now (the free-tier GPU
+            # lottery: T4s come and go). That is transient and expected, NOT a job
+            # defect — classify it as capacity so the scheduler DEFERS and retries
+            # on a later tick rather than hard-failing the job with a traceback.
+            if "Service Unavailable" in err or "503" in err:
+                raise CapacityError(
+                    "Colab has no free accelerator to assign right now "
+                    "(503 Service Unavailable — the free-tier GPU lottery); "
+                    "the job will retry on a later tick"
+                )
             raise BackendError(
                 f"colab {' '.join(args)} failed (rc={proc.returncode}): {err[:500]}"
             )

@@ -605,12 +605,16 @@ class Control:
             try:
                 provider.collect_outputs(placement, dest)
                 cached_to = str(dest)
-            except Exception:
+            except Exception as e:
+                # Expected when the session is already gone (reclaimed) — a concise
+                # line, no traceback: on a revisit we reap anyway (the tick-event
+                # below is the user-facing signal), on the transition tick we retry.
                 _log.warning(
-                    "collecting outputs for terminal job %s on %s raised",
+                    "could not collect outputs for terminal job %s on %s (%s); %s",
                     rec.spec.job_id,
                     placement.provider_name,
-                    exc_info=True,
+                    e,
+                    "reaping session anyway" if give_up else "will retry next tick",
                 )
                 if not give_up:
                     return  # retry on a later tick before touching the session

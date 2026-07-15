@@ -612,16 +612,10 @@ def _submit_via_control(
     is required (a placed job then runs on the backend while the laptop is free).
     ``--backend`` narrows the provider set the scheduler may place onto.
     """
-    backends, _broken = _make_backends(cfg, backend)
-    providers: dict[str, Provider] = {
-        name: BackendProvider(be, store) for name, be in backends.items()
-    }
-    control = Control(
-        store,
-        providers,
-        budget_cap=cfg.budget.daily,
-        week_cap=cfg.budget.weekly,
-    )
+    # Same driver as every other lifecycle command (so a submit's reconcile also
+    # performs the daemon-equivalent catch-up — collecting + reaping a prior
+    # terminal notebook session before placing this job).
+    control = _control(cfg, store, backend)
     now = datetime.now(timezone.utc)
     job_id = control.submit(spec, now=now)
     control.run_tick(now)
