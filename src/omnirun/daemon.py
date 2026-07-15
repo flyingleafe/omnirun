@@ -276,8 +276,11 @@ class Daemon:
     # --- request handlers -------------------------------------------------
 
     def _cmd_ping(self, _req: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            jobs = self._store.list_jobs()
+        # Deliberately LOCK-FREE: the store read is its own transaction, and the
+        # tick lock can be held for many seconds while a slow backend places —
+        # a ping that waits on it times out the CLI's liveness probe and
+        # needlessly degrades every read command to the daemonless slow path.
+        jobs = self._store.list_jobs()
         pending = sum(
             r.state in (JobState.QUEUED, JobState.HELD, JobState.PLACING) for r in jobs
         )
