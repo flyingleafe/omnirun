@@ -194,8 +194,8 @@ explicitly requested premium tier still surfaces, marked non-free.
 - Client state: `$OMNIRUN_STATE_DIR/omnirun.db` (default `~/.local/share/omnirun/`)
   — a SQLite database managed by the `Store` repository (SQLAlchemy Core 2.0). See §9
   for the full SQL state layer description, including the Postgres option and the atomic
-  `reserve_entry` concurrency guard. The optional `[state]` config section selects the
-  backend/path/url; `omnirun state migrate` imports from legacy JSON files.
+  `Store.reserve` concurrency guard. The optional `[state]` config section selects the
+  path/url (SQLite file or a Postgres URL for a shared daemon store).
 - Config: `~/.config/omnirun/config.toml` (override `$OMNIRUN_CONFIG`; backends,
   credentials refs, policy, daemon) + optional per-repo `omnirun.toml` (resource defaults,
   outputs, env.setup overrides). Backend sections are permissive: common fields are typed,
@@ -372,82 +372,104 @@ the same schema and interface work on both dialects.
 Each table carries a primary key plus the few columns we filter or sort on, and a
 `data` JSON column holding the full `model_dump(mode="json")` of the Pydantic domain
 object (`JobRecord`, `ProviderFacts`). Pydantic stays the serialization
-source of truth; later field additions need no schema migration, only a `STATE_SCHEMA_VERSION`
-bump in `meta`. On Postgres the `data` column is `JSONB` (for indexing performance);
-on SQLite it is plain `JSON` — this difference is handled once in `schema.py`
-(`JSONText = JSON().with_variant(JSONB(), "postgresql")`), invisible at call sites.
+source of truth; later field additions need no schema migration, only a
+`STATE_SCHEMA_VERSION` bump. The `data` column is a plain SQLAlchemy `JSON` on
+both dialects (SQLite JSON1 / Postgres `JSON`) — no per-dialect variant is
+declared in `schema.py`; `store.py` dispatches the only dialect-specific bits
+(the upsert and the SQLite write-lock shim).
+
+**There is no `queue` table — the `jobs` table IS the queue** (one unified job
+model, DESIGN §11). A job's `Placement` lives on its `data` blob; the indexed
+`backend`+`state` columns drive the per-provider active count.
 
 ```
-meta:         key TEXT PK, value TEXT
+meta:         key TEXT PK, value TEXT              # incl. the schema_version row
 jobs:         job_id TEXT PK, name TEXT, backend TEXT, state TEXT,
-              submitted_at TEXT, schema_version INT, data JSON/JSONB
+              project TEXT, submitted_at TEXT, schema_version INT, data JSON
+              [index ix_jobs_project on (project)]
 wait_samples: id INTEGER PK autoincr, backend TEXT, key TEXT,
               wait_s REAL, recorded_at TEXT  [index on (backend, key)]
-facts:        backend TEXT PK, discovered_at TEXT, ttl_s REAL, health TEXT, data JSON/JSONB
-queue:        qid TEXT PK, state TEXT, created_at TEXT, only_backend TEXT,
-              backend TEXT, job_id TEXT, data JSON/JSONB
+facts:        backend TEXT PK, discovered_at TEXT, ttl_s REAL, health TEXT, data JSON
+ledger:       id INTEGER PK autoincr, window TEXT, job_id TEXT, provider TEXT,
+              amount REAL, kind TEXT, at TEXT  [index on (window, at)]
 ```
 
-Timestamps are stored as ISO-8601 TEXT (portable and sortable).
+`jobs.project` is the submitting repo's slug (`RepoRef.slug`); it scopes
+`ps`/`queue`/`gc` so one daemon can serve several repos without one project's
+`queue --cancel all` touching another's jobs (§11, §12). Timestamps are stored as
+ISO-8601 TEXT (portable and sortable).
 
-### Atomic `reserve_entry` — the #12 double-book guard
+### Migration runner + version guard
 
-`Store.reserve_entry(qid, backend, cap)` is the only concurrency-critical operation.
-It must guarantee that no two callers can both pass the `count_active(backend) < cap`
-check and both flip to PLACING — which would over-book the backend.
+`open_store(url)` creates the engine, `create_all()`s the tables (idempotent),
+then runs the migration runner (`Store._migrate` → `_run_migrations`) inside ONE
+write transaction (`BEGIN IMMEDIATE` on SQLite takes the write lock up front so
+concurrent openers serialize). The current schema is `STATE_SCHEMA_VERSION = 6`,
+stamped into the `meta["schema_version"]` row:
 
-- **SQLite**: `Store.__init__` installs a pair of SQLAlchemy engine events that disable
-  pysqlite's implicit `BEGIN` and emit `BEGIN IMMEDIATE` at transaction start instead
-  (`_install_sqlite_write_lock`). `BEGIN IMMEDIATE` acquires the reserved write lock
-  up front, serializing all `reserve_entry` calls sequentially. `with_for_update()` on
-  the re-read query is a no-op clause on SQLite — the serialization comes from the write
-  lock. A generous `busy_timeout` (30 s) makes contending callers wait rather than raise.
+- version absent → fresh / pre-versioning DB: run all migrations, stamp CURRENT.
+- stored < CURRENT → run the missing migrations in order, stamp CURRENT.
+- stored == CURRENT → no-op.
+- stored > CURRENT → **refuse**: the DB was written by a NEWER omnirun; the open
+  raises naming both versions, so an older binary never corrupts a newer DB.
 
-- **Postgres**: `engine.begin()` opens a transaction at the server default (READ COMMITTED).
-  A `FOR UPDATE` on the target row (qid) locks that single row, but leaves the count of
-  OTHER rows readable by concurrent transactions — two threads reserving different qids
-  can both read `count_active("x") == 1` before either commits, and both flip, over-booking.
-  The fix is a **transaction-scoped advisory lock per backend**:
-  ```sql
-  SELECT pg_advisory_xact_lock(hashtext(:b))
-  ```
-  issued at the top of the `reserve_entry` transaction. This serializes all reservers
-  for the same backend string; the second thread blocks until the first commits, then
-  re-reads the count and finds the cap full, returning False. The advisory lock is
-  auto-released at transaction commit/rollback. On PG 18.1 this eliminated 25/25
-  over-books observed without the guard (reproduction in `pg_overbook_raw.py`).
+Migration `0…→6` is the one that killed the old dual model: it adds the `project`
+column to `jobs` (backfilling `spec.repo.slug` from each record's `data`), creates
+`ix_jobs_project`, and `DROP TABLE IF EXISTS queue`. Every step is idempotent on
+both dialects (guarded `ADD COLUMN` / `CREATE INDEX`, NULL-only backfill).
+
+### Atomic `Store.reserve` — the #12 double-book guard
+
+`Store.reserve(slot, rec)` is the only concurrency-critical operation. It must
+guarantee that no two ticks can both pass the `count_active(backend) < cap` check
+and both flip a job to PLACING — which would over-book the backend. It counts the
+provider's non-terminal `jobs` rows, and if under cap flips the target job
+QUEUED/HELD → PLACING and writes a stub `Placement` in ONE transaction.
+
+- **SQLite**: `Store.__init__` installs a pair of SQLAlchemy engine events that
+  disable pysqlite's implicit `BEGIN` and emit `BEGIN IMMEDIATE` at transaction
+  start instead (`_install_sqlite_write_lock`). `BEGIN IMMEDIATE` takes the
+  reserved write lock up front, serializing all `reserve` calls sequentially.
+  `with_for_update()` on the target-row re-read is a no-op clause on SQLite — the
+  serialization comes from the write lock. A generous `busy_timeout` (30 s) makes
+  contending callers wait rather than raise.
+- **Postgres**: `engine.begin()` opens a transaction at the server default; a
+  `SELECT … FOR UPDATE` (`with_for_update()`) row lock on the target job row
+  serializes reservers natively. A real-threads race test
+  (`test_reserve_race_single_winner` in `tests/test_state_store.py`) confirms a
+  single winner on SQLite; the Postgres path is covered by
+  `tests/test_store_postgres.py` (opt-in via `OMNIRUN_TEST_PG_URL`).
 
 The `_upsert` helper is the one place where dialect branching lives:
-`sqlite_insert(table).on_conflict_do_update(...)` vs `pg_insert(table).on_conflict_do_update(...)`.
-Call sites are dialect-unaware.
+`sqlite_insert(table).on_conflict_do_update(...)` vs
+`postgresql_insert(table).on_conflict_do_update(...)` (identical `index_elements=` /
+`set_=` kwargs). Call sites are dialect-unaware.
 
 ### Opening a Store
 
-`open_store(url)` creates the engine, `create_all()` (idempotent), stamps
-`meta["schema_version"] = 2`, and returns the `Store`. The `[state]` TOML section
-controls which engine is used:
+`open_store(url)` creates the engine, `create_all()`s (idempotent), runs the
+migration runner (which stamps `meta["schema_version"] = STATE_SCHEMA_VERSION`,
+currently 6, and refuses a newer DB — see above), and returns the `Store`. The
+`[state]` TOML section controls which engine is used:
 
 ```toml
 [state]
-backend = "sqlite"      # or "postgres"
 # path = "/custom/path/omnirun.db"   # explicit SQLite path (default: state_dir/omnirun.db)
-# url  = "postgresql+psycopg://user:pw@host/db"  # overrides backend/path
+# url  = "postgresql+psycopg://user:pw@host/db"  # shared Postgres store; wins over path
 ```
 
-A one-time JSON→SQL importer (`omnirun state migrate [--from DIR] [--dry-run]`) reads
-the legacy `$OMNIRUN_STATE_DIR/jobs/*/meta.json`, `facts/*.json`, `queue/*.json`, and
-`wait_history.json` files, tolerating `schema_version` 0 and 1, and upserts them into
-the SQL store. `omnirun state path` prints the active database URL.
+`omnirun state path` prints the active database URL.
 
 ## 10. Scheduler — Provider seam, pure tick, budget/deadline
 
-> **Status (core branch).** What ships today is the **pure cheapest-fitting
-> free→paid tick** plus the atomic reserve and reconcile/orphan-recovery described
-> below. The **budget ledger, per-job deadline (`start_by`/`finish_by`), priority,
-> `omnirun reprioritize`, and `omnirun budget` (daily/weekly caps)** are **deferred
-> to a follow-up branch, pending a real need for spend control** — the `tick`
-> signature below therefore takes no `ledger`, ranks by `submitted_at` only, and
-> invariants **budget_safety** and **deadline_defense** are not active in core.
+> **Status.** What ships today is the full scheduler: the pure
+> cheapest-fitting free→paid tick with priority/urgency ranking, the budget
+> ledger, per-job deadline (`start_by`/`finish_by`), `omnirun reprioritize` and
+> `omnirun budget` (daily/weekly caps), the atomic reserve, parallel reconcile,
+> orphan-recovery, and the typed per-backend `ReapPolicy` teardown contract — all
+> described below and driven by one `Control` shared by the daemonless `submit`
+> and the daemon. The `tick` signature takes the `ledger` and all eight
+> invariants (including `budget_safety` and `deadline_defense`) are active.
 
 ### Provider seam
 
@@ -586,19 +608,55 @@ that `tick` cannot:
 ```
 run_tick(now):
   1. reconcile: poll each PLACING/RUNNING job's provider → update job state
-     (terminal → realize budget; LOST → requeue with attempts+1)
-  2. gather slots: ask each provider.offer() for every distinct pending req
-  3. load ledger: Store.load_ledger(window, cap, now)
-  4. tick: pure function → decisions
-  5. enact: for each decision:
+     (terminal → realize budget + reap per ReapPolicy; LOST → requeue with
+      attempts+1, force-release the placement iff ReapPolicy.release_lost)
+  2. refresh facts: re-run stale providers' discover() (skipped with nothing pending)
+  3. gather slots: ask each provider.offer() for every distinct pending req
+  4. load ledger: Store.load_ledger(window, cap, now)
+  5. tick: pure function → decisions (hold / place / fail)
+  6. enact: for each decision:
        hold  → save HELD
+       fail  → save FAILED (attempts-cap tripped, last_error recorded)
        place → Store.reserve (atomic, #12 guard) → PLACING stub →
                provider.place → commit budget → save RUNNING
 ```
 
-`Store.reserve` (the §9 `reserve_entry` guard) flips QUEUED/HELD → PLACING
-and writes a stub `Placement` in ONE transaction — only one concurrent tick
-can win the race; the other sees the state already PLACING and skips it.
+`Store.reserve` (the §9 `#12` guard) flips QUEUED/HELD → PLACING and writes a
+stub `Placement` in ONE transaction — only one concurrent tick can win the race;
+the other sees the state already PLACING and skips it.
+
+**Attempts-cap (core).** `SchedPolicy.max_attempts = 3`. A placement that
+genuinely RAISED bumps `attempts` and records `last_error`; once
+`attempts >= max_attempts` with a `last_error` set, the tick emits a `fail`
+decision (not a hold or another retry) and `Control` saves the job FAILED. LOST
+churn / poll failures bump `attempts` too but never set `last_error`, so they
+never trip the cap — a job merely waiting for capacity is never failed.
+
+**Parallel reconcile.** The reconcile poll fans out across a thread pool
+(`_parallel`, `max_poll_workers` threads) but *every store write stays on the
+main thread* — poll I/O in threads, transitions applied on the main thread. A
+per-tick wall budget (`poll_timeout_s = 30`) drops a straggler from the round
+(its item keeps last-known state) so one slow backend can never hang a tick nor
+requeue a healthy job.
+
+**ReapPolicy — typed per-backend teardown contract** (`models.ReapPolicy`,
+declared by each `Backend`; the core never knows *why*, only what to do):
+- `hold_on_terminal` — a terminal job still holds a capacity-occupying,
+  billable/quota resource whose local disk (and uncollected outputs) vanish when
+  released, so reconcile collects outputs to the durable cache FIRST, then
+  releases (collect-then-release). Set for **Colab** and the **marketplaces**
+  (the latter tied to `auto_terminate`). Default backends: off.
+- `release_lost` — a LOST placement is a defunct held resource safe to
+  force-release to reclaim its slot; `False` means a LOST poll may be a transient
+  blip on a still-alive job that must never be killed from here.
+
+**Cancel (`wait`).** `cancel(wait=True)` (default) runs the full
+graceful→force→reap inline and saves the record `reaped=True` (so reconcile's
+terminal catch-up doesn't revisit a released placement). `cancel(wait=False)`
+(detached, `omnirun cancel --no-wait`) sends one best-effort signal, saves
+CANCELLED with `reaped=False` and KEEPS the placement — the next tick's terminal
+catch-up finishes the teardown (force-cancel + reap). A daemon's next tick (or
+the next daemonless catch-up read) completes it.
 
 **Daemonless vs daemon — one tick everywhere.** Direct `omnirun submit` stores
 the spec QUEUED and runs exactly ONE synchronous tick; no background process is
@@ -641,25 +699,50 @@ Phase 4's orphan-recovery lands.
 
 Direct `submit` stays daemonless (§10). For fan-out — many jobs, or spreading a
 batch across backends with per-backend concurrency caps — an *optional*
-long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
-`Control.run_tick` as the daemonless path.
+long-lived scheduler daemon is available (`daemon.py`). It owns **nothing new**:
+the durable job store (§9) IS the queue (there is no `QueueEntry`, no queue
+table), and it drives the SAME pure `Control.run_tick` the daemonless path runs.
 
 - **`omnirun serve`** runs the daemon in the foreground: a localhost TCP socket
   (default `127.0.0.1:8787`), newline-delimited JSON request/response, plus a
-  scheduler thread ticking every `poll_interval_s` (default 10s). It owns a
-  durable queue persisted via the SQL `Store`; a restart re-reads and resumes.
-- **Scheduler tick** (§10): reconcile → gather slots → load ledger → pure tick
-  → enact. Placement reserves a backend slot atomically (§9 guard, state →
-  PLACING) before dispatching `provider.place` on a thread pool; it backfills
-  as jobs complete. Each backend's `max_parallel` caps its concurrent
-  non-terminal jobs.
+  scheduler thread that drives `Control.run_tick` every `poll_interval_s`
+  (default 10s) on a **wakeable sleep** — a `tick` request (or the stop path)
+  short-circuits the interval so a just-enqueued job places immediately. Job
+  writes go straight through the shared `Store`; a restart re-reads and resumes
+  (an empty-handle PLACING stub is reverted to QUEUED by the first tick's
+  reconcile). `serve` configures INFO logging and logs the drained tick events
+  (releases, defers, failures) — journald/the log file is the daemon's only
+  observable surface.
+- **Socket protocol** is exactly three verbs (one JSON object per line each way):
+  `ping` (returns pending/running/done counts; deliberately lock-free so a slow
+  tick can't wedge it), `tick` (wake the loop now), `shutdown`. Job creation,
+  listing and cancellation do **not** go over the socket — they go straight
+  through the shared store (`Control.submit` / `store.list_jobs` /
+  `Control.cancel`). There is no second front door.
+- **Scheduler tick** (§10): reconcile → refresh facts → gather slots → load
+  ledger → pure tick → enact. Placement reserves a backend slot atomically (§9
+  `Store.reserve`, state → PLACING) before `provider.place`; poll I/O during
+  reconcile fans out across a thread pool while every store write stays on the
+  main thread. Each backend's `max_parallel` caps its concurrent non-terminal
+  jobs. A job pinned via `spec.only_backend` rides one unscoped `run_tick` — the
+  pure tick honors the pin as a provider-name match.
 - **Job lifecycle**: QUEUED → (HELD) → PLACING → RUNNING → SUCCEEDED / FAILED /
   CANCELLED.
-- **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...` writes jobs to
-  the shared store and nudges the daemon; `queue` (show the store's jobs),
-  `queue --wait` (poll the store until all terminal), `queue --cancel
-  <job-prefix|all>` (cancel through the store). The socket speaks exactly
-  `ping` / `tick` / `shutdown` — there is no separate queue table.
+- **Commands** (§12): `enqueue [--count N] [--backend NAME] -- CMD...` writes
+  jobs to the shared store via `Control.submit` and nudges the daemon with one
+  `tick` — it **requires a live daemon** (nothing would advance otherwise).
+  `queue` renders the store's jobs; `queue --wait` polls the store until all
+  terminal (also daemon-required); `queue --cancel <job-prefix|all>` cancels via
+  `Control.cancel` directly (works with or without a daemon). `all` is
+  **project-scoped** (the current repo unless `-A`); an explicit id prefix is
+  never scoped, since job ids are globally unique.
+- **Daemon-aware reads.** `submit` under a live daemon persists the job QUEUED
+  and nudges rather than running its own tick; `submit --wait` then polls until
+  RUNNING/terminal. The read commands (`ps` / `status` / `queue`) skip their
+  local catch-up tick when a live daemon answers `ping` within 2s (`_live_daemon`
+  in `cli.py`) — the daemonless-catch-up invariant means a running daemon has
+  already converged the store, so a plain store read suffices. A wedged daemon
+  (no `ping`) falls back to the local tick.
 - **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
   Assignment/least-loaded fairness and warm-worker reuse (every placement is
   still a cold one-shot `provider.place`) are deferred refinements.
@@ -668,16 +751,21 @@ long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
 
 ```
 omnirun submit [--name N] [--gpus 1] [--gpu-type H100 | --vram 40] [--time 15h]
-               [--backend uni] [--push] -- python train.py ...
+               [--backend uni] [--push] [--wait] -- python train.py ...
+                                          # --wait: block until RUNNING/terminal
 omnirun offers [same resource flags]      # probe & table, no submit
-omnirun ps                                # all known jobs, refreshed statuses
-omnirun status <job> | logs [-f] <job> | cancel <job> | pull <job> [dest]
+omnirun ps [-A|--all-projects]            # known jobs (current repo; -A = whole fleet)
+omnirun status <job> | logs [-f] <job> | pull <job> [dest]
+omnirun cancel <job> [--force] [--no-wait]  # --no-wait: signal now, next tick reaps
 omnirun backends check                    # config + connectivity sanity per backend
 omnirun backends discover                 # probe live capability/health; cache facts
-omnirun gc                                # reap finished job dirs, leaked instances
+omnirun gc [--all] [-A|--all-projects]    # reap finished job dirs, leaked instances
 omnirun serve [--host H] [--port P]       # run the scheduler daemon (optional, §11)
 omnirun enqueue [resource flags] [--count N] [--backend NAME] -- CMD...
-omnirun queue [--wait] [--cancel job|all] # inspect / wait on / cancel stored jobs
+                                          # write jobs + nudge the daemon (daemon required)
+omnirun queue [--wait] [--cancel job|all] [-A|--all-projects]
+                                          # render / wait on / cancel stored jobs;
+                                          # `all` is project-scoped unless -A
 ```
 
 ## 13. Implementation notes
@@ -715,12 +803,12 @@ omnirun queue [--wait] [--cancel job|all] # inspect / wait on / cancel stored jo
     repo.py        # git state, clean/pushed checks, RepoRef, env_file, bundle creation,
                    # remote_clone_plan/worker_clone_url/remote_is_public (public-repo direct clone)
     bootstrap.py   # bootstrap.sh generation (shared payload), notebook_env_spec
-    scheduler.py   # pure tick(jobs, slots, now) -> decisions; SchedPolicy
+    scheduler.py   # pure tick(jobs, slots, ledger, now) -> decisions; SchedPolicy
     control.py     # impure Control driver: reconcile → gather → tick → enact
     providers/     # base.py (Provider protocol, CancelMode),
                    # adapter.py (BackendProvider: Backend+Store → Provider seam)
-    state/         # store.py (Store, open_store, reserve, ledger_add/realize),
-                   # schema.py, migrate.py
+    state/         # store.py (Store, open_store, reserve, load_ledger, migrations),
+                   # schema.py (tables; the jobs table IS the queue)
     daemon.py      # optional localhost scheduler daemon (serve; ping/tick/shutdown)
     chooser.py     # parallel probing, ranking, offer table (display; tick does placement)
     execlayer/     # base.py (Exec protocol), local.py, ssh.py (ControlMaster, login_shell)

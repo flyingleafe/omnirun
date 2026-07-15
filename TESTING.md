@@ -82,6 +82,45 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   the marketplace code is transcribed from docs/research, not observed — hence
   §3.
 
+### 2026-07-15 — daemon live validation (local, SQLite)
+
+Ran the unified-job-model daemon for real on this machine — SQLite store, a
+temporary `omnirun serve` background process, three real project repos under
+`~/omnirun-live-tests/{titanic,mnist,house-prices}`. What was confirmed:
+
+- **`backends check`**: all three enabled backends (local, colab, kaggle) reported
+  OK under the daemon's environment.
+- **4 jobs across 3 projects, all SUCCEEDED**: local ×2, Colab (CPU), and Kaggle
+  (**T4**, the job printing `device: cuda`, final accuracy `0.9793`). Outputs
+  pulled back on every one.
+- **Daemon-aware timings** (a live daemon answering `ping`, so reads skip their
+  local tick): daemon-aware `submit` **1.27s**; scoped `ps` (current project)
+  **1.34s**; empty `ps` **1.04s**.
+- **Collect-then-reap (Colab `hold_on_terminal`)**: after the Colab job went
+  terminal the reconcile collected outputs to the durable cache and stopped the
+  session — the record shows `reaped=True`, outputs cached, the Colab session
+  stopped, and a later `omnirun pull` was served **from the cache** (no live
+  session needed).
+- **Poll-timeout skip** observed live: a slow Colab provisioning poll exceeded
+  `poll_timeout_s` and was dropped from that tick (last-known state kept, one
+  warning line logged) without hanging the tick or any concurrent read.
+- **Crash recovery**: `SIGKILL`-ing the daemon left the store intact; a CLI read
+  fell back to its own local tick (**1.4s**) and worked; restarting `omnirun serve`
+  recovered and jobs kept converging.
+- **`cancel --no-wait`**: signalled and returned immediately; the placement was
+  released by the daemon's **next tick**, with the INFO release event visible in
+  the daemon log.
+- **`queue --cancel all` project scoping**: run from one project's repo, it
+  cancelled only that project's jobs and **spared the other project's** running
+  job (verified via `-A`).
+- **`submit --wait`**: blocked until the job reached RUNNING, then returned.
+
+**Still creds-gated / unverified after this pass**: a real personal SSH box
+(none available), the RunPod / Vast / Thunder live provisioning paths, and the
+**Postgres** store (the dialect-compile + opt-in `tests/test_store_postgres.py`
+cover it, but a live shared-Postgres daemon run is pending the move to the
+production deploy environment — see `docs/deploy-acceptance.md`).
+
 ## 2. Per-backend: credentials, where they go, first live test
 
 ### Local — nothing needed, try right now

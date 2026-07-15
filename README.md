@@ -97,14 +97,11 @@ relocate it, or point it at a PostgreSQL server for a shared always-on daemon
 ```
 
 The schema is created and migrated automatically on first open — multiple CLI
-processes and the daemon can share one database safely.
-
-**Migrating from an earlier omnirun version** (if you have JSON state files):
+processes and the daemon can share one database safely. A DB written by a
+**newer** omnirun makes older binaries refuse to touch it (they name both schema
+versions and exit); upgrade the binary rather than downgrade the database.
 
 ```bash
-omnirun state migrate          # import from default state dir
-omnirun state migrate --from /path/to/state  # or from a custom dir
-omnirun state migrate --dry-run              # count what would be imported
 omnirun state path             # print the active database URL
 ```
 
@@ -300,6 +297,7 @@ unique id prefix.
 | `--env K=V` | env var forwarded to the job (repeatable) |
 | `--backend NAME` | restrict to one configured backend |
 | `--push` | auto-push an unpushed HEAD to origin |
+| `--wait` | block until the job reaches RUNNING or a terminal state |
 | `--dry-run` | print the rendered payload (Slurm: full sbatch script) and exit |
 
 **`omnirun offers [resource flags] [--backend NAME]`** — probe and print the
@@ -316,11 +314,14 @@ running daemon's queue. Takes all of `submit`'s resource flags
 `--outputs`, `--env`, `--push`) plus `--count N` (enqueue N copies) and
 `--backend NAME` (restrict placement to one backend).
 
-**`omnirun queue [--wait] [--cancel QID|all]`** — show the daemon's queue;
-`--wait` polls until every entry is terminal then summarizes; `--cancel` cancels
-one qid (or `all`, which also stops running jobs).
+**`omnirun queue [--wait] [--cancel JOB|all] [-A|--all-projects]`** — show the
+stored jobs (scoped to the current repo unless `-A`); `--wait` polls until every
+job is terminal then summarizes; `--cancel` cancels one job (id prefix) or `all`
+(project-scoped unless `-A`; an explicit id prefix is never scoped). `--wait` and
+`enqueue` need a running daemon; `--cancel` works with or without one.
 
-**`omnirun ps`** — all known jobs with refreshed statuses.
+**`omnirun ps [-A|--all-projects]`** — known jobs with refreshed statuses (scoped
+to the current repo unless `-A`, which adds a `PROJECT` column for the fleet).
 
 **`omnirun status <job>`** — one job's details (backend, offer, repo sha, exit
 code, timestamps).
@@ -328,8 +329,11 @@ code, timestamps).
 **`omnirun logs [-f|--follow] <job>`** — stream stdout+stderr; `-f` tails until
 the job finishes.
 
-**`omnirun cancel <job>`** — cancel a running job (marketplaces: also
-terminates the instance when `auto_terminate` is on).
+**`omnirun cancel <job> [--force] [--no-wait]`** — cancel a running job
+(marketplaces: also terminates the instance when `auto_terminate` is on).
+`--force` skips the graceful window and hard-kills; `--no-wait` just signals the
+cancel and returns, letting the next scheduler tick (or the daemon) release the
+held resource.
 
 **`omnirun pull <job> [dest]`** — copy collected outputs locally (default
 `./omnirun-outputs/<job_id>`); marketplaces auto-terminate after a successful
