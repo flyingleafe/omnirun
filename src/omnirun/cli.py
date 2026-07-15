@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
+import logging
 import os
 import shlex
 import shutil
@@ -779,6 +780,13 @@ def serve(
     host: str | None = typer.Option(None, "--host", help="Bind host override."),
     port: int | None = typer.Option(None, "--port", help="Bind port override."),
 ) -> None:
+    # The daemon's log stream (journald / a redirected file) is its only
+    # observable surface — configure INFO so tick events (releases, defers,
+    # failures) are visible. One-shot CLI commands keep the quiet default.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     cfg = _load_cfg()
     if host is not None:
         cfg.daemon.host = host
