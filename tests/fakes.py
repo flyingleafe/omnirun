@@ -66,6 +66,7 @@ class FakeProvider:
         place_hook: Callable[[JobRecord], None] | None = None,
         reap: ReapPolicy | None = None,
         poll_delay_s: float = 0.0,
+        cancel_error: Exception | None = None,
     ) -> None:
         self.name = name
         self._slots = slots
@@ -85,6 +86,11 @@ class FakeProvider:
         # order (a ``None`` entry = that call succeeds); once exhausted the last
         # entry sticks, so ``[err, None]`` means "fail once, then succeed forever".
         self._place_error = place_error
+        # ``cancel`` failure injection: raised (after recording the call) on every
+        # cancel while set. Mutable mid-test — set/clear it to model a provider
+        # whose teardown API flaps, e.g. to prove the catch-up retries a failed
+        # release instead of marking the job reaped.
+        self.cancel_error: Exception | None = cancel_error
         self._place_error_script: list[Exception | None] | None = (
             list(place_error_script) if place_error_script is not None else None
         )
@@ -156,6 +162,8 @@ class FakeProvider:
     def cancel(self, p: Placement, mode: CancelMode, *, wait: bool = True) -> None:
         self.cancel_calls.append((p.job_id, mode))
         self.cancel_waits.append(wait)
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
     def stream_logs(self, p: Placement) -> Iterator[str]:
         yield f"fake log for {p.job_id}"

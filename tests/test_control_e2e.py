@@ -1056,6 +1056,41 @@ def test_cancel_no_wait_signals_then_next_tick_reaps(tmp_path: Path) -> None:
         store.close()
 
 
+def test_cancel_no_wait_release_failure_retries_next_tick(tmp_path: Path) -> None:
+    """If the catch-up's force-release RAISES (provider API down), the record
+    stays un-reaped so a later tick retries the escalation — a flaky teardown
+    must never silently leak the placement behind a reaped=True record."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()])
+        control = Control(store, {"free": provider})
+        control.submit(_spec("nwf-1"), now=T0)
+        control.run_tick(T0)  # place it (RUNNING)
+        control.cancel("nwf-1", T1, wait=False)
+
+        provider.cancel_error = RuntimeError("teardown API down")
+        control.run_tick(T2)  # catch-up: release raises → NOT marked reaped
+        mid = store.load_job("nwf-1")
+        assert mid is not None
+        assert mid.state is JobState.CANCELLED
+        assert mid.reaped is False
+        assert not any(
+            "released cancelled placement" in e for e in control.take_events()
+        )
+
+        provider.cancel_error = None
+        control.run_tick(T3)  # retry succeeds → reaped + event
+        after = store.load_job("nwf-1")
+        assert after is not None
+        assert after.reaped is True
+        assert any(
+            "nwf-1" in e and "released cancelled placement" in e
+            for e in control.take_events()
+        )
+    finally:
+        store.close()
+
+
 def test_cancel_wait_true_reaps_inline_no_catch_up(tmp_path: Path) -> None:
     """cancel(wait=True) (the default) reaps inline and marks reaped=True, so a
     later tick's catch-up never touches the placement again."""

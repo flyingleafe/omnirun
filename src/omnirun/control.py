@@ -655,12 +655,15 @@ class Control:
             self._collect_and_reap(rec, placement, provider, now, give_up=True)
             return
         if rec.state is JobState.CANCELLED:
-            self._reap(placement)
-            self._store.save_job(rec.model_copy(update={"reaped": True}))
-            self._tick_events.append(
-                f"released cancelled placement of {rec.spec.job_id} on "
-                f"{placement.provider_name}"
-            )
+            # Mark reaped only when the release actually went through; a raising
+            # provider leaves the record un-reaped so the next tick retries the
+            # escalation instead of silently leaking the placement.
+            if self._reap(placement):
+                self._store.save_job(rec.model_copy(update={"reaped": True}))
+                self._tick_events.append(
+                    f"released cancelled placement of {rec.spec.job_id} on "
+                    f"{placement.provider_name}"
+                )
 
     def _collect_and_reap(
         self,
