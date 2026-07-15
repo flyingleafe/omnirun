@@ -337,4 +337,10 @@ class Daemon:
         on the very first tick.
         """
         with self._lock:
-            self._get_control().run_tick(datetime.now(timezone.utc))
+            control = self._get_control()
+            control.run_tick(datetime.now(timezone.utc))
+            # Surface what the machine did (releases, defers, failures). The CLI
+            # drains these to stdout; here journald/the log file is the only
+            # audience — without this the daemon's housekeeping is invisible.
+            for event in control.take_events():
+                _log.info("%s", event)
