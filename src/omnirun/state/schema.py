@@ -64,18 +64,6 @@ facts = Table(
     Column("data", JSON, nullable=False),
 )
 
-queue = Table(
-    "queue",
-    metadata,
-    Column("qid", Text, primary_key=True),
-    Column("state", Text),
-    Column("created_at", Text),
-    Column("only_backend", Text, nullable=True),
-    Column("backend", Text, nullable=True),
-    Column("job_id", Text, nullable=True),
-    Column("data", JSON, nullable=False),
-)
-
 # Budget ledger (DESIGN §7). Append-only log of committed/spent cost per job,
 # keyed by rolling window ("day"/"week"). ``at`` is ISO-8601. The (window, at)
 # index serves the window-scoped range scan in ``load_ledger``. There is NO
@@ -95,4 +83,4 @@ ledger = Table(
     Index("ix_ledger_window_at", "window", "at"),
 )
 
-ALL_TABLES = (meta, jobs, wait_samples, facts, queue, ledger)
+ALL_TABLES = (meta, jobs, wait_samples, facts, ledger)

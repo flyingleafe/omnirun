@@ -1084,17 +1084,74 @@ def test_list_is_an_alias_for_ps(env):
     assert job_id in result.output
 
 
-def test_queue_daemon_timeout_is_friendly_not_traceback(env, monkeypatch):
+def test_enqueue_daemon_timeout_is_friendly_not_traceback(env, monkeypatch):
     """A daemon that accepts the connection but never answers must yield a red
-    one-liner, never a raw traceback (M-6). `send_request` converts the socket
-    timeout to a ConnectionError, which `friendly_errors` renders."""
+    one-liner, never a raw traceback (M-6). `send_request` (the tick nudge)
+    converts the socket timeout to a ConnectionError, which `friendly_errors`
+    renders."""
     monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
 
     def _raise(*a, **k):
         raise ConnectionError("omnirun daemon at 127.0.0.1:9 did not respond")
 
     monkeypatch.setattr("omnirun.cli.send_request", _raise)
-    result = runner.invoke(app, ["queue"])
+    result = runner.invoke(app, ["enqueue", "--", "python", "train.py"])
     assert result.exit_code == 1
     assert "Traceback" not in result.output
     assert "did not respond" in result.output
+
+
+def test_enqueue_writes_jobs_and_nudges_daemon(env, monkeypatch):
+    """enqueue builds specs client-side, writes them to the shared store via
+    Control.submit, and sends ONE tick nudge. No queue table involved."""
+    monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
+    nudges: list[dict] = []
+    monkeypatch.setattr(
+        "omnirun.cli.send_request", lambda host, port, req: nudges.append(req)
+    )
+    result = runner.invoke(
+        app, ["enqueue", "--count", "2", "--backend", "stub", "--", "python", "t.py"]
+    )
+    assert result.exit_code == 0, result.output
+    recs = _store().list_jobs()
+    assert len(recs) == 2
+    assert all(r.state is JobState.QUEUED for r in recs)
+    assert all(r.spec.only_backend == "stub" for r in recs)
+    # Exactly one tick nudge, and it is a `tick` command.
+    assert nudges == [{"cmd": "tick"}]
+
+
+def test_enqueue_requires_a_running_daemon(env, monkeypatch):
+    """Without a live daemon nothing would place the jobs — error out."""
+    monkeypatch.setattr("omnirun.cli.daemon_address", lambda: None)
+    result = runner.invoke(app, ["enqueue", "--", "python", "train.py"])
+    assert result.exit_code == 1
+    assert "no omnirun daemon running" in result.output
+    assert _store().list_jobs() == []
+
+
+def test_queue_lists_store_jobs_without_a_daemon(env):
+    """queue (no flags) renders the store's jobs — no daemon socket needed."""
+    job_id = submit_one()
+    result = runner.invoke(app, ["queue"])
+    assert result.exit_code == 0, result.output
+    assert job_id in result.output
+
+
+def test_queue_cancel_cancels_through_the_store(env):
+    """queue --cancel <prefix> cancels via Control over the store (no daemon)."""
+    job_id = submit_one()
+    result = runner.invoke(app, ["queue", "--cancel", job_id])
+    assert result.exit_code == 0, result.output
+    assert "cancelled 1 job" in result.output
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.state is JobState.CANCELLED
+
+
+def test_queue_wait_requires_a_running_daemon(env, monkeypatch):
+    """--wait needs a daemon to advance jobs; without one it errors, not spins."""
+    monkeypatch.setattr("omnirun.cli.daemon_address", lambda: None)
+    submit_one()
+    result = runner.invoke(app, ["queue", "--wait"])
+    assert result.exit_code == 1
+    assert "no omnirun daemon running" in result.output

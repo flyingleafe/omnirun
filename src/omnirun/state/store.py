@@ -33,7 +33,6 @@ from omnirun.budget import BudgetLedger, LedgerEntry
 from omnirun.models import JobRecord, Placement, ProviderFacts, Slot, StatusReport
 from omnirun.models import JobState as _JobState
 from omnirun.models import JobStatus as _JobStatus
-from omnirun.queue import QueueEntry, QueueState
 from omnirun.state.schema import (
     ALL_TABLES,
     facts,
@@ -41,14 +40,8 @@ from omnirun.state.schema import (
     ledger,
     meta,
     metadata,
-    queue,
     wait_samples,
 )
-
-# Queue states that still occupy a backend slot (the cap counts these) — the
-# non-terminal states (PENDING/PLACING/RUNNING), derived from QueueState.terminal
-# so it tracks any future state additions.
-_ACTIVE_QUEUE_STATES = tuple(s.value for s in QueueState if not s.terminal)
 
 # SQL era. The DB carries its own meta(schema_version) row.
 # v3 (Phase 3): added the ``ledger`` table and reused the jobs ``backend``+``state``
@@ -86,7 +79,7 @@ def default_db_url() -> str:
 
 
 # How long a SQLite connection waits for a held write lock before giving up
-# with "database is locked". `reserve_entry` relies on this: when two threads
+# with "database is locked". `reserve` relies on this: when two threads
 # race for the last slot, the loser's ``BEGIN IMMEDIATE`` blocks here until the
 # winner commits, then proceeds and finds the cap full — returning False cleanly
 # instead of raising. Generous so real contention never surfaces as an error.
@@ -102,7 +95,7 @@ def _install_sqlite_write_lock(engine: Engine) -> None:
     ``BEGIN IMMEDIATE`` ourselves at transaction start so ``engine.begin()``
     acquires the reserved write lock up front. A ``busy_timeout`` makes a
     contending ``BEGIN IMMEDIATE`` wait for the holder to commit rather than fail
-    immediately, so the concurrency-loser in ``reserve_entry`` serializes and
+    immediately, so the concurrency-loser in ``reserve`` serializes and
     returns False instead of hitting "database is locked".
     """
 
@@ -320,8 +313,7 @@ class Store:
         The slot-level cap check: jobs whose scheduler ``state`` is PLACING or
         RUNNING and whose (scheduler-view) ``backend`` column equals *provider*.
         Shared by ``count_active_jobs`` (own connection) and ``reserve`` (the
-        reserve transaction's connection, so count-and-set is one atomic unit),
-        mirroring ``_count_active``/``reserve_entry`` at the queue level.
+        reserve transaction's connection, so count-and-set is one atomic unit).
         """
         return conn.execute(
             select(func.count())
@@ -338,8 +330,7 @@ class Store:
     def reserve(self, slot: Slot, rec: JobRecord) -> bool:
         """Atomically reserve job *rec* onto *slot* if the provider is under cap.
 
-        The slot-level #12 double-book guard, mirroring ``reserve_entry`` exactly.
-        Inside ONE ``transaction()`` (which holds the SQLite reserved write lock via
+        The slot-level #12 double-book guard. Inside ONE ``transaction()`` (which holds the SQLite reserved write lock via
         ``BEGIN IMMEDIATE``) we re-read the job row ``with_for_update()``, and —
         only if the persisted record is still placeable (``QUEUED`` or ``HELD``) and
         ``_count_active_jobs(slot.provider_name) < slot.capacity`` — flip it to
@@ -575,123 +566,6 @@ class Store:
         return BudgetLedger.model_validate(
             {"window": window, "cap": cap, "entries": entries}
         )
-
-    # ------------------------------------------------------------------
-    # Queue CRUD (mirrors QueueStore) + the atomic reserve primitive.
-    # ------------------------------------------------------------------
-
-    def _entry_values(self, e: QueueEntry) -> dict[str, Any]:
-        """The full ``queue`` row for *e* (indexed cols + the JSON blob)."""
-        return {
-            "qid": e.qid,
-            "state": e.state.value,
-            "created_at": e.created_at.isoformat(),
-            "only_backend": e.only_backend,
-            "backend": e.backend,
-            "job_id": e.job_id,
-            "data": e.model_dump(mode="json"),
-        }
-
-    def save_entry(self, e: QueueEntry) -> None:
-        """Upsert *e* into the ``queue`` table, keyed on ``qid``.
-
-        Stamps ``e.updated_at`` before writing (the touch that used to live in
-        ``QueueStore.save``). Mutates *e* in place so the caller's object matches
-        what was persisted.
-        """
-        e.updated_at = datetime.now(timezone.utc)
-        with self.transaction() as conn:
-            self._upsert(conn, queue, ["qid"], self._entry_values(e))
-
-    def get_entry(self, qid: str) -> QueueEntry | None:
-        """Return the ``QueueEntry`` for *qid*, or ``None`` if not found."""
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                select(queue.c.data).where(queue.c.qid == qid)
-            ).fetchone()
-        if row is None:
-            return None
-        return QueueEntry.model_validate(row[0])
-
-    def load_entries(self) -> list[QueueEntry]:
-        """Return all queue entries, sorted by ``created_at``."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                select(queue.c.data).order_by(queue.c.created_at)
-            ).fetchall()
-        return [QueueEntry.model_validate(row[0]) for row in rows]
-
-    def delete_entry(self, qid: str) -> None:
-        """Delete the queue entry *qid* (no-op if it does not exist)."""
-        with self.transaction() as conn:
-            conn.execute(delete(queue).where(queue.c.qid == qid))
-
-    def _count_active(self, conn: Connection, backend: str) -> int:
-        """Count non-terminal queue rows placed on *backend*, on *conn*.
-
-        The cap check. Shared by ``count_active`` (its own connection) and
-        ``reserve_entry`` (the reserve transaction's connection, so the
-        count-and-set is one atomic unit).
-        """
-        return conn.execute(
-            select(func.count())
-            .select_from(queue)
-            .where(queue.c.backend == backend)
-            .where(queue.c.state.in_(_ACTIVE_QUEUE_STATES))
-        ).scalar_one()
-
-    def count_active(self, backend: str) -> int:
-        """Number of non-terminal (PENDING/PLACING/RUNNING) entries on *backend*."""
-        with self._engine.connect() as conn:
-            return self._count_active(conn, backend)
-
-    def reserve_entry(self, qid: str, backend: str, cap: int) -> bool:
-        """Atomically reserve entry *qid* onto *backend* if under *cap*.
-
-        The #12 double-book guard. Inside ONE ``transaction()`` (which holds the
-        SQLite reserved write lock via ``BEGIN IMMEDIATE``) we re-read the entry
-        ``with_for_update()``, then — only if it is still ``PENDING`` and
-        ``_count_active(backend) < cap`` — flip it to ``PLACING`` with *backend*
-        set, all on the same connection. Because the count and the update share
-        the one transaction, no concurrent tick or machine can slip a second
-        reservation past the cap.
-
-        Returns ``True`` if the entry was reserved, ``False`` otherwise (missing,
-        not ``PENDING``, or the cap is already full).
-
-        Does NOT mutate a caller-held ``QueueEntry`` (it updates the row
-        directly); reload via ``get_entry`` if you need the post-reserve object.
-        """
-        with self.transaction() as conn:
-            # Re-read under the lock: BEGIN IMMEDIATE (issued in the ``begin``
-            # event handler) already serializes the whole write transaction on
-            # SQLite, so with_for_update() is a no-op but harmless.
-            row = conn.execute(
-                select(queue.c.data).where(queue.c.qid == qid).with_for_update()
-            ).fetchone()
-            if row is None:
-                return False
-            entry = QueueEntry.model_validate(row[0])
-            if entry.state is not QueueState.PENDING:
-                return False
-            if self._count_active(backend=backend, conn=conn) >= cap:
-                return False
-
-            entry.state = QueueState.PLACING
-            entry.backend = backend
-            entry.updated_at = datetime.now(timezone.utc)
-            # UPDATE directly on this connection — NOT save_entry(), which would
-            # open a nested transaction and break atomicity.
-            conn.execute(
-                update(queue)
-                .where(queue.c.qid == qid)
-                .values(
-                    state=entry.state.value,
-                    backend=entry.backend,
-                    data=entry.model_dump(mode="json"),
-                )
-            )
-            return True
 
 
 def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:

@@ -43,7 +43,6 @@ from omnirun.models import (
 )
 from omnirun.progress import report, reporting
 from omnirun.providers import BackendProvider, Provider
-from omnirun.queue import QueueState
 from omnirun.state import Store, open_store
 from omnirun.state.store import default_store_dir
 
@@ -692,14 +691,6 @@ def offers(
 
 # --------------------------------------------------------------------------- queue
 
-_QUEUE_STYLE = {
-    QueueState.RUNNING: "cyan",
-    QueueState.SUCCEEDED: "green",
-    QueueState.FAILED: "red",
-    QueueState.CANCELLED: "yellow",
-    QueueState.PLACING: "blue",
-}
-
 
 @app.command(
     help="Run the scheduler daemon in the foreground (background it yourself)."
@@ -719,7 +710,8 @@ def serve(
 
 
 @app.command(
-    help="Enqueue a job on the daemon: omnirun enqueue [OPTIONS] -- COMMAND..."
+    help="Enqueue a job for a running daemon to place: "
+    "omnirun enqueue [OPTIONS] -- COMMAND..."
 )
 @friendly_errors
 def enqueue(
@@ -780,45 +772,55 @@ def enqueue(
         priority=priority,
         max_cost=max_cost,
     )
+    # Jobs live in the shared store; a running daemon places them continuously.
+    # `enqueue` requires a live daemon (nothing would advance otherwise), writes
+    # each job via Control.submit over that store, then nudges the daemon to
+    # place them without waiting out its poll interval.
     host, port = _require_daemon()
-    resp = send_request(
-        host,
-        port,
-        {
-            "cmd": "enqueue",
-            "spec": spec.model_dump(mode="json"),
-            "count": count,
-            "backend": backend,
-        },
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    try:
+        control = _control(cfg, store)
+        now = datetime.now(timezone.utc)
+        job_ids: list[str] = []
+        for _ in range(max(1, count)):
+            job_spec = spec.model_copy(
+                update={
+                    "job_id": JobSpec.make_job_id(spec.name),
+                    "only_backend": backend,
+                }
+            )
+            job_ids.append(control.submit(job_spec, now=now))
+    finally:
+        store.close()
+    send_request(host, port, {"cmd": "tick"})  # nudge an immediate round
+    console.print(
+        f"[green]enqueued[/green] {len(job_ids)} job(s): {', '.join(job_ids)}"
     )
-    if not resp.get("ok"):
-        _die(str(resp.get("error", "enqueue failed")))
-    qids = resp.get("qids", [])
-    console.print(f"[green]enqueued[/green] {len(qids)} job(s): {', '.join(qids)}")
 
 
-@app.command(help="Show the daemon's job queue (or --wait / --cancel it).")
+@app.command(help="Show queued/running jobs (or --wait / --cancel them).")
 @friendly_errors
 def queue(
     wait: bool = typer.Option(
-        False, "--wait", help="Poll until every entry is terminal, then summarize."
+        False, "--wait", help="Poll the store until every job is terminal."
     ),
     cancel: str | None = typer.Option(
-        None, "--cancel", help="Cancel a qid (or 'all')."
+        None, "--cancel", help="Cancel a job (id prefix, or 'all')."
     ),
 ) -> None:
-    host, port = _require_daemon()
-    if cancel is not None:
-        resp = send_request(host, port, {"cmd": "cancel", "qid": cancel})
-        if not resp.get("ok"):
-            _die(str(resp.get("error", "cancel failed")))
-        console.print(f"cancelled {resp.get('cancelled', 0)} entr(y|ies)")
-        return
-    if wait:
-        _queue_wait(host, port)
-        return
-    resp = send_request(host, port, {"cmd": "list"})
-    console.print(_queue_table(resp.get("entries", [])))
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    try:
+        if cancel is not None:
+            _queue_cancel(cfg, store, cancel)
+            return
+        if wait:
+            _queue_wait(store)
+            return
+        console.print(_queue_table(store.list_jobs()))
+    finally:
+        store.close()
 
 
 def _require_daemon() -> tuple[str, int]:
@@ -829,42 +831,66 @@ def _require_daemon() -> tuple[str, int]:
     return addr
 
 
-def _queue_table(entries: list[dict[str, Any]]) -> Table:
+def _queue_table(records: list[JobRecord]) -> Table:
     table = Table()
-    for col in ("qid", "state", "backend", "job", "name", "command"):
+    for col in ("job", "state", "backend", "name", "command"):
         table.add_column(col)
-    for e in entries:
-        state = QueueState(e["state"])
-        style = _QUEUE_STYLE.get(state)
-        state_txt = f"[{style}]{state.value}[/{style}]" if style else state.value
+    for rec in records:
+        style = _STATE_STYLE.get(rec.state)
+        state_txt = (
+            f"[{style}]{rec.state.value}[/{style}]" if style else rec.state.value
+        )
+        if rec.state is JobState.QUEUED and rec.last_error:
+            state_txt += f"\n[dim]last error: {_truncate(rec.last_error)}[/dim]"
         table.add_row(
-            e["qid"],
+            rec.spec.job_id,
             state_txt,
-            e.get("backend") or "-",
-            e.get("job_id") or "-",
-            e["spec"]["name"],
-            _truncate(e["spec"]["command"]),
+            rec.placement.provider_name if rec.placement else "-",
+            rec.spec.name,
+            _truncate(rec.spec.command),
         )
     return table
 
 
-def _queue_wait(host: str, port: int) -> None:
+def _queue_cancel(cfg: Config, store: Store, ref: str) -> None:
+    """Cancel a job (id prefix) or every non-terminal job (``all``) directly over
+    the store — works with or without a daemon; the control cancel-vs-place race
+    fix makes it safe against a concurrent daemon tick."""
+    now = datetime.now(timezone.utc)
+    if ref == "all":
+        targets = [r for r in store.list_jobs() if not r.state.terminal]
+    else:
+        targets = [store.resolve_job(ref)]
+    cancelled = 0
+    for rec in targets:
+        if rec.state.terminal:
+            continue
+        _control(
+            cfg, store, rec.placement.provider_name if rec.placement else None
+        ).cancel(rec.spec.job_id, now)
+        cancelled += 1
+    console.print(f"cancelled {cancelled} job(s)")
+
+
+def _queue_wait(store: Store) -> None:
     import time as _time
 
-    entries: list[dict[str, Any]] = []
+    # A running daemon is what advances jobs; without one, polling would spin
+    # forever. Require it before waiting (the same message enqueue uses).
+    _require_daemon()
+    records: list[JobRecord] = []
     while True:
-        resp = send_request(host, port, {"cmd": "list"})
-        entries = resp.get("entries", [])
-        if not entries or all(QueueState(e["state"]).terminal for e in entries):
+        records = store.list_jobs()
+        if not records or all(r.state.terminal for r in records):
             break
         _time.sleep(3.0)
-    console.print(_queue_table(entries))
+    console.print(_queue_table(records))
     counts: dict[str, int] = {}
-    for e in entries:
-        counts[e["state"]] = counts.get(e["state"], 0) + 1
+    for rec in records:
+        counts[rec.state.value] = counts.get(rec.state.value, 0) + 1
     summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items()))
     console.print(f"queue drained: {summary or 'empty'}")
-    if counts.get(QueueState.FAILED.value):
+    if counts.get(JobState.FAILED.value):
         raise typer.Exit(1)
 
 

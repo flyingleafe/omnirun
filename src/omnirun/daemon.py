@@ -1,19 +1,15 @@
 """Long-lived localhost scheduler daemon.
 
-Owns the durable queue (the SQL ``Store``) and spreads its jobs across the
-configured backends, honoring each backend's ``max_parallel`` cap and
-backfilling as jobs finish. Clients talk to it over a tiny line-oriented JSON
-protocol: one JSON object per line each way.
-
-Placement is the SAME pure scheduler ``tick`` the daemonless ``submit`` runs,
-driven here through :class:`~omnirun.control.Control` over the daemon's shared
-``Store``. The ``queue`` table stays the client-facing view (``enqueue`` /
-``list`` / ``cancel`` speak ``QueueEntry``/``QueueState``); each non-terminal
-entry is mirrored to a scheduler ``JobRecord`` that the tick actually places,
-and every ``JobRecord`` transition is projected back onto its entry after the
-tick. The per-backend concurrency cap is now enforced by ``Store.reserve``
-(#12), not a manual count; the daemon's single-threaded tick serializes rounds
-so the pure driver's concurrent-tick caveats never bite.
+Owns nothing new: the durable job store (the SQL ``Store``) IS the queue. The
+daemon simply drives the SAME pure scheduler ``tick`` the daemonless ``submit``
+runs — through :class:`~omnirun.control.Control` over the shared ``Store`` — on
+a poll interval, spreading queued jobs across the configured backends and
+honoring each backend's ``max_parallel`` cap (enforced by ``Store.reserve``,
+#12). Clients talk to it over a tiny line-oriented JSON protocol (one JSON
+object per line each way): ``ping`` (counts), ``tick`` (wake the loop now), and
+``shutdown``. Job creation, listing and cancellation go straight through the
+shared store (``Control.submit`` / ``store.list_jobs`` / ``Control.cancel``) —
+there is no second front door.
 """
 
 from __future__ import annotations
@@ -31,13 +27,8 @@ from typing import Any, Callable
 from omnirun.backends.base import Backend, make_backend
 from omnirun.config import Config
 from omnirun.control import Control
-from omnirun.models import (
-    JobRecord,
-    JobSpec,
-    JobState,
-)
+from omnirun.models import JobState
 from omnirun.providers import BackendProvider, Provider
-from omnirun.queue import QueueEntry, QueueState
 from omnirun.state import Store, default_store_dir, open_store
 
 BackendFactory = Callable[[str, Any], Backend]
@@ -45,18 +36,6 @@ BackendFactory = Callable[[str, Any], Backend]
 _log = logging.getLogger("omnirun.daemon")
 
 _ACCEPT_TIMEOUT_S = 0.5
-
-# Scheduler JobState -> client-facing QueueState projection. PLACING/HELD both
-# read as PENDING to the queue view (a slot is being taken / the job is waiting).
-_STATE_TO_QUEUE: dict[JobState, QueueState] = {
-    JobState.QUEUED: QueueState.PENDING,
-    JobState.HELD: QueueState.PENDING,
-    JobState.PLACING: QueueState.PLACING,
-    JobState.RUNNING: QueueState.RUNNING,
-    JobState.SUCCEEDED: QueueState.SUCCEEDED,
-    JobState.FAILED: QueueState.FAILED,
-    JobState.CANCELLED: QueueState.CANCELLED,
-}
 
 
 def _state_root(state_dir: Path | None) -> Path:
@@ -143,7 +122,7 @@ class Daemon:
         self._provider_cache: dict[str, Provider] | None = None
         self._control: Control | None = None
 
-        # One Store for the whole daemon (queue + job persistence). An explicit
+        # One Store for the whole daemon (the job store IS the queue). An explicit
         # state_dir (tests, or a caller relocating the daemon's state home) puts
         # the SQLite DB there; otherwise honor the configured state URL.
         # daemon.json still tracks the liveness address under state_root
@@ -156,6 +135,11 @@ class Daemon:
         self._store: Store = open_store(db_url)
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        # Wakeable sleep: a `tick` request sets this so a client that just wrote a
+        # job can trigger an immediate scheduling round instead of waiting out the
+        # poll interval. The stop path sets BOTH `_stop` and `_wake` so the loop
+        # terminates promptly.
+        self._wake = threading.Event()
         self._sock: socket.socket | None = None
         self._scheduler_thread: threading.Thread | None = None
 
@@ -207,7 +191,6 @@ class Daemon:
         self._sock = sock
 
         self._write_daemon_json()
-        self._recover_placing()
         self._install_signal_handlers()
 
         self._scheduler_thread = threading.Thread(
@@ -219,34 +202,23 @@ class Daemon:
         finally:
             sock.close()
             self._stop.set()
+            self._wake.set()  # unblock a scheduler sleeping on the wake event
             if self._scheduler_thread is not None:
                 self._scheduler_thread.join(timeout=5.0)
             self._remove_daemon_json()
-
-    def _recover_placing(self) -> None:
-        """Reset any PLACING left by a crash mid-place back to a re-placeable state.
-
-        Placement is synchronous inside a tick, so a PLACING row only survives a
-        crash. The queue view's PLACING entries revert to PENDING; the scheduler
-        ``JobRecord`` side is recovered independently by ``Control``'s reconcile
-        (a PLACING job with an empty-handle stub placement reverts to QUEUED),
-        so the very next tick re-places it.
-        """
-        with self._lock:
-            for entry in self._store.load_entries():
-                if entry.state == QueueState.PLACING:
-                    entry.state = QueueState.PENDING
-                    entry.backend = None
-                    self._store.save_entry(entry)
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return  # signals only install from the main thread
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                signal.signal(sig, lambda *_: self._stop.set())
+                signal.signal(sig, lambda *_: self._request_stop())
             except (ValueError, OSError):
                 pass
+
+    def _request_stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
 
     def _write_daemon_json(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -294,9 +266,7 @@ class Daemon:
         cmd = req.get("cmd")
         handler = {
             "ping": self._cmd_ping,
-            "enqueue": self._cmd_enqueue,
-            "list": self._cmd_list,
-            "cancel": self._cmd_cancel,
+            "tick": self._cmd_tick,
             "shutdown": self._cmd_shutdown,
         }.get(cmd or "")
         if handler is None:
@@ -307,12 +277,12 @@ class Daemon:
 
     def _cmd_ping(self, _req: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            entries = self._store.load_entries()
+            jobs = self._store.list_jobs()
         pending = sum(
-            e.state in (QueueState.PENDING, QueueState.PLACING) for e in entries
+            r.state in (JobState.QUEUED, JobState.HELD, JobState.PLACING) for r in jobs
         )
-        running = sum(e.state == QueueState.RUNNING for e in entries)
-        done = sum(e.state.terminal for e in entries)
+        running = sum(r.state is JobState.RUNNING for r in jobs)
+        done = sum(r.state.terminal for r in jobs)
         return {
             "ok": True,
             "pid": os.getpid(),
@@ -321,51 +291,17 @@ class Daemon:
             "done": done,
         }
 
-    def _cmd_enqueue(self, req: dict[str, Any]) -> dict[str, Any]:
-        spec = JobSpec.model_validate(req["spec"])
-        count = int(req.get("count", 1) or 1)
-        only_backend = req.get("backend")
-        qids: list[str] = []
-        with self._lock:
-            for _ in range(max(1, count)):
-                job_spec = spec.model_copy(
-                    update={
-                        "job_id": JobSpec.make_job_id(spec.name),
-                        "only_backend": only_backend,
-                    }
-                )
-                entry = QueueEntry.new(job_spec, only_backend=only_backend)
-                self._store.save_entry(entry)
-                qids.append(entry.qid)
-        return {"ok": True, "qids": qids}
+    def _cmd_tick(self, _req: dict[str, Any]) -> dict[str, Any]:
+        """Wake the scheduler for an immediate round.
 
-    def _cmd_list(self, _req: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            entries = self._store.load_entries()
-        return {"ok": True, "entries": [e.model_dump(mode="json") for e in entries]}
-
-    def _cmd_cancel(self, req: dict[str, Any]) -> dict[str, Any]:
-        qid = req.get("qid")
-        now = datetime.now(timezone.utc)
-        with self._lock:
-            entries = self._store.load_entries()
-            targets = entries if qid == "all" else [e for e in entries if e.qid == qid]
-            control = self._get_control()
-            cancelled = 0
-            for entry in targets:
-                if entry.state.terminal:
-                    continue
-                # Cancel the scheduler job through Control (reaps any live
-                # placement + marks the JobRecord CANCELLED, so no later tick
-                # re-places it), then terminalize the queue entry.
-                control.cancel(entry.spec.job_id, now)
-                entry.state = QueueState.CANCELLED
-                self._store.save_entry(entry)
-                cancelled += 1
-        return {"ok": True, "cancelled": cancelled}
+        Lets a client that just wrote a job to the shared store ask for an
+        immediate scheduling round instead of waiting out ``poll_interval_s``.
+        """
+        self._wake.set()
+        return {"ok": True}
 
     def _cmd_shutdown(self, _req: dict[str, Any]) -> dict[str, Any]:
-        self._stop.set()
+        self._request_stop()
         return {"ok": True}
 
     # --- scheduler --------------------------------------------------------
@@ -376,86 +312,26 @@ class Daemon:
                 self._tick()
             except Exception:  # a tick failure must never kill the scheduler
                 _log.warning("scheduler tick raised; continuing", exc_info=True)
-            self._stop.wait(self.poll_interval)
+            # Wakeable sleep: block until the poll interval elapses OR a `tick`
+            # request (or the stop path) sets `_wake`, then clear it and re-check
+            # `_stop` at the top of the loop.
+            self._wake.wait(self.poll_interval)
+            self._wake.clear()
 
     def _tick(self) -> None:
-        """One scheduling round: mirror queue → jobs, run the tick, project back.
+        """One scheduling round: drive the pure ``tick`` through ``Control``.
 
         Everything runs under ``self._lock`` (serializing ticks against socket
         handlers), so the pure driver's at-least-once/concurrent-tick caveats do
         not apply here — reconcile, reserve and place happen without an
-        overlapping round.
+        overlapping round. A job pinned to one backend rides ``spec.only_backend``
+        (baked in at submit time); the pure ``tick`` honors the pin as a
+        provider-NAME match, so a single unscoped ``run_tick`` over the ONE shared
+        ``Store`` places every job — pinned and unpinned — correctly, and
+        ``Store.reserve`` still enforces each backend's cap globally and
+        atomically. A daemon restart mid-place needs no special recovery: an
+        empty-handle PLACING stub is reverted to QUEUED by ``Control``'s reconcile
+        on the very first tick.
         """
         with self._lock:
-            now = datetime.now(timezone.utc)
-            self._sync_jobs()
-            self._run_scheduler(now)
-            self._project(now)
-
-    def _sync_jobs(self) -> None:
-        """Ensure every non-terminal queue entry has a scheduler ``JobRecord``.
-
-        The ``queue`` table is the client-facing view; the scheduler places over
-        the ``jobs`` table. A newly enqueued entry gets a matching QUEUED job
-        record (keyed by its ``spec.job_id``) whose ``submitted_at`` is the
-        enqueue time, so the tick's submitted_at ranking honors queue order.
-        Idempotent — an entry whose job already exists is left untouched.
-        """
-        for entry in self._store.load_entries():
-            if entry.state.terminal:
-                continue
-            job_id = entry.spec.job_id
-            if self._store.load_job(job_id) is None:
-                self._store.save_job(
-                    JobRecord(
-                        spec=entry.spec,
-                        state=JobState.QUEUED,
-                        submitted_at=entry.created_at,
-                    )
-                )
-            if entry.job_id != job_id:
-                entry.job_id = job_id
-                self._store.save_entry(entry)
-
-    def _run_scheduler(self, now: datetime) -> None:
-        """Drive the pure ``tick`` through ``Control`` — ONE unscoped round.
-
-        A job pinned to one backend rides ``spec.only_backend`` (baked in by
-        ``_cmd_enqueue``, mirrored onto its ``JobRecord`` by ``_sync_jobs``);
-        the pure ``tick`` honors the pin as a provider-NAME match, so a single
-        ``run_tick`` over the ONE shared ``Store`` places every job — pinned and
-        unpinned — correctly, ``Store.reserve`` still enforcing each backend's
-        cap globally and atomically.
-        """
-        self._get_control().run_tick(now)
-
-    def _project(self, now: datetime) -> None:
-        """Mirror each job's scheduler state back onto its queue entry.
-
-        Maps ``JobState`` → ``QueueState`` (PLACING/HELD read as PENDING) and
-        copies the placement's provider onto ``entry.backend`` and label. The
-        attempts-cap that terminalizes a job whose placement keeps raising now
-        lives in the core tick (``Control`` marks the record FAILED with
-        ``last_error`` in its status detail), so ``_project`` only reflects that
-        FAILED record onto the entry — populating ``entry.error`` from the
-        record's ``last_error`` (falling back to the status detail, else the
-        state value). Already-terminal entries are left as-is (never resurrected).
-        """
-        for entry in self._store.load_entries():
-            if entry.state.terminal:
-                continue
-            rec = self._store.load_job(entry.spec.job_id)
-            if rec is None:
-                continue
-
-            entry.state = _STATE_TO_QUEUE[rec.state]
-            entry.attempts = rec.attempts
-            if rec.placement is not None:
-                entry.backend = rec.placement.provider_name
-                entry.offer_label = rec.placement.provider_name
-            elif rec.state in (JobState.QUEUED, JobState.HELD):
-                entry.backend = None
-            if rec.state is JobState.FAILED:
-                detail = rec.last_status.detail if rec.last_status else None
-                entry.error = rec.last_error or detail or rec.state.value
-            self._store.save_entry(entry)
+            self._get_control().run_tick(datetime.now(timezone.utc))

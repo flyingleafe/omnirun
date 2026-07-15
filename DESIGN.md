@@ -371,7 +371,7 @@ the same schema and interface work on both dialects.
 
 Each table carries a primary key plus the few columns we filter or sort on, and a
 `data` JSON column holding the full `model_dump(mode="json")` of the Pydantic domain
-object (`JobRecord`, `ProviderFacts`, `QueueEntry`). Pydantic stays the serialization
+object (`JobRecord`, `ProviderFacts`). Pydantic stays the serialization
 source of truth; later field additions need no schema migration, only a `STATE_SCHEMA_VERSION`
 bump in `meta`. On Postgres the `data` column is `JSONB` (for indexing performance);
 on SQLite it is plain `JSON` — this difference is handled once in `schema.py`
@@ -655,9 +655,11 @@ long-lived scheduler daemon is available (`daemon.py`). It uses the SAME
   non-terminal jobs.
 - **Job lifecycle**: QUEUED → (HELD) → PLACING → RUNNING → SUCCEEDED / FAILED /
   CANCELLED.
-- **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...`, `queue` (show the table),
-  `queue --wait` (poll until all terminal), `queue --cancel <qid|all>`; the
-  socket also speaks `ping` / `list` / `shutdown`.
+- **Commands**: `enqueue [--count N] [--backend NAME] -- CMD...` writes jobs to
+  the shared store and nudges the daemon; `queue` (show the store's jobs),
+  `queue --wait` (poll the store until all terminal), `queue --cancel
+  <job-prefix|all>` (cancel through the store). The socket speaks exactly
+  `ping` / `tick` / `shutdown` — there is no separate queue table.
 - **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
   Assignment/least-loaded fairness and warm-worker reuse (every placement is
   still a cold one-shot `provider.place`) are deferred refinements.
@@ -675,7 +677,7 @@ omnirun backends discover                 # probe live capability/health; cache 
 omnirun gc                                # reap finished job dirs, leaked instances
 omnirun serve [--host H] [--port P]       # run the scheduler daemon (optional, §11)
 omnirun enqueue [resource flags] [--count N] [--backend NAME] -- CMD...
-omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemon queue
+omnirun queue [--wait] [--cancel job|all] # inspect / wait on / cancel stored jobs
 ```
 
 ## 13. Implementation notes
@@ -719,8 +721,7 @@ omnirun queue [--wait] [--cancel qid|all] # inspect / wait on / cancel the daemo
                    # adapter.py (BackendProvider: Backend+Store → Provider seam)
     state/         # store.py (Store, open_store, reserve, ledger_add/realize),
                    # schema.py, migrate.py
-    queue.py       # durable QueueStore/QueueEntry backing the daemon
-    daemon.py      # optional localhost scheduler daemon (serve/enqueue/queue)
+    daemon.py      # optional localhost scheduler daemon (serve; ping/tick/shutdown)
     chooser.py     # parallel probing, ranking, offer table (display; tick does placement)
     execlayer/     # base.py (Exec protocol), local.py, ssh.py (ControlMaster, login_shell)
     backends/      # base.py, jobdir.py (shared job-dir/project-root/push/.env/status
