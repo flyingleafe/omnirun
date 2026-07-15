@@ -70,6 +70,8 @@ def _rec(
     state: JobState = JobState.QUEUED,
     submitted_at: datetime | None = None,
     only_backend: str | None = None,
+    attempts: int = 0,
+    last_error: str | None = None,
 ) -> JobRecord:
     return JobRecord(
         spec=_spec(
@@ -80,6 +82,8 @@ def _rec(
         ),
         state=state,
         submitted_at=submitted_at,
+        attempts=attempts,
+        last_error=last_error,
     )
 
 
@@ -106,6 +110,10 @@ def _places(decisions: list[Decision]) -> list[Decision]:
 
 def _holds(decisions: list[Decision]) -> list[Decision]:
     return [d for d in decisions if d.kind == "hold"]
+
+
+def _fails(decisions: list[Decision]) -> list[Decision]:
+    return [d for d in decisions if d.kind == "fail"]
 
 
 def _placed_on(decision: Decision) -> str:
@@ -1072,3 +1080,55 @@ class TestBackendPinning:
         assert placed.get("u") == "b"
         assert "p" not in placed  # pinned job starved; stays QUEUED
         assert _holds(out) == []
+
+
+# ---------------------------------------------------------------------------
+# Attempts-cap — fail a job whose placement keeps genuinely raising
+# ---------------------------------------------------------------------------
+
+
+class TestAttemptsCap:
+    def test_capped_out_job_failed_others_still_matched(self) -> None:
+        """A job at the attempts cap WITH a last_error emits one ``fail`` and no
+        place/hold; a healthy job in the same tick is still matched."""
+        capped = _rec(job_id="capped", attempts=3, last_error="boom")
+        healthy = _rec(job_id="healthy")
+        out = tick(
+            [capped, healthy], [_slot(provider_name="free")], BudgetLedger(), NOW
+        )
+
+        fails = _fails(out)
+        assert len(fails) == 1
+        assert fails[0].job_id == "capped"
+        assert "3 times" in fails[0].reason
+        assert "boom" in fails[0].reason
+        # The capped job is excluded from place/hold; the healthy one is placed.
+        assert {d.job_id for d in _places(out)} == {"healthy"}
+        assert [d.job_id for d in _holds(out)] == []
+        assert [d.job_id for d in fails] == ["capped"]
+
+    def test_capped_attempts_without_last_error_not_failed(self) -> None:
+        """attempts >= cap but last_error is None (requeue-loop churn: LOST /
+        poll failures) → NOT failed; the job is still matched normally."""
+        churned = _rec(job_id="churned", attempts=5, last_error=None)
+        out = tick([churned], [_slot(provider_name="free")], BudgetLedger(), NOW)
+        assert _fails(out) == []
+        assert {d.job_id for d in _places(out)} == {"churned"}
+
+    def test_max_attempts_honored_from_custom_policy(self) -> None:
+        """A custom SchedPolicy.max_attempts changes the cap: attempts=2 is under
+        the default 3 (not failed) but at a custom cap of 2 it IS failed."""
+        rec = _rec(job_id="j", attempts=2, last_error="nope")
+        slots = [_slot(provider_name="free")]
+
+        # Default cap (3): attempts=2 < 3 → placed, not failed.
+        out_default = tick([rec], slots, BudgetLedger(), NOW)
+        assert _fails(out_default) == []
+        assert {d.job_id for d in _places(out_default)} == {"j"}
+
+        # Custom cap (2): attempts=2 >= 2 → failed, not placed.
+        out_capped = tick(
+            [rec], slots, BudgetLedger(), NOW, policy=SchedPolicy(max_attempts=2)
+        )
+        assert [d.job_id for d in _fails(out_capped)] == ["j"]
+        assert _places(out_capped) == []

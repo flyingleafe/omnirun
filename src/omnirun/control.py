@@ -732,8 +732,32 @@ class Control:
             self._enact_hold(decision)
         elif decision.kind == "place":
             self._enact_place(decision, now)
+        elif decision.kind == "fail":
+            self._enact_fail(decision)
         # "requeue"/"noop": nothing to do — requeue is handled by reconcile, and
         # a job the tick left unplaced simply stays QUEUED for a future tick.
+
+    def _enact_fail(self, decision: Decision) -> None:
+        """Terminalize a job the tick capped out (placement raised too often).
+
+        Only a job still QUEUED/HELD is failed — a concurrent transition may have
+        moved it on, and a terminal job must never be resurrected. The tick's
+        ``reason`` (attempts + last error) becomes the FAILED status detail.
+        """
+        rec = self._store.load_job(decision.job_id)
+        if rec is None or rec.state not in (JobState.QUEUED, JobState.HELD):
+            return
+        self._store.save_job(
+            rec.model_copy(
+                update={
+                    "state": JobState.FAILED,
+                    "last_status": StatusReport(
+                        status=JobStatus.FAILED, detail=decision.reason
+                    ),
+                }
+            )
+        )
+        self._tick_events.append(f"failed {decision.job_id}: {decision.reason}")
 
     def _enact_hold(self, decision: Decision) -> None:
         """Mark a job HELD (no slot's capabilities can ever satisfy it)."""
@@ -811,16 +835,18 @@ class Control:
                 f"backing off {backoff:.0f}s before retry"
             )
             return
-        except Exception:
+        except Exception as e:
             # Backend submit failed: release the reservation so a later tick can
             # retry (spec §7b — misbehaving provider degraded, tick not crashed).
+            # Record the reason so the tick's attempts-cap can fail a job whose
+            # placement keeps raising, and read commands can show WHY.
             _log.warning(
                 "place raised for job %s on %s; releasing reservation",
                 decision.job_id,
                 slot.provider_name,
                 exc_info=True,
             )
-            self._release(decision.job_id, rec)
+            self._release(decision.job_id, rec, error=f"{slot.provider_name}: {e}")
             return
 
         # Commit the budget for a PAID placement with a knowable cost. Free slots
@@ -848,7 +874,13 @@ class Control:
         current = self._store.load_job(decision.job_id) or rec
         self._store.save_job(
             current.model_copy(
-                update={"state": JobState.RUNNING, "placement": placement}
+                update={
+                    "state": JobState.RUNNING,
+                    "placement": placement,
+                    # Clear any stale placement error so it cannot linger into a
+                    # later retry cycle and trip the attempts-cap.
+                    "last_error": None,
+                }
             )
         )
 
@@ -875,23 +907,34 @@ class Control:
         )
         self._store.save_facts(ProviderFacts.model_validate(base))
 
-    def _release(self, job_id: str, fallback: JobRecord, *, count: bool = True) -> None:
+    def _release(
+        self,
+        job_id: str,
+        fallback: JobRecord,
+        *,
+        count: bool = True,
+        error: str | None = None,
+    ) -> None:
         """Release a reservation: PLACING→QUEUED (no placement).
 
         ``count`` bumps ``attempts`` (a genuine failed placement). A capacity
         defer passes ``count=False``: the job did not fail to place, it is just
         waiting for a slot, so it must not creep toward the attempts cap.
+
+        ``error`` (when not ``None``) records the placement-failure reason onto
+        the record's ``last_error`` — read by the tick's attempts-cap rule and
+        surfaced by read commands. A capacity defer never sets it (a defer is not
+        a failure; recording one would let the cap kill a merely-waiting job).
         """
         rec = self._store.load_job(job_id) or fallback
-        self._store.save_job(
-            rec.model_copy(
-                update={
-                    "state": JobState.QUEUED,
-                    "attempts": rec.attempts + (1 if count else 0),
-                    "placement": None,
-                }
-            )
-        )
+        update: dict[str, Any] = {
+            "state": JobState.QUEUED,
+            "attempts": rec.attempts + (1 if count else 0),
+            "placement": None,
+        }
+        if error is not None:
+            update["last_error"] = error
+        self._store.save_job(rec.model_copy(update=update))
 
     # ------------------------------------------------------------------
     # Thin read helpers for CLI wiring

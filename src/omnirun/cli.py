@@ -909,6 +909,11 @@ def ps() -> None:
         status_txt = (
             f"[{style}]{rec.state.value}[/{style}]" if style else rec.state.value
         )
+        # A still-QUEUED job whose last placement raised: show WHY under its state
+        # so a job stuck retrying is never silently stuck (a FAILED job's reason
+        # rides its status detail, shown by `status`).
+        if rec.state is JobState.QUEUED and rec.last_error:
+            status_txt += f"\n[dim]last error: {_truncate(rec.last_error)}[/dim]"
         table.add_row(
             rec.spec.job_id,
             rec.placement.provider_name if rec.placement else "-",
@@ -945,6 +950,10 @@ def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
         rows.append(("exit code", str(st.exit_code)))
     if st is not None and st.detail:
         rows.append(("detail", st.detail))
+    # A still-QUEUED job whose last placement raised: surface WHY it keeps
+    # failing to place (a FAILED job shows the reason via its status detail above).
+    if rec.state is JobState.QUEUED and rec.last_error:
+        rows.append(("last error", rec.last_error))
     if rec.placement is not None and rec.placement.placed_at is not None:
         rows.append(("started", rec.placement.placed_at.isoformat()))
     if rec.placement is not None and rec.placement.ended_at is not None:

@@ -60,6 +60,8 @@ class FakeProvider:
         placed_at: datetime | None = None,
         discover_available: int | None = None,
         collect_error: Exception | None = None,
+        place_error: Exception | None = None,
+        place_error_script: list[Exception | None] | None = None,
         reap: ReapPolicy | None = None,
     ) -> None:
         self.name = name
@@ -68,6 +70,14 @@ class FakeProvider:
         self._placed_at = placed_at
         self._discover_available = discover_available
         self._collect_error = collect_error
+        # ``place`` failure injection. ``place_error`` (when set) is raised on
+        # EVERY place. ``place_error_script`` is a per-call sequence popped in
+        # order (a ``None`` entry = that call succeeds); once exhausted the last
+        # entry sticks, so ``[err, None]`` means "fail once, then succeed forever".
+        self._place_error = place_error
+        self._place_error_script: list[Exception | None] | None = (
+            list(place_error_script) if place_error_script is not None else None
+        )
         # Working copies of the scripts so popping does not mutate the caller's.
         self._poll_script: dict[str, list[JobStatus]] = {
             jid: list(seq) for jid, seq in (poll_script or {}).items()
@@ -108,6 +118,9 @@ class FakeProvider:
         _ = slot
         job_id = rec.spec.job_id
         self.place_calls.append(job_id)
+        err = self._next_place_error()
+        if err is not None:
+            raise err
         return Placement(
             provider_name=self.name,
             job_id=job_id,
@@ -144,6 +157,21 @@ class FakeProvider:
         seq = self._poll_script.setdefault(
             job_id, [JobStatus.RUNNING, JobStatus.SUCCEEDED]
         )
+        if len(seq) > 1:
+            return seq.pop(0)
+        return seq[0]
+
+    def _next_place_error(self) -> Exception | None:
+        """The exception this ``place`` call should raise (``None`` = succeed).
+
+        ``place_error`` always wins (raised on every call). Otherwise the
+        ``place_error_script`` is popped in order, the last entry sticking once
+        exhausted (so ``[err, None]`` fails the first place then succeeds)."""
+        if self._place_error is not None:
+            return self._place_error
+        seq = self._place_error_script
+        if not seq:
+            return None
         if len(seq) > 1:
             return seq.pop(0)
         return seq[0]

@@ -66,12 +66,17 @@ from omnirun.models import (
     Slot,
 )
 from omnirun.providers.base import Provider
+from omnirun.scheduler import SchedPolicy
 from omnirun.state.store import Store, open_store
 from tests.fakes import FlakyProvider
 
 UTC = timezone.utc
 # A fixed base time; ``advance_time`` only ever moves forward from here.
 BASE_NOW = datetime(2026, 7, 11, 6, 0, 0, tzinfo=UTC)
+
+# The attempts-cap the default-policy Control (built below) applies: a job whose
+# place() genuinely raises this many times is failed rather than retried forever.
+_ATTEMPTS_CAP = SchedPolicy().max_attempts
 
 _REPO = RepoRef(
     remote_url="https://github.com/example/repo.git",
@@ -321,7 +326,14 @@ class SchedulerInvariants(RuleBasedStateMachine):
         FlakyProvider raise/lose modes) must have returned the job to QUEUED
         (verified by membership), proving the C2 run-late / no-starve fix and the
         reconcile requeue path: a dropped/lost job re-queues rather than
-        disappearing or wedging."""
+        disappearing or wedging.
+
+        FAILED is admitted as a legitimate terminal outcome ONLY for a job that
+        genuinely hit the attempts-cap — its placement RAISED (``last_error`` set)
+        ``max_attempts`` times. That is the core's deliberate give-up (a
+        raise_on_place / timeout provider can never succeed), not silent loss; a
+        FAILED job WITHOUT a recorded ``last_error`` (or under the cap) WOULD be a
+        bug and is rejected."""
         live = {
             JobState.QUEUED,
             JobState.HELD,
@@ -334,9 +346,16 @@ class SchedulerInvariants(RuleBasedStateMachine):
                 continue
             rec = self.store.load_job(job_id)
             assert rec is not None, f"job {job_id} vanished from the store"
-            # No rule fails a job permanently: failures funnel to requeue (LOST)
-            # or release-on-place-raise (→ QUEUED). Membership in ``live`` proves
-            # no silent loss and no stuck FAILED for a still-active job.
+            if rec.state is JobState.FAILED:
+                # A capped-out placement (place() raised ``max_attempts`` times):
+                # a deliberate give-up, never silent loss.
+                assert rec.last_error is not None and rec.attempts >= _ATTEMPTS_CAP, (
+                    f"job {job_id} FAILED without a capped-out placement "
+                    f"(attempts={rec.attempts}, last_error={rec.last_error!r})"
+                )
+                continue
+            # Otherwise every non-cancelled job stays in the live set: an infra
+            # failure funnels to requeue (LOST) or release-on-place-raise (→ QUEUED).
             assert rec.state in live, (
                 f"job {job_id} in unexpected state {rec.state} (silent loss?)"
             )

@@ -728,3 +728,113 @@ def test_control_cancel_unknown_and_terminal_are_noops(tmp_path: Path) -> None:
     control.cancel("nope", T1)  # unknown → no-op
     assert provider.cancel_calls == []
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Attempts-cap + last_error recorded by Control (one machine, two drivers)
+# ---------------------------------------------------------------------------
+
+
+def test_place_raise_records_last_error_and_requeues(tmp_path: Path) -> None:
+    """A place() that raises returns the job to QUEUED with attempts=1 and a
+    last_error carrying the provider name + exception text."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FlakyProvider("free", [_free_slot()], mode="raise_on_place")
+        control = Control(store, {"free": provider})
+        job_id = control.submit(_spec(), now=T0)
+
+        control.run_tick(T0)
+        rec = store.load_job(job_id)
+        assert rec is not None
+        assert rec.state is JobState.QUEUED
+        assert rec.placement is None
+        assert rec.attempts == 1
+        assert rec.last_error is not None
+        assert rec.last_error.startswith("free: ")
+        assert "flaky place failed" in rec.last_error
+    finally:
+        store.close()
+
+
+def test_three_failing_ticks_fail_the_job_with_reason(tmp_path: Path) -> None:
+    """After max_attempts failing placements the pure tick fails the job: FAILED
+    state, the reason in last_status.detail, and a tick event emitted."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FlakyProvider("free", [_free_slot()], mode="raise_on_place")
+        control = Control(store, {"free": provider})
+        job_id = control.submit(_spec(), now=T0)
+
+        # Ticks 1..3 each: place raises → release with attempts+1, last_error set.
+        for _ in range(3):
+            control.run_tick(T0)
+        rec = store.load_job(job_id)
+        assert rec is not None
+        assert rec.state is JobState.QUEUED
+        assert rec.attempts == 3
+        assert rec.last_error is not None
+
+        # Tick 4: the tick sees attempts>=3 with a last_error → fail decision.
+        decisions = control.run_tick(T0)
+        assert [d.kind for d in decisions] == ["fail"]
+        failed = store.load_job(job_id)
+        assert failed is not None
+        assert failed.state is JobState.FAILED
+        assert failed.last_status is not None
+        assert failed.last_status.status is JobStatus.FAILED
+        assert "flaky place failed" in failed.last_status.detail
+        assert any(job_id in ev and "failed" in ev for ev in control.take_events())
+    finally:
+        store.close()
+
+
+def test_capacity_defers_never_fail_the_job(tmp_path: Path) -> None:
+    """CapacityError defers set no last_error and never bump attempts, so the
+    job is never failed no matter how many ticks it defers."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FlakyProvider("free", [_free_slot()], mode="capacity")
+        control = Control(store, {"free": provider})
+        job_id = control.submit(_spec(), now=T0)
+
+        for _ in range(10):
+            control.run_tick(T0)
+        rec = store.load_job(job_id)
+        assert rec is not None
+        assert rec.state is JobState.QUEUED  # still merely waiting, never failed
+        assert rec.attempts == 0
+        assert rec.last_error is None
+    finally:
+        store.close()
+
+
+def test_success_after_failure_clears_last_error(tmp_path: Path) -> None:
+    """A place that raises records last_error; a later successful place clears
+    it so the stale error cannot linger into a future retry and trip the cap."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "free",
+            slots=[_free_slot()],
+            place_error_script=[RuntimeError("first place boom"), None],
+        )
+        control = Control(store, {"free": provider})
+        job_id = control.submit(_spec(), now=T0)
+
+        # Tick 1: place raises → QUEUED with last_error set.
+        control.run_tick(T0)
+        failed_once = store.load_job(job_id)
+        assert failed_once is not None
+        assert failed_once.state is JobState.QUEUED
+        assert failed_once.attempts == 1
+        assert failed_once.last_error is not None
+
+        # Tick 2: place succeeds → RUNNING with last_error cleared.
+        control.run_tick(T1)
+        placed = store.load_job(job_id)
+        assert placed is not None
+        assert placed.state is JobState.RUNNING
+        assert placed.last_error is None
+    finally:
+        store.close()

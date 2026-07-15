@@ -24,7 +24,6 @@ import os
 import signal
 import socket
 import threading
-from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -36,13 +35,8 @@ from omnirun.models import (
     JobRecord,
     JobSpec,
     JobState,
-    Placement,
-    ProviderFacts,
-    ResourceSpec,
-    Slot,
-    Status,
 )
-from omnirun.providers import BackendProvider, CancelMode, CapacityError, Provider
+from omnirun.providers import BackendProvider, Provider
 from omnirun.queue import QueueEntry, QueueState
 from omnirun.state import Store, default_store_dir, open_store
 
@@ -50,7 +44,6 @@ BackendFactory = Callable[[str, Any], Backend]
 
 _log = logging.getLogger("omnirun.daemon")
 
-_MAX_ATTEMPTS = 3
 _ACCEPT_TIMEOUT_S = 0.5
 
 # Scheduler JobState -> client-facing QueueState projection. PLACING/HELD both
@@ -149,10 +142,6 @@ class Daemon:
         self._backend_cache: dict[str, Backend] | None = None
         self._provider_cache: dict[str, Provider] | None = None
         self._control: Control | None = None
-        # job_id -> last place() error, recorded by the provider wrapper so the
-        # queue view can surface a failing job's reason (the pure Control loop
-        # otherwise only logs the swallowed exception).
-        self._place_errors: dict[str, str] = {}
 
         # One Store for the whole daemon (queue + job persistence). An explicit
         # state_dir (tests, or a caller relocating the daemon's state home) puts
@@ -184,13 +173,12 @@ class Daemon:
 
     def _get_providers(self) -> dict[str, Provider]:
         """Enabled backends wrapped as scheduler ``Provider``s over the shared
-        ``Store``, each recording its ``place`` errors for the queue view."""
+        ``Store``. Place-failure reasons + the attempts-cap live in the core
+        (``Control``/``tick``) now, so no daemon-local wrapper is needed."""
         with self._lock:
             if self._provider_cache is None:
                 self._provider_cache = {
-                    name: _RecordingProvider(
-                        BackendProvider(be, self._store), self._place_errors
-                    )
+                    name: BackendProvider(be, self._store)
                     for name, be in self._get_backends().items()
                 }
             return self._provider_cache
@@ -444,30 +432,20 @@ class Daemon:
     def _project(self, now: datetime) -> None:
         """Mirror each job's scheduler state back onto its queue entry.
 
-        Maps ``JobState`` → ``QueueState`` (PLACING/HELD read as PENDING), copies
-        the placement's provider onto ``entry.backend`` and label, and enforces
-        the 3-attempt cap the queue view promises: a job the tick keeps failing to
-        place (back to QUEUED with ``attempts >= _MAX_ATTEMPTS``) is terminalized
-        FAILED on BOTH the job record (so no later tick re-places it) and the
-        entry, carrying the last recorded place error. Already-terminal entries
-        are left as-is (never resurrected).
+        Maps ``JobState`` → ``QueueState`` (PLACING/HELD read as PENDING) and
+        copies the placement's provider onto ``entry.backend`` and label. The
+        attempts-cap that terminalizes a job whose placement keeps raising now
+        lives in the core tick (``Control`` marks the record FAILED with
+        ``last_error`` in its status detail), so ``_project`` only reflects that
+        FAILED record onto the entry — populating ``entry.error`` from the
+        record's ``last_error`` (falling back to the status detail, else the
+        state value). Already-terminal entries are left as-is (never resurrected).
         """
         for entry in self._store.load_entries():
             if entry.state.terminal:
                 continue
             rec = self._store.load_job(entry.spec.job_id)
             if rec is None:
-                continue
-            if (
-                rec.state is JobState.QUEUED
-                and rec.attempts >= _MAX_ATTEMPTS
-                and self._place_errors.get(entry.spec.job_id)
-            ):
-                self._store.save_job(rec.model_copy(update={"state": JobState.FAILED}))
-                entry.state = QueueState.FAILED
-                entry.attempts = rec.attempts
-                entry.error = self._place_errors.pop(entry.spec.job_id)
-                self._store.save_entry(entry)
                 continue
 
             entry.state = _STATE_TO_QUEUE[rec.state]
@@ -478,63 +456,6 @@ class Daemon:
             elif rec.state in (JobState.QUEUED, JobState.HELD):
                 entry.backend = None
             if rec.state is JobState.FAILED:
-                entry.error = self._place_errors.pop(
-                    entry.spec.job_id, entry.error or rec.state.value
-                )
+                detail = rec.last_status.detail if rec.last_status else None
+                entry.error = rec.last_error or detail or rec.state.value
             self._store.save_entry(entry)
-
-
-class _RecordingProvider:
-    """Wrap a ``Provider`` to record ``place`` failures for the queue view.
-
-    ``Control`` swallows a ``place`` exception (releasing the reservation and
-    logging) so the pure loop never crashes on a misbehaving backend. The daemon
-    still wants the failure REASON to surface on the queue entry, so this thin
-    delegate captures the exception text (keyed by job id) and re-raises,
-    letting ``Control``'s normal release/retry path run unchanged.
-    """
-
-    def __init__(self, inner: Provider, errors: dict[str, str]) -> None:
-        self.name = inner.name
-        self._inner = inner
-        self._errors = errors
-        # A wrapper must forward the FULL Provider surface, including the reap
-        # policy the reconciler reads, so the daemon path behaves identically to
-        # the CLI (one state machine, two drivers).
-        self.reap = inner.reap
-
-    def discover(self) -> ProviderFacts:
-        return self._inner.discover()
-
-    def offer(self, req: ResourceSpec) -> list[Slot]:
-        return self._inner.offer(req)
-
-    def place(self, rec: JobRecord, slot: Slot) -> Placement:
-        try:
-            placement = self._inner.place(rec, slot)
-        except CapacityError:
-            # A capacity defer is not a place failure — don't record it as a queue
-            # error. Recording it would satisfy the terminalize gate (attempts cap
-            # + a recorded error) and FAIL a job that is merely waiting for a slot.
-            self._errors.pop(rec.spec.job_id, None)
-            raise
-        except Exception as e:
-            self._errors[rec.spec.job_id] = str(e)
-            raise
-        self._errors.pop(rec.spec.job_id, None)  # a good place clears any prior error
-        return placement
-
-    def poll(self, p: Placement) -> Status:
-        return self._inner.poll(p)
-
-    def cancel(self, p: Placement, mode: CancelMode) -> None:
-        self._inner.cancel(p, mode)
-
-    def stream_logs(self, p: Placement) -> Iterator[str]:
-        yield from self._inner.stream_logs(p)
-
-    def collect_outputs(self, p: Placement, dest: Path) -> None:
-        self._inner.collect_outputs(p, dest)
-
-    def gc(self) -> None:
-        self._inner.gc()

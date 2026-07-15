@@ -378,6 +378,10 @@ class JobRecord(BaseModel):
     attempts: int = 0  # number of placement attempts so far
     state: JobState = JobState.QUEUED  # scheduler-level lifecycle state
     placement: Placement | None = None  # active or most-recent placement
+    # Human-readable reason of the most recent placement failure (a place() that
+    # raised). Cleared on a successful placement. Read by the tick's attempts-cap
+    # rule and surfaced by read commands.
+    last_error: str | None = None
 
     def urgency(self, now: datetime) -> float:
         """Higher value = more urgent; used to rank QUEUED jobs within a priority tier.
@@ -479,7 +483,7 @@ class Status(BaseModel):
 class Decision(BaseModel):
     """Output of one ``tick`` call for a single job."""
 
-    kind: Literal["place", "hold", "requeue", "noop"]
+    kind: Literal["place", "hold", "requeue", "noop", "fail"]
     job_id: str
     slot: Slot | None = None
     reason: str = ""

@@ -43,9 +43,15 @@ class SchedPolicy(BaseModel):
             ever place on free slots; a job that can't be served for free this
             tick simply waits (liveness preserved — it is never held or
             refused). Mirrors the CLI's ``reprioritize --allow-paid`` gate.
+        max_attempts: The number of FAILED placement attempts (a ``place()``
+            that RAISED, recording a ``last_error``) after which a job is
+            failed rather than retried. Capacity defers do NOT count — they
+            never bump ``attempts`` with an error recorded — so a job merely
+            waiting for a slot is never failed by this cap.
     """
 
     allow_paid: bool = True
+    max_attempts: int = 3
 
 
 # Terminal / in-flight states are skipped entirely: only jobs the scheduler can
@@ -205,6 +211,23 @@ def tick(
     # so the job is admittable (it waits) — other providers' unsatisfying slots
     # must never hold a job pinned to a provider that is simply offering nothing.
     for rec in pending:
+        # Attempts-cap: a job whose placement has genuinely RAISED
+        # ``max_attempts`` times (``last_error`` set — LOST churn / poll failures
+        # bump ``attempts`` too but never set ``last_error``, so they never trip
+        # this) is failed rather than retried forever. Emitted as a ``fail``
+        # decision and EXCLUDED from hold/match this tick.
+        if rec.attempts >= policy.max_attempts and rec.last_error is not None:
+            decisions.append(
+                Decision(
+                    kind="fail",
+                    job_id=rec.spec.job_id,
+                    reason=(
+                        f"placement failed {rec.attempts} times; "
+                        f"last error: {rec.last_error}"
+                    ),
+                )
+            )
+            continue
         req = rec.spec.resources
         eligible = _pinned_slots(rec, slots)
         if not eligible:
