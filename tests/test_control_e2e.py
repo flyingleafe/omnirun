@@ -373,6 +373,12 @@ def test_terminal_notebook_session_collected_then_reaped(tmp_path: Path) -> None
         assert after.state is JobState.SUCCEEDED
         assert after.reaped is True
         assert after.outputs_cached_to == str(outputs_dir / "nb-000001")
+        # The full log was durably captured before the session was reaped, so a
+        # later `logs` can serve the finished job after its compute is freed.
+        log_path = outputs_dir.parent / "logs" / "nb-000001.log"
+        assert after.logs_cached_to == str(log_path)
+        assert log_path.read_text() == "fake log for nb-000001\n"
+        assert provider.capture_calls == [("nb-000001", log_path)]
         # collect happened, and the session was force-reaped (collect-before-reap).
         assert provider.collect_calls == [("nb-000001", outputs_dir / "nb-000001")]
         assert provider.cancel_calls == [("nb-000001", CancelMode.FORCE)]

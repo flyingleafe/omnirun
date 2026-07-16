@@ -403,6 +403,10 @@ class JobRecord(BaseModel):
     # an ephemeral (notebook) session — the daemon-equivalent catch-up. Once set,
     # ``pull`` serves from here because the session no longer exists.
     outputs_cached_to: str | None = None
+    # Where reconcile captured a durable copy of the FULL log before reaping an
+    # ephemeral session — so ``logs`` can serve the finished job's output hours
+    # after its compute was freed. Set alongside ``outputs_cached_to``.
+    logs_cached_to: str | None = None
     # Post-terminal housekeeping done: the held session (notebook VM) has been
     # collected + reaped, so reconcile must not revisit it. Distinct from the
     # terminal STATUS — a job can be SUCCEEDED yet still hold a leaked session.

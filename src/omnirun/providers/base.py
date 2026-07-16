@@ -92,6 +92,14 @@ class Provider(Protocol):
         """Yield the placed job's log lines (following until terminal)."""
         ...
 
+    def capture_logs(self, p: Placement, dest: Path) -> None:
+        """Write the placed job's FULL log (no-follow snapshot) to *dest*.
+
+        Used by the reconciler to durably cache a terminal job's log BEFORE its
+        (ephemeral) session is reaped, so ``logs`` can serve it after the compute
+        is freed."""
+        ...
+
     def collect_outputs(self, p: Placement, dest: Path) -> None:
         """Copy the placed job's collected outputs into *dest*."""
         ...

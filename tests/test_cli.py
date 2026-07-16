@@ -555,6 +555,24 @@ def test_logs_follow_flag(env):
     assert "following=True" in result.output
 
 
+def test_logs_served_from_cache_for_reaped_job(env, tmp_path):
+    """A terminal job whose session was reaped serves its log from the durable
+    cache (``logs_cached_to``), never touching the (gone) backend."""
+    job_id = submit_one()
+    cached = tmp_path / "cached.log"
+    cached.write_text("cached line 1\ncached line 2\n")
+    rec = _store().load_job(job_id)
+    assert rec is not None
+    _store().save_job(rec.model_copy(update={"logs_cached_to": str(cached)}))
+
+    result = runner.invoke(app, ["logs", job_id])
+    assert result.exit_code == 0, result.output
+    assert "cached line 1" in result.output
+    assert "cached line 2" in result.output
+    # The backend's live tailer was NOT used (its marker line never appears).
+    assert "following=" not in result.output
+
+
 def test_cancel_updates_store(env):
     job_id = submit_one()
     result = runner.invoke(app, ["cancel", job_id])

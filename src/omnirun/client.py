@@ -503,6 +503,18 @@ class LocalClient:
         handle = handle_of(rec)
         if handle is None:
             raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
+        if rec.logs_cached_to:
+            # The reconciler captured the full log to a durable cache and reaped the
+            # (ephemeral) session — serve the finished job from the cache, not the
+            # gone worker. `--follow` is meaningless on a terminal job: yield the
+            # captured log and stop.
+            cache = Path(rec.logs_cached_to)
+            if cache.is_file():
+                with cache.open(encoding="utf-8") as f:
+                    yield from f
+                return
+            # Cache path recorded but file missing — fall through to the backend
+            # (it may still have the session; if not it raises a clear error).
         be = self.backend_for(handle.backend)
         yield from be.logs(handle, follow=follow)
 

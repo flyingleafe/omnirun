@@ -636,6 +636,34 @@ class Control:
             )
         )
 
+    def _capture_logs(
+        self, rec: JobRecord, placement: Placement, provider: Provider
+    ) -> str | None:
+        """Snapshot the terminal job's full log to the durable cache; return its
+        path (or the already-cached path). Best-effort: a raising capture returns
+        None so the reap still proceeds and the log is simply unavailable later.
+
+        Only the daemon's always-on ingestor (Phase D) guarantees a live log for a
+        watched job; here at terminal we take a one-shot snapshot so a reaped
+        session's output survives even in daemonless mode."""
+        if rec.logs_cached_to is not None:
+            return rec.logs_cached_to
+        if self._outputs_dir is None:
+            return None
+        dest = self._outputs_dir.parent / "logs" / f"{rec.spec.job_id}.log"
+        try:
+            provider.capture_logs(placement, dest)
+        except Exception as e:
+            _log.warning(
+                "could not capture logs for terminal job %s on %s (%s); the finished "
+                "job's log may be unavailable after reap",
+                rec.spec.job_id,
+                placement.provider_name,
+                e,
+            )
+            return None
+        return str(dest)
+
     def _reap(self, placement: Placement) -> bool:
         """Tear down an abandoned placement (force-cancel + gc) — best-effort.
 
@@ -777,13 +805,24 @@ class Control:
                     f"could not collect outputs for {rec.spec.job_id}; releasing "
                     f"{placement.provider_name} placement anyway to free the slot"
                 )
+        # Durably capture the FULL log BEFORE releasing the (ephemeral) session, so
+        # ``logs`` can serve the finished job hours after its compute is freed. The
+        # backend was just proven reachable by the successful collect above; a
+        # capture failure is non-fatal (the reap must still proceed) — best-effort.
+        logs_cached_to = self._capture_logs(rec, placement, provider)
         reaped = self._reap(placement)
         # ``reaped=True`` is saved ONLY when the release actually went through. If
         # collect succeeded but the reap did not (e.g. the backend went
         # unreachable), persist ``outputs_cached_to`` anyway with ``reaped=False``
         # so the next tick skips straight to the reap retry (never re-collecting).
         self._store.save_job(
-            rec.model_copy(update={"reaped": reaped, "outputs_cached_to": cached_to})
+            rec.model_copy(
+                update={
+                    "reaped": reaped,
+                    "outputs_cached_to": cached_to,
+                    "logs_cached_to": logs_cached_to,
+                }
+            )
         )
         if cached_to is not None and reaped:
             self._tick_events.append(

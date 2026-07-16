@@ -302,6 +302,17 @@ class BackendProvider:
             follow=True,
         )
 
+    def capture_logs(self, p: Placement, dest: Path) -> None:
+        """Snapshot the terminal job's full log (no-follow) to *dest*.
+
+        Best-effort at the seam boundary, but exceptions propagate to the
+        reconciler so a ``BackendUnreachable`` is not mistaken for an empty log."""
+        handle = JobHandle(backend=self.name, job_id=p.job_id, data=p.handle)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("w", encoding="utf-8") as f:
+            for line in self._backend.logs(handle, follow=False):
+                f.write(line if line.endswith("\n") else line + "\n")
+
     def collect_outputs(self, p: Placement, dest: Path) -> None:
         self._backend.pull_outputs(
             JobHandle(backend=self.name, job_id=p.job_id, data=p.handle), dest
