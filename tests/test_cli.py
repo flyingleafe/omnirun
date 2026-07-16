@@ -579,6 +579,26 @@ def test_cancel_updates_store(env):
     assert rec.last_status.status is JobStatus.CANCELLED
 
 
+def test_cancel_queued_unplaced_job(env):
+    """A still-QUEUED (never placed) job is cancellable — it just has no placement
+    to reap. Chaotic workflows cancel jobs before they place; this must mark them
+    CANCELLED, not error 'never submitted'."""
+    result = runner.invoke(
+        app, ["enqueue", "--backend", "stub", "--", "python", "t.py"]
+    )
+    assert result.exit_code == 0, result.output
+    [job_id] = _store().list_job_ids()
+    queued = _store().load_job(job_id)
+    assert queued is not None and queued.state is JobState.QUEUED
+    assert queued.placement is None
+
+    result = runner.invoke(app, ["cancel", job_id])
+    assert result.exit_code == 0, result.output
+    after = _store().load_job(job_id)
+    assert after is not None and after.state is JobState.CANCELLED
+    assert StubBackend.cancelled == []  # no backend touched — nothing was placed
+
+
 def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
     modes: list[CancelMode] = []
     monkeypatch.setattr(

@@ -278,8 +278,20 @@ def test_resolve_prefix_and_logs_stream(daemon_url: str) -> None:
         rec = client.resolve_job(outcome.job_id[:8])  # unique prefix
         assert rec.spec.job_id == outcome.job_id
 
-        lines = list(client.logs(rec, follow=False))
-        assert any("log line 1" in ln for ln in lines)
+        # Read logs of a SETTLED job (a non-follow read of a still-ingesting job is
+        # legitimately partial). Poll until the durable log is captured.
+        lines: list[str] = []
+        for _ in range(200):
+            rec = client.resolve_job(outcome.job_id)
+            if (
+                rec.state in (JobState.SUCCEEDED, JobState.FAILED)
+                and rec.logs_cached_to
+            ):
+                lines = list(client.logs(rec, follow=False))
+                if any("log line 1" in ln for ln in lines):
+                    break
+            time.sleep(0.05)
+        assert any("log line 1" in ln for ln in lines), lines
         assert "log line 2" in lines
     finally:
         client.close()

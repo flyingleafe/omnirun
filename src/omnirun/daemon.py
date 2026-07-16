@@ -154,6 +154,10 @@ class Daemon:
     def serve(self) -> None:
         server, self.port = _make_threaded_server(self.host, self.port, self._app)
         self._server = server
+        # Force-open the store before any threads run so lock-free readers never
+        # race the lazy init (concurrent open would build two Store objects).
+        with self._lock:
+            self._core._store()
         self._write_daemon_json()
         self._install_signal_handlers()
         self._scheduler_thread = threading.Thread(
@@ -313,24 +317,28 @@ class Daemon:
                 d.wake()
                 return _json(wire.submit_outcome_to_json(outcome))
 
+        # Pure reads are LOCK-FREE: they hit the independently-transactional store
+        # directly, so a slow scheduler tick (a placement that blocks tens of
+        # seconds while holding d._lock) never blocks `ps`/`status`/`logs`/deploy-
+        # key reads. The daemon's scheduler thread is the continuous reconciler, so
+        # a read need not tick.
         @app.get("/jobs")
         def _list_jobs() -> str:
             project = bottle.request.query.get("project") or None
-            with d._lock:
-                recs = d._core.list_jobs(project=project)
+            recs = d._core._store().list_jobs(project=project)
             return _json({"jobs": [r.model_dump(mode="json") for r in recs]})
 
         @app.get("/jobs/resolve")
         def _resolve() -> str:
             ref = bottle.request.query.get("ref") or ""
-            with d._lock:
-                rec = d._core.resolve_job(ref)
+            rec = d._core._store().resolve_job(ref)
             return _json({"job": rec.model_dump(mode="json")})
 
         @app.get("/jobs/<jid>/status")
         def _status(jid: str) -> str:
-            with d._lock:
-                rec = d._core.status(jid)
+            # Lock-free read; the scheduler thread supplies the reconcile, so unlike
+            # the daemonless core.status this never drives a tick itself.
+            rec = d._core._store().resolve_job(jid)
             return _json({"job": rec.model_dump(mode="json")})
 
         @app.patch("/jobs/<jid>")
@@ -393,8 +401,7 @@ class Daemon:
         def _budget_get() -> str:
             from omnirun import wire
 
-            with d._lock:
-                rows = d._core.budget_status()
+            rows = d._core.budget_status()  # lock-free store read
             return _json({"rows": [wire.budget_row_to_json(r) for r in rows]})
 
         @app.post("/budget")
@@ -424,14 +431,12 @@ class Daemon:
 
         @app.get("/deploy-keys")
         def _dk_list() -> str:
-            with d._lock:
-                keys = d._core.deploy_key_list()
+            keys = d._core.deploy_key_list()  # lock-free store read
             return _json({"keys": [k.model_dump(mode="json") for k in keys]})
 
         @app.get("/deploy-keys/<origin:path>")
         def _dk_get(origin: str) -> str:
-            with d._lock:
-                dk = d._core.deploy_key_get(origin)
+            dk = d._core.deploy_key_get(origin)  # lock-free store read
             return _json({"key": dk.model_dump(mode="json") if dk else None})
 
         @app.post("/deploy-keys")
@@ -450,8 +455,7 @@ class Daemon:
         @app.get("/jobs/<jid>/logs")
         def _logs(jid: str) -> Any:
             follow = bottle.request.query.get("follow") == "1"
-            with d._lock:
-                rec = d._core.resolve_job(jid)
+            rec = d._core._store().resolve_job(jid)  # lock-free
             job_id = rec.spec.job_id
             bottle.response.content_type = "text/event-stream"
             bottle.response.set_header("Cache-Control", "no-cache")
@@ -500,8 +504,7 @@ class Daemon:
             import tarfile
             import tempfile
 
-            with d._lock:
-                rec = d._core.resolve_job(jid)
+            rec = d._core._store().resolve_job(jid)  # lock-free resolve
             tmp = Path(tempfile.mkdtemp(prefix="omnirun-pull-"))
             with d._lock:
                 d._core.pull(rec, tmp)

@@ -985,12 +985,13 @@ def cancel(
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     rec = client.resolve_job(job)
-    if _handle_of(rec) is None and rec.placement is None:
-        raise BackendError(
-            f"job {rec.spec.job_id} was never submitted; nothing to cancel"
-        )
-    # Control.cancel reaps the placement (graceful→force→gc) and marks the job
-    # CANCELLED — the same path the daemon uses.
+    if rec.state.terminal:
+        console.print(f"[dim]{rec.spec.job_id} is already {rec.state.value}[/dim]")
+        return
+    # Control.cancel reaps any placement (graceful→force→gc) and marks the job
+    # CANCELLED — the same path the daemon uses. A still-QUEUED (unplaced) job is
+    # cancelled too: it simply has no placement to reap, so it is removed from the
+    # pending set without touching a backend.
     if not force and not no_wait:
         # The graceful path polls the backend until the job stops (up to the
         # per-backend grace window), so warn before the wait — otherwise cancel
