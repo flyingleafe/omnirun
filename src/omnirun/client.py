@@ -28,8 +28,10 @@ from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.config import Config, ConfigError, default_config_path
 from omnirun.control import Control, resolve_meta_cap
+from omnirun.deploykey import resolve_code_plan
 from omnirun.models import (
     Deadline,
+    DeployKey,
     JobHandle,
     JobPolicy,
     JobRecord,
@@ -129,6 +131,12 @@ class Client(Protocol):
     def logs(self, rec: JobRecord, *, follow: bool) -> Iterator[str]: ...
     def pull(self, rec: JobRecord, dest: Path) -> tuple[list[Path], Path]: ...
     def backend_for(self, name: str) -> Backend: ...
+    # deploy-key store (owned by the placer: LocalClient hits the store, a
+    # RemoteClient asks the daemon). Used by code-plan resolution at submit.
+    def deploy_key_get(self, origin: str) -> DeployKey | None: ...
+    def deploy_key_register(self, dk: DeployKey) -> None: ...
+    def deploy_key_list(self) -> list[DeployKey]: ...
+    def deploy_key_delete(self, origin: str) -> bool: ...
 
 
 # --------------------------------------------------------------------------- local
@@ -252,6 +260,33 @@ class LocalClient:
             )
         return make_backend(name, bcfg)
 
+    # -- deploy-key store --
+    def deploy_key_get(self, origin: str) -> DeployKey | None:
+        return self._store().get_deploy_key(origin)
+
+    def deploy_key_register(self, dk: DeployKey) -> None:
+        self._store().put_deploy_key(dk)
+
+    def deploy_key_list(self) -> list[DeployKey]:
+        return self._store().list_deploy_keys()
+
+    def deploy_key_delete(self, origin: str) -> bool:
+        return self._store().delete_deploy_key(origin)
+
+    def _plan_code(self, spec: JobSpec) -> JobSpec:
+        """Resolve how the worker will get the code (public clone / deploy-key
+        clone / local-objects fallback) and stamp it onto the spec. Runs
+        client-side (needs local ``gh``/git); the resulting key MATERIAL is never
+        persisted here — the placer injects it from the store at submit time."""
+        if spec.code is not None:
+            return spec
+        plan = resolve_code_plan(
+            spec.repo,
+            get_key=self.deploy_key_get,
+            register_key=self.deploy_key_register,
+        )
+        return spec.model_copy(update={"code": plan})
+
     # -- store reads --
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
         return self._store().list_jobs(project=project)
@@ -273,6 +308,7 @@ class LocalClient:
                     f"backend {backend!r} is not configured (known: {known})"
                 )
             spec = spec.model_copy(update={"only_backend": backend})
+        spec = self._plan_code(spec)
         control = self._control()
         now = datetime.now(timezone.utc)
         job_id = control.submit(spec, now=now)
@@ -300,6 +336,7 @@ class LocalClient:
         """Persist ``count`` copies of *spec* QUEUED WITHOUT placing them — a
         running daemon is the placer. Pure bookkeeping (no backends touched), so
         it drives ``Control`` with no providers."""
+        spec = self._plan_code(spec)
         control = Control(self._store(), {})
         now = datetime.now(timezone.utc)
         job_ids: list[str] = []

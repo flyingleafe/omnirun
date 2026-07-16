@@ -28,6 +28,7 @@ from omnirun.config import BackendConfig
 from omnirun.models import (
     CancelMode,
     Capabilities as _Capabilities,
+    CodePlan,
     Health as _Health,
     JobHandle,
     JobRecord,
@@ -249,6 +250,15 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "omnirun.repo.capture_repo_state",
         lambda root, *, auto_push=False: ref,
+    )
+    # Code-delivery resolution runs real git/`gh` against the origin; stub it to a
+    # deterministic local plan so CLI lifecycle tests stay hermetic (deploy-key
+    # resolution has its own dedicated tests in test_deploykey.py).
+    monkeypatch.setattr(
+        "omnirun.client.resolve_code_plan",
+        lambda ref, *, get_key, register_key: CodePlan(
+            kind="local", origin=ref.remote_url
+        ),
     )
     # ps/queue/gc scope to the current project; in tests the "current" repo is the
     # stubbed submit repo, so its slug matches the jobs submit_one creates.
@@ -820,6 +830,33 @@ def test_backends_check_red_on_failure(env):
     assert result.exit_code == 1
     assert "ok: stub ready" in result.output
     assert "cannot reach stub" in result.output
+
+
+def test_deploy_key_add_list_rm_round_trip(env, tmp_path):
+    keyfile = tmp_path / "id_ed25519"
+    keyfile.write_text("PRIVATE-KEY-BODY")
+
+    result = runner.invoke(
+        app, ["deploy-key", "add", "git@github.com:me/proj.git", str(keyfile)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "registered" in result.output
+    assert _store().get_deploy_key("git@github.com:me/proj.git") is not None
+
+    result = runner.invoke(app, ["deploy-key", "list"])
+    assert result.exit_code == 0, result.output
+    assert "git@github.com:me/proj.git" in result.output
+
+    result = runner.invoke(app, ["deploy-key", "rm", "git@github.com:me/proj.git"])
+    assert result.exit_code == 0, result.output
+    assert "removed" in result.output
+    assert _store().get_deploy_key("git@github.com:me/proj.git") is None
+
+
+def test_deploy_key_list_empty(env):
+    result = runner.invoke(app, ["deploy-key", "list"])
+    assert result.exit_code == 0, result.output
+    assert "no deploy keys" in result.output
 
 
 def test_config_path_reports_existence(env):

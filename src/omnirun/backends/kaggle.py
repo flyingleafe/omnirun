@@ -252,6 +252,7 @@ def _render_harness(
     bundle_b64: str,
     env_b64: str,
     infra_env: dict[str, str] | None = None,
+    deploy_key_b64: str = "",
 ) -> str:
     """The script-kernel payload: decode the embedded bootstrap.sh (+ the git
     bundle, unless the repo is public and bootstrap clones it directly, + any
@@ -280,6 +281,7 @@ WORK = "/kaggle/working"
 BOOTSTRAP_B64 = "{bootstrap_b64}"
 BUNDLE_B64 = "{bundle_b64}"
 ENV_B64 = "{env_b64}"
+DEPLOY_KEY_B64 = "{deploy_key_b64}"
 
 os.makedirs(JOB_DIR, exist_ok=True)
 os.environ["OMNIRUN_ROOT"] = ROOT
@@ -288,6 +290,11 @@ os.environ["OMNIRUN_ROOT"] = ROOT
 if BUNDLE_B64:  # empty when the repo is public (bootstrap clones it directly)
     with open(JOB_DIR + "/bundle.git", "wb") as f:
         f.write(base64.b64decode(BUNDLE_B64))
+if DEPLOY_KEY_B64:  # private repo → read-only deploy key for the ssh clone
+    key_path = JOB_DIR + "/deploy_key"
+    with open(key_path, "wb") as f:
+        f.write(base64.b64decode(DEPLOY_KEY_B64))
+    os.chmod(key_path, 0o600)
 if ENV_B64:  # uncommitted secrets, shipped as a blob; bootstrap sources it
     env_path = JOB_DIR + "/.env"
     with open(env_path, "wb") as f:
@@ -554,7 +561,20 @@ class KaggleBackend(Backend):
         NOT shipped as a dataset: a dataset would 409 the kernel push until it
         finished processing and needs a create/delete lifecycle. Cost of
         embedding: the kernel source carries the bundle, so only code-sized repos
-        fit. Shared by submit and render_payload so `--dry-run` previews it."""
+        fit. Shared by submit and render_payload so `--dry-run` previews it.
+
+        When a client-side ``CodePlan`` rides the spec (the daemon/thin-client
+        path), it decides instead: ``remote`` → anonymous https clone; ``private``
+        → ssh clone with the delivered read-only deploy key (embedded base64)."""
+        plan = spec.code
+        if plan is not None and plan.kind == "remote":
+            return CodeSource(kind="remote", clone_url=plan.clone_url)
+        if plan is not None and plan.kind == "private":
+            return CodeSource(
+                kind="private",
+                clone_url=plan.clone_url,
+                deploy_key_path=f"{KAGGLE_ROOT}/jobs/{job_id}/deploy_key",
+            )
         clone_url = _remote_clone_plan(spec.repo, _local_root(spec))
         if clone_url is not None:
             return CodeSource(kind="remote", clone_url=clone_url)
@@ -590,6 +610,18 @@ class KaggleBackend(Backend):
             else:
                 bundle_b64 = ""
 
+            # private repo → the read-only deploy key (injected at place time) rides
+            # embedded base64, decoded into $JOB_DIR/deploy_key by the harness.
+            deploy_key_b64 = ""
+            if code.kind == "private" and spec.code is not None:
+                key_material = spec.code.deploy_key_material
+                if not key_material:
+                    raise BackendError(
+                        "private code plan without a deploy key; the placer did not "
+                        "inject one (no key registered for the origin)"
+                    )
+                deploy_key_b64 = base64.b64encode(key_material.encode()).decode()
+
             # uncommitted, gitignored .env ships as its own blob (never via git)
             envf = _env_file(spec)
             env_b64 = (
@@ -621,7 +653,9 @@ class KaggleBackend(Backend):
             )
             boot_b64 = base64.b64encode(script.encode()).decode()
 
-            harness = _render_harness(job_id, boot_b64, bundle_b64, env_b64, infra_env)
+            harness = _render_harness(
+                job_id, boot_b64, bundle_b64, env_b64, infra_env, deploy_key_b64
+            )
             self._guard_source_size(harness, shipped_bundle=bool(bundle_b64))
 
             k_dir = stage / "kernel"

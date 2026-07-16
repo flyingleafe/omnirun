@@ -207,15 +207,23 @@ class RepoRef(BaseModel):
 
 class CodePlan(BaseModel):
     """How the worker materializes the repo — decided CLIENT-SIDE at submit time
-    so the placer (daemon) needs no local git objects. Workers always clone from
-    origin: ``remote`` is an anonymous https url (public repo); ``private`` is an
-    ssh url cloned with the origin's read-only deploy key (delivered out-of-band
-    to the worker, like ``.env``). ``bundle``/``bare`` are daemonless-only
-    fallbacks for a local-only repo (no reachable origin)."""
+    so the placer (daemon) needs no local git objects.
 
-    kind: Literal["remote", "private", "bundle", "bare"] = "remote"
-    clone_url: str = ""  # https (remote) or ssh git@host:owner/repo.git (private)
+    * ``remote``  — worker clones the anonymous https url (public repo).
+    * ``private`` — worker clones the ssh url with the origin's read-only deploy
+      key, delivered out-of-band to the worker like ``.env``.
+    * ``local``   — no cloneable origin; the placer delivers the repo from its own
+      local objects via the backend's native path (ssh push / notebook bundle).
+      Only works when the placer has the checkout (daemonless or co-located).
+
+    ``deploy_key_material`` is TRANSIENT: the provider adapter injects the private
+    key from the store at place time for ``private``; it is never persisted on the
+    job record."""
+
+    kind: Literal["remote", "private", "local"] = "remote"
+    clone_url: str = ""  # https (remote) or ssh git@host:owner/repo (private)
     origin: str = ""  # remote_url; for ``private`` it keys the deploy-key lookup
+    deploy_key_material: str | None = None  # transient; injected at place time
 
 
 class DeployKey(BaseModel):
@@ -255,6 +263,9 @@ class JobSpec(BaseModel):
     policy: JobPolicy = Field(default_factory=JobPolicy)
     # Pin placement to this provider name (config key); None = any fitting provider.
     only_backend: str | None = None
+    # How the worker materializes the repo (resolved client-side at submit). None
+    # for legacy/hand-built specs → backends fall back to the local-objects path.
+    code: CodePlan | None = None
 
     @staticmethod
     def make_job_id(name: str) -> str:

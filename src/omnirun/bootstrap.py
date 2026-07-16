@@ -175,11 +175,15 @@ class CodeSource:
                    the backend); bootstrap fetches from it into the object store.
     kind="remote": the repo is public — bootstrap clones/fetches clone_url (an
                    anonymous https url) directly on the worker, no bundle shipped.
+    kind="private": the repo is private — bootstrap clones/fetches clone_url (an
+                   ssh url) with the read-only deploy key delivered at
+                   deploy_key_path (out-of-band, like .env), no bundle shipped.
     """
 
-    kind: str = "bare"  # "bare" | "bundle" | "remote"
+    kind: str = "bare"  # "bare" | "bundle" | "remote" | "private"
     bundle_path: str = "$JOB_DIR/bundle.git"
-    clone_url: str = ""  # anonymous https url, for kind="remote"
+    clone_url: str = ""  # anonymous https (remote) or ssh git@host:owner/repo (private)
+    deploy_key_path: str = "$JOB_DIR/deploy_key"  # for kind="private"
 
 
 @dataclass
@@ -390,6 +394,19 @@ if [ ! -d "$GIT_DIR" ]; then
   git clone --bare "$CLONE_URL" "$GIT_DIR" >/dev/null 2>&1 || fail "clone of $CLONE_URL failed"
 else
   git --git-dir="$GIT_DIR" fetch "$CLONE_URL" '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || fail "fetch from $CLONE_URL failed"
+fi
+"""
+    elif params.code.kind == "private":
+        code_block = f"""\
+DEPLOY_KEY="{params.code.deploy_key_path}"
+[ -f "$DEPLOY_KEY" ] || fail "deploy key missing at $DEPLOY_KEY (private repo)"
+chmod 600 "$DEPLOY_KEY" 2>/dev/null || true
+export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null"
+CLONE_URL={shlex.quote(params.code.clone_url)}
+if [ ! -d "$GIT_DIR" ]; then
+  git clone --bare "$CLONE_URL" "$GIT_DIR" >/dev/null 2>&1 || fail "private clone of $CLONE_URL failed"
+else
+  git --git-dir="$GIT_DIR" fetch "$CLONE_URL" '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || fail "private fetch from $CLONE_URL failed"
 fi
 """
     else:

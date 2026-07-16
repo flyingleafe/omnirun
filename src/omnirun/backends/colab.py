@@ -448,9 +448,21 @@ class ColabBackend(Backend):
     # ---- submit -----------------------------------------------------------------
 
     def _code_source(self, spec: JobSpec, job_dir: str) -> CodeSource:
-        """Where the worker gets the repo: clone a public+pushed repo directly,
-        else ship a bundle. Shared by submit and render_payload so `--dry-run`
-        previews the real delivery."""
+        """Where the worker gets the repo. When a client-side ``CodePlan`` rides the
+        spec (the daemon/thin-client path) it decides: ``remote`` → anonymous https
+        clone; ``private`` → ssh clone with the delivered read-only deploy key.
+        Absent a plan (co-located/daemonless legacy) fall back to probing the local
+        checkout: clone a public+pushed repo directly, else ship a bundle. Shared by
+        submit and render_payload so `--dry-run` previews the real delivery."""
+        plan = spec.code
+        if plan is not None and plan.kind == "remote":
+            return CodeSource(kind="remote", clone_url=plan.clone_url)
+        if plan is not None and plan.kind == "private":
+            return CodeSource(
+                kind="private",
+                clone_url=plan.clone_url,
+                deploy_key_path=f"{job_dir}/deploy_key",
+            )
         clone_url = _remote_clone_plan(spec)
         if clone_url is not None:
             return CodeSource(kind="remote", clone_url=clone_url)
@@ -559,6 +571,25 @@ class ColabBackend(Backend):
                         session,
                         str(bundle),
                         f"{job_dir}/bundle.git",
+                        timeout=UPLOAD_TIMEOUT_S,
+                    )
+                if code.kind == "private" and spec.code is not None:
+                    # Private repo → the read-only deploy key (injected at place
+                    # time) rides out-of-band into $JOB_DIR/deploy_key, exactly like
+                    # .env; bootstrap's private code_block clones over ssh with it.
+                    key_material = spec.code.deploy_key_material
+                    if not key_material:
+                        raise BackendError(
+                            "private code plan without a deploy key; the placer "
+                            "did not inject one (no key registered for the origin)"
+                        )
+                    (local / "deploy_key").write_text(key_material)
+                    self._colab(
+                        "upload",
+                        "-s",
+                        session,
+                        str(local / "deploy_key"),
+                        f"{job_dir}/deploy_key",
                         timeout=UPLOAD_TIMEOUT_S,
                     )
                 envf = _env_file(spec)

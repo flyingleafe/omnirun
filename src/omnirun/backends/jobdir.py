@@ -17,6 +17,7 @@ from omnirun.backends.base import BackendError
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
+    CodeSource,
     generate_bootstrap,
 )
 from omnirun.execlayer.base import Exec, shell_quote
@@ -112,15 +113,32 @@ def stage_job(
     params: BootstrapParams,
     root: str,
 ) -> str:
-    """Push code + stage any .env + write bootstrap.sh; returns the worker job dir.
+    """Deliver code + stage any .env/deploy-key + write bootstrap.sh; returns the
+    worker job dir.
 
-    params.project_root must be the resolved (absolute) shared project dir; the
-    object store is created under it and the exact sha pushed there."""
+    Code delivery follows the job's ``CodePlan`` (resolved client-side at submit):
+    ``remote``/``private`` → the WORKER clones from origin (public https, or ssh
+    with the delivered deploy key), so the placer needs no local git objects;
+    ``local``/None → the placer pushes the exact sha from its own checkout into
+    the worker object store (the co-located/daemonless fallback).
+
+    params.project_root must be the resolved (absolute) shared project dir."""
     project_root = params.project_root or project_root_of(root, spec.repo.slug, None)
     git_dir = remote_git_dir(exec_, project_root)
-    report(f"pushing {spec.repo.sha[:12]} to {exec_.describe()}…")
-    push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
     job_dir = job_dir_of(root, spec.job_id)
+    plan = spec.code
+    if plan is not None and plan.kind == "remote":
+        params.code = CodeSource(kind="remote", clone_url=plan.clone_url)
+    elif plan is not None and plan.kind == "private":
+        params.code = CodeSource(kind="private", clone_url=plan.clone_url)
+        if plan.deploy_key_material:
+            exec_.write_file(
+                f"{job_dir}/deploy_key", plan.deploy_key_material, mode="600"
+            )
+    else:
+        report(f"pushing {spec.repo.sha[:12]} to {exec_.describe()}…")
+        push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
+        params.code = CodeSource(kind="bare")
     stage_env_file(exec_, local_repo_root, job_dir)
     script = generate_bootstrap(spec, params)
     exec_.write_file(f"{job_dir}/bootstrap.sh", script, mode="755")

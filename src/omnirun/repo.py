@@ -249,6 +249,117 @@ def remote_clone_plan(ref: RepoRef, root: Path) -> str | None:
     return url if anc.returncode == 0 else None
 
 
+# --------------------------------------------------------------------------- deploy keys
+#
+# Workers always clone from origin (DESIGN, relaxed invariant #3): public repos
+# anonymously, private repos with a per-origin read-only DEPLOY KEY. These are the
+# client-side primitives — key generation and the GitHub `gh` provisioning path.
+# The client orchestrates them (it holds the store, via the Client) in
+# ``omnirun.deploykey``; here we only shell out to `ssh-keygen` and `gh`.
+
+
+def ssh_clone_url(remote_url: str) -> str | None:
+    """The ssh clone url a worker uses with a deploy key: ``git@host:owner/repo``.
+
+    Already-ssh scp-style (``git@host:owner/repo.git``) and ``ssh://`` urls pass
+    through (normalized to scp-style); an http(s) url is rewritten to scp-style so
+    a deploy key (an ssh key) can authenticate. Returns None for undecipherable
+    or local-only remotes."""
+    u = remote_url.strip()
+    if not u:
+        return None
+    if u.startswith(("https://", "http://")):
+        rest = u.split("://", 1)[1]
+        host, _, path = rest.partition("/")
+        return f"git@{host}:{path}" if host and path else None
+    if u.startswith("ssh://"):
+        rest = u[len("ssh://") :].split("@", 1)[-1]
+        host, _, path = rest.partition("/")
+        return f"git@{host}:{path}" if host and path else None
+    if _SCP_URL.match(u):
+        return u  # already git@host:owner/repo(.git)
+    return None
+
+
+def github_slug(remote_url: str) -> str | None:
+    """``owner/repo`` for a github.com remote (any url form), else None."""
+    https = worker_clone_url(remote_url)
+    if https is None:
+        return None
+    parts = https.split("/", 3)
+    if len(parts) < 4 or not parts[2].endswith("github.com"):
+        return None
+    return parts[3].removesuffix(".git")
+
+
+def generate_deploy_keypair(comment: str = "omnirun-deploy") -> tuple[str, str]:
+    """Generate an ed25519 keypair with ``ssh-keygen``; return (private, public).
+
+    Both are text (OpenSSH private PEM + the single-line public key). No passphrase
+    — the key is read-only and scoped to one repo."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        key = Path(d) / "id_ed25519"
+        r = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(key)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            raise RepoError(f"ssh-keygen failed:\n{r.stderr.strip()}")
+        return key.read_text(), (key.with_suffix(".pub")).read_text().strip()
+
+
+def _gh(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def gh_available() -> bool:
+    return shutil.which("gh") is not None
+
+
+def gh_can_admin(owner_repo: str) -> bool:
+    """Whether the authenticated `gh` user can add a deploy key to *owner_repo*
+    (i.e. has admin permission). False on any gh/auth/lookup failure."""
+    if not gh_available():
+        return False
+    r = _gh("api", f"repos/{owner_repo}", "--jq", ".permissions.admin")
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def gh_create_deploy_key(owner_repo: str, public_key: str, title: str) -> str:
+    """Register *public_key* as a READ-ONLY deploy key on *owner_repo* via `gh`;
+    return the created key's id (as a string). Raises RepoError on failure."""
+    r = _gh(
+        "api",
+        "-X",
+        "POST",
+        f"repos/{owner_repo}/keys",
+        "-f",
+        f"title={title}",
+        "-f",
+        f"key={public_key}",
+        "-F",
+        "read_only=true",
+        "--jq",
+        ".id",
+    )
+    if r.returncode != 0:
+        raise RepoError(
+            f"creating a deploy key on {owner_repo} via gh failed:\n{r.stderr.strip()}"
+        )
+    return r.stdout.strip()
+
+
+def gh_delete_deploy_key(owner_repo: str, key_id: str) -> None:
+    """Best-effort delete of a deploy key by id (for `omnirun deploy-key rm`)."""
+    _gh("api", "-X", "DELETE", f"repos/{owner_repo}/keys/{key_id}")
+
+
 def create_bundle(root: Path, sha: str, dest: Path) -> Path:
     """`git bundle` carrying `sha` (and its history), for backends where the
     client cannot push directly (Kaggle datasets, Colab uploads).

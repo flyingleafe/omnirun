@@ -60,6 +60,12 @@ app.add_typer(backends_app, name="backends")
 state_app = typer.Typer(no_args_is_help=True, help="State store management.")
 app.add_typer(state_app, name="state")
 
+deploy_key_app = typer.Typer(
+    no_args_is_help=True,
+    help="Read-only deploy keys for cloning private repos on workers.",
+)
+app.add_typer(deploy_key_app, name="deploy-key")
+
 console = Console(highlight=False)
 
 _state: dict[str, Any] = {
@@ -1202,6 +1208,75 @@ def backends_discover(
             facts.health_detail,
         )
     console.print(table)
+
+
+@deploy_key_app.command("list", help="List registered deploy keys (per origin).")
+@friendly_errors
+def deploy_key_list() -> None:
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        keys = client.deploy_key_list()
+    finally:
+        client.close()
+    if not keys:
+        console.print("[dim]no deploy keys registered[/dim]")
+        return
+    table = Table("origin", "gh key id", "created")
+    for dk in keys:
+        table.add_row(
+            dk.origin,
+            dk.key_id or "-",
+            dk.created_at.isoformat(timespec="seconds") if dk.created_at else "-",
+        )
+    console.print(table)
+
+
+@deploy_key_app.command(
+    "add", help="Register a deploy key for an origin from a private-key file."
+)
+@friendly_errors
+def deploy_key_add(
+    origin: str = typer.Argument(..., help="Repo origin URL (as git remote reports)."),
+    keyfile: Path = typer.Argument(
+        ..., help="Path to the PEM/OpenSSH private key with read access to the repo."
+    ),
+    public_key: Path | None = typer.Option(
+        None, "--public-key", help="Optional matching public key (for reference)."
+    ),
+) -> None:
+    from omnirun.models import DeployKey
+
+    if not keyfile.is_file():
+        _die(f"key file not found: {keyfile}")
+    priv = keyfile.read_text()
+    pub = public_key.read_text() if public_key and public_key.is_file() else ""
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        client.deploy_key_register(
+            DeployKey(origin=origin, private_key=priv, public_key=pub, key_id=None)
+        )
+    finally:
+        client.close()
+    console.print(f"[green]registered[/green] deploy key for {origin}")
+
+
+@deploy_key_app.command("rm", help="Forget the deploy key registered for an origin.")
+@friendly_errors
+def deploy_key_rm(
+    origin: str = typer.Argument(..., help="Repo origin URL to forget."),
+) -> None:
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        removed = client.deploy_key_delete(origin)
+    finally:
+        client.close()
+    if removed:
+        console.print(f"removed deploy key for {origin}")
+    else:
+        console.print(f"[dim]no deploy key was registered for {origin}[/dim]")
 
 
 @app.command(

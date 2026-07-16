@@ -41,6 +41,7 @@ from omnirun.models import (
     Cost,
     JobHandle,
     JobRecord,
+    JobSpec,
     JobStatus,
     Link,
     Offer,
@@ -52,6 +53,7 @@ from omnirun.models import (
 )
 from omnirun.providers.base import CancelMode
 from omnirun.providers.base import CapacityError as SeamCapacityError
+from omnirun.repo import RepoError
 from omnirun.state.store import Store
 
 _sleep = time.sleep  # test seam
@@ -171,9 +173,10 @@ class BackendProvider:
         reconcile poll.  STARTING never triggers a requeue.
         """
         offer = Offer.model_validate(slot.provider_ref["offer"])
+        spec = self._inject_deploy_key(rec.spec)
         try:
             handle = self._backend.submit(
-                rec.spec, offer, on_provisioning=self._persist_partial(rec)
+                spec, offer, on_provisioning=self._persist_partial(rec)
             )
         except CapacityError as e:
             # Backend was at capacity (a concurrency/quota cap). Re-raise as the
@@ -192,6 +195,34 @@ class BackendProvider:
             links=links,
             state=JobStatus.STARTING,
             placed_at=datetime.now(timezone.utc),
+        )
+
+    def _inject_deploy_key(self, spec: JobSpec) -> JobSpec:
+        """For a private code plan, read the origin's deploy key from the store and
+        inject its private half as transient ``deploy_key_material`` on the spec.
+
+        The key never rides the persisted spec (it is a secret, like ``.env``) —
+        the placer loads it from the store here, at the last moment before submit,
+        and the backend stages it out-of-band into the worker's ``deploy_key``
+        file. A missing key raises so we fail loud rather than clone-fail on the
+        worker with a confusing permission error."""
+        code = spec.code
+        if code is None or code.kind != "private":
+            return spec
+        dk = self._store.get_deploy_key(code.origin)
+        if dk is None:
+            # Permanent config error, not a transient capacity blip: let it hit the
+            # generic ``place`` handler (release + record last_error) so the job
+            # fails loud via the attempts-cap and read commands show why.
+            raise RepoError(
+                f"no deploy key registered for {code.origin}; run "
+                f"`omnirun deploy-key add {code.origin} <keyfile>` or re-submit "
+                "with `gh` authenticated as a repo admin"
+            )
+        return spec.model_copy(
+            update={
+                "code": code.model_copy(update={"deploy_key_material": dk.private_key})
+            }
         )
 
     def poll(self, p: Placement) -> Status:
