@@ -92,4 +92,16 @@ ledger = Table(
     Index("ix_ledger_window_at", "window", "at"),
 )
 
-ALL_TABLES = (meta, jobs, wait_samples, facts, ledger)
+# Read-only deploy keys for cloning PRIVATE repos on the worker, one per git
+# origin (DESIGN: workers always clone from origin — public anonymously, private
+# via a per-origin deploy key auto-provisioned through ``gh``). The private key
+# is delivered out-of-band to the worker (like ``.env``), never through git.
+deploy_keys = Table(
+    "deploy_keys",
+    metadata,
+    Column("origin", Text, primary_key=True),
+    Column("created_at", Text),
+    Column("data", JSON, nullable=False),
+)
+
+ALL_TABLES = (meta, jobs, wait_samples, facts, ledger, deploy_keys)

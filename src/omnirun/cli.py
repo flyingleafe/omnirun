@@ -3,13 +3,10 @@ backend -> store. All real logic lives in those modules (DESIGN §9)."""
 
 from __future__ import annotations
 
-import concurrent.futures
 import functools
 import logging
 import os
 import shlex
-import shutil
-from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -20,6 +17,12 @@ from rich.table import Table
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
+from omnirun.client import (
+    Client,
+    SubmitOutcome,
+    handle_of as _handle_of,
+    make_client,
+)
 from omnirun.sshconn import ssh_argv
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.daemon import Daemon, daemon_address, send_request
@@ -31,12 +34,10 @@ from omnirun.config import (
     load_repo_defaults,
     parse_duration,
 )
-from omnirun.control import Control, resolve_meta_cap
 from omnirun.models import (
     Deadline,
     EnvSpec,
     Health,
-    JobHandle,
     JobPolicy,
     JobRecord,
     JobSpec,
@@ -45,9 +46,6 @@ from omnirun.models import (
     ResourceSpec,
 )
 from omnirun.progress import report, reporting
-from omnirun.providers import BackendProvider, Provider
-from omnirun.state import Store, open_store
-from omnirun.state.store import default_store_dir
 
 app = typer.Typer(
     name="omnirun",
@@ -64,7 +62,11 @@ app.add_typer(state_app, name="state")
 
 console = Console(highlight=False)
 
-_state: dict[str, Any] = {"config_path": None}
+_state: dict[str, Any] = {
+    "config_path": None,
+    "daemon_address": None,
+    "force_local": False,
+}
 
 _STATE_STYLE = {
     JobState.SUCCEEDED: "green",
@@ -91,6 +93,16 @@ def main(
         "--config",
         help="Config file (default: $OMNIRUN_CONFIG or ~/.config/omnirun/config.toml).",
     ),
+    daemon: str | None = typer.Option(
+        None,
+        "--daemon",
+        help="Talk to the daemon at host:port (overrides config/env for this run).",
+    ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Force daemonless: ignore any configured daemon address.",
+    ),
     version: bool = typer.Option(
         False,
         "--version",
@@ -100,6 +112,8 @@ def main(
     ),
 ) -> None:
     _state["config_path"] = config
+    _state["daemon_address"] = daemon
+    _state["force_local"] = local
 
 
 # --------------------------------------------------------------------------- helpers
@@ -142,7 +156,23 @@ def _die(msg: str) -> NoReturn:
 
 
 def _load_cfg() -> Config:
-    return load_config(_state["config_path"])
+    """Load the config, then apply the highest-precedence daemon overrides: the
+    ``--daemon``/``--local`` CLI flags win over the ``OMNIRUN_DAEMON_ADDRESS`` env
+    var and the TOML ``[daemon].address`` (both already resolved by load_config)."""
+    cfg = load_config(_state["config_path"])
+    force_local: bool = _state["force_local"]
+    daemon_addr: str | None = _state["daemon_address"]
+    if force_local and daemon_addr is not None:
+        _die("--daemon and --local are mutually exclusive")
+    if force_local:
+        return cfg.model_copy(
+            update={"daemon": cfg.daemon.model_copy(update={"address": None})}
+        )
+    if daemon_addr is not None:
+        return cfg.model_copy(
+            update={"daemon": cfg.daemon.model_copy(update={"address": daemon_addr})}
+        )
+    return cfg
 
 
 def _render_payload(backend_obj: Backend, spec: JobSpec, offer: Offer) -> None:
@@ -268,117 +298,6 @@ def _repo_job_defaults() -> dict[str, Any]:
     except repo_mod.RepoError:
         return {}
     return load_repo_defaults(root).get("job", {}) or {}
-
-
-def _make_backends(
-    cfg: Config, only: str | None
-) -> tuple[dict[str, Backend], list[Offer]]:
-    """Construct enabled backends; a backend whose constructor fails becomes a
-    synthetic unfit offer instead of killing the whole command."""
-    sections = {n: c for n, c in cfg.backends.items() if c.enabled}
-    if only is not None:
-        if only not in cfg.backends:
-            known = ", ".join(sorted(cfg.backends)) or "none configured"
-            raise BackendError(f"backend {only!r} is not configured (known: {known})")
-        sections = {only: cfg.backends[only]}
-    if not sections:
-        raise ConfigError(
-            "no backends configured/enabled — add [backends.*] sections to "
-            f"{_state['config_path'] or default_config_path()}"
-        )
-    backends: dict[str, Backend] = {}
-    broken: list[Offer] = []
-    for name, bcfg in sections.items():
-        try:
-            backends[name] = make_backend(name, bcfg)
-        except Exception as e:
-            broken.append(
-                Offer(
-                    backend=name,
-                    label=f"{name}: unavailable",
-                    fits=False,
-                    unfit_reasons=[f"backend init failed: {e}"],
-                )
-            )
-    return backends, broken
-
-
-def _apply_admission(
-    offers: list[Offer], res: ResourceSpec, store: Store
-) -> list[Offer]:
-    """Mark fitting offers unfit when FRESH cached facts prove the job can't run there.
-    Stale facts (past their TTL) are ignored so an old cache can never wrongly block a submit."""
-    now = datetime.now(timezone.utc)
-    for o in offers:
-        if not o.fits:
-            continue
-        facts = store.load_facts(o.backend)
-        if facts is None or not facts.is_fresh(now):
-            continue
-        reasons = facts.capabilities.satisfies(res)
-        if reasons:
-            o.fits = False
-            o.unfit_reasons.extend(reasons)
-    return offers
-
-
-def _probe(
-    cfg: Config, res: ResourceSpec, only: str | None
-) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
-    backends, broken = _make_backends(cfg, only)
-    offers = (
-        chooser.gather_offers(backends, res, timeout_s=cfg.policy.probe_timeout_s)
-        + broken
-    )
-    store = open_store(cfg.state.resolved_url())
-    try:
-        offers = _apply_admission(offers, res, store)
-    finally:
-        store.close()
-    ranked = chooser.rank(offers, res, cfg.policy)
-    unfit = [o for o in offers if not o.fits]
-    return backends, ranked, unfit
-
-
-def _backend_for(cfg: Config, name: str) -> Backend:
-    bcfg = cfg.backends.get(name)
-    if bcfg is None:
-        raise BackendError(
-            f"backend {name!r} is not in the config anymore; cannot reach the job"
-        )
-    return make_backend(name, bcfg)
-
-
-def _control(cfg: Config, store: Store, backend: str | None = None) -> Control:
-    """Build the ONE state-machine driver over *store* and the enabled backends.
-
-    Every lifecycle command (``submit``/``ps``/``status``/``cancel``/``gc``) drives
-    this same ``Control.run_tick`` — the daemon differs only in cadence, never in
-    what a transition means. ``backend`` narrows the provider set (``--backend``)."""
-    backends, _broken = _make_backends(cfg, backend)
-    providers: dict[str, Provider] = {
-        name: BackendProvider(be, store) for name, be in backends.items()
-    }
-    # The day cap is the primary window the tick gates against; the weekly cap is
-    # enforced alongside it in _enact_place. A live `omnirun budget` override in
-    # the meta table wins over these config defaults (resolve_meta_cap).
-    return Control(
-        store,
-        providers,
-        budget_cap=cfg.budget.daily,
-        week_cap=cfg.budget.weekly,
-        outputs_dir=default_store_dir() / "outputs",
-    )
-
-
-def _handle_of(rec: JobRecord) -> JobHandle | None:
-    """The backend handle for the live-I/O commands (``logs``/``pull``/``ssh``),
-    derived from the job's ``placement`` — the single source of truth. ``None``
-    when the job was never placed anywhere."""
-    p = rec.placement
-    if p is None or not p.handle:
-        return None
-    return JobHandle(backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle)
 
 
 def _ago(dt: datetime | None, now: datetime) -> str:
@@ -568,167 +487,62 @@ def submit(
         _render_payload(backend_obj, spec, synthetic)
         return
 
-    # --dry-run without a named backend: the chooser still selects which backend
-    # to preview (display only — nothing is submitted, no Control involved).
-    if dry_run:
-        spec = _spec()
-        res = spec.resources
-        backends, ranked, unfit = _probe(cfg, res, backend)
-        if not ranked:
-            console.print(chooser.render_offer_table(ranked, unfit, res))
-            _die("no fitting offers")
-        picked = chooser.auto_pick(ranked, cfg.policy) or ranked[0]
-        _render_payload(backends[picked.offer.backend], spec, picked.offer)
-        return
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        # --dry-run without a named backend: the chooser still selects which
+        # backend to preview (display only — nothing is submitted).
+        if dry_run:
+            spec = _spec()
+            res = spec.resources
+            backends, ranked, unfit = client.probe(res, backend)
+            if not ranked:
+                console.print(chooser.render_offer_table(ranked, unfit, res))
+                _die("no fitting offers")
+            picked = chooser.auto_pick(ranked, cfg.policy) or ranked[0]
+            _render_payload(backends[picked.offer.backend], spec, picked.offer)
+            return
 
-    # Real placement now runs through the scheduler: the pure ``tick`` inside
-    # ``Control`` reconciles, reserves atomically, and places on the cheapest
-    # offer that fits — the same tick the daemon runs. The chooser remains the
-    # engine of ``omnirun offers`` (display only).
-    # A submit spends most of its wall-clock inside a backend provisioning a
-    # remote (Colab VM cold start, Kaggle kernel queue, ssh push). Narrate those
-    # steps on a live status line so the command is never silent — backends call
-    # `progress.report(...)` and we render each message here.
-    live = _live_daemon(cfg)
+        # Real placement runs through the client: daemonless it drives the pure
+        # ``tick`` in-process; with a daemon configured the request is placed by
+        # the daemon. A submit spends most of its wall-clock inside a backend
+        # provisioning a remote (Colab VM cold start, Kaggle kernel queue, ssh
+        # push); narrate those steps on a live status line so it is never silent —
+        # backends call ``progress.report(...)`` and we render each message here.
+        def _place() -> None:
+            report("resolving repo state…")
+            spec = _spec()
+            _report_submit(client.submit(spec, backend=backend))
 
-    def _place() -> None:
-        report("resolving repo state…")
-        spec = _spec()
-        store = open_store(cfg.state.resolved_url())
-        try:
-            if live is not None:
-                _submit_via_daemon(store, cfg, spec, backend, live, wait=wait)
-            else:
-                _submit_via_control(store, cfg, spec, backend)
-        finally:
-            store.close()
-
-    # On a terminal, narrate on one live status line (spinner). When output is
-    # piped / redirected (CI, `nohup`) a Live spinner renders nothing, so print
-    # each step as its own dim line instead — either way the command is never
-    # silent through the slow provisioning steps.
-    if console.is_terminal:
-        with console.status("[cyan]submitting…", spinner="dots") as status:
-            with reporting(lambda msg: status.update(f"[cyan]{msg}")):
+        # On a terminal, narrate on one live status line (spinner). When output is
+        # piped / redirected (CI, `nohup`) a Live spinner renders nothing, so print
+        # each step as its own dim line instead — either way never silent.
+        if console.is_terminal:
+            with console.status("[cyan]submitting…", spinner="dots") as status:
+                with reporting(lambda msg: status.update(f"[cyan]{msg}")):
+                    _place()
+        else:
+            with reporting(lambda msg: console.print(f"[dim]· {msg}[/dim]")):
                 _place()
-    else:
-        with reporting(lambda msg: console.print(f"[dim]· {msg}[/dim]")):
-            _place()
+    finally:
+        client.close()
 
 
-def _submit_via_control(
-    store: Store, cfg: Config, spec: JobSpec, backend: str | None
-) -> None:
-    """Persist *spec* QUEUED, run one synchronous tick, and report the outcome.
-
-    Daemonless: ``Control`` does its own single tick here — no background process
-    is required (a placed job then runs on the backend while the laptop is free).
-    ``--backend`` pins the job to that provider via ``spec.only_backend``; the
-    pure tick honors the pin, so ``Control`` still sees ALL enabled backends
-    (a full reconcile of any other in-flight job runs unimpeded).
-    """
-    if backend is not None:
-        if backend not in cfg.backends:
-            known = ", ".join(sorted(cfg.backends)) or "none configured"
-            raise BackendError(
-                f"backend {backend!r} is not configured (known: {known})"
-            )
-        spec = spec.model_copy(update={"only_backend": backend})
-    # Same driver as every other lifecycle command (so a submit's reconcile also
-    # performs the daemon-equivalent catch-up — collecting + reaping a prior
-    # terminal notebook session before placing this job).
-    control = _control(cfg, store)
-    now = datetime.now(timezone.utc)
-    job_id = control.submit(spec, now=now)
-    control.run_tick(now)
-
-    rec = store.load_job(job_id)
-    if rec is None:  # pragma: no cover — we just wrote it
-        _die(f"job {job_id} vanished after submit")
-
-    if rec.placement is not None and rec.placement.handle:
+def _report_submit(outcome: SubmitOutcome) -> None:
+    """Render a submit outcome (placed / held / queued-unplaced)."""
+    if outcome.placed:
         console.print(
-            f"[green]submitted[/green] {job_id} -> {rec.placement.provider_name}"
+            f"[green]submitted[/green] {outcome.job_id} -> {outcome.provider_name}"
         )
-        console.print(f"follow logs with: omnirun logs -f {job_id}")
+        console.print(f"follow logs with: omnirun logs -f {outcome.job_id}")
         return
-    if rec.state is JobState.HELD:
-        reason = rec.last_status.detail if rec.last_status else "no slot can satisfy it"
-        _die(f"job {job_id} cannot be placed: {reason}")
-    # QUEUED but unplaced: admissible yet no fitting offer right now.
-    # The record persists; a running `omnirun serve` will place it on the next
-    # tick. Daemonless submits have no auto-wakeup, so inform the user and
-    # exit 0 — the job is not lost, merely waiting.
+    if outcome.state is JobState.HELD:
+        _die(f"job {outcome.job_id} cannot be placed: {outcome.held_reason}")
+    # QUEUED but unplaced: admissible yet no fitting offer right now. The record
+    # persists; a running `omnirun serve` will place it on the next tick.
     console.print(
-        f"queued {job_id}: no slot free right now — it will place on a later tick; "
-        "run `omnirun serve` to place it in the background"
+        f"queued {outcome.job_id}: no slot free right now — it will place on a later "
+        "tick; run `omnirun serve` to place it in the background"
     )
-
-
-def _submit_via_daemon(
-    store: Store,
-    cfg: Config,
-    spec: JobSpec,
-    backend: str | None,
-    addr: tuple[str, int],
-    *,
-    wait: bool,
-) -> None:
-    """Persist *spec* QUEUED, nudge the live daemon to place it, and (optionally)
-    wait for it — the fast submit path.
-
-    A running daemon is the placer, so we do NOT run a local tick here (it would
-    redo the daemon's work). We only write the QUEUED record and send a ``tick``
-    nudge so the daemon places it immediately instead of waiting out its poll
-    interval. With ``--wait`` we then poll the store, narrating state transitions
-    until the job is RUNNING or terminal (exit non-zero on FAILED/CANCELLED)."""
-    if backend is not None:
-        if backend not in cfg.backends:
-            known = ", ".join(sorted(cfg.backends)) or "none configured"
-            raise BackendError(
-                f"backend {backend!r} is not configured (known: {known})"
-            )
-        spec = spec.model_copy(update={"only_backend": backend})
-    control = _control(cfg, store)
-    now = datetime.now(timezone.utc)
-    job_id = control.submit(spec, now=now)
-    host, port = addr
-    send_request(host, port, {"cmd": "tick"})  # place it now, not next poll
-    if not wait:
-        console.print(
-            f"queued {job_id}; a running daemon is placing it (omnirun status {job_id})"
-        )
-        return
-    _wait_for_placement(store, job_id)
-
-
-def _wait_for_placement(store: Store, job_id: str) -> None:
-    """Poll the store every 1s, printing each state transition, until *job_id*
-    is RUNNING or terminal. Exits non-zero on FAILED/CANCELLED."""
-    import time as _time
-
-    last: JobState | None = None
-    while True:
-        rec = store.load_job(job_id)
-        if rec is None:  # pragma: no cover — we just wrote it
-            _die(f"job {job_id} vanished after submit")
-        where = rec.placement.provider_name if rec.placement else None
-        if rec.state is not last:
-            last = rec.state
-            if rec.state is JobState.PLACING and where:
-                console.print(f"[cyan]placing on {where}[/cyan]")
-            elif rec.state is JobState.RUNNING and where:
-                console.print(f"[cyan]running on {where}[/cyan]")
-        if rec.state is JobState.RUNNING:
-            console.print(f"[green]running[/green] {job_id} -> {where}")
-            console.print(f"follow logs with: omnirun logs -f {job_id}")
-            return
-        if rec.state.terminal:
-            console.print(f"{job_id} finished: {rec.state.value}")
-            if rec.state in (JobState.FAILED, JobState.CANCELLED):
-                raise typer.Exit(1)
-            return
-        _time.sleep(1.0)
 
 
 # --------------------------------------------------------------------------- offers
@@ -765,7 +579,11 @@ def offers(
         min_cuda=min_cuda,
     )
     cfg = _load_cfg()
-    _, ranked, unfit = _probe(cfg, res, backend)
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        _, ranked, unfit = client.probe(res, backend)
+    finally:
+        client.close()
     console.print(chooser.render_offer_table(ranked, unfit, res))
 
 
@@ -861,25 +679,15 @@ def enqueue(
     )
     # Jobs live in the shared store; a running daemon places them continuously.
     # `enqueue` requires a live daemon (nothing would advance otherwise), writes
-    # each job via Control.submit over that store, then nudges the daemon to
-    # place them without waiting out its poll interval.
+    # each job QUEUED via the client, then nudges the daemon to place them without
+    # waiting out its poll interval.
     host, port = _require_daemon()
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
+    client = make_client(cfg, config_path=_state["config_path"])
     try:
-        control = _control(cfg, store)
-        now = datetime.now(timezone.utc)
-        job_ids: list[str] = []
-        for _ in range(max(1, count)):
-            job_spec = spec.model_copy(
-                update={
-                    "job_id": JobSpec.make_job_id(spec.name),
-                    "only_backend": backend,
-                }
-            )
-            job_ids.append(control.submit(job_spec, now=now))
+        job_ids = client.enqueue(spec, backend=backend, count=count)
     finally:
-        store.close()
+        client.close()
     send_request(host, port, {"cmd": "tick"})  # nudge an immediate round
     console.print(
         f"[green]enqueued[/green] {len(job_ids)} job(s): {', '.join(job_ids)}"
@@ -903,21 +711,21 @@ def queue(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
+    client = make_client(cfg, config_path=_state["config_path"])
     scope = None if all_projects else _current_project()
     try:
         if cancel is not None:
-            _queue_cancel(cfg, store, cancel, scope=scope)
+            _queue_cancel(client, cancel, scope=scope)
             return
         if wait:
-            _queue_wait(store)
+            _queue_wait(client)
             return
-        records = store.list_jobs(project=scope)
+        records = client.list_jobs(project=scope)
         console.print(_queue_table(records, show_project=scope is None))
         if scope is not None:
             console.print(f"[dim]project: {scope} (use -A for all)[/dim]")
     finally:
-        store.close()
+        client.close()
 
 
 def _require_daemon() -> tuple[str, int]:
@@ -926,45 +734,6 @@ def _require_daemon() -> tuple[str, int]:
         _die("no omnirun daemon running — start one with `omnirun serve`")
     assert addr is not None
     return addr
-
-
-def _parallel_by_name(
-    items: list[tuple[str, Any]], fn: Callable[[tuple[str, Any]], Any]
-) -> dict[str, Any]:
-    """Run ``fn(item)`` for each ``(name, cfg)`` in a thread pool, returning a
-    ``name -> result-or-Exception`` map. Callers iterate their own ordering to
-    print, so order is preserved regardless of completion order. An empty list
-    short-circuits (no pool)."""
-    if not items:
-        return {}
-    out: dict[str, Any] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool:
-        future_to_name = {pool.submit(fn, item): item[0] for item in items}
-        for future in concurrent.futures.as_completed(future_to_name):
-            name = future_to_name[future]
-            exc = future.exception()
-            out[name] = exc if exc is not None else future.result()
-    return out
-
-
-def _live_daemon(cfg: Config) -> tuple[str, int] | None:
-    """The address of a RESPONSIVE daemon, or ``None``.
-
-    ``daemon_address()`` only proves a pid is alive; this pings the socket to
-    confirm the daemon actually answers. A wedged/unresponsive daemon (any
-    exception or refusal) returns ``None`` so a read command falls back to its
-    own local tick instead of crashing over the stuck socket. When alive, the
-    daemon is the catch-up, so read commands skip their local tick."""
-    _ = cfg
-    addr = daemon_address()
-    if addr is None:
-        return None
-    host, port = addr
-    try:
-        resp = send_request(host, port, {"cmd": "ping"}, timeout=2.0)
-    except Exception:
-        return None
-    return addr if resp.get("ok") else None
 
 
 def _current_project() -> str | None:
@@ -1004,32 +773,27 @@ def _queue_table(records: list[JobRecord], *, show_project: bool = False) -> Tab
     return table
 
 
-def _queue_cancel(
-    cfg: Config, store: Store, ref: str, *, scope: str | None = None
-) -> None:
-    """Cancel a job (id prefix) or every non-terminal job (``all``) directly over
-    the store — works with or without a daemon; the control cancel-vs-place race
-    fix makes it safe against a concurrent daemon tick.
+def _queue_cancel(client: Client, ref: str, *, scope: str | None = None) -> None:
+    """Cancel a job (id prefix) or every non-terminal job (``all``) — works with
+    or without a daemon; the control cancel-vs-place race fix makes it safe
+    against a concurrent daemon tick.
 
     ``all`` is scoped to *scope* (the current project, unless ``-A``); an explicit
     id prefix is never scoped (job ids are globally unique)."""
-    now = datetime.now(timezone.utc)
     if ref == "all":
-        targets = [r for r in store.list_jobs(project=scope) if not r.state.terminal]
+        targets = [r for r in client.list_jobs(project=scope) if not r.state.terminal]
     else:
-        targets = [store.resolve_job(ref)]
+        targets = [client.resolve_job(ref)]
     cancelled = 0
     for rec in targets:
         if rec.state.terminal:
             continue
-        _control(
-            cfg, store, rec.placement.provider_name if rec.placement else None
-        ).cancel(rec.spec.job_id, now)
+        client.cancel(rec)
         cancelled += 1
     console.print(f"cancelled {cancelled} job(s)")
 
 
-def _queue_wait(store: Store) -> None:
+def _queue_wait(client: Client) -> None:
     import time as _time
 
     # A running daemon is what advances jobs; without one, polling would spin
@@ -1037,7 +801,7 @@ def _queue_wait(store: Store) -> None:
     _require_daemon()
     records: list[JobRecord] = []
     while True:
-        records = store.list_jobs()
+        records = client.list_jobs()
         if not records or all(r.state.terminal for r in records):
             break
         _time.sleep(3.0)
@@ -1073,21 +837,16 @@ def ps(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    # When a daemon is alive it already keeps the store caught up (it IS the
-    # catch-up), so a read command reads the store directly — no local tick, no
-    # provider polling. Without one, drive the machine ourselves: reconcile live
-    # placements, self-GC stale sessions, and place any queued job onto a free
-    # backend, so a daemonless `ps` gives the same answer a running daemon would.
-    # The tick is now parallel, so a momentarily-slow backend degrades it (skipped
-    # this round), never hangs the command.
-    if _live_daemon(cfg) is None:
-        control = _control(cfg, store)
-        control.run_tick(datetime.now(timezone.utc))
-        for event in control.take_events():
-            console.print(f"[dim]· {event}[/dim]")
+    client = make_client(cfg, config_path=_state["config_path"])
+    # Daemonless, the client drives the machine itself: reconcile live placements,
+    # self-GC stale sessions, and place any queued job onto a free backend, so
+    # `ps` gives the same answer a running daemon would. With a daemon configured
+    # the daemon is the catch-up and the client just reads. The tick is parallel,
+    # so a momentarily-slow backend degrades it (skipped this round), never hangs.
+    for event in client.tick():
+        console.print(f"[dim]· {event}[/dim]")
     scope = None if all_projects else _current_project()
-    records = store.list_jobs(project=scope)
+    records = client.list_jobs(project=scope)
     if not records:
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
@@ -1129,13 +888,10 @@ def ps(
 @friendly_errors
 def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    rec = store.resolve_job(job)
-    # Same machine as `ps`/the daemon — one tick reconciles this job's live state.
-    # Skip it when a daemon is alive (it already keeps the store caught up).
-    if _live_daemon(cfg) is None:
-        _control(cfg, store).run_tick(datetime.now(timezone.utc))
-    rec = store.load_job(rec.spec.job_id) or rec
+    client = make_client(cfg, config_path=_state["config_path"])
+    # One tick reconciles this job's live state (daemonless catch-up; a no-op
+    # with a daemon, which already keeps the store fresh).
+    rec = client.status(job)
     st = rec.last_status
     backend = rec.placement.provider_name if rec.placement else "-"
     rows: list[tuple[str, str]] = [
@@ -1180,12 +936,9 @@ def logs(
     ),
 ) -> None:
     cfg = _load_cfg()
-    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
-    handle = _handle_of(rec)
-    if handle is None:
-        raise BackendError(f"job {rec.spec.job_id} was never submitted; no logs")
-    be = _backend_for(cfg, handle.backend)
-    for line in be.logs(handle, follow=follow):
+    client = make_client(cfg, config_path=_state["config_path"])
+    rec = client.resolve_job(job)
+    for line in client.logs(rec, follow=follow):
         typer.echo(line.rstrip("\n"))
 
 
@@ -1203,14 +956,14 @@ def cancel(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    rec = store.resolve_job(job)
+    client = make_client(cfg, config_path=_state["config_path"])
+    rec = client.resolve_job(job)
     if _handle_of(rec) is None and rec.placement is None:
         raise BackendError(
             f"job {rec.spec.job_id} was never submitted; nothing to cancel"
         )
-    # One machine: Control.cancel reaps the placement (graceful→force→gc) and
-    # marks the job CANCELLED — the same path the daemon uses.
+    # Control.cancel reaps the placement (graceful→force→gc) and marks the job
+    # CANCELLED — the same path the daemon uses.
     if not force and not no_wait:
         # The graceful path polls the backend until the job stops (up to the
         # per-backend grace window), so warn before the wait — otherwise cancel
@@ -1219,9 +972,7 @@ def cancel(
             f"[dim]asking {rec.spec.job_id} to stop; "
             f"waiting for graceful shutdown…[/dim]"
         )
-    _control(cfg, store, rec.placement.provider_name if rec.placement else None).cancel(
-        rec.spec.job_id, datetime.now(timezone.utc), force=force, wait=not no_wait
-    )
+    client.cancel(rec, force=force, wait=not no_wait)
     if no_wait:
         console.print(
             "cancel signalled; resources are released on the next tick "
@@ -1251,9 +1002,9 @@ def reprioritize(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
+    client = make_client(cfg, config_path=_state["config_path"])
     try:
-        rec = store.resolve_job(job)
+        rec = client.resolve_job(job)
         deadline: Deadline | None = None
         if start_by is not None or finish_by is not None:
             existing = rec.spec.policy.deadline or Deadline()
@@ -1265,8 +1016,7 @@ def reprioritize(
                 if finish_by is not None
                 else existing.finish_by,
             )
-        control = Control(store, {})
-        new_policy = control.reprioritize(
+        new_policy = client.reprioritize(
             rec.spec.job_id,
             priority=priority,
             deadline=deadline,
@@ -1275,7 +1025,7 @@ def reprioritize(
     except ValueError as e:
         _die(str(e))
     finally:
-        store.close()
+        client.close()
     console.print(f"reprioritized {rec.spec.job_id}:")
     console.print(f"[bold]priority:[/bold] {new_policy.priority}")
     pay = "free-only" if new_policy.max_cost == 0.0 else "paid allowed"
@@ -1300,39 +1050,30 @@ def budget(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
+    client = make_client(cfg, config_path=_state["config_path"])
     try:
-        control = Control(store, {})
         changed = False
         if daily is not None:
-            control.budget("day", daily)
+            client.budget_set("day", daily)
             changed = True
         if weekly is not None:
-            control.budget("week", weekly)
+            client.budget_set("week", weekly)
             changed = True
         if changed:
             console.print("[green]budget updated[/green]")
-        now = datetime.now(timezone.utc)
         # Both windows are GENUINELY enforced by every ``Control`` (the tick's day
         # gate + ``_enact_place``'s weekly gate), so this shows the same
-        # spend-vs-cap the scheduler acts on. ``resolve_meta_cap`` is the SAME
-        # resolver ``Control`` uses, so the display can never drift from
-        # enforcement on how a stored cap is read.
+        # spend-vs-cap the scheduler acts on.
         table = Table("window", "spent", "cap")
-        for window, cfg_default in (
-            ("day", cfg.budget.daily),
-            ("week", cfg.budget.weekly),
-        ):
-            cap = resolve_meta_cap(store, window, cfg_default)
-            spent = store.load_ledger(window, cap, now).in_window_total(now)
+        for row in client.budget_status():
             table.add_row(
-                window,
-                f"${spent:g}",
-                "unbounded" if cap is None else f"${cap:g}",
+                row.window,
+                f"${row.spent:g}",
+                "unbounded" if row.cap is None else f"${row.cap:g}",
             )
         console.print(table)
     finally:
-        store.close()
+        client.close()
 
 
 @app.command(help="Pull a job's collected outputs to a local directory.")
@@ -1344,30 +1085,13 @@ def pull(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    rec = store.resolve_job(job)
-    handle = _handle_of(rec)
-    if handle is None:
-        raise BackendError(f"job {rec.spec.job_id} was never submitted; no outputs")
-    dest = dest or Path("omnirun-outputs") / rec.spec.job_id
-    if rec.outputs_cached_to:
-        # The reconciler already collected these outputs into a durable cache and
-        # reaped the (notebook) session — so the live backend can no longer serve
-        # them. Copy from the cache instead of hitting a stopped session.
-        cache = Path(rec.outputs_cached_to)
-        if not cache.is_dir():
-            raise BackendError(
-                f"cached outputs for {rec.spec.job_id} are missing at {cache} "
-                "(session already reaped, nothing to re-fetch)"
-            )
-        dest.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(cache, dest, dirs_exist_ok=True)
-        paths = sorted(p for p in dest.rglob("*") if p.is_file())
-    else:
-        be = _backend_for(cfg, handle.backend)
-        paths = be.pull_outputs(handle, dest)
-    rec.outputs_pulled_to = str(dest)
-    store.save_job(rec)
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        rec = client.resolve_job(job)
+        dest = dest or Path("omnirun-outputs") / rec.spec.job_id
+        paths, dest = client.pull(rec, dest)
+    finally:
+        client.close()
     console.print(f"pulled {len(paths)} path(s) to {dest}")
 
 
@@ -1385,35 +1109,21 @@ def gc(
     ),
 ) -> None:
     cfg = _load_cfg()
-    store = open_store(cfg.state.resolved_url())
-    control = _control(cfg, store)
-    now = datetime.now(timezone.utc)
-    # A tick first: reconcile advances lost sessions (which are reaped in the
-    # process) and settles terminal states before we reap their leftovers.
-    control.run_tick(now)
-    for event in control.take_events():
-        console.print(f"[dim]· {event}[/dim]")
+    client = make_client(cfg, config_path=_state["config_path"])
     scope = None if all_projects else _current_project()
-    cleaned = failed = skipped = 0
-    for rec in store.list_jobs(project=scope):
-        handle = _handle_of(rec)
-        if handle is None:
-            continue
-        try:
-            if rec.state.terminal:
-                _backend_for(cfg, handle.backend).gc(handle)
-            elif all_:
-                control.cancel(rec.spec.job_id, now, force=True)  # cancels + reaps
-            else:
-                skipped += 1
-                continue
-        except Exception as e:
-            failed += 1
-            console.print(f"[yellow]warn:[/yellow] gc of {rec.spec.job_id} failed: {e}")
-            continue
-        cleaned += 1
+    try:
+        outcome = client.gc(all_=all_, project=scope)
+    finally:
+        client.close()
+    # A tick runs first inside gc: reconcile advances lost sessions (reaped in the
+    # process) and settles terminal states before their leftovers are reaped.
+    for event in outcome.events:
+        console.print(f"[dim]· {event}[/dim]")
+    for warn in outcome.warnings:
+        console.print(f"[yellow]warn:[/yellow] {warn}")
     console.print(
-        f"gc done: {cleaned} cleaned, {failed} failed, {skipped} skipped (non-terminal)"
+        f"gc done: {outcome.cleaned} cleaned, {outcome.failed} failed, "
+        f"{outcome.skipped} skipped (non-terminal)"
     )
 
 
@@ -1426,42 +1136,26 @@ def backends_check(
     name: str | None = typer.Argument(None, help="Check only this backend."),
 ) -> None:
     cfg = _load_cfg()
-    sections = cfg.backends
-    if name is not None:
-        if name not in sections:
-            known = ", ".join(sorted(sections)) or "none configured"
-            raise BackendError(f"backend {name!r} is not configured (known: {known})")
-        sections = {name: sections[name]}
-    if not sections:
-        raise ConfigError(
-            "no backends configured — add [backends.*] sections to "
-            f"{_state['config_path'] or default_config_path()}"
-        )
-
-    # Run the per-backend check() calls in parallel (each is a blocking
-    # connectivity probe), then print in the original config order.
-    def _check_one(item: tuple[str, Any]) -> str:
-        nm, bcfg = item
-        return make_backend(nm, bcfg).check()
-
-    enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
-    results = _parallel_by_name(enabled, _check_one)
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        rows = client.backends_check(name)
+    finally:
+        client.close()
 
     table = Table()
     table.add_column("backend")
     table.add_column("type")
     table.add_column("status")
     any_failed = False
-    for nm, bcfg in sections.items():
-        if not bcfg.enabled:
-            table.add_row(nm, bcfg.type, "disabled", style="dim")
+    for row in rows:
+        if not row.enabled:
+            table.add_row(row.name, row.type, "disabled", style="dim")
             continue
-        outcome = results[nm]
-        if isinstance(outcome, Exception):
+        if isinstance(row.outcome, Exception):
             any_failed = True
-            table.add_row(nm, bcfg.type, f"[red]{outcome}[/red]")
+            table.add_row(row.name, row.type, f"[red]{row.outcome}[/red]")
         else:
-            table.add_row(nm, bcfg.type, f"[green]{outcome}[/green]")
+            table.add_row(row.name, row.type, f"[green]{row.outcome}[/green]")
     console.print(table)
     if any_failed:
         raise typer.Exit(1)
@@ -1483,36 +1177,24 @@ def backends_discover(
     name: str | None = typer.Argument(None, help="Discover only this backend."),
 ) -> None:
     cfg = _load_cfg()
-    sections = cfg.backends
-    if name is not None:
-        if name not in sections:
-            known = ", ".join(sorted(sections)) or "none configured"
-            raise BackendError(f"backend {name!r} is not configured (known: {known})")
-        sections = {name: sections[name]}
-    store = open_store(cfg.state.resolved_url())
-
-    # Run the per-backend discover() probes in parallel; save + print in the
-    # original config order afterward. A raising backend surfaces its error.
-    def _discover_one(item: tuple[str, Any]):
-        nm, bcfg = item
-        return make_backend(nm, bcfg).discover()
-
-    enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
-    results = _parallel_by_name(enabled, _discover_one)
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        rows = client.backends_discover(name)
+    finally:
+        client.close()
 
     table = Table("backend", "health", "GPUs", "max walltime", "max parallel", "notes")
-    for nm, bcfg in sections.items():
-        if not bcfg.enabled:
-            table.add_row(nm, "disabled", "-", "-", "-", "", style="dim")
+    for row in rows:
+        if not row.enabled:
+            table.add_row(row.name, "disabled", "-", "-", "-", "", style="dim")
             continue
-        outcome = results[nm]
-        if isinstance(outcome, Exception):
-            raise outcome
-        facts = outcome
-        store.save_facts(facts)
+        if isinstance(row.facts, Exception):
+            raise row.facts
+        facts = row.facts
+        assert facts is not None
         c = facts.capabilities
         table.add_row(
-            nm,
+            row.name,
             _health_markup(facts.health),
             ", ".join(c.gpu_types) or "-",
             str(c.max_walltime) if c.max_walltime is not None else "-",
@@ -1549,11 +1231,15 @@ def ssh(
         omnirun ssh train-abc123 -- nvidia-smi
     """
     cfg = _load_cfg()
-    rec = open_store(cfg.state.resolved_url()).resolve_job(job)
-    handle = _handle_of(rec)
-    if handle is None:
-        _die(f"job {rec.spec.job_id} was never submitted; cannot ssh into it")
-    be = _backend_for(cfg, handle.backend)
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        rec = client.resolve_job(job)
+        handle = _handle_of(rec)
+        if handle is None:
+            _die(f"job {rec.spec.job_id} was never submitted; cannot ssh into it")
+        be = client.backend_for(handle.backend)
+    finally:
+        client.close()
     ep = be.ssh_endpoint(handle)
     if ep is None:
         # Give a clear reason based on backend type.

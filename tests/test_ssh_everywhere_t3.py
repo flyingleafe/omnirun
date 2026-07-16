@@ -574,23 +574,22 @@ class TestOmnirunSshCommand:
 
         import omnirun.cli as cli_mod
 
-        # Patch the SQL store lookup to return our fake records (new Store API).
+        # Patch the client seam to resolve our fake records + hand back a mock
+        # backend (the ssh command goes through make_client now).
         def fake_resolve_job(ref: str) -> JobRecord:
             for r in store_records:
                 if r.spec.job_id == ref or r.spec.job_id.startswith(ref):
                     return r
             raise KeyError(ref)
 
-        fake_store = MagicMock()
-        fake_store.resolve_job.side_effect = fake_resolve_job
-        monkeypatch.setattr(cli_mod, "open_store", lambda url: fake_store)
-
-        # Patch _backend_for to return a mock backend.
         fake_be = MagicMock()
         fake_be.config.type = "colab"
         fake_be.ssh_endpoint.return_value = endpoint
 
-        monkeypatch.setattr(cli_mod, "_backend_for", lambda cfg, name: fake_be)
+        fake_client = MagicMock()
+        fake_client.resolve_job.side_effect = fake_resolve_job
+        fake_client.backend_for.return_value = fake_be
+        monkeypatch.setattr(cli_mod, "make_client", lambda cfg, **kw: fake_client)
         monkeypatch.setattr(cli_mod, "_load_cfg", lambda: MagicMock())
 
         runner = CliRunner()

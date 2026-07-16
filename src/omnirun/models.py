@@ -205,6 +205,29 @@ class RepoRef(BaseModel):
     local_root: str | None = None
 
 
+class CodePlan(BaseModel):
+    """How the worker materializes the repo — decided CLIENT-SIDE at submit time
+    so the placer (daemon) needs no local git objects. Workers always clone from
+    origin: ``remote`` is an anonymous https url (public repo); ``private`` is an
+    ssh url cloned with the origin's read-only deploy key (delivered out-of-band
+    to the worker, like ``.env``). ``bundle``/``bare`` are daemonless-only
+    fallbacks for a local-only repo (no reachable origin)."""
+
+    kind: Literal["remote", "private", "bundle", "bare"] = "remote"
+    clone_url: str = ""  # https (remote) or ssh git@host:owner/repo.git (private)
+    origin: str = ""  # remote_url; for ``private`` it keys the deploy-key lookup
+
+
+class DeployKey(BaseModel):
+    """A read-only deploy key for cloning a private origin on the worker."""
+
+    origin: str  # the git remote url this key authorizes (dedup key)
+    private_key: str  # OpenSSH ed25519 private key (delivered to the worker)
+    public_key: str  # the matching public key (registered at the forge)
+    key_id: str | None = None  # forge-side id (e.g. GitHub deploy-key id), for deletion
+    created_at: datetime | None = None
+
+
 class Deadline(BaseModel):
     """Optional window in which a job must start and/or finish."""
 

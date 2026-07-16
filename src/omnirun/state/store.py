@@ -42,11 +42,19 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from omnirun.budget import BudgetLedger, LedgerEntry
-from omnirun.models import JobRecord, Placement, ProviderFacts, Slot, StatusReport
+from omnirun.models import (
+    DeployKey,
+    JobRecord,
+    Placement,
+    ProviderFacts,
+    Slot,
+    StatusReport,
+)
 from omnirun.models import JobState as _JobState
 from omnirun.models import JobStatus as _JobStatus
 from omnirun.state.schema import (
     ALL_TABLES,
+    deploy_keys,
     facts,
     jobs,
     ledger,
@@ -76,7 +84,11 @@ _SUPPORTED_DIALECTS = ("sqlite", "postgresql")
 # on ``jobs``, backfilled from each record's ``repo.slug``; and the dead ``queue``
 # table (old dual model) is dropped. Fresh DBs get the column from ``schema.py``;
 # legacy DBs get it via the 0→6 migration, which is idempotent (safe to re-run).
-STATE_SCHEMA_VERSION = 6
+# v7: adds the ``deploy_keys`` table (per-origin read-only keys for cloning
+# private repos on the worker). Purely additive — ``create_all`` creates the new
+# table on an existing DB before ``_migrate`` runs, so there is no data migration,
+# only the version bump (an older omnirun refuses a v7 DB via the guard).
+STATE_SCHEMA_VERSION = 7
 
 # Scheduler states that occupy a provider slot (the #12 capacity guard counts
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
@@ -534,6 +546,60 @@ class Store:
     # ------------------------------------------------------------------
     # Facts CRUD (mirrors FactStore)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Deploy keys — read-only per-origin keys for cloning private repos.
+    # ------------------------------------------------------------------
+
+    def put_deploy_key(self, dk: DeployKey) -> None:
+        """Upsert *dk* into ``deploy_keys`` (keyed on ``dk.origin``)."""
+        if dk.created_at is None:
+            dk = dk.model_copy(update={"created_at": datetime.now(timezone.utc)})
+        values: dict[str, Any] = {
+            "origin": dk.origin,
+            "created_at": dk.created_at.isoformat() if dk.created_at else None,
+            "data": dk.model_dump(mode="json"),
+        }
+        with self.transaction() as conn:
+            self._upsert(conn, deploy_keys, ["origin"], values)
+
+    def get_deploy_key(self, origin: str) -> DeployKey | None:
+        """Return the ``DeployKey`` for *origin*, or ``None`` if none is stored."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(cast(deploy_keys.c.data, Text)).where(
+                    deploy_keys.c.origin == origin
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return DeployKey.model_validate(_decode_json_column(row[0]))
+        except (ValueError, TypeError) as e:
+            _log.warning("skipping corrupt deploy_key row %s: %s", origin, e)
+            return None
+
+    def list_deploy_keys(self) -> list[DeployKey]:
+        """All stored deploy keys, ordered by origin."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(cast(deploy_keys.c.data, Text)).order_by(deploy_keys.c.origin)
+            ).fetchall()
+        out: list[DeployKey] = []
+        for row in rows:
+            try:
+                out.append(DeployKey.model_validate(_decode_json_column(row[0])))
+            except (ValueError, TypeError) as e:
+                _log.warning("skipping corrupt deploy_key row: %s", e)
+        return out
+
+    def delete_deploy_key(self, origin: str) -> bool:
+        """Delete the deploy key for *origin*; return True if a row was removed."""
+        with self.transaction() as conn:
+            result = conn.execute(
+                deploy_keys.delete().where(deploy_keys.c.origin == origin)
+            )
+        return bool(result.rowcount)
 
     def save_facts(self, pf: ProviderFacts) -> None:
         """Upsert *pf* into the ``facts`` table (keyed on ``pf.backend``)."""

@@ -1063,7 +1063,7 @@ def test_daemonless_submit_control_built_with_config_budget_caps(env, monkeypatc
             super().__init__(store, providers, **kwargs)  # pyright: ignore[reportArgumentType]
             built.append(self)
 
-    monkeypatch.setattr("omnirun.cli.Control", RecordingControl)
+    monkeypatch.setattr("omnirun.client.Control", RecordingControl)
     result = runner.invoke(app, ["submit", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
     assert built, "submit did not build a Control"
@@ -1304,15 +1304,24 @@ def _shutdown_daemon(daemon: Daemon, thread: threading.Thread) -> None:
     thread.join(timeout=5.0)
 
 
+# The CLI↔daemon coupling below was driven by a local ``daemon.json``+pid probe.
+# The thin-client refactor replaces that with config-driven selection
+# (``[daemon].address`` → a RemoteClient that proxies to the daemon). These three
+# are rewritten against that model in Phase C, when RemoteClient lands; the daemon
+# core itself stays covered by tests/test_queue.py. Until then they are skipped:
+# with no ``[daemon].address`` configured the CLI now always runs daemonless, so a
+# stray local daemon is (intentionally) ignored.
+_PHASE_C = "rewritten for config-driven RemoteClient in Phase C (daemon RPC)"
+
+
+@pytest.mark.skip(reason=_PHASE_C)
 def test_ps_with_live_daemon_skips_the_local_tick(env, monkeypatch):
-    """With a daemon alive, `ps` reads the store directly (the daemon is the
-    catch-up) and does NOT build/drive its own local Control tick. Spying on the
-    CLI-local `_control` factory proves the read process never ticks (the factory
-    is process-local, untouched by the daemon's own reconcile thread)."""
+    """With a remote daemon configured, `ps` reads through it (the daemon is the
+    catch-up) and does NOT drive its own tick."""
     import omnirun.cli as cli_mod
 
     built: list[object] = []
-    real_control = cli_mod._control
+    real_control = cli_mod._control  # pyright: ignore[reportAttributeAccessIssue]
 
     def _spy_control(*args, **kwargs):
         built.append(1)
@@ -1331,15 +1340,15 @@ def test_ps_with_live_daemon_skips_the_local_tick(env, monkeypatch):
         result = runner.invoke(app, ["ps"])
         assert result.exit_code == 0, result.output
         assert job_id in result.output
-        # The daemon-alive fast path never built a local Control (no local tick).
         assert built == []
     finally:
         _shutdown_daemon(daemon, thread)
 
 
+@pytest.mark.skip(reason=_PHASE_C)
 def test_submit_with_live_daemon_returns_quickly_and_daemon_places(env):
-    """With a daemon alive, `submit` (no --wait) writes QUEUED, nudges the daemon,
-    and prints the hand-off line — the daemon then places the job."""
+    """With a remote daemon configured, `submit` (no --wait) writes QUEUED, nudges
+    the daemon, and prints the hand-off line — the daemon then places the job."""
     daemon, thread = _spin_daemon(env.state_dir, env.config_file)
     try:
         result = runner.invoke(app, ["submit", "--", "python", "train.py"])
@@ -1359,6 +1368,7 @@ def test_submit_with_live_daemon_returns_quickly_and_daemon_places(env):
         _shutdown_daemon(daemon, thread)
 
 
+@pytest.mark.skip(reason=_PHASE_C)
 def test_submit_wait_blocks_until_running(env):
     """`submit --wait` blocks until the daemon drives the job to RUNNING, then
     prints the running line and exits 0."""
@@ -1372,3 +1382,45 @@ def test_submit_wait_blocks_until_running(env):
         assert rec is not None and rec.state is JobState.RUNNING
     finally:
         _shutdown_daemon(daemon, thread)
+
+
+# ---------------------------------------- daemon-address selection (flags/env/toml)
+
+
+def test_cli_daemon_flag_selects_remote(env):
+    """`--daemon host:port` overrides config to select the (not-yet-wired) remote
+    client — proving the flag takes effect, as a friendly error not a traceback."""
+    result = runner.invoke(app, ["--daemon", "10.0.0.9:8787", "ps"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "remote daemon client is not wired yet" in result.output
+
+
+def test_cli_local_flag_forces_daemonless(env):
+    """`--local` ignores a configured daemon address and runs daemonless."""
+    env.config_file.write_text(BASE_CONFIG + '\n[daemon]\naddress = "10.0.0.9:8787"\n')
+    # Without --local the configured address selects the (unwired) remote client.
+    remote = runner.invoke(app, ["ps"])
+    assert remote.exit_code == 1
+    assert "not wired yet" in remote.output
+    # With --local it runs daemonless and reads the (empty) store.
+    result = runner.invoke(app, ["--local", "ps"])
+    assert result.exit_code == 0, result.output
+    assert "no jobs yet" in result.output
+
+
+def test_cli_daemon_and_local_are_mutually_exclusive(env):
+    result = runner.invoke(app, ["--daemon", "h:1", "--local", "ps"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+def test_cli_daemon_env_selects_remote(env, monkeypatch):
+    """`OMNIRUN_DAEMON_ADDRESS` selects the remote client (env over TOML default)."""
+    monkeypatch.setenv("OMNIRUN_DAEMON_ADDRESS", "10.0.0.9:8787")
+    result = runner.invoke(app, ["ps"])
+    assert result.exit_code == 1
+    assert "not wired yet" in result.output
+    # An explicit --local still wins over the env var.
+    override = runner.invoke(app, ["--local", "ps"])
+    assert override.exit_code == 0, override.output

@@ -100,9 +100,36 @@ class BudgetConfig(BaseModel):
 
 
 class DaemonConfig(BaseModel):
-    host: str = "127.0.0.1"  # localhost socket; bind 0.0.0.0 + auth to go remote
-    port: int = 8787
+    # When set ("host:port"), the CLI is a THIN client: every command is a request
+    # to this daemon, which owns the store, all state transitions, and all backend
+    # credentials. When None the CLI runs daemonless (an in-process controller
+    # talks to a local store synchronously). This — not a local pid probe — is
+    # what selects daemon vs daemonless (see omnirun.client.make_client).
+    #
+    # Override order (highest wins): the ``--daemon``/``--local`` CLI flags, then
+    # the ``OMNIRUN_DAEMON_ADDRESS`` env var (empty = force daemonless), then this
+    # TOML field, then the default (None = daemonless).
+    address: str | None = None
+    host: str = "127.0.0.1"  # bind host for `omnirun serve` (mesh IP to go remote)
+    port: int = 8787  # bind port for `omnirun serve`
     poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
+
+    def resolved_address(self) -> tuple[str, int] | None:
+        """Parse ``address`` into ``(host, port)``, or None when daemonless.
+
+        Accepts ``host:port``; a bare host defaults to :data:`port`. An IPv6
+        literal must be bracketed (``[::1]:8787``)."""
+        if not self.address:
+            return None
+        raw = self.address.strip()
+        if raw.startswith("["):  # [ipv6]:port
+            host, _, rest = raw[1:].partition("]")
+            port = int(rest.lstrip(":")) if rest.lstrip(":") else self.port
+            return host, port
+        host, sep, rest = raw.rpartition(":")
+        if not sep:
+            return raw, self.port
+        return host, int(rest)
 
 
 class BoreConfig(BaseModel):
@@ -225,7 +252,14 @@ def load_config(path: Path | None = None) -> Config:
             raise ConfigError(f"bad config at {path}: {e}") from e
     # Apply env-var overrides for bore config (env wins over TOML).
     bore = BoreConfig.from_env_and_toml(cfg.bore.model_dump())
-    return cfg.model_copy(update={"bore": bore})
+    cfg = cfg.model_copy(update={"bore": bore})
+    # Daemon address env override (env wins over TOML). An empty value forces
+    # daemonless (``address=None``); an unset var leaves the TOML value alone.
+    env_addr = os.environ.get("OMNIRUN_DAEMON_ADDRESS")
+    if env_addr is not None:
+        daemon = cfg.daemon.model_copy(update={"address": env_addr.strip() or None})
+        cfg = cfg.model_copy(update={"daemon": daemon})
+    return cfg
 
 
 def load_repo_defaults(repo_root: Path) -> dict[str, Any]:

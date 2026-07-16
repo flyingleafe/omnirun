@@ -8,7 +8,9 @@ import tomllib
 
 import pytest
 
-from omnirun.config import BackendConfig, BoreConfig, Config
+from pathlib import Path
+
+from omnirun.config import BackendConfig, BoreConfig, Config, DaemonConfig, load_config
 
 
 def make_config(**kw) -> BackendConfig:
@@ -149,3 +151,60 @@ def test_budget_defaults_are_unbounded_when_absent():
     cfg = Config.model_validate(data)
     assert cfg.budget.daily is None
     assert cfg.budget.weekly is None
+
+
+# ------------------------------------------------------------------ [daemon].address
+
+
+def test_daemon_address_default_is_daemonless():
+    assert DaemonConfig().address is None
+    assert DaemonConfig().resolved_address() is None
+
+
+def test_daemon_resolved_address_formats():
+    assert DaemonConfig(address="10.0.0.1:8787").resolved_address() == (
+        "10.0.0.1",
+        8787,
+    )
+    # bare host falls back to the port field
+    assert DaemonConfig(address="10.0.0.1", port=9001).resolved_address() == (
+        "10.0.0.1",
+        9001,
+    )
+    # bracketed IPv6
+    assert DaemonConfig(address="[::1]:8787").resolved_address() == ("::1", 8787)
+
+
+def test_daemon_address_from_toml():
+    cfg = Config.model_validate(tomllib.loads('[daemon]\naddress = "h:8787"\n'))
+    assert cfg.daemon.resolved_address() == ("h", 8787)
+
+
+def _write(tmp_path: Path, text: str) -> Path:
+    p = tmp_path / "config.toml"
+    p.write_text(text)
+    return p
+
+
+def test_daemon_address_env_overrides_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OMNIRUN_DAEMON_ADDRESS", "env-host:9999")
+    cfg = load_config(_write(tmp_path, '[daemon]\naddress = "toml-host:8787"\n'))
+    assert cfg.daemon.resolved_address() == ("env-host", 9999)
+
+
+def test_daemon_address_env_empty_forces_daemonless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OMNIRUN_DAEMON_ADDRESS", "")
+    cfg = load_config(_write(tmp_path, '[daemon]\naddress = "toml-host:8787"\n'))
+    assert cfg.daemon.address is None
+
+
+def test_daemon_address_unset_env_keeps_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("OMNIRUN_DAEMON_ADDRESS", raising=False)
+    cfg = load_config(_write(tmp_path, '[daemon]\naddress = "toml-host:8787"\n'))
+    assert cfg.daemon.resolved_address() == ("toml-host", 8787)

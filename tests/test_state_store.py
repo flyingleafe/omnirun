@@ -29,9 +29,16 @@ from omnirun.state.store import Store, StoreError
 def test_open_store_creates_schema(tmp_path: Path) -> None:
     store = open_store(f"sqlite:///{tmp_path / 't.db'}")
     names = set(inspect(store._engine).get_table_names())
-    assert {"meta", "jobs", "wait_samples", "facts", "ledger"} <= names
-    assert store.schema_version() == 6  # STATE_SCHEMA_VERSION
-    assert STATE_SCHEMA_VERSION == 6
+    assert {
+        "meta",
+        "jobs",
+        "wait_samples",
+        "facts",
+        "ledger",
+        "deploy_keys",
+    } <= names
+    assert store.schema_version() == 7  # STATE_SCHEMA_VERSION
+    assert STATE_SCHEMA_VERSION == 7
     # Fresh DBs carry the ``project`` column + its index natively.
     cols = {c["name"] for c in inspect(store._engine).get_columns("jobs")}
     assert "project" in cols
