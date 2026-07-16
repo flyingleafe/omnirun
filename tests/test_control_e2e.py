@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from omnirun.backends.base import BackendUnreachable
 from omnirun.control import Control
 from omnirun.models import (
     Capabilities,
@@ -1112,5 +1113,189 @@ def test_cancel_wait_true_reaps_inline_no_catch_up(tmp_path: Path) -> None:
 
         control.run_tick(T2)  # catch-up must NOT revisit a reaped placement
         assert provider.cancel_calls == calls_before
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# "cannot synchronize with the backend → change nothing" (BackendUnreachable).
+# An environment that cannot even contact/authenticate a backend must not make
+# any state-changing decision about that backend's jobs (user ruling).
+# ---------------------------------------------------------------------------
+
+
+def test_poll_raise_keeps_last_known_state(tmp_path: Path) -> None:
+    """A poll that RAISES (for any reason) keeps the last-known state: the
+    placement's true state is unknown, so we change nothing — no requeue, no
+    attempts bump, placement intact. Definitive requeues come only from an
+    authoritative LOST status."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "free",
+            slots=[_free_slot()],
+            poll_error=RuntimeError("boom"),
+        )
+        control = Control(store, {"free": provider})
+        store.save_job(
+            JobRecord(
+                spec=_spec("pr-1"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                attempts=1,
+                placement=Placement(
+                    provider_name="free",
+                    job_id="pr-1",
+                    handle={"id": "pr-1"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.run_tick(T1)
+
+        after = store.load_job("pr-1")
+        assert after is not None
+        assert after.state is JobState.RUNNING  # last-known state kept
+        assert after.attempts == 1  # NOT requeued (would bump to 2)
+        assert after.placement is not None  # placement intact
+        assert provider.poll_calls == ["pr-1"]  # it was polled (and raised)
+    finally:
+        store.close()
+
+
+def test_unreachable_collect_leaves_terminal_job_untouched(tmp_path: Path) -> None:
+    """A terminal, unreaped job on a hold-on-terminal backend whose collect raises
+    ``BackendUnreachable`` is left UNTOUCHED — in BOTH the transition tick and the
+    give-up revisit. An unreachable backend says nothing about whether the
+    resource is gone, so the give-up heuristic does not apply: no collect success,
+    no reap, no reaped flag."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "mk",
+            slots=[],
+            collect_error=BackendUnreachable("no key"),
+            reap=ReapPolicy(hold_on_terminal=True),
+        )
+        control = Control(store, {"mk": provider}, outputs_dir=tmp_path / "cache")
+        store.save_job(
+            JobRecord(
+                spec=_spec("un-1"),
+                state=JobState.SUCCEEDED,
+                submitted_at=T0,
+                reaped=False,
+                placement=Placement(
+                    provider_name="mk",
+                    job_id="un-1",
+                    handle={"id": "un-1"},
+                    state=JobStatus.SUCCEEDED,
+                ),
+            )
+        )
+
+        # Two ticks: the second is the give-up revisit. Both must leave it be.
+        control.run_tick(T1)
+        control.run_tick(T2)
+
+        after = store.load_job("un-1")
+        assert after is not None
+        assert after.reaped is False
+        assert after.outputs_cached_to is None
+        assert provider.cancel_calls == []  # never released
+    finally:
+        store.close()
+
+
+def test_reap_failure_keeps_record_unreaped_until_reachable(tmp_path: Path) -> None:
+    """Collect succeeds but the reap raises ``BackendUnreachable``: persist
+    ``outputs_cached_to`` (so a later tick skips straight to the reap retry) with
+    ``reaped=False``. Once the backend is reachable again, the next tick's reap
+    goes through and marks it reaped."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "mk",
+            slots=[],
+            cancel_error=BackendUnreachable("no key"),
+            reap=ReapPolicy(hold_on_terminal=True),
+        )
+        outputs_dir = tmp_path / "cache"
+        control = Control(store, {"mk": provider}, outputs_dir=outputs_dir)
+        store.save_job(
+            JobRecord(
+                spec=_spec("rf-1"),
+                state=JobState.SUCCEEDED,
+                submitted_at=T0,
+                reaped=False,
+                placement=Placement(
+                    provider_name="mk",
+                    job_id="rf-1",
+                    handle={"id": "rf-1"},
+                    state=JobStatus.SUCCEEDED,
+                ),
+            )
+        )
+
+        control.run_tick(T1)  # collect ok, reap unreachable
+        mid = store.load_job("rf-1")
+        assert mid is not None
+        assert mid.outputs_cached_to == str(outputs_dir / "rf-1")  # collected
+        assert mid.reaped is False  # reap did NOT go through
+        assert provider.collect_calls == [("rf-1", outputs_dir / "rf-1")]
+
+        provider.cancel_error = None
+        control.run_tick(T2)  # backend reachable now → reap retry succeeds
+        after = store.load_job("rf-1")
+        assert after is not None
+        assert after.reaped is True
+        # collect not repeated — it went straight to the reap retry.
+        assert provider.collect_calls == [("rf-1", outputs_dir / "rf-1")]
+        assert ("rf-1", CancelMode.FORCE) in provider.cancel_calls
+    finally:
+        store.close()
+
+
+def test_cancel_wait_with_unreachable_backend_keeps_reaped_false(
+    tmp_path: Path,
+) -> None:
+    """A wait=True cancel whose ``provider.cancel`` raises (backend unreachable)
+    marks the job CANCELLED but keeps ``reaped=False``, so the next tick's
+    terminal catch-up finishes the teardown once the backend is reachable."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "mk",
+            slots=[_free_slot()],
+            cancel_error=BackendUnreachable("no key"),
+            reap=ReapPolicy(hold_on_terminal=True),
+        )
+        control = Control(store, {"mk": provider}, outputs_dir=tmp_path / "cache")
+        store.save_job(
+            JobRecord(
+                spec=_spec("cw-1"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="mk",
+                    job_id="cw-1",
+                    handle={"id": "cw-1"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.cancel("cw-1", T1)  # wait=True; provider.cancel raises
+
+        mid = store.load_job("cw-1")
+        assert mid is not None
+        assert mid.state is JobState.CANCELLED
+        assert mid.reaped is False  # teardown never went through
+
+        provider.cancel_error = None
+        control.run_tick(T2)  # catch-up finishes the teardown
+        after = store.load_job("cw-1")
+        assert after is not None
+        assert after.reaped is True
     finally:
         store.close()

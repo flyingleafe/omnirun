@@ -5,7 +5,9 @@ A ``Provider`` is the pure scheduler's view of an execution target: it offers
 answers ``poll``/``cancel``/``stream_logs``/``collect_outputs`` about the
 resulting ``Placement``. Everything above this seam speaks only in the small
 display-and-decision models (``Slot``/``Placement``/``Status``/``ProviderFacts``/
-``CancelMode``) — never a concrete ``Backend``.
+``CancelMode``) plus the two seam errors (``CapacityError``,
+``BackendUnreachable`` — re-exported here so callers never import the backends
+package) — never a concrete ``Backend``.
 
 The one bridge from this seam to today's eight ``Backend`` implementations is
 ``omnirun.providers.adapter.BackendProvider``; the pure ``tick`` never rewrites a
@@ -18,6 +20,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
 
+# Part of the seam contract: any provider method may raise it to say "this
+# environment cannot contact/authenticate the target at all — its state is
+# unknown, change nothing". Re-exported so seam consumers (control) never
+# import the backends package.
+from omnirun.backends.base import BackendUnreachable as BackendUnreachable
 from omnirun.models import (
     CancelMode,
     JobRecord,

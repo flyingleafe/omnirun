@@ -29,7 +29,12 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
-from omnirun.backends.base import Backend, CapacityError, ProvisioningSink
+from omnirun.backends.base import (
+    Backend,
+    BackendUnreachable,
+    CapacityError,
+    ProvisioningSink,
+)
 from omnirun.models import (
     Availability,
     Capabilities,
@@ -247,9 +252,16 @@ class BackendProvider:
 
     @staticmethod
     def _try(fn: Callable[[], None]) -> None:
-        """Run *fn*, swallowing exceptions (best-effort cancel/reap stages)."""
+        """Run *fn*, swallowing exceptions (best-effort cancel/reap stages).
+
+        A ``BackendUnreachable`` is the one exception NOT swallowed: it means the
+        stage was never even attempted (the backend could not be contacted), so
+        the caller must know rather than proceed as if the teardown happened.
+        """
         try:
             fn()
+        except BackendUnreachable:
+            raise  # nothing was done — the caller must not proceed as if it was
         except Exception:
             _log.warning("cancel/reap stage raised; continuing", exc_info=True)
 

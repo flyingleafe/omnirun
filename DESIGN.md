@@ -650,6 +650,21 @@ declared by each `Backend`; the core never knows *why*, only what to do):
   force-release to reclaim its slot; `False` means a LOST poll may be a transient
   blip on a still-alive job that must never be killed from here.
 
+**BackendUnreachable — "cannot sync → change nothing"**
+(`backends.base.BackendUnreachable`, a `BackendError` subclass). When this
+environment cannot even contact/authenticate a backend (missing/invalid API key,
+network transport failure), the true state of that backend's jobs and resources
+is UNKNOWN, so the core makes NO state-changing decision about them: a poll that
+raises it keeps the last-known state (never requeues — definitive requeues come
+only from an authoritative LOST status), and a collect/reap that raises it leaves
+the record untouched (no `reaped` flag), warning and leaving the work for an
+environment that can reach the backend. A collect that succeeded but a reap that
+then failed keeps the outputs (`outputs_cached_to` set, `reaped=False`) so a
+later tick retries only the reap. Concretely, marketplace `pull_outputs` never
+converts a SUCCESSFUL pull into a failure: a failing auto-terminate is logged
+(the instance is still billing) and the reap stage retries it — the pulled paths
+are always returned.
+
 **Cancel (`wait`).** `cancel(wait=True)` (default) runs the full
 graceful→force→reap inline and saves the record `reaped=True` (so reconcile's
 terminal catch-up doesn't revisit a released placement). `cancel(wait=False)`

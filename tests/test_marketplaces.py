@@ -14,7 +14,7 @@ import pytest
 import respx
 
 from omnirun.backends import jobdir, marketplace
-from omnirun.backends.base import BackendError
+from omnirun.backends.base import BackendError, BackendUnreachable
 from omnirun.backends.runpod import (
     GRAPHQL_URL,
     REST_BASE,
@@ -245,6 +245,15 @@ def test_runpod_probe_missing_key(monkeypatch):
     assert len(offers) == 1
     assert not offers[0].fits
     assert "RUNPOD_API_KEY" in offers[0].unfit_reasons[0]
+
+
+def test_require_key_missing_raises_backend_unreachable(monkeypatch):
+    """A missing API key means this environment cannot authenticate the backend,
+    so ``_require_key`` raises ``BackendUnreachable`` (the true job/resource state
+    is UNKNOWN) — NOT a plain BackendError, so the core changes nothing."""
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    with pytest.raises(BackendUnreachable, match="RUNPOD_API_KEY"):
+        runpod_backend()._require_key()
 
 
 @respx.mock
@@ -561,6 +570,30 @@ def test_runpod_pull_outputs_auto_terminates(fake_ssh, monkeypatch, tmp_path):
     paths = runpod_backend().pull_outputs(make_handle(), tmp_path)
     assert paths == [tmp_path / "result.txt"]
     assert delete.called
+
+
+@respx.mock
+def test_pull_outputs_terminate_failure_does_not_poison_successful_pull(
+    fake_ssh, monkeypatch, tmp_path, caplog
+):
+    """A pull that SUCCEEDED must never be turned into a raise by a failing
+    auto-terminate: pull_outputs returns the pulled paths and only warns. The
+    core's reap stage retries the terminate ("cannot sync → change nothing" is
+    for the reap, not for discarding outputs we already have)."""
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "RUNNING"})
+    )
+    # The terminate (DELETE) fails with a server error — the service answered.
+    respx.delete(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(500, text="terminate boom")
+    )
+    monkeypatch.setattr(
+        jobdir, "pull_outputs", lambda ex, job_dir, dest: [dest / "result.txt"]
+    )
+    with caplog.at_level("WARNING"):
+        paths = runpod_backend().pull_outputs(make_handle(), tmp_path)
+    assert paths == [tmp_path / "result.txt"]  # outputs kept, no raise
+    assert any("still billing" in r.message for r in caplog.records)
 
 
 @respx.mock

@@ -72,6 +72,7 @@ class FakeProvider:
         reap: ReapPolicy | None = None,
         poll_delay_s: float = 0.0,
         cancel_error: Exception | None = None,
+        poll_error: Exception | None = None,
         discover_available_script: list[int | None] | None = None,
     ) -> None:
         self.name = name
@@ -105,6 +106,10 @@ class FakeProvider:
         # whose teardown API flaps, e.g. to prove the catch-up retries a failed
         # release instead of marking the job reaped.
         self.cancel_error: Exception | None = cancel_error
+        # ``poll`` failure injection: raised (after recording the call in
+        # ``poll_calls``) on every poll while set. Mutable mid-test — set/clear it
+        # to model a backend the current environment cannot synchronize with.
+        self.poll_error: Exception | None = poll_error
         self._place_error_script: list[Exception | None] | None = (
             list(place_error_script) if place_error_script is not None else None
         )
@@ -170,6 +175,8 @@ class FakeProvider:
         if self._poll_delay_s:
             time.sleep(self._poll_delay_s)
         self.poll_calls.append(p.job_id)
+        if self.poll_error is not None:
+            raise self.poll_error
         state = self._next_status(p.job_id)
         exit_code = 0 if state is JobStatus.SUCCEEDED else None
         return Status(state=state, exit_code=exit_code)

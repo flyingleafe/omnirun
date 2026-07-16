@@ -48,6 +48,7 @@ Backend config knobs (``[backends.<name>]`` extras): ``image``,
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -59,7 +60,12 @@ import httpx
 from pydantic import BaseModel, Field
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    BackendUnreachable,
+    ProvisioningSink,
+)
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, shell_quote
 from omnirun.repo import local_root_of
@@ -94,6 +100,7 @@ WAIT_ESTIMATE_S = 150.0  # honest ballpark: instance provisioning + image pull
 WAIT_NOTE = "instance provisioning + image pull, typically 2-3 min"
 
 _sleep = time.sleep  # test seam
+_log = logging.getLogger("omnirun.backends.marketplace")
 
 
 class HTTPBackendError(BackendError):
@@ -188,7 +195,7 @@ class MarketplaceBackend(Backend, ABC):
     def _require_key(self) -> str:
         key = self._api_key()
         if not key:
-            raise BackendError(f"{self.name}: set {self._key_env()} (API key)")
+            raise BackendUnreachable(f"{self.name}: set {self._key_env()} (API key)")
         return key
 
     def _request(
@@ -208,7 +215,7 @@ class MarketplaceBackend(Backend, ABC):
                 method, url, json=json_body, headers=hdrs, timeout=HTTP_TIMEOUT_S
             )
         except httpx.HTTPError as e:
-            raise BackendError(f"{self.name}: {method} {url} failed: {e}") from e
+            raise BackendUnreachable(f"{self.name}: {method} {url} failed: {e}") from e
         if resp.status_code >= 400:
             raise HTTPBackendError(
                 f"{self.name}: {method} {url} -> HTTP {resp.status_code}: "
@@ -490,11 +497,16 @@ class MarketplaceBackend(Backend, ABC):
                 if self._get_instance(instance_id) is not None:
                     self._terminate(instance_id)
             except BackendError as e:
-                raise BackendError(
-                    f"{self.name}: outputs pulled to {dest}, but auto-terminate of "
-                    f"instance {instance_id} failed — it is still billing, run "
-                    f"`omnirun gc`. ({e})"
-                ) from e
+                # The pull SUCCEEDED — never trade that for a raise. The core's
+                # reap stage retries the terminate (and reports honestly).
+                _log.warning(
+                    "%s: outputs pulled to %s, but auto-terminate of instance %s "
+                    "failed — it is still billing; the reap will retry (%s)",
+                    self.name,
+                    dest,
+                    instance_id,
+                    e,
+                )
         return paths
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:

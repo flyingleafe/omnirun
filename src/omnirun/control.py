@@ -53,7 +53,12 @@ from omnirun.models import (
     StatusReport,
 )
 from omnirun.budget import LedgerEntry
-from omnirun.providers.base import CancelMode, CapacityError, Provider
+from omnirun.providers.base import (
+    BackendUnreachable,
+    CancelMode,
+    CapacityError,
+    Provider,
+)
 from omnirun.scheduler import SchedPolicy, tick
 from omnirun.state.store import Store
 
@@ -297,9 +302,12 @@ class Control:
 
         ``wait`` controls how thoroughly the placement is torn down HERE:
 
-        * ``wait=True`` (default) — the full graceful/force reap runs inline and
-          the record is saved ``reaped=True`` (the held resource is gone, so
-          reconcile's terminal catch-up must not revisit it).
+        * ``wait=True`` (default) — the full graceful/force reap runs inline and,
+          IF it went through, the record is saved ``reaped=True`` (the held
+          resource is gone, so reconcile's terminal catch-up must not revisit it).
+          If ``provider.cancel`` raised (e.g. the backend was unreachable), the
+          record is saved ``reaped=False`` so the terminal catch-up finishes the
+          teardown from an environment that can reach the backend.
         * ``wait=False`` — a single best-effort ``cancel(wait=False)`` signal is
           sent (no grace loop, no reap), then the record is saved CANCELLED with
           ``reaped=False`` and the placement KEPT. The next tick's
@@ -316,12 +324,14 @@ class Control:
         if rec is None or rec.state.terminal:
             return
         mode = CancelMode.FORCE if force else CancelMode.GRACEFUL
+        cancel_ok = True
         if rec.placement is not None and rec.placement.handle:
             provider = self._providers.get(rec.placement.provider_name)
             if provider is not None:
                 try:
                     provider.cancel(rec.placement, mode, wait=wait)
                 except Exception:
+                    cancel_ok = False
                     _log.warning(
                         "cancel raised for job %s on %s; marking cancelled anyway",
                         job_id,
@@ -344,9 +354,13 @@ class Control:
                     # wait=True force-reaps the placement above, so the held
                     # resource is gone — mark it reaped so reconcile's terminal
                     # catch-up doesn't try to collect from a released placement.
+                    # But only when the reap actually went through: if
+                    # provider.cancel raised (e.g. the backend was unreachable),
+                    # keep reaped=False so ``_catch_up_terminal`` finishes the
+                    # teardown from an environment that can reach the backend.
                     # wait=False only signalled: keep reaped=False so the next
                     # tick's _catch_up_terminal completes the teardown.
-                    "reaped": wait,
+                    "reaped": wait and cancel_ok,
                 }
             )
         )
@@ -455,8 +469,9 @@ class Control:
           fanned out with a per-tick wall budget. A straggler is skipped (state
           kept) so a slow backend can never hang ``ps`` nor requeue a healthy job.
         * **Apply** (main thread): ``_apply_poll`` runs the transition for each
-          finished item — an Exception takes the poll-raised requeue path, a
-          ``Status`` the LOST/terminal/active paths.
+          finished item — an Exception keeps the last-known state (a poll we
+          cannot complete tells us nothing, so we change nothing), a ``Status``
+          the LOST/terminal/active paths.
         """
         to_poll: list[tuple[JobRecord, Placement, Provider]] = []
         for rec in self._store.list_jobs():
@@ -521,16 +536,29 @@ class Control:
         """Persist the transition for one polled placement (main thread).
 
         *outcome* is either the ``Status`` ``poll`` returned or the ``Exception``
-        it raised. An exception takes the poll-raised requeue path; a ``Status``
-        takes the existing LOST / terminal / active paths."""
+        it raised. A poll that raises — for ANY reason — keeps the last-known
+        state (change nothing); definitive requeues come only from an
+        authoritative LOST status below. A ``Status`` takes the existing LOST /
+        terminal / active paths."""
         if isinstance(outcome, Exception):
-            _log.warning(
-                "poll raised for job %s on %s; requeueing",
-                rec.spec.job_id,
-                placement.provider_name,
-                exc_info=(type(outcome), outcome, outcome.__traceback__),
-            )
-            self._requeue(rec, now)
+            # Cannot synchronize with the backend (auth/transport/any raise): the
+            # placement's true state is unknown, so we change NOTHING — keep the
+            # last-known state and let a tick that can reach the backend decide.
+            # Definitive requeues come only from an authoritative LOST status.
+            if isinstance(outcome, BackendUnreachable):
+                _log.warning(
+                    "cannot reach %s to poll job %s (%s); keeping last-known state",
+                    placement.provider_name,
+                    rec.spec.job_id,
+                    outcome,
+                )
+            else:
+                _log.warning(
+                    "poll raised for job %s on %s; keeping last-known state",
+                    rec.spec.job_id,
+                    placement.provider_name,
+                    exc_info=(type(outcome), outcome, outcome.__traceback__),
+                )
             return
         status = outcome
 
@@ -625,6 +653,15 @@ class Control:
         try:
             provider.cancel(placement, CancelMode.FORCE)
             return True
+        except BackendUnreachable as e:
+            _log.warning(
+                "cannot reach %s to release placement of %s (%s); leaving it for an "
+                "environment that can",
+                placement.provider_name,
+                placement.job_id,
+                e,
+            )
+            return False
         except Exception:
             _log.warning(
                 "reap of placement %s on %s raised; continuing",
@@ -690,7 +727,15 @@ class Control:
           resource is already gone (nothing leaked) — releasing is then a harmless
           no-op and the (already lost) outputs cost nothing more.
 
-        Idempotent via ``rec.reaped``: once set, ``_reconcile`` never revisits."""
+        The give-up releases apply only when the backend is REACHABLE. A collect
+        that raises ``BackendUnreachable`` leaves the record UNTOUCHED in both
+        modes — an unreachable backend says nothing about whether the resource is
+        gone, so we change nothing (no reap, no reaped flag). A collect that
+        succeeded but a reap that then failed persists ``outputs_cached_to`` with
+        ``reaped=False``, so a later tick retries just the reap.
+
+        Idempotent via ``rec.reaped``: once set True, ``_reconcile`` never
+        revisits."""
         if self._outputs_dir is None:
             # No durable cache configured (a unit Control): we cannot collect-
             # before-release safely, so leave the resource for `gc`/`cancel`.
@@ -701,6 +746,20 @@ class Control:
             try:
                 provider.collect_outputs(placement, dest)
                 cached_to = str(dest)
+            except BackendUnreachable as e:
+                # We could not even contact the backend, so the give-up heuristic
+                # (a persistently failing collect means the resource is already
+                # gone) does NOT hold — it only holds for a REACHABLE backend.
+                # Change nothing in BOTH give_up modes; leave the record for a
+                # tick that can reach the backend.
+                _log.warning(
+                    "cannot reach %s to collect outputs of terminal job %s (%s); "
+                    "leaving the job untouched",
+                    placement.provider_name,
+                    rec.spec.job_id,
+                    e,
+                )
+                return
             except Exception as e:
                 # Expected when the resource is already gone (reclaimed) — a concise
                 # line, no traceback: on a revisit we release anyway (the tick-event
@@ -719,8 +778,12 @@ class Control:
                     f"{placement.provider_name} placement anyway to free the slot"
                 )
         reaped = self._reap(placement)
+        # ``reaped=True`` is saved ONLY when the release actually went through. If
+        # collect succeeded but the reap did not (e.g. the backend went
+        # unreachable), persist ``outputs_cached_to`` anyway with ``reaped=False``
+        # so the next tick skips straight to the reap retry (never re-collecting).
         self._store.save_job(
-            rec.model_copy(update={"reaped": True, "outputs_cached_to": cached_to})
+            rec.model_copy(update={"reaped": reaped, "outputs_cached_to": cached_to})
         )
         if cached_to is not None and reaped:
             self._tick_events.append(
@@ -729,7 +792,10 @@ class Control:
             )
 
     def _requeue(self, rec: JobRecord, now: datetime) -> None:
-        """Return a lost/failed-to-poll job to QUEUED (``attempts+1``, no placement).
+        """Return a LOST job to QUEUED (``attempts+1``, no placement).
+
+        Called only for an authoritative LOST status — a poll that RAISES keeps
+        the last-known state (we cannot requeue on information we do not have).
 
         If the lost placement was PAID (a ``committed`` ledger row was written for
         it at place time — ``cost_actual is not None``), void that commitment

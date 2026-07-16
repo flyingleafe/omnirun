@@ -42,6 +42,17 @@ class CapacityError(BackendError):
     the reservation and retry on a later tick rather than fail the job."""
 
 
+class BackendUnreachable(BackendError):
+    """The backend service cannot be contacted or authenticated from this
+    environment (missing/invalid API key, network transport failure).
+
+    The true state of the backend's jobs and resources is UNKNOWN — callers
+    must treat any operation that raises this as "no information" and change
+    nothing (no requeue, no release, no reaped flag), leaving the record for
+    an environment that can reach the backend.
+    """
+
+
 @dataclass
 class SSHEndpoint:
     """SSH connection parameters for ``omnirun ssh <job>``.
