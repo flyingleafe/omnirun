@@ -73,6 +73,55 @@ class _FakeBackend(Backend):
         return [dest / "result.txt"]
 
 
+class _LiveLogBackend(Backend):
+    """A backend whose ``logs(follow=True)`` streams over time until the job goes
+    terminal — exercises the daemon's live ingestor and SSE fan-out. One instance
+    per name (the daemon memoizes it), so per-job terminal events are shared."""
+
+    def __init__(self, name: str, config: BackendConfig, *, runs: int = 3) -> None:
+        super().__init__(name, config)
+        self._runs = runs
+        self._polls: dict[str, int] = {}
+        self._terminal: dict[str, threading.Event] = {}
+
+    def _ev(self, job_id: str) -> threading.Event:
+        return self._terminal.setdefault(job_id, threading.Event())
+
+    def probe(self, res: ResourceSpec) -> list[Offer]:
+        return [Offer(backend=self.name, label=f"{self.name}: box", fits=True)]
+
+    def submit(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+    ) -> JobHandle:
+        return JobHandle(backend=self.name, job_id=spec.job_id, data={"t": spec.job_id})
+
+    def status(self, handle: JobHandle) -> StatusReport:
+        n = self._polls.get(handle.job_id, 0) + 1
+        self._polls[handle.job_id] = n
+        if n <= self._runs:
+            return StatusReport(status=JobStatus.RUNNING)
+        self._ev(handle.job_id).set()  # release the follow generator
+        return StatusReport(status=JobStatus.SUCCEEDED, exit_code=0)
+
+    def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
+        yield f"start {handle.job_id}"
+        i = 0
+        while follow and not self._ev(handle.job_id).is_set():
+            yield f"tick {i}"
+            i += 1
+            time.sleep(0.02)
+        yield "end"
+
+    def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        self._ev(handle.job_id).set()
+
+    def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
+        return []
+
+
 def _spec(name: str = "job") -> JobSpec:
     return JobSpec(
         job_id=JobSpec.make_job_id(name),
@@ -109,6 +158,100 @@ def daemon_url(tmp_path: Path) -> Iterator[str]:
     finally:
         daemon.shutdown()
         thread.join(timeout=5.0)
+
+
+@pytest.fixture
+def live_daemon(tmp_path: Path) -> Iterator[tuple[str, Daemon]]:
+    cfg = Config(
+        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.05),
+        backends={"live": BackendConfig(type="live", max_parallel=4)},
+    )
+    daemon = Daemon(
+        cfg,
+        state_dir=tmp_path,
+        backend_factory=lambda n, b: _LiveLogBackend(n, b, runs=3),
+    )
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    port = None
+    for _ in range(500):
+        p = _daemon_json_path(tmp_path)
+        if p.exists():
+            port = json.loads(p.read_text())["port"]
+            break
+        time.sleep(0.01)
+    assert port is not None
+    try:
+        yield f"http://127.0.0.1:{port}", daemon
+    finally:
+        daemon.shutdown()
+        thread.join(timeout=5.0)
+
+
+def _live_spec(name: str) -> JobSpec:
+    return JobSpec(
+        job_id=JobSpec.make_job_id(name),
+        name=name,
+        command="python train.py",
+        repo=RepoRef(remote_url="", sha="a" * 40, branch="main", slug="proj"),
+        code=CodePlan(kind="local", origin=""),
+    )
+
+
+def test_live_ingest_is_durable_after_terminal(live_daemon: tuple[str, Daemon]) -> None:
+    """A RUNNING job's log is ingested live to a durable file; once the job settles
+    (compute freed), a fresh `logs` read still returns the full captured log."""
+    url, _daemon = live_daemon
+    client = RemoteClient(url)
+    try:
+        outcome = client.submit(_live_spec("dur"))
+        # Wait for the job to settle AND its ingestor to finish flushing the durable
+        # log (the scheduler's sync sets logs_cached_to just after terminal).
+        rec = client.status(outcome.job_id)
+        for _ in range(300):
+            rec = client.status(outcome.job_id)
+            if rec.state is JobState.SUCCEEDED and rec.logs_cached_to is not None:
+                break
+            time.sleep(0.05)
+        assert rec.state is JobState.SUCCEEDED
+        # logs_cached_to points at the durable ingest copy for this non-holding
+        # backend, and a read after the session is gone returns the full log.
+        assert rec.logs_cached_to is not None
+        lines = list(client.logs(rec, follow=False))
+        assert any("start" in ln for ln in lines)
+        assert "end" in lines
+    finally:
+        client.close()
+
+
+def test_logs_follow_fans_out_to_two_clients(live_daemon: tuple[str, Daemon]) -> None:
+    """Two concurrent `logs -f` viewers both receive the full stream off the ONE
+    backend tail the daemon runs (SSE fan-out)."""
+    url, _daemon = live_daemon
+    submit_client = RemoteClient(url)
+    outcome = submit_client.submit(_live_spec("fan"))
+    rec = submit_client.resolve_job(outcome.job_id)
+
+    results: list[list[str]] = [[], []]
+
+    def _follow(idx: int) -> None:
+        c = RemoteClient(url)
+        try:
+            for line in c.logs(rec, follow=True):
+                results[idx].append(line)
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=_follow, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15.0)
+
+    submit_client.close()
+    for got in results:
+        assert any("start" in ln for ln in got), got
+        assert "end" in got, got
 
 
 def test_submit_ps_status_roundtrip(daemon_url: str) -> None:

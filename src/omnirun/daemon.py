@@ -31,9 +31,10 @@ from typing import Any, Callable
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from omnirun.backends.base import Backend, BackendError, make_backend
-from omnirun.client import LocalClient
+from omnirun.client import LocalClient, handle_of
 from omnirun.config import Config, ConfigError
-from omnirun.models import DeployKey, JobSpec, ResourceSpec
+from omnirun.logingest import LogIngestManager, tail_file
+from omnirun.models import DeployKey, JobSpec, JobState, ResourceSpec
 from omnirun.repo import RepoError
 from omnirun.state import default_store_dir
 
@@ -142,6 +143,10 @@ class Daemon:
         self._wake = threading.Event()
         self._server: WSGIServer | None = None
         self._scheduler_thread: threading.Thread | None = None
+        # Live log ingestion: the daemon is the sole tailer of any worker. One
+        # ingestor per RUNNING job appends the backend's stream to a durable file
+        # under $STATE/logs; the SSE endpoint fans that file out to every viewer.
+        self._ingest = LogIngestManager(self.state_root / "logs", self._make_tail_fn)
         self._app = self._build_app()
 
     # --- lifecycle --------------------------------------------------------
@@ -162,6 +167,7 @@ class Daemon:
             self._wake.set()
             if self._scheduler_thread is not None:
                 self._scheduler_thread.join(timeout=5.0)
+            self._ingest.stop_all()
             self._core.close()
             self._remove_daemon_json()
 
@@ -204,6 +210,7 @@ class Daemon:
                 with self._lock:
                     for event in self._core.tick():
                         _log.info("%s", event)
+                self._sync_ingestors()
             except Exception:  # a tick failure must never kill the scheduler
                 _log.warning("scheduler tick raised; continuing", exc_info=True)
             self._wake.wait(self.poll_interval)
@@ -212,6 +219,51 @@ class Daemon:
     def wake(self) -> None:
         """Ask the scheduler for an immediate round (a client just wrote a job)."""
         self._wake.set()
+
+    # --- live log ingestion ----------------------------------------------
+
+    def _make_tail_fn(self, job_id: str) -> Callable[[], Any]:
+        """A zero-arg factory yielding *job_id*'s live backend log lines.
+
+        Resolved lazily (at ingestor start) against the current record so it picks
+        up the placement handle. The backend follow-generator self-terminates when
+        the job goes terminal, ending the ingestor."""
+
+        def _tail() -> Any:
+            with self._lock:
+                rec = self._core._store().load_job(job_id)
+            if rec is None:
+                return
+            handle = handle_of(rec)
+            if handle is None:
+                return
+            backend = self._core.backend_for(handle.backend)
+            yield from backend.logs(handle, follow=True)
+
+        return _tail
+
+    def _sync_ingestors(self) -> None:
+        """Reconcile the live ingestor set with the RUNNING jobs, and — for a job
+        whose ingestor just finished — point ``logs_cached_to`` at the durable live
+        file UNLESS the reconciler already captured an authoritative snapshot.
+
+        For a hold-on-terminal backend the reconciler reads the complete log once
+        at terminal (into ``<id>.log``) and sets ``logs_cached_to`` before reaping,
+        so we leave that in place; for a non-holding backend nothing else captures
+        the log, so the ingestor's ``<id>.live.log`` becomes the durable copy."""
+        with self._lock:
+            running = {
+                rec.spec.job_id
+                for rec in self._core._store().list_jobs()
+                if rec.state is JobState.RUNNING and rec.placement is not None
+            }
+        for job_id, path in self._ingest.sync(running):
+            with self._lock:
+                rec = self._core._store().load_job(job_id)
+                if rec is not None and not rec.logs_cached_to and path.is_file():
+                    self._core._store().save_job(
+                        rec.model_copy(update={"logs_cached_to": str(path)})
+                    )
 
     # --- HTTP app ---------------------------------------------------------
 
@@ -400,16 +452,45 @@ class Daemon:
             follow = bottle.request.query.get("follow") == "1"
             with d._lock:
                 rec = d._core.resolve_job(jid)
+            job_id = rec.spec.job_id
             bottle.response.content_type = "text/event-stream"
             bottle.response.set_header("Cache-Control", "no-cache")
             bottle.response.set_header("X-Accel-Buffering", "no")
 
+            # The daemon is the sole tailer: a RUNNING job streams from its live
+            # ingest file (fanned out to every viewer off ONE backend tail); a
+            # finished job serves its durable ``logs_cached_to`` (the reconciler's
+            # complete snapshot, or the ingestor's live file for non-holding
+            # backends). Only a job this daemon never ingested falls back to a
+            # direct one-shot tail through the core.
+            live_path = d._ingest.path_for(job_id)
+            active = d._ingest.is_active(job_id)
+            cached = (
+                Path(rec.logs_cached_to)
+                if rec.logs_cached_to and Path(rec.logs_cached_to).is_file()
+                else None
+            )
+
             def _events() -> Any:
-                # SSE: one `data:` frame per log line; a trailing sentinel event
-                # marks the stream complete so the client stops cleanly. The core
-                # serves a reaped job from its cached copy, or live-tails otherwise.
-                for line in d._core.logs(rec, follow=follow):
-                    yield f"data: {line.rstrip(chr(10))}\n\n"
+                # SSE: one `data:` frame per line; a trailing `eof` event lets the
+                # client stop cleanly. Order matters: a live (RUNNING) job follows
+                # its ingest file; a finished job prefers the authoritative cached
+                # snapshot (complete even when the live tail was cut short by reap),
+                # then the live file, then a direct one-shot tail.
+                if active:
+                    for line in tail_file(
+                        live_path, lambda: follow and d._ingest.is_active(job_id)
+                    ):
+                        yield f"data: {line.rstrip(chr(10))}\n\n"
+                elif cached is not None:
+                    for line in tail_file(cached, lambda: False):
+                        yield f"data: {line.rstrip(chr(10))}\n\n"
+                elif live_path.is_file():
+                    for line in tail_file(live_path, lambda: False):
+                        yield f"data: {line.rstrip(chr(10))}\n\n"
+                else:
+                    for line in d._core.logs(rec, follow=follow):
+                        yield f"data: {line.rstrip(chr(10))}\n\n"
                 yield "event: eof\ndata: \n\n"
 
             return _events()
