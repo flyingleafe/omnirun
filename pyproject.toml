@@ -18,7 +18,8 @@ dependencies = [
 kaggle = ["kaggle>=2.2"]
 colab = ["google-colab-cli>=0.6"]
 postgres = ["psycopg[binary]>=3.1"]
-all = ["omnirun[kaggle,colab,postgres]"]
+daemon = ["bottle>=0.13"]
+all = ["omnirun[kaggle,colab,postgres,daemon]"]
 
 [project.scripts]
 omnirun = "omnirun.cli:app"
@@ -30,6 +31,7 @@ dev = [
     "respx>=0.21",
     "kaggle>=2.2",
     "hypothesis>=6.100",
+    "bottle>=0.13",
 ]
 
 [build-system]

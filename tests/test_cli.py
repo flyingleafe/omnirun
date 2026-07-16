@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 import types
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -13,8 +11,6 @@ from typing import ClassVar
 import pytest
 from typer.testing import CliRunner
 
-from omnirun.config import load_config
-from omnirun.daemon import Daemon, daemon_address, send_request
 
 from omnirun.backends.base import (
     Backend,
@@ -1149,31 +1145,20 @@ def test_list_is_an_alias_for_ps(env):
     assert job_id in result.output
 
 
-def test_enqueue_daemon_timeout_is_friendly_not_traceback(env, monkeypatch):
-    """A daemon that accepts the connection but never answers must yield a red
-    one-liner, never a raw traceback (M-6). `send_request` (the tick nudge)
-    converts the socket timeout to a ConnectionError, which `friendly_errors`
-    renders."""
-    monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
-
-    def _raise(*a, **k):
-        raise ConnectionError("omnirun daemon at 127.0.0.1:9 did not respond")
-
-    monkeypatch.setattr("omnirun.cli.send_request", _raise)
-    result = runner.invoke(app, ["enqueue", "--", "python", "train.py"])
+def test_enqueue_daemon_unreachable_is_friendly_not_traceback(env):
+    """With a daemon configured but not listening, enqueue's POST fails as a red
+    one-liner, never a raw traceback (M-6)."""
+    result = runner.invoke(
+        app, ["--daemon", "127.0.0.1:9", "enqueue", "--", "python", "train.py"]
+    )
     assert result.exit_code == 1
     assert "Traceback" not in result.output
-    assert "did not respond" in result.output
+    assert "cannot reach the omnirun daemon" in result.output
 
 
-def test_enqueue_writes_jobs_and_nudges_daemon(env, monkeypatch):
-    """enqueue builds specs client-side, writes them to the shared store via
-    Control.submit, and sends ONE tick nudge. No queue table involved."""
-    monkeypatch.setattr("omnirun.cli._require_daemon", lambda: ("127.0.0.1", 9))
-    nudges: list[dict] = []
-    monkeypatch.setattr(
-        "omnirun.cli.send_request", lambda host, port, req: nudges.append(req)
-    )
+def test_enqueue_writes_jobs_daemonless_with_hint(env):
+    """Daemonless, enqueue builds specs client-side and writes them QUEUED to the
+    store (unplaced), then hints that a daemon/tick is needed to place them."""
     result = runner.invoke(
         app, ["enqueue", "--count", "2", "--backend", "stub", "--", "python", "t.py"]
     )
@@ -1182,17 +1167,18 @@ def test_enqueue_writes_jobs_and_nudges_daemon(env, monkeypatch):
     assert len(recs) == 2
     assert all(r.state is JobState.QUEUED for r in recs)
     assert all(r.spec.only_backend == "stub" for r in recs)
-    # Exactly one tick nudge, and it is a `tick` command.
-    assert nudges == [{"cmd": "tick"}]
+    assert all(r.placement is None for r in recs)  # enqueue never places
+    assert "no daemon configured" in result.output
 
 
-def test_enqueue_requires_a_running_daemon(env, monkeypatch):
-    """Without a live daemon nothing would place the jobs — error out."""
-    monkeypatch.setattr("omnirun.cli.daemon_address", lambda: None)
-    result = runner.invoke(app, ["enqueue", "--", "python", "train.py"])
-    assert result.exit_code == 1
-    assert "no omnirun daemon running" in result.output
-    assert _store().list_jobs() == []
+def test_tick_places_enqueued_jobs(env):
+    """`omnirun tick` drives one scheduling round that places enqueued jobs."""
+    runner.invoke(app, ["enqueue", "--backend", "stub", "--", "python", "t.py"])
+    result = runner.invoke(app, ["tick"])
+    assert result.exit_code == 0, result.output
+    [job_id] = _store().list_job_ids()
+    rec = _store().load_job(job_id)
+    assert rec is not None and rec.state is JobState.RUNNING
 
 
 def test_queue_lists_store_jobs_without_a_daemon(env):
@@ -1292,13 +1278,13 @@ def test_queue_cancel_by_id_is_not_project_scoped(env):
     assert rec is not None and rec.state is JobState.CANCELLED
 
 
-def test_queue_wait_requires_a_running_daemon(env, monkeypatch):
-    """--wait needs a daemon to advance jobs; without one it errors, not spins."""
-    monkeypatch.setattr("omnirun.cli.daemon_address", lambda: None)
+def test_queue_wait_requires_a_running_daemon(env):
+    """--wait needs a daemon to advance jobs; with none configured it errors, not
+    spins."""
     submit_one()
     result = runner.invoke(app, ["queue", "--wait"])
     assert result.exit_code == 1
-    assert "no omnirun daemon running" in result.output
+    assert "no daemon configured" in result.output
 
 
 # ------------------------------------------------------------------ P2: cancel --no-wait
@@ -1332,132 +1318,27 @@ def test_cli_cancel_no_wait_signals_then_next_read_reaps(env):
     assert after.reaped is True
 
 
-# ------------------------------------------------------------------ P2: daemon-aware fast paths
-
-
-def _spin_daemon(state_dir: Path, config_file: Path) -> tuple[Daemon, threading.Thread]:
-    """Start a real Daemon over the CLI's shared store/state dir in a thread,
-    returning ``(daemon, thread)``. The caller shuts it down. The daemon's DB is
-    ``{state_dir}/omnirun.db`` — the SAME file the CLI opens by default."""
-    cfg = load_config(config_file)
-    cfg.daemon.host = "127.0.0.1"
-    cfg.daemon.port = 0
-    cfg.daemon.poll_interval_s = 0.02
-    daemon = Daemon(cfg, state_dir=state_dir)
-    thread = threading.Thread(target=daemon.serve, daemon=True)
-    thread.start()
-    for _ in range(500):
-        if daemon_address(state_dir) is not None:
-            break
-        time.sleep(0.01)
-    assert daemon_address(state_dir) is not None, "daemon never came up"
-    return daemon, thread
-
-
-def _shutdown_daemon(daemon: Daemon, thread: threading.Thread) -> None:
-    send_request(daemon.host, daemon.port, {"cmd": "shutdown"})
-    thread.join(timeout=5.0)
-
-
-# The CLI↔daemon coupling below was driven by a local ``daemon.json``+pid probe.
-# The thin-client refactor replaces that with config-driven selection
-# (``[daemon].address`` → a RemoteClient that proxies to the daemon). These three
-# are rewritten against that model in Phase C, when RemoteClient lands; the daemon
-# core itself stays covered by tests/test_queue.py. Until then they are skipped:
-# with no ``[daemon].address`` configured the CLI now always runs daemonless, so a
-# stray local daemon is (intentionally) ignored.
-_PHASE_C = "rewritten for config-driven RemoteClient in Phase C (daemon RPC)"
-
-
-@pytest.mark.skip(reason=_PHASE_C)
-def test_ps_with_live_daemon_skips_the_local_tick(env, monkeypatch):
-    """With a remote daemon configured, `ps` reads through it (the daemon is the
-    catch-up) and does NOT drive its own tick."""
-    import omnirun.cli as cli_mod
-
-    built: list[object] = []
-    real_control = cli_mod._control  # pyright: ignore[reportAttributeAccessIssue]
-
-    def _spy_control(*args, **kwargs):
-        built.append(1)
-        return real_control(*args, **kwargs)
-
-    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
-    try:
-        job_id = submit_one()  # daemon (alive) places it via the nudge
-        for _ in range(500):
-            rec = _store().load_job(job_id)
-            if rec is not None and rec.state is JobState.RUNNING:
-                break
-            time.sleep(0.01)
-
-        monkeypatch.setattr(cli_mod, "_control", _spy_control)
-        result = runner.invoke(app, ["ps"])
-        assert result.exit_code == 0, result.output
-        assert job_id in result.output
-        assert built == []
-    finally:
-        _shutdown_daemon(daemon, thread)
-
-
-@pytest.mark.skip(reason=_PHASE_C)
-def test_submit_with_live_daemon_returns_quickly_and_daemon_places(env):
-    """With a remote daemon configured, `submit` (no --wait) writes QUEUED, nudges
-    the daemon, and prints the hand-off line — the daemon then places the job."""
-    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
-    try:
-        result = runner.invoke(app, ["submit", "--", "python", "train.py"])
-        assert result.exit_code == 0, result.output
-        assert "a running daemon is placing it" in result.output
-
-        [job_id] = _store().list_job_ids()
-        placed = False
-        for _ in range(500):
-            rec = _store().load_job(job_id)
-            if rec is not None and rec.placement is not None and rec.placement.handle:
-                placed = True
-                break
-            time.sleep(0.01)
-        assert placed, "the daemon did not place the nudged job"
-    finally:
-        _shutdown_daemon(daemon, thread)
-
-
-@pytest.mark.skip(reason=_PHASE_C)
-def test_submit_wait_blocks_until_running(env):
-    """`submit --wait` blocks until the daemon drives the job to RUNNING, then
-    prints the running line and exits 0."""
-    daemon, thread = _spin_daemon(env.state_dir, env.config_file)
-    try:
-        result = runner.invoke(app, ["submit", "--wait", "--", "python", "train.py"])
-        assert result.exit_code == 0, result.output
-        assert "running" in result.output
-        [job_id] = _store().list_job_ids()
-        rec = _store().load_job(job_id)
-        assert rec is not None and rec.state is JobState.RUNNING
-    finally:
-        _shutdown_daemon(daemon, thread)
-
-
 # ---------------------------------------- daemon-address selection (flags/env/toml)
 
 
 def test_cli_daemon_flag_selects_remote(env):
-    """`--daemon host:port` overrides config to select the (not-yet-wired) remote
-    client — proving the flag takes effect, as a friendly error not a traceback."""
-    result = runner.invoke(app, ["--daemon", "10.0.0.9:8787", "ps"])
+    """`--daemon host:port` overrides config to select the remote client; with no
+    daemon listening the connection fails as a friendly one-liner, not a traceback
+    (proving the flag routed us to RemoteClient, not the local store)."""
+    result = runner.invoke(app, ["--daemon", "127.0.0.1:9", "ps"])
     assert result.exit_code == 1
     assert "Traceback" not in result.output
-    assert "remote daemon client is not wired yet" in result.output
+    assert "cannot reach the omnirun daemon" in result.output
 
 
 def test_cli_local_flag_forces_daemonless(env):
     """`--local` ignores a configured daemon address and runs daemonless."""
-    env.config_file.write_text(BASE_CONFIG + '\n[daemon]\naddress = "10.0.0.9:8787"\n')
-    # Without --local the configured address selects the (unwired) remote client.
+    env.config_file.write_text(BASE_CONFIG + '\n[daemon]\naddress = "127.0.0.1:9"\n')
+    # Without --local the configured address selects the remote client (which then
+    # cannot reach the dead port — a connection error, not a store read).
     remote = runner.invoke(app, ["ps"])
     assert remote.exit_code == 1
-    assert "not wired yet" in remote.output
+    assert "cannot reach the omnirun daemon" in remote.output
     # With --local it runs daemonless and reads the (empty) store.
     result = runner.invoke(app, ["--local", "ps"])
     assert result.exit_code == 0, result.output
@@ -1472,10 +1353,10 @@ def test_cli_daemon_and_local_are_mutually_exclusive(env):
 
 def test_cli_daemon_env_selects_remote(env, monkeypatch):
     """`OMNIRUN_DAEMON_ADDRESS` selects the remote client (env over TOML default)."""
-    monkeypatch.setenv("OMNIRUN_DAEMON_ADDRESS", "10.0.0.9:8787")
+    monkeypatch.setenv("OMNIRUN_DAEMON_ADDRESS", "127.0.0.1:9")
     result = runner.invoke(app, ["ps"])
     assert result.exit_code == 1
-    assert "not wired yet" in result.output
+    assert "cannot reach the omnirun daemon" in result.output
     # An explicit --local still wins over the env var.
     override = runner.invoke(app, ["--local", "ps"])
     assert override.exit_code == 0, override.output

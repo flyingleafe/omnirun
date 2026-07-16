@@ -7,8 +7,10 @@ The CLI is thin: it parses flags, does *local* git-repo work, and then calls a
   over a local :class:`~omnirun.state.store.Store` and the configured backends, so
   every verb runs synchronously in the CLI process (it holds the backend
   credentials). This is the behavior the CLI had inline before the split.
-* ``RemoteClient`` — a thin JSON-RPC proxy to a running daemon that owns the
-  store, the state machine, and the credentials (lands in a later phase).
+* :class:`RemoteClient` — a thin HTTP proxy to a running daemon that owns the
+  store, the state machine, and the credentials. It does its local git work
+  (repo capture, code-plan resolution) then sends fully-formed requests, so it
+  needs no store access and no backend credentials of its own.
 
 :func:`make_client` picks between them by whether ``[daemon].address`` is
 configured — never by probing for a local pid.
@@ -44,6 +46,25 @@ from omnirun.models import (
 from omnirun.providers import BackendProvider, Provider
 from omnirun.state import Store, open_store
 from omnirun.state.store import default_store_dir
+
+
+GetKey = Callable[[str], "DeployKey | None"]
+RegisterKey = Callable[["DeployKey"], None]
+
+
+def resolve_spec_code(
+    spec: JobSpec, get_key: GetKey, register_key: RegisterKey
+) -> JobSpec:
+    """Stamp a resolved ``CodePlan`` onto *spec* if it has none yet.
+
+    Runs client-side in BOTH modes (it needs the caller's local ``gh``/git): the
+    daemon never re-resolves — it receives a spec whose ``code`` is already set and
+    only injects the deploy-key MATERIAL from its store at place time. Idempotent:
+    a spec that already carries a plan is returned unchanged."""
+    if spec.code is not None:
+        return spec
+    plan = resolve_code_plan(spec.repo, get_key=get_key, register_key=register_key)
+    return spec.model_copy(update={"code": plan})
 
 
 def handle_of(rec: JobRecord) -> JobHandle | None:
@@ -142,8 +163,14 @@ class Client(Protocol):
 # --------------------------------------------------------------------------- local
 
 
+BackendFactory = Callable[[str, Any], Backend]
+
+
 def _make_backends(
-    cfg: Config, only: str | None, config_path: Path | None
+    cfg: Config,
+    only: str | None,
+    config_path: Path | None,
+    factory: BackendFactory = make_backend,
 ) -> tuple[dict[str, Backend], list[Offer]]:
     """Construct enabled backends; a backend whose constructor fails becomes a
     synthetic unfit offer instead of killing the whole command."""
@@ -162,7 +189,7 @@ def _make_backends(
     broken: list[Offer] = []
     for name, bcfg in sections.items():
         try:
-            backends[name] = make_backend(name, bcfg)
+            backends[name] = factory(name, bcfg)
         except Exception as e:
             broken.append(
                 Offer(
@@ -218,9 +245,18 @@ class LocalClient:
     matching the per-command store lifetime the CLI had before the split.
     """
 
-    def __init__(self, cfg: Config, *, config_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        config_path: Path | None = None,
+        backend_factory: BackendFactory = make_backend,
+        outputs_dir: Path | None = None,
+    ) -> None:
         self.cfg = cfg
         self._config_path = config_path
+        self._backend_factory = backend_factory
+        self._outputs_dir = outputs_dir or (default_store_dir() / "outputs")
         self._store_obj: Store | None = None
 
     # -- infra --
@@ -240,7 +276,9 @@ class LocalClient:
         Every lifecycle verb drives this same ``Control.run_tick`` — the daemon
         differs only in cadence, never in what a transition means. ``backend``
         narrows the provider set (``--backend``)."""
-        backends, _broken = _make_backends(self.cfg, backend, self._config_path)
+        backends, _broken = _make_backends(
+            self.cfg, backend, self._config_path, self._backend_factory
+        )
         providers: dict[str, Provider] = {
             name: BackendProvider(be, self._store()) for name, be in backends.items()
         }
@@ -249,7 +287,7 @@ class LocalClient:
             providers,
             budget_cap=self.cfg.budget.daily,
             week_cap=self.cfg.budget.weekly,
-            outputs_dir=default_store_dir() / "outputs",
+            outputs_dir=self._outputs_dir,
         )
 
     def backend_for(self, name: str) -> Backend:
@@ -258,7 +296,7 @@ class LocalClient:
             raise BackendError(
                 f"backend {name!r} is not in the config anymore; cannot reach the job"
             )
-        return make_backend(name, bcfg)
+        return self._backend_factory(name, bcfg)
 
     # -- deploy-key store --
     def deploy_key_get(self, origin: str) -> DeployKey | None:
@@ -274,18 +312,7 @@ class LocalClient:
         return self._store().delete_deploy_key(origin)
 
     def _plan_code(self, spec: JobSpec) -> JobSpec:
-        """Resolve how the worker will get the code (public clone / deploy-key
-        clone / local-objects fallback) and stamp it onto the spec. Runs
-        client-side (needs local ``gh``/git); the resulting key MATERIAL is never
-        persisted here — the placer injects it from the store at submit time."""
-        if spec.code is not None:
-            return spec
-        plan = resolve_code_plan(
-            spec.repo,
-            get_key=self.deploy_key_get,
-            register_key=self.deploy_key_register,
-        )
-        return spec.model_copy(update={"code": plan})
+        return resolve_spec_code(spec, self.deploy_key_get, self.deploy_key_register)
 
     # -- store reads --
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
@@ -426,7 +453,9 @@ class LocalClient:
     def probe(
         self, res: ResourceSpec, only: str | None
     ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
-        backends, broken = _make_backends(self.cfg, only, self._config_path)
+        backends, broken = _make_backends(
+            self.cfg, only, self._config_path, self._backend_factory
+        )
         offers = (
             chooser.gather_offers(
                 backends, res, timeout_s=self.cfg.policy.probe_timeout_s
@@ -443,7 +472,7 @@ class LocalClient:
 
         def _check_one(item: tuple[str, Any]) -> str:
             nm, bcfg = item
-            return make_backend(nm, bcfg).check()
+            return self._backend_factory(nm, bcfg).check()
 
         enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
         results = _parallel_by_name(enabled, _check_one)
@@ -463,7 +492,7 @@ class LocalClient:
 
         def _discover_one(item: tuple[str, Any]) -> ProviderFacts:
             nm, bcfg = item
-            return make_backend(nm, bcfg).discover()
+            return self._backend_factory(nm, bcfg).discover()
 
         enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
         results = _parallel_by_name(enabled, _discover_one)
@@ -541,13 +570,234 @@ class LocalClient:
         return paths, dest
 
 
+# --------------------------------------------------------------------------- remote
+
+
+class RemoteClient:
+    """Thin HTTP proxy to a running daemon that OWNS the store, the state machine,
+    and all backend credentials.
+
+    Every verb is one request; domain models cross the wire as JSON (pydantic), the
+    small result dataclasses via :mod:`omnirun.wire`. The client does its own LOCAL
+    work first — capturing the repo, resolving the code plan (asking the daemon for
+    deploy keys through :meth:`deploy_key_get`) — then sends a fully-formed spec, so
+    the daemon never needs the client's git objects or credentials."""
+
+    def __init__(self, base_url: str, *, timeout: float = 60.0) -> None:
+        import httpx
+
+        self._base = base_url.rstrip("/")
+        self._http = httpx.Client(base_url=self._base, timeout=timeout)
+
+    def close(self) -> None:
+        self._http.close()
+
+    # -- transport --
+    def _request(self, method: str, path: str, **kw: Any) -> Any:
+        import httpx
+
+        try:
+            resp = self._http.request(method, path, **kw)
+        except httpx.HTTPError as e:
+            raise ConnectionError(
+                f"cannot reach the omnirun daemon at {self._base} "
+                f"({e}); is it running? (`omnirun serve` on the daemon host)"
+            ) from e
+        if resp.status_code >= 400:
+            self._raise_typed(resp)
+        return resp
+
+    def _get(self, path: str, **kw: Any) -> Any:
+        return self._request("GET", path, **kw).json()
+
+    def _post(self, path: str, **kw: Any) -> Any:
+        return self._request("POST", path, **kw).json()
+
+    def _raise_typed(self, resp: Any) -> None:
+        """Re-raise the daemon's typed error as the matching client exception, so
+        ``friendly_errors`` renders it as the daemonless path would."""
+        try:
+            payload = resp.json()
+            message = payload.get("error", resp.text)
+            etype = payload.get("type", "BackendError")
+        except Exception:
+            message, etype = resp.text or f"HTTP {resp.status_code}", "BackendError"
+        if etype == "KeyError":
+            raise KeyError(message)
+        if etype == "ConfigError":
+            raise ConfigError(message)
+        if etype == "RepoError":
+            from omnirun.repo import RepoError
+
+            raise RepoError(message)
+        raise BackendError(message)
+
+    # -- deploy-key store (asks the daemon) --
+    def deploy_key_get(self, origin: str) -> DeployKey | None:
+        data = self._get(f"/deploy-keys/{origin}")
+        return DeployKey.model_validate(data["key"]) if data.get("key") else None
+
+    def deploy_key_register(self, dk: DeployKey) -> None:
+        self._post("/deploy-keys", json={"key": dk.model_dump(mode="json")})
+
+    def deploy_key_list(self) -> list[DeployKey]:
+        data = self._get("/deploy-keys")
+        return [DeployKey.model_validate(k) for k in data["keys"]]
+
+    def deploy_key_delete(self, origin: str) -> bool:
+        return bool(self._request("DELETE", f"/deploy-keys/{origin}").json()["removed"])
+
+    def _plan_code(self, spec: JobSpec) -> JobSpec:
+        return resolve_spec_code(spec, self.deploy_key_get, self.deploy_key_register)
+
+    # -- lifecycle --
+    def submit(self, spec: JobSpec, *, backend: str | None = None) -> SubmitOutcome:
+        from omnirun import wire
+
+        spec = self._plan_code(spec)
+        body = {
+            "mode": "submit",
+            "spec": spec.model_dump(mode="json"),
+            "backend": backend,
+        }
+        return wire.submit_outcome_from_json(self._post("/jobs", json=body))
+
+    def enqueue(
+        self, spec: JobSpec, *, backend: str | None = None, count: int = 1
+    ) -> list[str]:
+        spec = self._plan_code(spec)
+        body = {
+            "mode": "enqueue",
+            "spec": spec.model_dump(mode="json"),
+            "backend": backend,
+            "count": count,
+        }
+        return list(self._post("/jobs", json=body)["job_ids"])
+
+    def tick(self) -> list[str]:
+        return list(self._post("/tick")["events"])
+
+    def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
+        params = {"project": project} if project else {}
+        data = self._get("/jobs", params=params)
+        return [JobRecord.model_validate(j) for j in data["jobs"]]
+
+    def resolve_job(self, ref: str) -> JobRecord:
+        data = self._get("/jobs/resolve", params={"ref": ref})
+        return JobRecord.model_validate(data["job"])
+
+    def status(self, ref: str) -> JobRecord:
+        data = self._get(f"/jobs/{ref}/status")
+        return JobRecord.model_validate(data["job"])
+
+    def cancel(self, rec: JobRecord, *, force: bool = False, wait: bool = True) -> None:
+        params = {"force": "1" if force else "0", "wait": "1" if wait else "0"}
+        self._post(f"/jobs/{rec.spec.job_id}/cancel", params=params)
+
+    def reprioritize(
+        self,
+        job_id: str,
+        *,
+        priority: int | None,
+        deadline: Deadline | None,
+        allow_paid: bool | None,
+    ) -> JobPolicy:
+        from omnirun import wire
+
+        body: dict[str, Any] = {"priority": priority, "allow_paid": allow_paid}
+        body["deadline"] = deadline.model_dump(mode="json") if deadline else None
+        data = self._request("PATCH", f"/jobs/{job_id}", json=body).json()
+        return wire.policy_from_json(data["policy"])
+
+    def budget_set(self, window: str, cap: float) -> None:
+        self._post("/budget", json={"window": window, "cap": cap})
+
+    def budget_status(self) -> list[BudgetRow]:
+        from omnirun import wire
+
+        return [wire.budget_row_from_json(r) for r in self._get("/budget")["rows"]]
+
+    def gc(self, *, all_: bool, project: str | None) -> GcOutcome:
+        from omnirun import wire
+
+        data = self._post("/gc", json={"all": all_, "project": project})
+        return wire.gc_outcome_from_json(data)
+
+    def probe(
+        self, res: ResourceSpec, only: str | None
+    ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
+        from omnirun import wire
+
+        data = self._post(
+            "/offers", json={"resources": res.model_dump(mode="json"), "only": only}
+        )
+        ranked = [wire.ranked_offer_from_json(r) for r in data["ranked"]]
+        unfit = [Offer.model_validate(o) for o in data["unfit"]]
+        # No Backend objects cross the wire — the daemon holds the credentials. The
+        # offers table needs none; the only caller that does (`submit --dry-run`
+        # payload preview) is a local-mode feature.
+        return {}, ranked, unfit
+
+    def backends_check(self, name: str | None) -> list[CheckRow]:
+        from omnirun import wire
+
+        params = {"name": name} if name else {}
+        data = self._get("/backends/check", params=params)
+        return [wire.check_row_from_json(r) for r in data["rows"]]
+
+    def backends_discover(self, name: str | None) -> list[DiscoverRow]:
+        from omnirun import wire
+
+        params = {"name": name} if name else {}
+        data = self._post("/backends/discover", params=params)
+        return [wire.discover_row_from_json(r) for r in data["rows"]]
+
+    def logs(self, rec: JobRecord, *, follow: bool) -> Iterator[str]:
+        params = {"follow": "1" if follow else "0"}
+        with self._http.stream(
+            "GET", f"/jobs/{rec.spec.job_id}/logs", params=params
+        ) as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                self._raise_typed(resp)
+            for raw in resp.iter_lines():
+                # SSE frames: `data: <line>` payloads, a terminal `event: eof`.
+                if raw.startswith("event: eof"):
+                    break
+                if raw.startswith("data:"):
+                    yield raw[len("data:") :].lstrip(" ")
+
+    def pull(self, rec: JobRecord, dest: Path) -> tuple[list[Path], Path]:
+        import io
+        import tarfile
+
+        from omnirun.backends import tarsafe
+
+        with self._http.stream("GET", f"/jobs/{rec.spec.job_id}/outputs") as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                self._raise_typed(resp)
+            buf = io.BytesIO(resp.read())
+        dest.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=buf, mode="r:*") as tf:
+            tarsafe.extract_all(tf, dest)
+        paths = sorted(p for p in dest.rglob("*") if p.is_file())
+        return paths, dest
+
+    def backend_for(self, name: str) -> Backend:
+        # The daemon owns the credentials; a client-side backend object cannot be
+        # built in remote mode. Only the interactive `ssh` verb needs one, which is
+        # not proxied yet.
+        raise BackendError(
+            "interactive backend access (ssh) is not available in daemon mode; "
+            "run the command on the daemon host, or unset the daemon address"
+        )
+
+
 def make_client(cfg: Config, *, config_path: Path | None = None) -> Client:
     """Select the client by configuration: a remote daemon when ``[daemon].address``
     is set, else a daemonless in-process ``LocalClient``."""
-    if cfg.daemon.resolved_address() is not None:
-        raise ConfigError(
-            "a daemon address is configured but the remote daemon client is not "
-            "wired yet (lands in a later phase); clear the daemon address to run "
-            "daemonless"
-        )
+    base_url = cfg.daemon.resolved_base_url()
+    if base_url is not None:
+        return RemoteClient(base_url)
     return LocalClient(cfg, config_path=config_path)

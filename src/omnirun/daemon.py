@@ -1,15 +1,22 @@
-"""Long-lived localhost scheduler daemon.
+"""The omnirun scheduler daemon — an HTTP service that OWNS the store, the state
+machine, and all backend credentials.
 
-Owns nothing new: the durable job store (the SQL ``Store``) IS the queue. The
-daemon simply drives the SAME pure scheduler ``tick`` the daemonless ``submit``
-runs — through :class:`~omnirun.control.Control` over the shared ``Store`` — on
-a poll interval, spreading queued jobs across the configured backends and
-honoring each backend's ``max_parallel`` cap (enforced by ``Store.reserve``,
-#12). Clients talk to it over a tiny line-oriented JSON protocol (one JSON
-object per line each way): ``ping`` (counts), ``tick`` (wake the loop now), and
-``shutdown``. Job creation, listing and cancellation go straight through the
-shared store (``Control.submit`` / ``store.list_jobs`` / ``Control.cancel``) —
-there is no second front door.
+A thin ``RemoteClient`` (``omnirun.client``) turns each CLI verb into an HTTP
+request here; the daemon executes it against an in-process :class:`LocalClient`
+core (the exact same verb implementations the daemonless CLI runs) under one
+lock, and a background scheduler thread drives ``tick`` on the poll interval so
+queued jobs place and running jobs reconcile continuously.
+
+HTTP (not a bespoke socket protocol) is the transport so any client — ``curl``,
+a future web UI, another language — can talk to it, and so it can sit behind a
+TLS/bearer front end (Caddy) when exposed beyond the WireGuard mesh. The server
+is a **bottle** app under a **threaded** stdlib WSGI server (sync, thread-per-
+request), matching the scheduler-thread + row-locked ``Store`` model; there is no
+async runtime.
+
+The old line-oriented ``ping``/``tick``/``shutdown`` socket protocol is gone; the
+only liveness breadcrumb is ``daemon.json`` (host/port/pid), written for humans
+and `serve`'s own logging — never for client routing (that is config-driven).
 """
 
 from __future__ import annotations
@@ -18,24 +25,21 @@ import json
 import logging
 import os
 import signal
-import socket
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from omnirun.backends.base import Backend, make_backend
-from omnirun.config import Config
-from omnirun.control import Control
-from omnirun.models import JobState
-from omnirun.providers import BackendProvider, Provider
-from omnirun.state import Store, default_store_dir, open_store
+from omnirun.backends.base import Backend, BackendError, make_backend
+from omnirun.client import LocalClient
+from omnirun.config import Config, ConfigError
+from omnirun.models import DeployKey, JobSpec, ResourceSpec
+from omnirun.repo import RepoError
+from omnirun.state import default_store_dir
 
 BackendFactory = Callable[[str, Any], Backend]
 
 _log = logging.getLogger("omnirun.daemon")
-
-_ACCEPT_TIMEOUT_S = 0.5
 
 
 def _state_root(state_dir: Path | None) -> Path:
@@ -46,65 +50,46 @@ def _daemon_json_path(state_dir: Path | None = None) -> Path:
     return _state_root(state_dir) / "daemon.json"
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but not ours
-    return True
+class _QuietWSGIRequestHandler(WSGIRequestHandler):
+    """A WSGI request handler that routes access logs through the module logger at
+    DEBUG (bottle/wsgiref default is a noisy stderr line per request)."""
+
+    def log_message(self, format: str, *args: Any) -> None:
+        _log.debug("http %s - %s", self.address_string(), format % args)
 
 
-def daemon_address(state_dir: Path | None = None) -> tuple[str, int] | None:
-    """(host, port) of the running daemon, or None if none is alive."""
-    p = _daemon_json_path(state_dir)
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text())
-        pid = int(data["pid"])
-        host = str(data["host"])
-        port = int(data["port"])
-    except (ValueError, KeyError, OSError):
-        return None
-    if not _pid_alive(pid):
-        return None
-    return host, port
+def _make_threaded_server(host: str, port: int, app: Any) -> tuple[WSGIServer, int]:
+    """A thread-per-request WSGI server bound to (host, port).
 
+    Threading (via ``ThreadingMixIn``) matches the row-locked ``Store`` + single
+    scheduler thread model and, crucially, lets a long-lived streaming response
+    (``logs -f`` SSE, a chunked ``pull`` tar) run without blocking other requests.
+    ``daemon_threads`` so a shutdown does not wait on in-flight streams. Returns
+    the bound port (resolving an ephemeral ``0``)."""
+    from socketserver import ThreadingMixIn
 
-def send_request(
-    host: str, port: int, req: dict[str, Any], timeout: float = 30.0
-) -> dict[str, Any]:
-    """Send one JSON request line, read one JSON response line."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as conn:
-            conn.settimeout(timeout)
-            conn.sendall((json.dumps(req) + "\n").encode())
-            buf = bytearray()
-            while not buf.endswith(b"\n"):
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-    except ConnectionRefusedError as e:
-        raise ConnectionError(
-            f"cannot reach omnirun daemon at {host}:{port} "
-            "(is it running? start it with `omnirun serve`)"
-        ) from e
-    except (TimeoutError, socket.timeout) as e:
-        # The daemon is up but did not answer within the window (a long reconcile
-        # / probe holding the handler). Surface a friendly line, not a traceback.
-        raise ConnectionError(
-            f"omnirun daemon at {host}:{port} did not respond within {timeout:g}s "
-            "(it may be busy — retry, or check `omnirun serve`)"
-        ) from e
-    if not buf:
-        raise ConnectionError(f"daemon at {host}:{port} closed the connection")
-    return json.loads(bytes(buf).decode())
+    class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = make_server(
+        host,
+        port,
+        app,
+        server_class=_ThreadingWSGIServer,
+        handler_class=_QuietWSGIRequestHandler,
+    )
+    return server, server.server_address[1]
 
 
 class Daemon:
+    """The HTTP scheduler daemon.
+
+    ``state_dir`` (tests, or a relocated daemon home) puts the SQLite DB + the
+    ``daemon.json`` breadcrumb under it; otherwise the configured state URL and the
+    default store dir are used. ``backend_factory`` is injectable for tests.
+    """
+
     def __init__(
         self,
         cfg: Config,
@@ -117,108 +102,87 @@ class Daemon:
         self.port = cfg.daemon.port
         self.poll_interval = cfg.daemon.poll_interval_s
 
-        self._backend_factory = backend_factory
-        self._backend_cache: dict[str, Backend] | None = None
-        self._provider_cache: dict[str, Provider] | None = None
-        self._control: Control | None = None
-
-        # One Store for the whole daemon (the job store IS the queue). An explicit
-        # state_dir (tests, or a caller relocating the daemon's state home) puts
-        # the SQLite DB there; otherwise honor the configured state URL.
-        # daemon.json still tracks the liveness address under state_root
-        # regardless.
-        db_url = (
+        # The core: one LocalClient over ONE store, holding the credentials. Every
+        # HTTP handler and the scheduler thread go through it under `self._lock`
+        # (the pure tick is not safe against concurrent ticks; the lock serializes
+        # them exactly as the old socket daemon did). Streaming handlers resolve
+        # under the lock, then stream OUTSIDE it.
+        state_url = (
             f"sqlite:///{self.state_root / 'omnirun.db'}"
             if state_dir is not None
-            else cfg.state.resolved_url()
+            else None
         )
-        self._store: Store = open_store(db_url)
+        if state_url is not None:
+            cfg = cfg.model_copy(
+                update={"state": cfg.state.model_copy(update={"url": state_url})}
+            )
+        # Memoize backend instances by name: the core rebuilds Control (and its
+        # providers) every verb, but a long-lived daemon must not reconstruct a
+        # backend (and re-open any pooled connection it holds) on every tick — and
+        # a backend that keeps per-session in-memory state (auth token, poll
+        # cursor) must persist it across ticks. One instance per name, for the
+        # daemon's lifetime.
+        cache: dict[str, Backend] = {}
+
+        def _cached_factory(name: str, bcfg: Any) -> Backend:
+            be = cache.get(name)
+            if be is None:
+                be = backend_factory(name, bcfg)
+                cache[name] = be
+            return be
+
+        self._core = LocalClient(
+            cfg,
+            config_path=None,
+            backend_factory=_cached_factory,
+            outputs_dir=self.state_root / "outputs",
+        )
         self._lock = threading.RLock()
         self._stop = threading.Event()
-        # Wakeable sleep: a `tick` request sets this so a client that just wrote a
-        # job can trigger an immediate scheduling round instead of waiting out the
-        # poll interval. The stop path sets BOTH `_stop` and `_wake` so the loop
-        # terminates promptly.
         self._wake = threading.Event()
-        self._sock: socket.socket | None = None
+        self._server: WSGIServer | None = None
         self._scheduler_thread: threading.Thread | None = None
-
-    # --- backends / providers / control -----------------------------------
-
-    def _get_backends(self) -> dict[str, Backend]:
-        with self._lock:
-            if self._backend_cache is None:
-                self._backend_cache = {
-                    name: self._backend_factory(name, bcfg)
-                    for name, bcfg in self.cfg.backends.items()
-                    if bcfg.enabled
-                }
-            return self._backend_cache
-
-    def _get_providers(self) -> dict[str, Provider]:
-        """Enabled backends wrapped as scheduler ``Provider``s over the shared
-        ``Store``. Place-failure reasons + the attempts-cap live in the core
-        (``Control``/``tick``) now, so no daemon-local wrapper is needed."""
-        with self._lock:
-            if self._provider_cache is None:
-                self._provider_cache = {
-                    name: BackendProvider(be, self._store)
-                    for name, be in self._get_backends().items()
-                }
-            return self._provider_cache
-
-    def _get_control(self) -> Control:
-        with self._lock:
-            if self._control is None:
-                self._control = Control(
-                    self._store,
-                    self._get_providers(),
-                    budget_cap=self.cfg.budget.daily,
-                    week_cap=self.cfg.budget.weekly,
-                    outputs_dir=default_store_dir() / "outputs",
-                )
-            return self._control
+        self._app = self._build_app()
 
     # --- lifecycle --------------------------------------------------------
 
     def serve(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
-        self.port = sock.getsockname()[1]  # resolve an ephemeral (port 0) bind
-        sock.listen(16)
-        sock.settimeout(_ACCEPT_TIMEOUT_S)
-        self._sock = sock
-
+        server, self.port = _make_threaded_server(self.host, self.port, self._app)
+        self._server = server
         self._write_daemon_json()
         self._install_signal_handlers()
-
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop, name="omnirun-scheduler", daemon=True
         )
         self._scheduler_thread.start()
         try:
-            self._accept_loop(sock)
+            server.serve_forever(poll_interval=0.5)
         finally:
-            sock.close()
             self._stop.set()
-            self._wake.set()  # unblock a scheduler sleeping on the wake event
+            self._wake.set()
             if self._scheduler_thread is not None:
                 self._scheduler_thread.join(timeout=5.0)
+            self._core.close()
             self._remove_daemon_json()
+
+    def shutdown(self) -> None:
+        """Stop the server loop (safe to call from any thread)."""
+        self._stop.set()
+        self._wake.set()
+        if self._server is not None:
+            # serve_forever() blocks in another thread; shutdown() returns once it
+            # has exited its loop. Run it off-thread so a signal handler never
+            # deadlocks waiting on the very loop it interrupts.
+            threading.Thread(target=self._server.shutdown, daemon=True).start()
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():
-            return  # signals only install from the main thread
+            return
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                signal.signal(sig, lambda *_: self._request_stop())
+                signal.signal(sig, lambda *_: self.shutdown())
             except (ValueError, OSError):
                 pass
-
-    def _request_stop(self) -> None:
-        self._stop.set()
-        self._wake.set()
 
     def _write_daemon_json(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -232,115 +196,304 @@ class Daemon:
     def _remove_daemon_json(self) -> None:
         _daemon_json_path(self.state_root).unlink(missing_ok=True)
 
-    # --- socket server ----------------------------------------------------
-
-    def _accept_loop(self, sock: socket.socket) -> None:
-        while not self._stop.is_set():
-            try:
-                conn, _ = sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(
-                target=self._handle_conn, args=(conn,), daemon=True
-            ).start()
-
-    def _handle_conn(self, conn: socket.socket) -> None:
-        with conn:
-            conn.settimeout(30.0)
-            try:
-                line = conn.makefile("rb").readline()
-                if not line:
-                    return
-                req = json.loads(line.decode())
-                resp = self._dispatch(req)
-            except Exception as e:  # never let a bad request kill the handler
-                resp = {"ok": False, "error": str(e)}
-            try:
-                conn.sendall((json.dumps(resp) + "\n").encode())
-            except OSError:
-                pass
-
-    def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
-        cmd = req.get("cmd")
-        handler = {
-            "ping": self._cmd_ping,
-            "tick": self._cmd_tick,
-            "shutdown": self._cmd_shutdown,
-        }.get(cmd or "")
-        if handler is None:
-            return {"ok": False, "error": f"unknown cmd {cmd!r}"}
-        return handler(req)
-
-    # --- request handlers -------------------------------------------------
-
-    def _cmd_ping(self, _req: dict[str, Any]) -> dict[str, Any]:
-        # Deliberately LOCK-FREE: the store read is its own transaction, and the
-        # tick lock can be held for many seconds while a slow backend places —
-        # a ping that waits on it times out the CLI's liveness probe and
-        # needlessly degrades every read command to the daemonless slow path.
-        jobs = self._store.list_jobs()
-        pending = sum(
-            r.state in (JobState.QUEUED, JobState.HELD, JobState.PLACING) for r in jobs
-        )
-        running = sum(r.state is JobState.RUNNING for r in jobs)
-        done = sum(r.state.terminal for r in jobs)
-        return {
-            "ok": True,
-            "pid": os.getpid(),
-            "pending": pending,
-            "running": running,
-            "done": done,
-        }
-
-    def _cmd_tick(self, _req: dict[str, Any]) -> dict[str, Any]:
-        """Wake the scheduler for an immediate round.
-
-        Lets a client that just wrote a job to the shared store ask for an
-        immediate scheduling round instead of waiting out ``poll_interval_s``.
-        """
-        self._wake.set()
-        return {"ok": True}
-
-    def _cmd_shutdown(self, _req: dict[str, Any]) -> dict[str, Any]:
-        self._request_stop()
-        return {"ok": True}
-
     # --- scheduler --------------------------------------------------------
 
     def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self._tick()
+                with self._lock:
+                    for event in self._core.tick():
+                        _log.info("%s", event)
             except Exception:  # a tick failure must never kill the scheduler
                 _log.warning("scheduler tick raised; continuing", exc_info=True)
-            # Wakeable sleep: block until the poll interval elapses OR a `tick`
-            # request (or the stop path) sets `_wake`, then clear it and re-check
-            # `_stop` at the top of the loop.
             self._wake.wait(self.poll_interval)
             self._wake.clear()
 
-    def _tick(self) -> None:
-        """One scheduling round: drive the pure ``tick`` through ``Control``.
+    def wake(self) -> None:
+        """Ask the scheduler for an immediate round (a client just wrote a job)."""
+        self._wake.set()
 
-        Everything runs under ``self._lock`` (serializing ticks against socket
-        handlers), so the pure driver's at-least-once/concurrent-tick caveats do
-        not apply here — reconcile, reserve and place happen without an
-        overlapping round. A job pinned to one backend rides ``spec.only_backend``
-        (baked in at submit time); the pure ``tick`` honors the pin as a
-        provider-NAME match, so a single unscoped ``run_tick`` over the ONE shared
-        ``Store`` places every job — pinned and unpinned — correctly, and
-        ``Store.reserve`` still enforces each backend's cap globally and
-        atomically. A daemon restart mid-place needs no special recovery: an
-        empty-handle PLACING stub is reverted to QUEUED by ``Control``'s reconcile
-        on the very first tick.
-        """
-        with self._lock:
-            control = self._get_control()
-            control.run_tick(datetime.now(timezone.utc))
-            # Surface what the machine did (releases, defers, failures). The CLI
-            # drains these to stdout; here journald/the log file is the only
-            # audience — without this the daemon's housekeeping is invisible.
-            for event in control.take_events():
-                _log.info("%s", event)
+    # --- HTTP app ---------------------------------------------------------
+
+    def _build_app(self) -> Any:
+        import importlib
+
+        # bottle ships no type stubs; treat the module as Any so its dynamic
+        # decorators/request/response objects don't trip the type checker.
+        bottle: Any = importlib.import_module("bottle")
+
+        app = bottle.Bottle()
+        d = self
+
+        def _json(payload: Any, status: int = 200) -> str:
+            bottle.response.status = status
+            bottle.response.content_type = "application/json"
+            return json.dumps(payload)
+
+        def _body() -> dict[str, Any]:
+            return bottle.request.json or {}
+
+        @app.get("/healthz")
+        def _healthz() -> str:
+            return _json({"ok": True, "pid": os.getpid()})
+
+        @app.post("/tick")
+        def _tick() -> str:
+            with d._lock:
+                events = d._core.tick()
+            return _json({"events": events})
+
+        @app.post("/jobs")
+        def _post_jobs() -> str:
+            from omnirun import wire
+
+            body = _body()
+            spec = JobSpec.model_validate(body["spec"])
+            backend = body.get("backend")
+            with d._lock:
+                if body.get("mode") == "enqueue":
+                    ids = d._core.enqueue(
+                        spec, backend=backend, count=int(body.get("count", 1))
+                    )
+                    d.wake()
+                    return _json({"job_ids": ids})
+                outcome = d._core.submit(spec, backend=backend)
+                d.wake()
+                return _json(wire.submit_outcome_to_json(outcome))
+
+        @app.get("/jobs")
+        def _list_jobs() -> str:
+            project = bottle.request.query.get("project") or None
+            with d._lock:
+                recs = d._core.list_jobs(project=project)
+            return _json({"jobs": [r.model_dump(mode="json") for r in recs]})
+
+        @app.get("/jobs/resolve")
+        def _resolve() -> str:
+            ref = bottle.request.query.get("ref") or ""
+            with d._lock:
+                rec = d._core.resolve_job(ref)
+            return _json({"job": rec.model_dump(mode="json")})
+
+        @app.get("/jobs/<jid>/status")
+        def _status(jid: str) -> str:
+            with d._lock:
+                rec = d._core.status(jid)
+            return _json({"job": rec.model_dump(mode="json")})
+
+        @app.patch("/jobs/<jid>")
+        def _reprioritize(jid: str) -> str:
+            from omnirun import wire
+            from omnirun.models import Deadline
+
+            body = _body()
+            deadline = (
+                Deadline.model_validate(body["deadline"])
+                if body.get("deadline") is not None
+                else None
+            )
+            with d._lock:
+                policy = d._core.reprioritize(
+                    jid,
+                    priority=body.get("priority"),
+                    deadline=deadline,
+                    allow_paid=body.get("allow_paid"),
+                )
+            return _json({"policy": wire.policy_to_json(policy)})
+
+        @app.post("/jobs/<jid>/cancel")
+        def _cancel(jid: str) -> str:
+            force = bottle.request.query.get("force") == "1"
+            wait = bottle.request.query.get("wait") != "0"
+            with d._lock:
+                rec = d._core.resolve_job(jid)
+                d._core.cancel(rec, force=force, wait=wait)
+            return _json({"ok": True})
+
+        @app.post("/gc")
+        def _gc() -> str:
+            from omnirun import wire
+
+            body = _body()
+            with d._lock:
+                out = d._core.gc(
+                    all_=bool(body.get("all")), project=body.get("project")
+                )
+            return _json(wire.gc_outcome_to_json(out))
+
+        @app.post("/offers")
+        def _offers() -> str:
+            from omnirun import wire
+
+            body = _body()
+            res = ResourceSpec.model_validate(body["resources"])
+            only = body.get("only")
+            with d._lock:
+                _backends, ranked, unfit = d._core.probe(res, only)
+            return _json(
+                {
+                    "ranked": [wire.ranked_offer_to_json(r) for r in ranked],
+                    "unfit": [o.model_dump(mode="json") for o in unfit],
+                }
+            )
+
+        @app.get("/budget")
+        def _budget_get() -> str:
+            from omnirun import wire
+
+            with d._lock:
+                rows = d._core.budget_status()
+            return _json({"rows": [wire.budget_row_to_json(r) for r in rows]})
+
+        @app.post("/budget")
+        def _budget_set() -> str:
+            body = _body()
+            with d._lock:
+                d._core.budget_set(body["window"], float(body["cap"]))
+            return _json({"ok": True})
+
+        @app.get("/backends/check")
+        def _check() -> str:
+            from omnirun import wire
+
+            name = bottle.request.query.get("name") or None
+            with d._lock:
+                rows = d._core.backends_check(name)
+            return _json({"rows": [wire.check_row_to_json(r) for r in rows]})
+
+        @app.post("/backends/discover")
+        def _discover() -> str:
+            from omnirun import wire
+
+            name = bottle.request.query.get("name") or None
+            with d._lock:
+                rows = d._core.backends_discover(name)
+            return _json({"rows": [wire.discover_row_to_json(r) for r in rows]})
+
+        @app.get("/deploy-keys")
+        def _dk_list() -> str:
+            with d._lock:
+                keys = d._core.deploy_key_list()
+            return _json({"keys": [k.model_dump(mode="json") for k in keys]})
+
+        @app.get("/deploy-keys/<origin:path>")
+        def _dk_get(origin: str) -> str:
+            with d._lock:
+                dk = d._core.deploy_key_get(origin)
+            return _json({"key": dk.model_dump(mode="json") if dk else None})
+
+        @app.post("/deploy-keys")
+        def _dk_register() -> str:
+            dk = DeployKey.model_validate(_body()["key"])
+            with d._lock:
+                d._core.deploy_key_register(dk)
+            return _json({"ok": True})
+
+        @app.delete("/deploy-keys/<origin:path>")
+        def _dk_delete(origin: str) -> str:
+            with d._lock:
+                removed = d._core.deploy_key_delete(origin)
+            return _json({"removed": removed})
+
+        @app.get("/jobs/<jid>/logs")
+        def _logs(jid: str) -> Any:
+            follow = bottle.request.query.get("follow") == "1"
+            with d._lock:
+                rec = d._core.resolve_job(jid)
+            bottle.response.content_type = "text/event-stream"
+            bottle.response.set_header("Cache-Control", "no-cache")
+            bottle.response.set_header("X-Accel-Buffering", "no")
+
+            def _events() -> Any:
+                # SSE: one `data:` frame per log line; a trailing sentinel event
+                # marks the stream complete so the client stops cleanly. The core
+                # serves a reaped job from its cached copy, or live-tails otherwise.
+                for line in d._core.logs(rec, follow=follow):
+                    yield f"data: {line.rstrip(chr(10))}\n\n"
+                yield "event: eof\ndata: \n\n"
+
+            return _events()
+
+        @app.get("/jobs/<jid>/outputs")
+        def _outputs(jid: str) -> Any:
+            import tarfile
+            import tempfile
+
+            with d._lock:
+                rec = d._core.resolve_job(jid)
+            tmp = Path(tempfile.mkdtemp(prefix="omnirun-pull-"))
+            with d._lock:
+                d._core.pull(rec, tmp)
+            bottle.response.content_type = "application/x-tar"
+
+            def _tar() -> Any:
+                # Stream a tar of the pulled dir, then remove the temp copy. bottle
+                # writes each chunk as the generator yields, so a large pull never
+                # buffers wholly in memory.
+                import io
+
+                buf = io.BytesIO()
+                with tarfile.open(fileobj=buf, mode="w") as tf:
+                    tf.add(tmp, arcname=".")
+                yield buf.getvalue()
+                import shutil
+
+                shutil.rmtree(tmp, ignore_errors=True)
+
+            return _tar()
+
+        # Map core exceptions to a typed JSON error the RemoteClient re-raises as
+        # the SAME exception class, so the CLI renders it exactly as the daemonless
+        # path would. Installed as a plugin wrapping every route.
+        app.install(_ErrorTranslator(bottle))
+        return app
+
+
+# Core exception name -> HTTP status. Anything unlisted is a 500.
+_ERROR_STATUS = {
+    "KeyError": 404,
+    "ConfigError": 400,
+    "BackendError": 400,
+    "RepoError": 400,
+    "StoreError": 400,
+    "ValueError": 400,
+}
+
+
+class _ErrorTranslator:
+    """A bottle plugin that turns a core exception raised inside any route into a
+    typed JSON error response (``{"error", "type"}``) with a mapped status code."""
+
+    api = 2
+
+    def __init__(self, bottle_mod: Any) -> None:
+        self._bottle = bottle_mod
+
+    def apply(self, callback: Callable[..., Any], _route: Any) -> Callable[..., Any]:
+        bottle = self._bottle
+
+        def wrapper(*a: Any, **kw: Any) -> Any:
+            try:
+                return callback(*a, **kw)
+            except bottle.HTTPResponse:
+                raise
+            except KeyError as e:
+                msg = e.args[0] if e.args else str(e)
+                return _error_json(bottle, 404, str(msg), "KeyError")
+            except (ConfigError, BackendError, RepoError, ValueError) as e:
+                etype = type(e).__name__
+                return _error_json(bottle, _ERROR_STATUS.get(etype, 400), str(e), etype)
+            except Exception as e:  # never leak a bare traceback to the client
+                _log.warning("request handler raised", exc_info=True)
+                return _error_json(bottle, 500, str(e), type(e).__name__)
+
+        return wrapper
+
+
+def _error_json(bottle: Any, status: int, message: str, etype: str) -> str:
+    bottle.response.status = status
+    bottle.response.content_type = "application/json"
+    return json.dumps({"error": message, "type": etype})
+
+
+__all__ = ["Daemon"]

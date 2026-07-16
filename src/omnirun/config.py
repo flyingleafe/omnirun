@@ -131,6 +131,26 @@ class DaemonConfig(BaseModel):
             return raw, self.port
         return host, int(rest)
 
+    def resolved_base_url(self) -> str | None:
+        """The daemon's HTTP base URL for the client, or None when daemonless.
+
+        A value already containing a scheme (``https://omnirun.example``) is used
+        verbatim — this is how a Caddy/TLS front end or a bearer-token endpoint is
+        addressed. A bare ``host:port`` (or bare host) becomes ``http://host:port``
+        (the WireGuard-mesh default, no TLS)."""
+        if not self.address:
+            return None
+        raw = self.address.strip()
+        if "://" in raw:
+            return raw.rstrip("/")
+        resolved = self.resolved_address()
+        if resolved is None:
+            return None
+        host, port = resolved
+        # Re-bracket an IPv6 literal for the URL authority.
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        return f"http://{authority}"
+
 
 class BoreConfig(BaseModel):
     """Config for a self-hosted bore tunnel server (ssh-everywhere feature).

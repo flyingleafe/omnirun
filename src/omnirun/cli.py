@@ -25,7 +25,7 @@ from omnirun.client import (
 )
 from omnirun.sshconn import ssh_argv
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
-from omnirun.daemon import Daemon, daemon_address, send_request
+from omnirun.daemon import Daemon
 from omnirun.config import (
     Config,
     ConfigError,
@@ -620,6 +620,20 @@ def serve(
     Daemon(cfg).serve()
 
 
+@app.command(help="Drive one scheduling round now (place pending, reconcile running).")
+@friendly_errors
+def tick() -> None:
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        events = client.tick()
+    finally:
+        client.close()
+    for event in events:
+        console.print(f"[dim]· {event}[/dim]")
+    console.print(f"tick done: {len(events)} event(s)")
+
+
 @app.command(
     help="Enqueue a job for a running daemon to place: "
     "omnirun enqueue [OPTIONS] -- COMMAND..."
@@ -684,20 +698,24 @@ def enqueue(
         max_cost=max_cost,
     )
     # Jobs live in the shared store; a running daemon places them continuously.
-    # `enqueue` requires a live daemon (nothing would advance otherwise), writes
-    # each job QUEUED via the client, then nudges the daemon to place them without
-    # waiting out its poll interval.
-    host, port = _require_daemon()
+    # `enqueue` writes each job QUEUED via the client. In daemon mode the daemon
+    # owns the scheduler loop and wakes itself to place them; daemonless, they wait
+    # for the next `omnirun serve` (or `omnirun tick`).
     cfg = _load_cfg()
+    daemonless = cfg.daemon.resolved_base_url() is None
     client = make_client(cfg, config_path=_state["config_path"])
     try:
         job_ids = client.enqueue(spec, backend=backend, count=count)
     finally:
         client.close()
-    send_request(host, port, {"cmd": "tick"})  # nudge an immediate round
     console.print(
         f"[green]enqueued[/green] {len(job_ids)} job(s): {', '.join(job_ids)}"
     )
+    if daemonless:
+        console.print(
+            "[dim]no daemon configured — run `omnirun serve` to place these, or "
+            "`omnirun tick` once[/dim]"
+        )
 
 
 @app.command(help="Show queued/running jobs (or --wait / --cancel them).")
@@ -734,12 +752,15 @@ def queue(
         client.close()
 
 
-def _require_daemon() -> tuple[str, int]:
-    addr = daemon_address()
-    if addr is None:
-        _die("no omnirun daemon running — start one with `omnirun serve`")
-    assert addr is not None
-    return addr
+def _require_daemon_configured() -> None:
+    """A daemon must own the scheduler loop for jobs to advance while we poll; with
+    no ``[daemon].address`` nothing would place them, so waiting would spin forever.
+    Fail fast with the same guidance ``enqueue`` gives."""
+    if _load_cfg().daemon.resolved_base_url() is None:
+        _die(
+            "no daemon configured — set [daemon].address (or --daemon host:port) and "
+            "run `omnirun serve` on that host, so jobs advance while you wait"
+        )
 
 
 def _current_project() -> str | None:
@@ -804,7 +825,7 @@ def _queue_wait(client: Client) -> None:
 
     # A running daemon is what advances jobs; without one, polling would spin
     # forever. Require it before waiting (the same message enqueue uses).
-    _require_daemon()
+    _require_daemon_configured()
     records: list[JobRecord] = []
     while True:
         records = client.list_jobs()

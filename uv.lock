@@ -55,6 +55,15 @@ wheels = [
 ]
 
 [[package]]
+name = "bottle"
+version = "0.13.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/71/cca6167c06d00c81375fd668719df245864076d284f7cb46a694cbeb5454/bottle-0.13.4.tar.gz", hash = "sha256:787e78327e12b227938de02248333d788cfe45987edca735f8f88e03472c3f47", size = 98717, upload-time = "2025-06-15T10:08:59.439Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/83/f6/b55ec74cfe68c6584163faa311503c20b0da4c09883a41e8e00d6726c954/bottle-0.13.4-py2.py3-none-any.whl", hash = "sha256:045684fbd2764eac9cdeb824861d1551d113e8b683d8d26e296898d3dd99a12e", size = 103807, upload-time = "2025-06-15T10:08:57.691Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.6.17"
 source = { registry = "https://pypi.org/simple" }
@@ -711,12 +720,16 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "bottle" },
     { name = "google-colab-cli" },
     { name = "kaggle" },
     { name = "psycopg", extra = ["binary"] },
 ]
 colab = [
     { name = "google-colab-cli" },
+]
+daemon = [
+    { name = "bottle" },
 ]
 kaggle = [
     { name = "kaggle" },
@@ -727,6 +740,7 @@ postgres = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "bottle" },
     { name = "hypothesis" },
     { name = "kaggle" },
     { name = "pytest" },
@@ -736,20 +750,22 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "bottle", marker = "extra == 'daemon'", specifier = ">=0.13" },
     { name = "google-colab-cli", marker = "extra == 'colab'", specifier = ">=0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "kaggle", marker = "extra == 'kaggle'", specifier = ">=2.2" },
-    { name = "omnirun", extras = ["kaggle", "colab", "postgres"], marker = "extra == 'all'" },
+    { name = "omnirun", extras = ["kaggle", "colab", "postgres", "daemon"], marker = "extra == 'all'" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "rich", specifier = ">=13.7" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["kaggle", "colab", "postgres", "all"]
+provides-extras = ["kaggle", "colab", "postgres", "daemon", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "bottle", specifier = ">=0.13" },
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "kaggle", specifier = ">=2.2" },
     { name = "pytest", specifier = ">=8.2" },

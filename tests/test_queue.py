@@ -1,16 +1,14 @@
 """Unified-model daemon tests: the job store IS the queue.
 
-The daemon drives the SAME pure ``tick`` the daemonless CLI runs. These tests
-seed jobs directly through ``Control.submit`` over the daemon's shared store,
-drive ``daemon._tick()``, and assert on ``JobRecord``s — there is no separate
-queue table or projection. The socket protocol is now just ``ping`` / ``tick`` /
-``shutdown``.
+The daemon drives the SAME pure ``tick`` the daemonless CLI runs — through its
+in-process ``LocalClient`` core. These tests seed jobs directly through
+``Control.submit`` over the daemon's shared store, drive one round via
+``daemon._core.tick()``, and assert on ``JobRecord``s — there is no separate queue
+table or projection. (HTTP end-to-end coverage lives in test_daemon_http.py.)
 """
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +16,7 @@ from pathlib import Path
 from omnirun.backends.base import Backend, ProvisioningSink
 from omnirun.config import BackendConfig, Config, DaemonConfig
 from omnirun.control import Control
-from omnirun.daemon import Daemon, daemon_address, send_request
+from omnirun.daemon import Daemon
 from omnirun.models import (
     CancelMode,
     JobHandle,
@@ -62,14 +60,17 @@ class FakeBackend(Backend):
         runs_before_done: int = 1,
         fail_submit: bool = False,
         submitted: list[str] | None = None,
+        cancelled: list[str] | None = None,
         cost_per_hour: float | None = None,
     ) -> None:
         super().__init__(name, config)
         self.runs_before_done = runs_before_done
         self.fail_submit = fail_submit
         self.submitted = submitted if submitted is not None else []
+        # Shared across the per-call FakeBackend instances the LocalClient core
+        # rebuilds, so a cancel recorded on any instance is observable in the test.
+        self.cancelled = cancelled if cancelled is not None else []
         self.cost_per_hour = cost_per_hour
-        self.cancelled: list[str] = []
         self._polls: dict[str, int] = {}
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
@@ -121,6 +122,7 @@ def make_daemon(
     runs_before_done: int = 1,
     fail_submit: bool = False,
     submitted: list[str] | None = None,
+    cancelled: list[str] | None = None,
     cost_per_hour: float | None = None,
     poll_interval_s: float = 0.01,
 ) -> Daemon:
@@ -139,6 +141,7 @@ def make_daemon(
             runs_before_done=runs_before_done,
             fail_submit=fail_submit,
             submitted=submitted,
+            cancelled=cancelled,
             cost_per_hour=cost_per_hour,
         )
 
@@ -151,16 +154,22 @@ def _now() -> datetime:
 
 def _seed(daemon: Daemon, spec: JobSpec) -> str:
     """Submit *spec* into the daemon's shared store via Control (as the CLI does)."""
-    return daemon._get_control().submit(spec, now=_now())
+    return Control(daemon._core._store(), {}).submit(spec, now=_now())
+
+
+def _tick(daemon: Daemon) -> None:
+    """Drive one scheduling round through the daemon's core (as its loop does)."""
+    daemon._core.tick()
 
 
 def _states(daemon: Daemon) -> list[JobState]:
-    return [r.state for r in daemon._store.list_jobs()]
+    return [r.state for r in daemon._core._store().list_jobs()]
 
 
 def _no_placing(daemon: Daemon) -> None:
     """A synchronous tick must not leave a job PLACING (place is inline)."""
-    assert not any(r.state is JobState.PLACING for r in daemon._store.list_jobs()), (
+    jobs = daemon._core._store().list_jobs()
+    assert not any(r.state is JobState.PLACING for r in jobs), (
         "a synchronous tick must not leave a job PLACING"
     )
 
@@ -176,7 +185,7 @@ def test_respects_cap_and_backfills(tmp_path: Path) -> None:
 
     peak = 0
     for _ in range(40):
-        daemon._tick()
+        _tick(daemon)
         _no_placing(daemon)
         running = sum(s is JobState.RUNNING for s in _states(daemon))
         peak = max(peak, running)
@@ -193,10 +202,10 @@ def test_spreads_across_two_backends(tmp_path: Path) -> None:
     _seed(daemon, make_spec("j1"))
     _seed(daemon, make_spec("j2"))
 
-    daemon._tick()
+    _tick(daemon)
     _no_placing(daemon)
 
-    recs = daemon._store.list_jobs()
+    recs = daemon._core._store().list_jobs()
     assert all(r.state is JobState.RUNNING for r in recs)
     assert {r.placement.provider_name for r in recs if r.placement} == {"a", "b"}
 
@@ -208,10 +217,10 @@ def test_only_backend_restriction(tmp_path: Path) -> None:
     daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
     _seed(daemon, make_spec("j", only_backend="b"))
 
-    daemon._tick()
+    _tick(daemon)
     _no_placing(daemon)
 
-    [rec] = daemon._store.list_jobs()
+    [rec] = daemon._core._store().list_jobs()
     assert rec.state is JobState.RUNNING
     assert rec.placement is not None and rec.placement.provider_name == "b"
     assert rec.spec.only_backend == "b"
@@ -222,12 +231,12 @@ def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:
     _seed(daemon, make_spec())
 
     for _ in range(10):
-        daemon._tick()
+        _tick(daemon)
         _no_placing(daemon)
         if all(s.terminal for s in _states(daemon)):
             break
 
-    [rec] = daemon._store.list_jobs()
+    [rec] = daemon._core._store().list_jobs()
     assert rec.state is JobState.FAILED
     assert rec.attempts == 3
     # The place-failure reason is surfaced on the FAILED job's status detail.
@@ -260,9 +269,9 @@ def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> Non
     store.close()
 
     daemon = make_daemon(tmp_path, {"a": 1})
-    daemon._tick()  # reconcile reverts the stub, then this same tick re-places
+    _tick(daemon)  # reconcile reverts the stub, then this same tick re-places
 
-    [rec] = daemon._store.list_jobs()
+    [rec] = daemon._core._store().list_jobs()
     # After one tick it is placed and running on 'a' (reverted → re-placed).
     assert rec.state is JobState.RUNNING
     assert rec.placement is not None
@@ -271,128 +280,21 @@ def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> Non
     assert rec.attempts == 1  # the revert bumped attempts once
 
 
-# ------------------------------------------------------------------ protocol
-
-
-def test_socket_protocol_ping_tick_shutdown(tmp_path: Path) -> None:
-    # No backends => nothing gets placed, so submitted jobs stay QUEUED and the
-    # scheduler thread can't interfere with the counts.
-    cfg = Config(daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.05))
-    daemon = Daemon(cfg, state_dir=tmp_path)
-    thread = threading.Thread(target=daemon.serve, daemon=True)
-    thread.start()
-    try:
-        addr = None
-        for _ in range(200):
-            addr = daemon_address(tmp_path)
-            if addr is not None:
-                break
-            time.sleep(0.01)
-        assert addr is not None, "daemon never wrote a live daemon.json"
-        host, port = addr
-
-        pong = send_request(host, port, {"cmd": "ping"})
-        assert pong["ok"] is True
-        assert pong["pending"] == 0 and pong["running"] == 0 and pong["done"] == 0
-
-        # Seed two QUEUED jobs directly into the shared store.
-        daemon._get_control().submit(make_spec("proto1"), now=_now())
-        daemon._get_control().submit(make_spec("proto2"), now=_now())
-
-        pong = send_request(host, port, {"cmd": "ping"})
-        assert pong["pending"] == 2
-
-        # tick nudge is accepted.
-        assert send_request(host, port, {"cmd": "tick"})["ok"] is True
-
-        bad = send_request(host, port, {"cmd": "nonsense"})
-        assert bad["ok"] is False
-
-        stop = send_request(host, port, {"cmd": "shutdown"})
-        assert stop["ok"] is True
-    finally:
-        thread.join(timeout=5.0)
-
-    assert not thread.is_alive()
-    assert daemon_address(tmp_path) is None  # daemon.json removed on exit
-
-
-def test_tick_nudge_wakes_the_loop_early(tmp_path: Path) -> None:
-    """With a huge poll interval, a `tick` nudge still gets a pending job placed
-    promptly — the wakeable sleep, not a timed-out poll, drives the round."""
-    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=100, poll_interval_s=3600)
-    thread = threading.Thread(target=daemon.serve, daemon=True)
-    thread.start()
-    host, port = daemon.host, daemon.port
-    try:
-        addr = None
-        for _ in range(200):
-            addr = daemon_address(tmp_path)
-            if addr is not None:
-                break
-            time.sleep(0.01)
-        assert addr is not None
-        host, port = addr
-
-        # Wait out the very first (startup) tick so the loop is asleep on _wake.
-        time.sleep(0.2)
-        _seed(daemon, make_spec("nudged"))
-        send_request(host, port, {"cmd": "tick"})
-
-        placed = False
-        for _ in range(200):
-            [rec] = daemon._store.list_jobs()
-            if rec.state is JobState.RUNNING:
-                placed = True
-                break
-            time.sleep(0.01)
-        assert placed, "tick nudge did not place the job promptly"
-    finally:
-        send_request(host, port, {"cmd": "shutdown"})
-        thread.join(timeout=5.0)
-
-
-def test_daemon_address_absent(tmp_path: Path) -> None:
-    assert daemon_address(tmp_path) is None
-
-
-def test_send_request_timeout_raises_friendly_connection_error() -> None:
-    """A server that accepts the connection but never replies must surface a
-    ConnectionError with a clear message — not a raw socket TimeoutError (M-6)."""
-    import socket as _socket
-
-    import pytest
-
-    srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    host, port = srv.getsockname()
-    try:
-        with pytest.raises(ConnectionError, match="did not respond"):
-            send_request(host, port, {"cmd": "ping"}, timeout=0.3)
-    finally:
-        srv.close()
-
-
 # ------------------------------------------------------------------ cancel
 
 
-def test_queue_cancel_through_the_store(tmp_path: Path) -> None:
-    """queue --cancel cancels through the store (Control.cancel), no daemon
-    socket. A RUNNING job is force-reaped and marked CANCELLED."""
-    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=100)
+def test_queue_cancel_through_the_core(tmp_path: Path) -> None:
+    """Cancel goes through the daemon's core (Control.cancel over the shared
+    store). A RUNNING job is force-reaped and marked CANCELLED."""
+    cancelled: list[str] = []
+    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=100, cancelled=cancelled)
     job_id = _seed(daemon, make_spec("cxl"))
-    daemon._tick()  # place it (RUNNING)
-    rec = daemon._store.load_job(job_id)
+    _tick(daemon)  # place it (RUNNING)
+    rec = daemon._core._store().load_job(job_id)
     assert rec is not None and rec.state is JobState.RUNNING
 
-    # Cancel directly over the store, exactly as `queue --cancel` does.
-    backend = daemon._get_backends()["a"]
-    assert isinstance(backend, FakeBackend)
-    control = Control(daemon._store, daemon._get_providers())
-    control.cancel(job_id, _now())
+    daemon._core.cancel(rec, force=True)
 
-    after = daemon._store.load_job(job_id)
+    after = daemon._core._store().load_job(job_id)
     assert after is not None and after.state is JobState.CANCELLED
-    assert job_id in backend.cancelled  # the placement was reaped
+    assert job_id in cancelled  # the placement was reaped
