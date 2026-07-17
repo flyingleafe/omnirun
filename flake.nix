@@ -24,7 +24,9 @@
 
       mkOmnirun = pkgs: pkgs.python312Packages.buildPythonApplication {
         pname = "omnirun";
-        version = "0.5.0";
+        # Single source of truth: read the version from pyproject.toml so the
+        # nix label never drifts from __version__ on a release bump.
+        version = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project.version;
         pyproject = true;
         src = self;
         build-system = [ pkgs.python312Packages.hatchling ];
