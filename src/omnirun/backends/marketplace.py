@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -201,12 +200,12 @@ class MarketplaceBackend(Backend, ABC):
         self.reap = ReapPolicy(hold_on_terminal=auto, release_lost=auto)
         # Provider API throttle. Parallel provisioning fans many concurrent API
         # calls at one provider; vast caps at ~3 req/s and answers a burst with
-        # HTTP 429. ``api_min_interval_s`` spaces this backend's calls (shared
-        # across the placement threads via one memoized instance) to stay under the
+        # HTTP 429. ``api_min_interval_s`` spaces the calls to stay under the
         # ceiling; 429s that still slip through are retried with backoff below.
+        # The spacing STATE lives in the shared EndpointManager keyed by
+        # provider name, so the limit covers every backend section (and every
+        # placement thread) talking to this provider API, not just this one.
         self._min_interval_s = float(self.config.extra("api_min_interval_s", 0.0))
-        self._rate_lock = threading.Lock()
-        self._last_call_at = 0.0
 
     # ---- provider primitives (subclass surface) -------------------------------
 
@@ -295,16 +294,16 @@ class MarketplaceBackend(Backend, ABC):
         )
 
     def _throttle(self) -> None:
-        """Space this backend's provider-API calls to ``api_min_interval_s`` so a
-        burst of parallel provisioning never trips the provider's rate limit. A
-        no-op when the interval is 0 (the default)."""
+        """Space provider-API calls to ``api_min_interval_s`` so a burst of
+        parallel provisioning never trips the provider's rate limit. A no-op
+        when the interval is 0 (the default). The last-call state is the
+        SHARED per-provider :class:`~omnirun.endpoints.manager.Throttle`, so
+        the ceiling holds across all backend sections on this provider."""
         if self._min_interval_s <= 0:
             return
-        with self._rate_lock:
-            wait = self._min_interval_s - (time.monotonic() - self._last_call_at)
-            if wait > 0:
-                _sleep(wait)
-            self._last_call_at = time.monotonic()
+        self.endpoint_manager().throttle(self.provider or self.type_name).wait(
+            self._min_interval_s
+        )
 
     # ---- ssh key handling --------------------------------------------------------
 

@@ -113,6 +113,11 @@ class DaemonConfig(BaseModel):
     host: str = "127.0.0.1"  # bind host for `omnirun serve` (mesh IP to go remote)
     port: int = 8787  # bind port for `omnirun serve`
     poll_interval_s: float = 10.0  # scheduler tick: refresh running + place pending
+    # Wall budget for ONE tick's parallel status-poll batch. A poll slower than this
+    # is dropped for the tick (last-known state kept). Raise it for a backend whose
+    # status read is slow — e.g. Colab, whose `colab exec` beacon round-trip can
+    # exceed the 30s default, so its jobs never advance and get declared LOST.
+    poll_timeout_s: float = 30.0
 
     def resolved_address(self) -> tuple[str, int] | None:
         """Parse ``address`` into ``(host, port)``, or None when daemonless.

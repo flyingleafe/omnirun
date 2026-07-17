@@ -32,6 +32,7 @@ from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.config import Config, ConfigError, default_config_path
 from omnirun.control import Control, resolve_meta_cap
 from omnirun.deploykey import resolve_code_plan
+from omnirun.endpoints.manager import EndpointManager
 from omnirun.models import (
     Deadline,
     DeployKey,
@@ -195,9 +196,19 @@ def _make_backends(
     only: str | None,
     config_path: Path | None,
     factory: BackendFactory = make_backend,
+    store: Store | None = None,
+    endpoints: EndpointManager | None = None,
 ) -> tuple[dict[str, Backend], list[Offer]]:
     """Construct enabled backends; a backend whose constructor fails becomes a
-    synthetic unfit offer instead of killing the whole command."""
+    synthetic unfit offer instead of killing the whole command.
+
+    *store* is the CONFIGURED state store, injected into every backend
+    (``Backend.store``) so their best-effort caches (wait history, facts,
+    entitlement blocks) hit the one real store instead of resolving a default
+    (the H48 dual-store bug). *endpoints* is the process's shared
+    :class:`EndpointManager`, injected on the same path so backends pointed at
+    one physical target share its ssh session, API throttle, and discovery
+    cache instead of duplicating remote traffic."""
     sections = {n: c for n, c in cfg.backends.items() if c.enabled}
     if only is not None:
         if only not in cfg.backends:
@@ -213,7 +224,12 @@ def _make_backends(
     broken: list[Offer] = []
     for name, bcfg in sections.items():
         try:
-            backends[name] = factory(name, bcfg)
+            be = factory(name, bcfg)
+            if store is not None:  # never reset a cached instance's store
+                be.store = store
+            if endpoints is not None:
+                be.endpoints = endpoints
+            backends[name] = be
         except Exception as e:
             broken.append(
                 Offer(
@@ -283,6 +299,10 @@ class LocalClient:
         self._backend_factory = backend_factory
         self._outputs_dir = outputs_dir or (default_store_dir() / "outputs")
         self._store_obj: Store | None = None
+        # ONE EndpointManager per client (per process, in the daemon): every
+        # backend this client builds shares its ssh sessions, provider-API
+        # throttles, and discovery cache. Injected wherever backends are made.
+        self._endpoints = EndpointManager()
         # Passed to every Control this client builds: a context manager wrapped
         # around the slow ``provider.place`` submit so the daemon can drop its
         # store lock there (so a concurrent cancel is not starved). Daemonless:
@@ -307,7 +327,12 @@ class LocalClient:
         differs only in cadence, never in what a transition means. ``backend``
         narrows the provider set (``--backend``)."""
         backends, _broken = _make_backends(
-            self.cfg, backend, self._config_path, self._backend_factory
+            self.cfg,
+            backend,
+            self._config_path,
+            self._backend_factory,
+            self._store(),
+            self._endpoints,
         )
         providers: dict[str, Provider] = {
             name: BackendProvider(be, self._store()) for name, be in backends.items()
@@ -327,7 +352,10 @@ class LocalClient:
             raise BackendError(
                 f"backend {name!r} is not in the config anymore; cannot reach the job"
             )
-        return self._backend_factory(name, bcfg)
+        be = self._backend_factory(name, bcfg)
+        be.store = self._store()  # single-store rule (H48): inject, never resolve
+        be.endpoints = self._endpoints  # share sessions/throttles/discovery
+        return be
 
     # -- deploy-key store --
     def deploy_key_get(self, origin: str) -> DeployKey | None:
@@ -507,7 +535,12 @@ class LocalClient:
         self, res: ResourceSpec, only: str | None
     ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
         backends, broken = _make_backends(
-            self.cfg, only, self._config_path, self._backend_factory
+            self.cfg,
+            only,
+            self._config_path,
+            self._backend_factory,
+            self._store(),
+            self._endpoints,
         )
         offers = (
             chooser.gather_offers(
@@ -525,7 +558,9 @@ class LocalClient:
 
         def _check_one(item: tuple[str, Any]) -> str:
             nm, bcfg = item
-            return self._backend_factory(nm, bcfg).check()
+            be = self._backend_factory(nm, bcfg)
+            be.endpoints = self._endpoints  # share sessions/throttles
+            return be.check()
 
         enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
         results = _parallel_by_name(enabled, _check_one)
@@ -545,7 +580,11 @@ class LocalClient:
 
         def _discover_one(item: tuple[str, Any]) -> ProviderFacts:
             nm, bcfg = item
-            return self._backend_factory(nm, bcfg).discover()
+            be = self._backend_factory(nm, bcfg)
+            # Shared discovery cache + single flight: backends on one physical
+            # endpoint coalesce identical queries even in this parallel fan-out.
+            be.endpoints = self._endpoints
+            return be.discover()
 
         enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
         results = _parallel_by_name(enabled, _discover_one)

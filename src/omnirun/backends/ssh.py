@@ -20,7 +20,7 @@ from omnirun.backends.base import (
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams
 from omnirun.execlayer.base import Exec, ExecError, shell_quote
-from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
+from omnirun.execlayer.ssh import RECONNECT_HINT
 from omnirun.repo import local_root_of
 from omnirun.models import (
     KNOWN_GPU_VRAM_GB,
@@ -62,7 +62,10 @@ class SshBackend(Backend):
                 raise BackendError(
                     f"backend {self.name!r}: 'host' is required for type=ssh"
                 )
-            self._exec = SSHExec(
+            # Through the shared EndpointManager: any other backend section
+            # pointed at this host with these options reuses the SAME SSHExec
+            # (one ControlMaster lifecycle per physical target).
+            self._exec = self.endpoint_manager().ssh_exec(
                 self.config.host,
                 port=self.config.extra("port"),
                 identity=self.config.extra("identity"),

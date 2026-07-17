@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,8 @@ from omnirun.models import (
 
 if TYPE_CHECKING:
     from omnirun.config import BackendConfig
+    from omnirun.endpoints.manager import EndpointManager
+    from omnirun.state.store import Store
 
 
 class BackendError(RuntimeError):
@@ -111,6 +114,50 @@ class Backend(ABC):
     def __init__(self, name: str, config: "BackendConfig") -> None:
         self.name = name  # config key, e.g. "uni"
         self.config = config
+        # The CONFIGURED state store, injected by whoever builds the backend
+        # (client._make_backends / backend_for) — the single-store rule
+        # (ROBUST-7/H48): a backend must never resolve a default store of its
+        # own while the placer's store lives elsewhere. Best-effort caches
+        # (wait history, facts, entitlement blocks) read/write through
+        # ``state_store()`` below.
+        self.store: "Store | None" = None
+        # The shared per-process EndpointManager (ssh sessions, provider API
+        # throttles, discovery cache), injected on the same factory path as the
+        # store. Backends reach it through ``endpoint_manager()`` below.
+        self.endpoints: "EndpointManager | None" = None
+
+    def endpoint_manager(self) -> "EndpointManager":
+        """The injected shared :class:`EndpointManager`; a standalone backend
+        (direct construction in tests, ``--dry-run`` rendering) lazily gets a
+        private one, which degrades gracefully to today's per-backend behavior
+        (per-instance sessions/throttle/cache) — never a global singleton."""
+        if self.endpoints is None:
+            from omnirun.endpoints.manager import EndpointManager
+
+            self.endpoints = EndpointManager()
+        return self.endpoints
+
+    @contextmanager
+    def state_store(self) -> Iterator["Store"]:
+        """Yield the injected shared store; fall back to briefly opening the
+        DEFAULT one only when nothing was injected (standalone construction,
+        e.g. ``--dry-run`` rendering or direct use in tests).
+
+        The fallback goes through ``open_store()``'s single-store guard, so on a
+        host whose config points ``[state]`` at another database it RAISES
+        instead of minting a stray SQLite file (H48) — callers of the
+        best-effort cache paths already tolerate that as a cache miss.
+        """
+        if self.store is not None:
+            yield self.store
+            return
+        from omnirun.state.store import open_store
+
+        store = open_store()
+        try:
+            yield store
+        finally:
+            store.close()
 
     @abstractmethod
     def probe(self, res: ResourceSpec) -> list[Offer]: ...

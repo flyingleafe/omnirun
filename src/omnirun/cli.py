@@ -1658,11 +1658,11 @@ def config_path() -> None:
 # --------------------------------------------------------------------------- state
 
 
-@state_app.command("path", help="Print the default SQLite DB URL.")
+@state_app.command(
+    "path", help="Print the state DB URL (configured [state] or the default)."
+)
 def state_path() -> None:
-    from omnirun.state import default_db_url
-
-    typer.echo(default_db_url())
+    typer.echo(_load_cfg().state.resolved_url())
 
 
 if __name__ == "__main__":

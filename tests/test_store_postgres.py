@@ -238,3 +238,93 @@ def test_newer_schema_version_refused(pg_store: Store) -> None:
     msg = str(exc.value)
     assert str(future) in msg
     assert str(STATE_SCHEMA_VERSION) in msg
+
+
+def test_migration_v7_reconstruction_on_postgres() -> None:
+    """The 7→8 step on the postgres dialect: the guarded ``ALTER TABLE jobs ADD
+    COLUMN seq`` fires (the v7 table lacks it) and reconstruction events are
+    emitted — then a re-open is a no-op (idempotent)."""
+    import json
+
+    from sqlalchemy import text as sa_text
+
+    assert PG_URL is not None
+    admin = create_engine(PG_URL, future=True)
+    metadata.drop_all(admin)
+    rec = _running_on("j-running", "uni")
+    with admin.begin() as conn:
+        conn.execute(
+            sa_text(
+                "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, name TEXT, "
+                "backend TEXT, state TEXT, project TEXT, submitted_at TEXT, "
+                "schema_version INTEGER NOT NULL, data JSON NOT NULL)"
+            )
+        )
+        conn.execute(sa_text("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)"))
+        conn.execute(sa_text("INSERT INTO meta VALUES ('schema_version', '7')"))
+        conn.execute(
+            sa_text(
+                "INSERT INTO jobs (job_id, name, backend, state, project, "
+                "submitted_at, schema_version, data) VALUES "
+                "('j-running', 'j-running', 'uni', 'running', 'proj', NULL, 7, "
+                ":data)"
+            ),
+            {"data": json.dumps(rec.model_dump(mode="json"))},
+        )
+    admin.dispose()
+
+    for _ in range(2):  # second open must be a no-op, not duplicate events
+        store = open_store(PG_URL)
+        try:
+            assert store.schema_version() == STATE_SCHEMA_VERSION
+            events = store.job_events_for("j-running")
+            assert [e.action for e in events] == [
+                "submit",
+                "reserve",
+                "provision",
+                "activate",
+            ]
+            assert all(e.actor == "migration" for e in events)
+        finally:
+            store.close()
+
+
+def test_events_intents_resources_on_postgres(pg_store: Store) -> None:
+    """Dialect pass over the new P1 surfaces: CAS transition (FOR UPDATE row
+    lock), the restricted-set intent upsert, and resource mint/release."""
+    from omnirun.state.store import StaleTransition
+
+    rec = _queued("j1")
+    assert (
+        pg_store.transition(
+            "j1",
+            rec,
+            expected_seq=0,
+            actor="client",
+            action="submit",
+            data={"cost_cents": 10},
+        )
+        == 1
+    )
+    with pytest.raises(StaleTransition):
+        pg_store.transition("j1", rec, expected_seq=0, actor="client", action="submit")
+    assert [e.action for e in pg_store.job_events_for("j1")] == ["submit"]
+
+    pg_store.put_intent("j1", "place", "reserved", "uni", {})
+    created = pg_store.get_intent("j1")
+    assert created is not None
+    pg_store.put_intent("j1", "place", "provisioned", "uni", {})  # ON CONFLICT
+    updated = pg_store.get_intent("j1")
+    assert updated is not None
+    assert updated.stage == "provisioned"
+    assert updated.created_at == created.created_at
+    assert pg_store.close_intent("j1") is True
+
+    pg_store.mint_resource("uni", "omnirun-j1", "j1")
+    with pytest.raises(StoreError, match="already minted"):
+        pg_store.mint_resource("uni", "omnirun-j1", "j1")
+    assert [r.external_key for r in pg_store.unreleased_resources("uni")] == [
+        "omnirun-j1"
+    ]
+    pg_store.release_resource("uni", "omnirun-j1")
+    assert pg_store.unreleased_resources() == []

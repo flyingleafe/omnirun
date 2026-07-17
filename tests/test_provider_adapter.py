@@ -232,6 +232,30 @@ def test_offer_capacity_prefers_facts_available(store: Store) -> None:
     assert slots[0].capacity == 0
 
 
+def test_offer_capacity_caps_at_max_parallel_even_with_available(store: Store) -> None:
+    """The concurrency cap (max_parallel less active) applies EVEN when the backend
+    discovers free capacity: a notebook that reports available>0 but only runs one
+    session at a time must not be handed a second job while one is active."""
+    provider, _backend = _provider(store, max_parallel=1)
+    now = datetime.now(timezone.utc)
+    # discovered available=3, but 1 omnirun job already active on this backend
+    store.save_facts(
+        ProviderFacts(
+            backend="stub",
+            discovered_at=now,
+            capabilities=Capabilities(gpu_types=["T4"]),
+            available=3,
+            capacity_at=now,
+        )
+    )
+    store.save_job(_running_on("busy-1", "stub"))
+
+    slots = provider.offer(ResourceSpec())
+
+    # min(available=3, max_parallel(1) - active(1) = 0) → 0: no second placement.
+    assert slots[0].capacity == 0
+
+
 def test_offer_capacity_fallback_when_available_unknown(store: Store) -> None:
     # Facts present but WITHOUT a capacity block (available is None) → the legacy
     # count-based capacity still applies, so backends that don't yet discover

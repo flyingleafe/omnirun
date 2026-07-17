@@ -51,7 +51,6 @@ from omnirun.bootstrap import (
 )
 from omnirun.config import BoreConfig
 from omnirun.progress import report
-from omnirun.state import default_db_url, open_store
 from omnirun.models import (
     CancelMode,
     JobHandle,
@@ -383,11 +382,8 @@ class ColabBackend(Backend):
         now = time.time()
         ttl = self._blocked_ttl_s()
         try:
-            store = open_store(default_db_url())
-            try:
+            with self.state_store() as store:
                 raw = store.get_meta(self._blocked_key())
-            finally:
-                store.close()
         except Exception:
             return set()
         try:
@@ -401,8 +397,7 @@ class ColabBackend(Backend):
         now = time.time()
         ttl = self._blocked_ttl_s()
         try:
-            store = open_store(default_db_url())
-            try:
+            with self.state_store() as store:
                 raw = store.get_meta(self._blocked_key())
                 try:
                     data = json.loads(raw) if raw else {}
@@ -411,8 +406,6 @@ class ColabBackend(Backend):
                 data = {f: ts for f, ts in data.items() if now - float(ts) < ttl}
                 data[flag] = now
                 store.set_meta(self._blocked_key(), json.dumps(data))
-            finally:
-                store.close()
         except Exception:
             pass
 

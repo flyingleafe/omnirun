@@ -8,8 +8,9 @@ without a network.
 from __future__ import annotations
 
 import subprocess
+import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -110,11 +111,104 @@ class Exec(ABC):
             cmd += f" && chmod {mode} {q}"
         self.run(cmd, stdin=content, check=True)
 
+    def run_batch(
+        self, commands: Sequence[str], *, timeout: float | None = None
+    ) -> list[ExecResult]:
+        """Run several small READ-ONLY commands in ONE remote invocation.
+
+        Joins the commands into a single delimited script (one ssh round-trip
+        per batch instead of one per command — the O(hosts)-not-O(jobs)
+        reconcile cost, CONN-1/OBS-3) and splits the combined output back into
+        one ``ExecResult`` per command. Each command runs in its own subshell;
+        a failing command never stops the batch.
+
+        Contract: line-oriented commands only — each result's stdout/stderr is
+        normalized to end with exactly one trailing newline when non-empty
+        (fine for every squeue/cat/status parser; not for binary payloads).
+        Raises :class:`ExecError` if the batch envelope itself did not survive
+        the transport (missing markers — a drop or timeout mid-batch).
+        """
+        if not commands:
+            return []
+        marker = f"__omnirun_batch_{uuid.uuid4().hex}__"
+        script = _compose_batch(commands, marker)
+        r = self.run(script, timeout=timeout)
+        return _split_batch(r, len(commands), marker)
+
 
 def shell_quote(s: str) -> str:
     import shlex
 
     return shlex.quote(s)
+
+
+def _compose_batch(commands: Sequence[str], marker: str) -> str:
+    """One shell script running every command in its own subshell, wrapping each
+    command's stdout/stderr/rc in *marker* lines ``_split_batch`` can cut on.
+    The marker carries a per-batch random nonce so command output can never
+    collide with it. A trailing ``printf '\\n'`` after each captured file
+    terminates an unterminated final line so the next marker stays on its own
+    line (the single-trailing-newline normalization ``run_batch`` documents)."""
+    parts = ['__ob_t="$(mktemp -d)" || exit 97']
+    for i, cmd in enumerate(commands):
+        parts += [
+            f'({cmd}\n) >"$__ob_t/o" 2>"$__ob_t/e"',
+            "__ob_rc=$?",
+            f"printf '%s\\n' \"{marker}:{i}:rc=$__ob_rc\"",
+            'cat "$__ob_t/o"',
+            f"printf '\\n%s\\n' \"{marker}:{i}:err\"",
+            'cat "$__ob_t/e"',
+            "printf '\\n'",
+        ]
+    parts.append('rm -rf "$__ob_t"')
+    return "\n".join(parts)
+
+
+def _split_batch(r: ExecResult, n: int, marker: str) -> list[ExecResult]:
+    """Cut a batch invocation's combined stdout back into per-command results.
+
+    Raises ExecError when any command's markers are missing — the envelope
+    itself failed (transport drop, timeout, mktemp failure), so no per-command
+    result can honestly be reported."""
+    lines = r.stdout.splitlines()
+    results: list[ExecResult] = []
+    pos = 0
+    for i in range(n):
+        rc_prefix = f"{marker}:{i}:rc="
+        err_line = f"{marker}:{i}:err"
+        try:
+            rc_at = next(
+                j for j in range(pos, len(lines)) if lines[j].startswith(rc_prefix)
+            )
+            err_at = next(j for j in range(rc_at, len(lines)) if lines[j] == err_line)
+        except StopIteration:
+            raise ExecError(
+                f"batch output truncated: markers for command {i} missing "
+                f"(rc {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}",
+                r,
+            ) from None
+        rc = int(lines[rc_at][len(rc_prefix) :])
+        stop = next(
+            (
+                j
+                for j in range(err_at + 1, len(lines))
+                if lines[j].startswith(f"{marker}:{i + 1}:rc=")
+            ),
+            len(lines),
+        )
+        out = _batch_section(lines[rc_at + 1 : err_at])
+        err = _batch_section(lines[err_at + 1 : stop])
+        results.append(ExecResult(returncode=rc, stdout=out, stderr=err))
+        pos = stop
+    return results
+
+
+def _batch_section(section: list[str]) -> str:
+    """Reassemble one captured stream: drop the single sentinel blank line the
+    composer appended after ``cat``, then normalize to one trailing newline."""
+    if section and section[-1] == "":
+        section = section[:-1]
+    return "\n".join(section) + "\n" if section else ""
 
 
 def stream_lines(argv: list[str]) -> Iterator[str]:

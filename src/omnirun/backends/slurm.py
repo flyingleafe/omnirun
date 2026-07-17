@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,8 +22,9 @@ from omnirun.backends.base import Backend, BackendError, ProvisioningSink, regis
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.config import BackendConfig
-from omnirun.execlayer.base import Exec, ExecError, shell_quote
-from omnirun.execlayer.ssh import RECONNECT_HINT, SSHExec
+from omnirun.endpoints.manager import DISCOVER_TTL_S, ESTIMATE_TTL_S
+from omnirun.execlayer.base import Exec, ExecError, ExecResult, shell_quote
+from omnirun.execlayer.ssh import RECONNECT_HINT
 from omnirun.models import (
     CancelMode,
     Capabilities,
@@ -38,7 +39,6 @@ from omnirun.models import (
     normalize_gpu_type,
 )
 from omnirun.repo import local_root_of
-from omnirun.state import default_db_url, open_store
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def _scontrol_field(line: str, key: str) -> str | None:
 
 
 def _check_assoc(
-    exec_: Exec,
+    run_assoc: Callable[[], ExecResult],
     account: str,
     partition: str,
     qos: str | None,
@@ -95,13 +95,11 @@ def _check_assoc(
     """Return a human-readable error string if the account+partition+QOS combo
     is not in the user's sacctmgr associations, or None if it's valid (or if
     sacctmgr is unavailable/unparseable — best-effort, never degrades on parse
-    failure alone).
+    failure alone). ``run_assoc`` runs the (identical-across-backends) assoc
+    query — the caller routes it through the shared discovery cache.
     """
     try:
-        r = exec_.run(
-            "sacctmgr -nP show assoc user=$USER format=Account,Partition,QOS",
-            timeout=15,
-        )
+        r = run_assoc()
         if not r.ok or not r.stdout.strip():
             return None  # can't tell → leave health as-is
         valid_combos: list[tuple[str, str, set[str]]] = []
@@ -256,7 +254,10 @@ class SlurmBackend(Backend):
                 raise BackendError(
                     f"backend {self.name!r}: 'host' is required for type=slurm"
                 )
-            self._exec = SSHExec(
+            # Through the shared EndpointManager: every backend section pointed
+            # at this login host with these options gets the SAME SSHExec (one
+            # ControlMaster lifecycle for all three apocrita partitions).
+            self._exec = self.endpoint_manager().ssh_exec(
                 self.config.host,
                 port=self.config.extra("port"),
                 identity=self.config.extra("identity"),
@@ -279,6 +280,28 @@ class SlurmBackend(Backend):
         if ensure is not None:
             ensure(interactive=interactive)
 
+    def _endpoint_key(self) -> tuple[object, ...]:
+        """Identity of the physical login host this backend talks to — the
+        discovery-cache namespace shared by every backend section on it."""
+        return (
+            "ssh",
+            self.config.host,
+            self.config.extra("port"),
+            tuple(_ssh_command(self.config)),
+        )
+
+    def _cached_run(self, command: str, *, ttl_s: float, timeout: float) -> ExecResult:
+        """Run a READ-ONLY discovery command through the shared per-endpoint TTL
+        cache: N backend sections on one login host make ONE remote round per
+        distinct query per TTL window (single-flighted under concurrency). Only
+        successful results are cached, so a transient failure never sticks."""
+        return self.endpoint_manager().cached(
+            (*self._endpoint_key(), command),
+            ttl_s,
+            lambda: self.exec_.run(command, timeout=timeout),
+            should_cache=lambda r: r.ok,
+        )
+
     def discover(self) -> ProviderFacts:
         """Query the cluster for partition walltime, GRES GPU types, QOS limits,
         and account/partition/QOS association validity.
@@ -292,23 +315,31 @@ class SlurmBackend(Backend):
             self._connect(interactive=False)
             caps = Capabilities()
             part = self.config.partition
+            # Slow-moving cluster facts go through the shared discovery cache:
+            # backends sharing this login host coalesce identical queries into
+            # one remote round per TTL window (tick-anatomy finding 5).
             if part:
-                r = self.exec_.run(
-                    f"scontrol show partition {shell_quote(part)} -o", timeout=15
+                r = self._cached_run(
+                    f"scontrol show partition {shell_quote(part)} -o",
+                    ttl_s=DISCOVER_TTL_S,
+                    timeout=15,
                 )
                 if r.ok:
                     mt = _scontrol_field(r.stdout, "MaxTime")
                     if mt is not None:
                         caps.max_walltime = _parse_slurm_duration(mt)
-                g = self.exec_.run(
-                    f"sinfo -p {shell_quote(part)} -h -o '%G'", timeout=15
+                g = self._cached_run(
+                    f"sinfo -p {shell_quote(part)} -h -o '%G'",
+                    ttl_s=DISCOVER_TTL_S,
+                    timeout=15,
                 )
                 if g.ok:
                     caps.gpu_types = _parse_sinfo_gres(g.stdout)
             qos = self.config.qos
             if qos:
-                q = self.exec_.run(
+                q = self._cached_run(
                     f"sacctmgr -nP show qos {shell_quote(qos)} format=MaxWall,MaxSubmitJobsPerUser",
+                    ttl_s=DISCOVER_TTL_S,
                     timeout=15,
                 )
                 if q.ok:
@@ -332,7 +363,20 @@ class SlurmBackend(Backend):
             health_detail = "ok"
             account = self.config.account
             if account and part:
-                assoc_detail = _check_assoc(self.exec_, account, part, qos)
+                # The assoc query is IDENTICAL for every backend on this host
+                # (it is per-$USER, not per-partition) — the exact triplicated
+                # call the tick-anatomy capture showed; one round per window.
+                assoc_detail = _check_assoc(
+                    lambda: self._cached_run(
+                        "sacctmgr -nP show assoc user=$USER"
+                        " format=Account,Partition,QOS",
+                        ttl_s=DISCOVER_TTL_S,
+                        timeout=15,
+                    ),
+                    account,
+                    part,
+                    qos,
+                )
                 if assoc_detail is not None:
                     health = Health.DEGRADED
                     health_detail = assoc_detail
@@ -434,11 +478,8 @@ class SlurmBackend(Backend):
         except Exception:
             pass
         try:
-            store = open_store(default_db_url())
-            try:
+            with self.state_store() as store:
                 median = store.median_wait_s(self.name, self._wait_key(res.gpu_type))
-            finally:
-                store.close()
         except Exception:
             median = None
         if median is not None:
@@ -485,7 +526,10 @@ class SlurmBackend(Backend):
             'printf "OMNIRUN_START=%s\\nOMNIRUN_NOW=%s\\n" '
             '"$(date -d "$ts" +%s 2>/dev/null)" "$(date +%s)"; fi'
         )
-        r = self.exec_.run(cmd, timeout=20)
+        # Cached per (endpoint, exact flag set): the flags carry the partition
+        # and the requested --time (the "time bucket"), so identical pending
+        # requests share one dry-run per minute instead of one per probe.
+        r = self._cached_run(cmd, ttl_s=ESTIMATE_TTL_S, timeout=20)
         start = re.search(r"OMNIRUN_START=(\d+)", r.stdout)
         now = re.search(r"OMNIRUN_NOW=(\d+)", r.stdout)
         if not (start and now):
@@ -640,11 +684,8 @@ class SlurmBackend(Backend):
         never consults the offer table) and gives a wall-time-specific message.
         """
         try:
-            store = open_store(default_db_url())
-            try:
+            with self.state_store() as store:
                 facts = store.load_facts(self.name)
-            finally:
-                store.close()
         except Exception:
             facts = None
         max_walltime = facts.capabilities.max_walltime if facts else None
@@ -809,11 +850,8 @@ class SlurmBackend(Backend):
             if wait_s < 0:
                 return
             key = handle.data.get("wait_key") or self._wait_key(None)
-            store = open_store(default_db_url())
-            try:
+            with self.state_store() as store:
                 store.record_wait(self.name, key, wait_s)
-            finally:
-                store.close()
         except Exception:
             pass
 

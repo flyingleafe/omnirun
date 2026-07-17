@@ -42,6 +42,7 @@ from omnirun.backends.base import (
     register,
 )
 from omnirun.backends import jobdir, tarsafe
+from omnirun.endpoints.manager import QUOTA_TTL_S
 from omnirun.progress import report
 from omnirun.bootstrap import (
     BootstrapParams,
@@ -378,11 +379,22 @@ class KaggleBackend(Backend):
 
     # ---- discover ------------------------------------------------------------
 
+    def _quota_remaining(self) -> tuple[float | None, str | None]:
+        """(remaining_gpu_hours, refresh_iso) through the shared endpoint
+        cache: the quota API is account-level, so every kaggle backend, probe,
+        and discover in the process shares ONE fetch per TTL window (the
+        tick-anatomy capture showed it fetched 3x in 5s). Errors propagate
+        uncached, so a transient failure never sticks."""
+        return self.endpoint_manager().cached(
+            ("kaggle", "quota_view"),
+            QUOTA_TTL_S,
+            lambda: _remaining_from_quota(self._api().quota_view()),
+        )
+
     def discover(self) -> ProviderFacts:
         now = datetime.now(timezone.utc)
         try:
-            q = self._api().quota_view()
-            remaining_h, refresh = _remaining_from_quota(q)
+            remaining_h, refresh = self._quota_remaining()
             budget = {
                 "gpu_hours_remaining": remaining_h,
                 "refresh": refresh,
@@ -419,7 +431,7 @@ class KaggleBackend(Backend):
         blocked only when Kaggle itself would refuse it (remaining <= 0).  A
         quota the API can't report (None) never blocks."""
         try:
-            remaining_h, refresh = _remaining_from_quota(self._api().quota_view())
+            remaining_h, refresh = self._quota_remaining()
         except Exception:
             return []  # quota unknown → be optimistic, let the submit try
         if remaining_h is None or remaining_h > 0:
