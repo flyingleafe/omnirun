@@ -18,7 +18,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from omnirun.backends import jobdir
-from omnirun.backends.base import Backend, BackendError, ProvisioningSink, register
+from omnirun.backends.base import (
+    Backend,
+    BackendError,
+    BackendUnreachable,
+    ProvisioningSink,
+    register,
+)
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.bootstrap import BootstrapParams, generate_bootstrap
 from omnirun.config import BackendConfig
@@ -594,6 +600,54 @@ class SlurmBackend(Backend):
         offer: Offer | None = None,
         on_provisioning: ProvisioningSink | None = None,
     ) -> JobHandle:
+        return self._do_submit(spec, attempt=1)
+
+    # --- staged placement seam (v2 engine) ------------------------------------
+    # The sbatch submission IS the resource creation and carries the whole
+    # payload, so rent = the (already idempotent, adopt-by-job-name) submit and
+    # boot/launch stay the base no-ops.
+
+    def rent_resource(
+        self,
+        spec: JobSpec,
+        offer: Offer | None = None,
+        on_provisioning: ProvisioningSink | None = None,
+        *,
+        attempt: int = 1,
+    ) -> JobHandle:
+        try:
+            return self._do_submit(spec, attempt=attempt)
+        except ExecError as e:
+            # A dead/denied transport: the cluster could not be asked at all —
+            # state unknown, freeze (COST-3) rather than count an attempt.
+            raise BackendUnreachable(str(e)) from e
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt by the deterministic sbatch job name ``omnirun-<job_id>``
+        (SCHED-8): a pending/running Slurm job with our name is OUR submission
+        from a prior placer — never duplicate it."""
+        try:
+            self._connect(interactive=False)
+            ex = self.exec_
+            sid = self._find_slurm_job(ex, spec.job_id)
+            if sid is None:
+                return None
+            root = jobdir.remote_root(ex, self.config.root)
+            return JobHandle(
+                backend=self.name,
+                job_id=spec.job_id,
+                data={
+                    "job_dir": jobdir.job_dir_of(root, spec.job_id),
+                    "root": root,
+                    "slug": spec.repo.slug,
+                    "slurm_job_id": sid,
+                    "wait_key": self._wait_key(spec.resources.gpu_type),
+                },
+            )
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def _do_submit(self, spec: JobSpec, attempt: int) -> JobHandle:
         self._enforce_walltime(spec)
         ex = self.exec_
         # Ensure the shared master is up BEFORE sbatch, so the non-idempotent submit
@@ -633,7 +687,9 @@ class SlurmBackend(Backend):
             project_root=project_root,
             setup_lines=list(self.config.env_setup),
         )
-        job_dir = jobdir.stage_job(ex, spec, local_root_of(spec.repo), params, root)
+        job_dir = jobdir.stage_job(
+            ex, spec, local_root_of(spec.repo), params, root, attempt=attempt
+        )
         script = render_sbatch(spec, self.config, job_dir, root)
         # keep a copy on the cluster for reproducibility/debugging
         ex.write_file(f"{job_dir}/job.sbatch", script)
@@ -728,7 +784,18 @@ class SlurmBackend(Backend):
         except ExecError as e:
             return StatusReport(status=JobStatus.LOST, detail=str(e))
 
-    def _status_inner(self, handle: JobHandle) -> StatusReport:
+    def observe_status(self, handle: JobHandle) -> StatusReport:
+        """Observer poll (COST-3): transport failure raises ``BackendUnreachable``
+        (state unknown, freeze). LOST from here is positive evidence — squeue
+        AND accounting have no record of the job and there is no result.json."""
+        try:
+            return self._status_inner(handle, raise_unreachable=True)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def _status_inner(
+        self, handle: JobHandle, *, raise_unreachable: bool = False
+    ) -> StatusReport:
         ex = self.exec_
         sid = handle.data["slurm_job_id"]
         job_dir = handle.data["job_dir"]
@@ -745,10 +812,15 @@ class SlurmBackend(Backend):
                 self._record_wait_once(handle, submit_t, start_t)
                 # bootstrap may still be cloning/solving the env -> STARTING
                 return jobdir.derive_status(
-                    ex, job_dir, absent_means=JobStatus.STARTING
+                    ex,
+                    job_dir,
+                    absent_means=JobStatus.STARTING,
+                    raise_unreachable=raise_unreachable,
                 )
             if state:
-                return self._terminal_report(job_dir, state, None)
+                return self._terminal_report(
+                    job_dir, state, None, raise_unreachable=raise_unreachable
+                )
 
         # gone from squeue -> accounting
         r2 = ex.run(
@@ -773,7 +845,12 @@ class SlurmBackend(Backend):
 
         if not state:
             # slurm has no record at all; the job-dir files are the last word
-            report = jobdir.derive_status(ex, job_dir, absent_means=JobStatus.LOST)
+            report = jobdir.derive_status(
+                ex,
+                job_dir,
+                absent_means=JobStatus.LOST,
+                raise_unreachable=raise_unreachable,
+            )
             if report.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
                 return report
             return StatusReport(
@@ -782,11 +859,23 @@ class SlurmBackend(Backend):
         if state in QUEUED_STATES:
             return StatusReport(status=JobStatus.QUEUED)
         if state in LIVE_STATES:
-            return jobdir.derive_status(ex, job_dir, absent_means=JobStatus.STARTING)
-        return self._terminal_report(job_dir, state, exit_str)
+            return jobdir.derive_status(
+                ex,
+                job_dir,
+                absent_means=JobStatus.STARTING,
+                raise_unreachable=raise_unreachable,
+            )
+        return self._terminal_report(
+            job_dir, state, exit_str, raise_unreachable=raise_unreachable
+        )
 
     def _terminal_report(
-        self, job_dir: str, state: str, exit_str: str | None
+        self,
+        job_dir: str,
+        state: str,
+        exit_str: str | None,
+        *,
+        raise_unreachable: bool = False,
     ) -> StatusReport:
         slurm_exit: int | None = None
         if exit_str and ":" in exit_str:
@@ -798,7 +887,12 @@ class SlurmBackend(Backend):
         cancelled = state.startswith("CANCELLED")
 
         # prefer the job's own result.json for the exit code
-        report = jobdir.derive_status(self.exec_, job_dir, absent_means=JobStatus.LOST)
+        report = jobdir.derive_status(
+            self.exec_,
+            job_dir,
+            absent_means=JobStatus.LOST,
+            raise_unreachable=raise_unreachable,
+        )
         if report.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
             return StatusReport(
                 status=JobStatus.CANCELLED if cancelled else report.status,
@@ -835,6 +929,62 @@ class SlurmBackend(Backend):
         return StatusReport(
             status=JobStatus.LOST, detail=f"unknown slurm state {state!r}"
         )
+
+    def observe_batch(self, handles: list[JobHandle]) -> list[StatusReport]:
+        """ONE composed remote invocation for the whole observed set: a single
+        ``squeue --name`` over every job's deterministic name plus one status
+        triple per job dir, all in one ``run_batch`` (OBS-12: O(hosts), not
+        O(jobs)). Gone-from-squeue with NO durable result is positive death
+        evidence; the transport failing is unreachable (freeze)."""
+        if not handles:
+            return []
+        names = {h.job_id: f"omnirun-{h.job_id}" for h in handles}
+        commands = [
+            f"squeue --me -h -n {shell_quote(','.join(names.values()))} -o '%j|%T'"
+        ]
+        commands += [jobdir.status_command(h.data["job_dir"]) for h in handles]
+        try:
+            self._connect(interactive=False)
+            results = self.exec_.run_batch(commands)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+        states: dict[str, str] = {}
+        if results[0].ok:
+            for line in results[0].stdout.strip().splitlines():
+                parts = line.split("|")
+                if len(parts) >= 2 and parts[1].strip():
+                    states[parts[0].strip()] = parts[1].strip().split()[0]
+        reports: list[StatusReport] = []
+        for h, triple in zip(handles, results[1:]):
+            state = states.get(names[h.job_id], "")
+            if state in QUEUED_STATES:
+                reports.append(StatusReport(status=JobStatus.QUEUED))
+                continue
+            if state in LIVE_STATES:
+                reports.append(
+                    jobdir.parse_status_result(
+                        triple,
+                        absent_means=JobStatus.STARTING,
+                        raise_unreachable=True,
+                    )
+                )
+                continue
+            # Terminal in (or gone from) squeue: the job dir's durable result
+            # outranks everything; squeue-empty + no result.json = dead.
+            report = jobdir.parse_status_result(
+                triple, absent_means=JobStatus.LOST, raise_unreachable=True
+            )
+            if report.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
+                reports.append(report)
+            else:
+                reports.append(
+                    StatusReport(
+                        status=JobStatus.LOST,
+                        detail=f"{names[h.job_id]} gone from squeue with no "
+                        "durable result",
+                    )
+                )
+        return reports
 
     def _record_wait_once(self, handle: JobHandle, submit_t: str, start_t: str) -> None:
         """Record submit->start delta into local history on first sighting of

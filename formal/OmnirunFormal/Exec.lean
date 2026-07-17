@@ -32,6 +32,7 @@ inductive Action where
   | logAppend (id : Nat)
   | finish (id : Nat) (ok : Bool)
   | cancel (id : Nat)
+  | fail (id : Nat)
   | capture (id : Nat)
   | reap (id : Nat)
   | releaseLost (id : Nat)
@@ -166,6 +167,14 @@ def apply (m : M) : Action → Option M
         some { m with jobs := pre ++ { j with st := .cancelled } :: post,
                       events := m.events + 1 }
       else none
+  | .fail id =>
+    match findSplit id m.jobs with
+    | none => none
+    | some (pre, j, post) =>
+      if _h : j.st = .queued then
+        some { m with jobs := pre ++ { j with st := .failed } :: post,
+                      events := m.events + 1 }
+      else none
   | .capture id =>
     match findSplit id m.jobs with
     | none => none
@@ -290,6 +299,17 @@ theorem apply_sound {m m' : M} {a : Action}
         cases h
         obtain ⟨hj, _⟩ := findSplit_sound hf
         exact .cancel m pre post j hj hg.1 hg.2
+      · cases h
+  | fail id =>
+    simp only [apply] at h
+    split at h
+    · cases h
+    · rename_i pre j post hf
+      split at h
+      · rename_i hg
+        cases h
+        obtain ⟨hj, _⟩ := findSplit_sound hf
+        exact .failQueued m pre post j hj hg
       · cases h
   | capture id =>
     simp only [apply] at h
@@ -461,6 +481,21 @@ theorem apply_complete {m m' : M} (inv : Inv m) (h : Step m m') :
       simp only [Option.some.injEq, Prod.mk.injEq] at heq
       obtain ⟨rfl, rfl, rfl⟩ := heq
       rw [dif_pos ⟨hnt, hnp⟩]
+  | failQueued pre post j hj hq =>
+    have hfs : findSplit j.id m.jobs = some (pre, j, post) := by
+      rw [hj]
+      exact findSplit_complete pre j post (hj ▸ inv.wf_ids)
+    refine ⟨.fail j.id, ?_⟩
+    simp only [apply]
+    split
+    · rename_i hnone
+      rw [hfs] at hnone
+      cases hnone
+    · rename_i pre' j' post' heq
+      rw [hfs] at heq
+      simp only [Option.some.injEq, Prod.mk.injEq] at heq
+      obtain ⟨rfl, rfl, rfl⟩ := heq
+      rw [dif_pos hq]
   | capture pre post j hj hp =>
     have hfs : findSplit j.id m.jobs = some (pre, j, post) := by
       rw [hj]

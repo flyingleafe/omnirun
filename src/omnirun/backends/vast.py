@@ -23,12 +23,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from omnirun.backends.base import BackendError, register
+from omnirun.backends.base import BackendError, OfferGoneError, register
 from omnirun.backends.marketplace import (
     HTTPBackendError,
     Instance,
-    InstanceUnreachable,
     MarketplaceBackend,
+    instance_label,
 )
 from omnirun.models import (
     JobSpec,
@@ -133,28 +133,35 @@ class VastBackend(MarketplaceBackend):
 
     def _create_instance(self, spec: JobSpec, offer: Offer) -> Instance:
         ask_id = offer.details["ask_id"]
+        label = instance_label(spec.job_id)
         payload = {
             "image": self.config.extra("image", DEFAULT_IMAGE),
             "disk": int(max(spec.resources.disk_gb or 0, 50)),
             "runtype": "ssh",
+            # The deterministic adopt key (SCHED-8): a crashed placer finds the
+            # rental again by this label instead of renting a duplicate.
+            "label": label,
         }
         taken_msg = (
             f"{self.name}: renting offer {ask_id} failed — vast offers churn "
-            "fast and this one was likely taken. Re-run probe/`omnirun offers` "
-            "and pick a fresh offer."
+            "fast and this one was likely taken (no_such_ask). Re-probe and "
+            "pick a fresh offer."
         )
         try:
             data = self._request(
                 "PUT", f"{BASE}/asks/{ask_id}/", json_body=payload
             ).json()
         except HTTPBackendError as e:
-            # A churned/taken offer (4xx) is retryable: raise InstanceUnreachable so
-            # submit re-probes a FRESH offer rather than failing the placement.
+            # A churned/taken offer (4xx: no_such_ask/410/400) is capacity
+            # contention, not a defect: raise OfferGoneError so the v1 submit
+            # loop re-probes a fresh offer and the staged seam re-shops.
             if e.status_code is not None and 400 <= e.status_code < 500:
-                raise InstanceUnreachable(f"{taken_msg} ({e})") from e
+                raise OfferGoneError(f"{taken_msg} ({e})", offer_key=str(ask_id)) from e
             raise
         if not data.get("success"):
-            raise InstanceUnreachable(f"{taken_msg} (response: {str(data)[:200]})")
+            raise OfferGoneError(
+                f"{taken_msg} (response: {str(data)[:200]})", offer_key=str(ask_id)
+            )
         contract = data.get("new_contract")
         if contract is None:
             raise BackendError(
@@ -165,6 +172,7 @@ class VastBackend(MarketplaceBackend):
             instance_id=str(contract),
             status="loading",
             gpu_type=offer.gpu_type,
+            label=label,
             raw=data,
         )
 
@@ -174,6 +182,10 @@ class VastBackend(MarketplaceBackend):
             if str(raw.get("id")) == str(instance_id):
                 return self._parse_instance(raw)
         return None
+
+    def _list_instances(self) -> list[Instance]:
+        data = self._request("GET", f"{BASE}/instances/").json()
+        return [self._parse_instance(raw) for raw in data.get("instances", [])]
 
     def _parse_instance(self, raw: dict[str, Any]) -> Instance:
         host: str | None = None
@@ -199,6 +211,7 @@ class VastBackend(MarketplaceBackend):
             status=str(raw.get("actual_status") or "").lower(),
             cost_per_hour=raw.get("dph_total"),
             gpu_type=normalize_vast_gpu(raw.get("gpu_name") or "", raw.get("gpu_ram")),
+            label=raw.get("label") or None,
             raw=raw,
         )
 

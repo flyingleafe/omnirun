@@ -64,10 +64,12 @@ from omnirun.backends.base import (
     Backend,
     BackendError,
     BackendUnreachable,
+    CapacityError,
+    OfferGoneError,
     ProvisioningSink,
 )
 from omnirun.bootstrap import BootstrapParams
-from omnirun.execlayer.base import Exec, shell_quote
+from omnirun.execlayer.base import Exec, ExecError, shell_quote
 from omnirun.repo import local_root_of
 from omnirun.models import (
     CancelMode,
@@ -106,11 +108,21 @@ DEFAULT_PROVISION_ATTEMPTS = 3
 # a generous retry count keeps a placement from failing on a transient 429.
 DEFAULT_API_429_RETRIES = 6
 DEFAULT_RETRY_AFTER_S = 5.0
+# No-progress watchdog on the staged provisioning wait (COST-4): the provider
+# status string unchanged AND not ready for this long → the rental is dead;
+# destroy it and fail the stage instead of billing until the overall timeout.
+DEFAULT_PROVISION_STALL_S = 90.0
 WAIT_ESTIMATE_S = 150.0  # honest ballpark: instance provisioning + image pull
 WAIT_NOTE = "instance provisioning + image pull, typically 2-3 min"
 
 _sleep = time.sleep  # test seam
+_monotonic = time.monotonic  # test seam (the stall watchdog's clock)
 _log = logging.getLogger("omnirun.backends.marketplace")
+
+
+def instance_label(job_id: str) -> str:
+    """The deterministic instance name/label for a job (SCHED-8 adopt key)."""
+    return f"omnirun-{job_id}"
 
 
 def _retry_after_s(resp: "httpx.Response") -> float:
@@ -161,6 +173,7 @@ class Instance(BaseModel):
     status: str = ""  # provider status, lowercased ("running" == ready)
     cost_per_hour: float | None = None
     gpu_type: str | None = None
+    label: str | None = None  # our deterministic name (omnirun-<job_id>), if set
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -222,6 +235,11 @@ class MarketplaceBackend(Backend, ABC):
         """Current state, or None if the instance no longer exists."""
 
     @abstractmethod
+    def _list_instances(self) -> list[Instance]:
+        """Every live instance on the account (one list call — the batched
+        observation and the adopt-by-label probe both ride it)."""
+
+    @abstractmethod
     def _terminate(self, instance_id: str) -> None:
         """Destroy the instance (the variant that ends ALL billing)."""
 
@@ -269,19 +287,27 @@ class MarketplaceBackend(Backend, ABC):
                 raise BackendUnreachable(
                     f"{self.name}: {method} {url} failed: {e}"
                 ) from e
-            if resp.status_code == 429 and attempt < retries:
-                wait = _retry_after_s(resp)
-                _log.info(
-                    "%s: %s %s rate-limited (429); retry %d/%d in %.1fs",
-                    self.name,
-                    method,
-                    url,
-                    attempt + 1,
-                    retries,
-                    wait,
+            if resp.status_code == 429:
+                if attempt < retries:
+                    wait = _retry_after_s(resp)
+                    _log.info(
+                        "%s: %s %s rate-limited (429); retry %d/%d in %.1fs",
+                        self.name,
+                        method,
+                        url,
+                        attempt + 1,
+                        retries,
+                        wait,
+                    )
+                    _sleep(wait)
+                    continue
+                # Retries exhausted: the provider is saturated RIGHT NOW — a
+                # transient capacity condition, not a defect. The scheduler
+                # defers quietly and retries later (JOB-4).
+                raise CapacityError(
+                    f"{self.name}: {method} {url} still rate-limited (429) after "
+                    f"{retries} retries — provider API saturated, retry later"
                 )
-                _sleep(wait)
-                continue
             if resp.status_code >= 400:
                 raise HTTPBackendError(
                     f"{self.name}: {method} {url} -> HTTP {resp.status_code}: "
@@ -289,7 +315,7 @@ class MarketplaceBackend(Backend, ABC):
                     status_code=resp.status_code,
                 )
             return resp
-        raise BackendUnreachable(  # pragma: no cover - loop always returns/raises
+        raise CapacityError(  # pragma: no cover - loop always returns/raises
             f"{self.name}: {method} {url} exhausted 429 retries"
         )
 
@@ -409,11 +435,11 @@ class MarketplaceBackend(Backend, ABC):
         )
         current = offer
         tried: set[str] = set()
-        last: InstanceUnreachable | None = None
+        last: BackendError | None = None
         for attempt in range(1, attempts + 1):
             try:
                 return self._submit_once(spec, current, on_provisioning)
-            except InstanceUnreachable as e:
+            except (InstanceUnreachable, OfferGoneError) as e:
                 # The RENTAL was dead-on-arrival (never ran / no sshd) or the offer
                 # churned before we could rent it; the failed instance is already
                 # terminated. Re-PROBE for a fresh cheapest offer (re-renting the
@@ -439,6 +465,236 @@ class MarketplaceBackend(Backend, ABC):
             f"{self.name}: could not get a usable instance after {attempts} "
             f"attempts (last: {last})"
         )
+
+    # ---- staged placement seam (v2 engine) ------------------------------------
+    # rent = create-or-adopt the instance ONLY; boot = the provisioning + sshd
+    # wait (per-stage budgets + the COST-4 stall watchdog); launch = stage the
+    # job dir and start the bootstrap detached. Re-shopping a churned ask
+    # belongs to the CALLER (the engine re-shops on capacity contention) — the
+    # staged path never loops internally.
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt by the deterministic instance name/label ``omnirun-<job_id>``
+        (SCHED-8): an account instance carrying our label is OUR rental from a
+        prior placer — adopt it, never rent a duplicate."""
+        label = instance_label(spec.job_id)
+        for inst in self._list_instances():
+            if inst.label == label:
+                return self._instance_handle(spec.job_id, inst)
+        return None
+
+    def _instance_handle(self, job_id: str, inst: Instance) -> JobHandle:
+        """The handle for an adopted instance: ssh coordinates when it already
+        has them, else a provisioning stub the boot stage completes."""
+        data: dict[str, Any] = {"instance_id": inst.instance_id}
+        if inst.ssh_target and inst.status.lower() == "running":
+            user = self._default_ssh_user()
+            target = (
+                inst.ssh_target
+                if "@" in inst.ssh_target
+                else f"{user}@{inst.ssh_target}"
+            )
+            data.update({"ssh_target": target, "ssh_port": inst.ssh_port})
+        else:
+            data["provisioning"] = True
+        return JobHandle(backend=self.name, job_id=job_id, data=data)
+
+    def rent_resource(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+        *,
+        attempt: int = 1,
+    ) -> JobHandle:
+        """Create the instance for *offer* and return a provisioning handle.
+
+        A churned/taken ask surfaces as ``OfferGoneError`` (capacity
+        contention at the seam) so the caller re-shops; nothing is retried
+        here."""
+        inst = self._create_instance(spec, offer)
+        handle = JobHandle(
+            backend=self.name,
+            job_id=spec.job_id,
+            data={"instance_id": inst.instance_id, "provisioning": True},
+        )
+        if on_provisioning is not None:
+            on_provisioning(handle)
+        return handle
+
+    def resource_ready(self, handle: JobHandle) -> JobHandle:
+        """Wait for the rented instance to run and accept ssh (per-stage
+        budgets: ``provision_timeout_s`` then ``ssh_wait_timeout_s``), with a
+        no-progress watchdog (``provision_stall_s``, COST-4). A rental that
+        never becomes usable is DESTROYED first, then the failure propagates
+        (an infra failure — the rental's fault, not the job's)."""
+        instance_id = handle.data["instance_id"]
+        try:
+            inst = self._wait_provisioned_watched(instance_id)
+            assert inst.ssh_target is not None
+            user = self._default_ssh_user()
+            target = (
+                inst.ssh_target
+                if "@" in inst.ssh_target
+                else f"{user}@{inst.ssh_target}"
+            )
+            ex = self._make_exec(target, inst.ssh_port)
+            self._wait_ssh(ex)
+        except InstanceUnreachable:
+            try:  # destroy FIRST — a dead rental must not bill (COST-4)
+                self._terminate(instance_id)
+            except Exception:
+                _log.warning(
+                    "%s: could not destroy dead-on-arrival instance %s; "
+                    "the release/reap will retry",
+                    self.name,
+                    instance_id,
+                )
+            raise
+        data = dict(handle.data)
+        data.pop("provisioning", None)
+        data.update({"ssh_target": target, "ssh_port": inst.ssh_port})
+        return JobHandle(backend=self.name, job_id=handle.job_id, data=data)
+
+    def launch_job(
+        self, spec: JobSpec, handle: JobHandle, *, attempt: int = 1
+    ) -> JobHandle:
+        ex = self._exec_from_handle(handle)
+        root = jobdir.remote_root(ex, self.config.root)
+        job_dir = jobdir.job_dir_of(root, spec.job_id)
+        # Idempotent (SCHED-8): a bootstrap already started on this instance
+        # (pid recorded) is adopted, never re-executed.
+        if not ex.run(f"test -f {shell_quote(f'{job_dir}/pid')}").ok:
+            project_root = jobdir.resolve_project_root(
+                ex, root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
+            )
+            params = BootstrapParams(
+                omnirun_root=root,
+                project_root=project_root,
+                setup_lines=list(self.config.env_setup),
+            )
+            job_dir = jobdir.stage_job(
+                ex, spec, local_root_of(spec.repo), params, root, attempt=attempt
+            )
+            self._launch_detached(ex, job_dir)
+        data = dict(handle.data)
+        data.update({"job_dir": job_dir, "root": root, "slug": spec.repo.slug})
+        return JobHandle(backend=self.name, job_id=spec.job_id, data=data)
+
+    def observe_status(self, handle: JobHandle) -> StatusReport:
+        """Observer poll (COST-3): the instance list lacking our id is POSITIVE
+        death evidence (LOST); an unreachable provider API or a worker that
+        cannot be ssh'd while its instance still exists is UNKNOWN — raise
+        ``BackendUnreachable`` and freeze rather than mis-reap a live rental."""
+        instance_id = handle.data["instance_id"]
+        try:
+            inst = self._get_instance(instance_id)
+        except BackendUnreachable:
+            raise
+        except BackendError as e:
+            # API reachable but erroring: no information either way.
+            raise BackendUnreachable(str(e)) from e
+        if inst is None:
+            return StatusReport(
+                status=JobStatus.LOST,
+                detail=f"instance {instance_id} no longer exists",
+            )
+        if not handle.data.get("job_dir"):
+            return StatusReport(
+                status=JobStatus.PROVISIONING,
+                detail=f"instance {instance_id} is {inst.status or 'unknown'}; "
+                "job not launched yet",
+            )
+        try:
+            return jobdir.derive_status(
+                self._exec_from_handle(handle),
+                handle.data["job_dir"],
+                raise_unreachable=True,
+            )
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def observe_batch(self, handles: list[JobHandle]) -> list[StatusReport]:
+        """ONE account-wide instance list per cycle (never one GET per
+        instance — the v1 pathology), then a status triple per still-live
+        instance over its own ssh endpoint. An id missing from the list is
+        positive death evidence; an unreachable API or worker freezes."""
+        if not handles:
+            return []
+        instances = {i.instance_id: i for i in self._list_instances()}
+        reports: list[StatusReport] = []
+        for h in handles:
+            instance_id = str(h.data.get("instance_id"))
+            inst = instances.get(instance_id)
+            if inst is None:
+                reports.append(
+                    StatusReport(
+                        status=JobStatus.LOST,
+                        detail=f"instance {instance_id} no longer exists",
+                    )
+                )
+                continue
+            if not h.data.get("job_dir"):
+                reports.append(
+                    StatusReport(
+                        status=JobStatus.PROVISIONING,
+                        detail=f"instance {instance_id} is "
+                        f"{inst.status or 'unknown'}; job not launched yet",
+                    )
+                )
+                continue
+            try:
+                reports.append(
+                    jobdir.derive_status(
+                        self._exec_from_handle(h),
+                        h.data["job_dir"],
+                        raise_unreachable=True,
+                    )
+                )
+            except ExecError as e:
+                raise BackendUnreachable(str(e)) from e
+        return reports
+
+    def _wait_provisioned_watched(self, instance_id: str) -> Instance:
+        """``_wait_provisioned`` plus the COST-4 no-progress watchdog: the
+        provider's progress signature (status string + ssh endpoint) unchanged
+        AND not ready for ``provision_stall_s`` (default 90 s) means the rental
+        is wedged — fail now instead of billing until the overall timeout."""
+        timeout = float(
+            self.config.extra("provision_timeout_s", DEFAULT_PROVISION_TIMEOUT_S)
+        )
+        stall = float(self.config.extra("provision_stall_s", DEFAULT_PROVISION_STALL_S))
+        deadline = _monotonic() + timeout
+        signature: str | None = None
+        signature_since = _monotonic()
+        last: Instance | None = None
+        while True:
+            inst = self._get_instance(instance_id)
+            if inst is not None:
+                last = inst
+                if inst.ssh_target and inst.status.lower() == "running":
+                    return inst
+            sig = (
+                f"{inst.status}|{inst.ssh_target}|{inst.ssh_port}"
+                if inst is not None
+                else "<not visible>"
+            )
+            now = _monotonic()
+            if sig != signature:
+                signature, signature_since = sig, now
+            elif now - signature_since >= stall:
+                raise InstanceUnreachable(
+                    f"{self.name}: instance {instance_id} made no provisioning "
+                    f"progress for {stall:.0f}s (status {sig!r} unchanged) — "
+                    "treating the rental as dead"
+                )
+            if _monotonic() >= deadline:
+                raise InstanceUnreachable(
+                    f"{self.name}: instance {instance_id} not ready after "
+                    f"{timeout:.0f}s (last status: "
+                    f"{last.status if last else 'not visible yet'})"
+                )
+            _sleep(PROVISION_POLL_S)
 
     @staticmethod
     def _offer_key(offer: Offer) -> str:
@@ -703,6 +959,12 @@ class MarketplaceBackend(Backend, ABC):
                     e,
                 )
         return paths
+
+    def capture_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
+        """Pull-only variant for the engine's capture work item: never
+        auto-terminates — capture precedes release (I6), the reap tears down."""
+        ex = self._exec_from_handle(handle)
+        return jobdir.pull_outputs(ex, handle.data["job_dir"], dest)
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         if handle.data.get("job_dir"):  # a provisioning stub has nothing to kill

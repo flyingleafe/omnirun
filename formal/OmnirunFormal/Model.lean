@@ -143,6 +143,14 @@ inductive Step : M → M → Prop where
       (hj : m.jobs = pre ++ j :: post)
       (hnt : j.st.terminal = false) (hnp : j.st ≠ .placing) :
       Step m { m with jobs := pre ++ { j with st := .cancelled } :: post, events := m.events + 1 }
+  /-- Scheduler gives up on a queued job (placement-attempts budget
+  exhausted — the `Fail` decision): QUEUED → FAILED. The job never held a
+  slot or a provider resource from QUEUED, so nothing else changes and no
+  budget is voided. -/
+  | failQueued (m : M) (pre post : List Job) (j : Job)
+      (hj : m.jobs = pre ++ j :: post)
+      (hq : j.st = .queued) :
+      Step m { m with jobs := pre ++ { j with st := .failed } :: post, events := m.events + 1 }
   /-- Durable capture of logs/outputs — live (ingestor) or at terminal.
   Never allowed for a job that holds no placement. -/
   | capture (m : M) (pre post : List Job) (j : Job)

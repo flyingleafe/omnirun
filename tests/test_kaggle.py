@@ -911,3 +911,80 @@ def test_submit_without_bore_harness_has_no_bore_vars(
     assert "OMNIRUN_BORE_PUBLIC_HOST" not in run_py
     assert "OMNIRUN_BORE_SECRET" not in run_py
     assert "OMNIRUN_SSH_PUBKEY" not in run_py
+
+
+# ---- typed outcomes + structural capacity + adoption (P5) --------------------
+
+
+def test_submit_session_cap_is_capacity_error(fake_api, backend):
+    """The live-observed 'Maximum batch GPU session count of 2 reached' push
+    rejection is a transient capacity condition (JOB-4): CapacityError, so the
+    scheduler defers quietly instead of failing the job."""
+    from omnirun.backends.base import CapacityError
+
+    def capped_push(folder):
+        return {"error": "Maximum batch GPU session count of 2 reached"}
+
+    fake_api.kernels_push = capped_push
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(CapacityError, match="session cap"):
+        backend.submit(spec, offer)
+
+
+def test_submit_session_cap_exception_is_capacity_error(fake_api, backend):
+    """Same cap surfacing as a raised client exception instead of a response
+    error field."""
+    from omnirun.backends.base import CapacityError
+
+    def capped_push(folder):
+        raise RuntimeError("Maximum batch GPU session count of 2 reached")
+
+    fake_api.kernels_push = capped_push
+    spec = make_spec(gpu_type="P100")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(CapacityError, match="session cap"):
+        backend.submit(spec, offer)
+
+
+def test_discover_reports_structural_session_cap(fake_api, backend):
+    """SCHED-3: facts carry the platform's structural concurrent-session limit
+    (2 batch sessions), independent of config max_parallel."""
+    facts = backend.discover()
+    assert facts.max_parallel == KaggleBackend.STRUCTURAL_SESSIONS == 2
+    assert facts.available is not None and facts.available <= 2
+    assert facts.capacity_at is not None
+
+
+def test_find_resource_adopts_live_kernel(fake_api, backend):
+    fake_api.status_value = "running"
+    handle = backend.find_resource(make_spec(gpu_type="P100"))
+    assert handle is not None
+    assert handle.data["kernel_ref"] == f"testuser/omnirun-{JOB_ID}"
+
+
+def test_find_resource_adopts_complete_kernel(fake_api, backend):
+    """A COMPLETE kernel settles from its durable result — adopted, never
+    re-pushed (SCHED-8 / JOB-3: finished jobs are never re-executed)."""
+    fake_api.status_value = "complete"
+    assert backend.find_resource(make_spec(gpu_type="P100")) is not None
+
+
+def test_find_resource_ignores_errored_kernel(fake_api, backend):
+    fake_api.status_value = "error"
+    assert backend.find_resource(make_spec(gpu_type="P100")) is None
+
+
+def test_observe_status_api_failure_is_unreachable(fake_api, backend):
+    """COST-3: a failing status API gives NO information — the observer path
+    raises BackendUnreachable (freeze) where status() would report LOST."""
+    from omnirun.backends.base import BackendUnreachable
+
+    def boom(kernel):
+        raise OSError("api down")
+
+    fake_api.kernels_status = boom
+    handle = make_handle()
+    assert backend.status(handle).status is JobStatus.LOST
+    with pytest.raises(BackendUnreachable):
+        backend.observe_status(handle)

@@ -144,6 +144,9 @@ class ThunderBackend(MarketplaceBackend):
         raw = data.get(str(instance_id))
         if raw is None:
             return None
+        return self._parse_thunder_instance(str(instance_id), raw)
+
+    def _parse_thunder_instance(self, instance_id: str, raw: dict) -> Instance:
         ip = raw.get("ip") or None
         port = raw.get("port")
         return Instance(
@@ -153,8 +156,21 @@ class ThunderBackend(MarketplaceBackend):
             ssh_port=int(port) if port else None,
             status=str(raw.get("status") or "").lower(),
             gpu_type=normalize_thunder_gpu(raw.get("gpuType") or ""),
+            # Thunder's create call takes no name/label, so instances cannot be
+            # adopted by deterministic key (find_resource never matches).
+            label=None,
             raw=raw,
         )
+
+    def _list_instances(self) -> list[Instance]:
+        data = self._request("GET", f"{BASE}/v1/instances/list").json()
+        if not isinstance(data, dict):
+            return []
+        return [
+            self._parse_thunder_instance(str(iid), raw)
+            for iid, raw in data.items()
+            if isinstance(raw, dict)
+        ]
 
     def _terminate(self, instance_id: str) -> None:
         # Exact delete path is not fully documented (docs only say "delete

@@ -37,6 +37,7 @@ from omnirun.backends.base import (
     Backend,
     BackendError,
     CapacityError,
+    EntitlementError,
     ProvisioningSink,
     SSHEndpoint,
     register,
@@ -57,6 +58,7 @@ from omnirun.models import (
     JobSpec,
     JobStatus,
     Offer,
+    ProviderFacts,
     ReapPolicy,
     ResourceSpec,
     StatusReport,
@@ -598,9 +600,16 @@ class ColabBackend(Backend):
                 raise
         if not placed:
             tried = ", ".join(str(f) for f in ladder)
-            raise BackendError(
+            # A typed entitlement rejection (JOB-4): the ACCOUNT can never run
+            # this request as-asked here — the seam avoids the (backend,
+            # resource-class) pair for the learned-block TTL instead of
+            # counting attempts. The blocked flags are already remembered
+            # (TTL'd) in the injected store, so probe stops offering them too.
+            raise EntitlementError(
                 f"colab: account is not entitled to any fitting accelerator "
-                f"({tried}) — last: {last_reject}"
+                f"({tried}) — last: {last_reject}",
+                resource_class=tried,
+                ttl_s=self._blocked_ttl_s(),
             )
 
         # bore env — generated at submit time; empty when bore is disabled so
@@ -1015,3 +1024,51 @@ class ColabBackend(Backend):
         v = version[0] if version else "unknown"
         n = _count_sessions(self._colab("sessions", timeout=30))
         return f"ok: colab CLI {v}; {n} active session(s)"
+
+    # ---- structural capacity + adoption (v2 seam) ------------------------------
+
+    #: Colab's free tier runs ~ONE concurrent session — a structural platform
+    #: fact (SCHED-3), not a config choice. Overridable for paid tiers via the
+    #: `structural_sessions` config extra; config `max_parallel` remains an
+    #: ADDITIONAL min applied by the provider seam.
+    STRUCTURAL_SESSIONS = 1
+
+    def discover(self) -> ProviderFacts:
+        """Base facts plus live capacity truth: ``available`` = the platform's
+        structural session cap minus the sessions Colab itself reports active
+        (ours or not) — independent of config ``max_parallel`` (SCHED-3)."""
+        facts = super().discover()
+        try:
+            active = _count_sessions(self._colab("sessions", timeout=30))
+        except Exception:
+            return facts  # capacity unknown — never fabricated
+        structural = int(
+            self.config.extra("structural_sessions", self.STRUCTURAL_SESSIONS)
+        )
+        facts.max_parallel = structural
+        facts.active = active
+        facts.available = max(0, structural - active)
+        facts.capacity_at = datetime.now(timezone.utc)
+        return facts
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt by the deterministic session name ``omnirun-<job_id>``
+        (SCHED-8): a live session with our name is OUR provisioning from a
+        prior placer — reuse it instead of assigning a duplicate VM."""
+        session = self._session(spec.job_id)
+        try:
+            out = self._colab("sessions", timeout=30)
+        except BackendError:
+            return None  # listing unavailable — best-effort, rent decides
+        for line in out.splitlines():
+            if session in line and "Hardware:" in line:
+                return JobHandle(
+                    backend=self.name,
+                    job_id=spec.job_id,
+                    data={
+                        "session": session,
+                        "job_dir": f"{COLAB_ROOT}/jobs/{spec.job_id}",
+                        "root": COLAB_ROOT,
+                    },
+                )
+        return None

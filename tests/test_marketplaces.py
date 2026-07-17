@@ -986,3 +986,146 @@ def test_ops_on_provisioning_stub_raise_actionable_not_keyerror(tmp_path):
         be.logs(stub)
     with pytest.raises(BackendError, match="no ssh yet"):
         be.pull_outputs(stub, tmp_path)
+
+
+# ---- typed outcomes + staged placement (P5) ----------------------------------
+
+
+@respx.mock
+def test_429_exhaustion_is_typed_capacity_error():
+    """A provider API still rate-limiting after every retry is transient
+    capacity saturation (JOB-4): CapacityError (→ CapacityContention at the
+    seam), never a hard failure that burns an attempt."""
+    from omnirun.backends.base import CapacityError
+
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(429, json={"retry_after": 0})
+    )
+    with pytest.raises(CapacityError, match="429"):
+        runpod_backend(api_429_retries=1)._get_instance("pod123")
+
+
+@respx.mock
+def test_vast_churned_ask_is_typed_offer_gone(spec):
+    """no_such_ask/410/400 on the rent call is a taken offer: the typed
+    OfferGoneError carries the ask id so re-shops can exclude it."""
+    from omnirun.backends.base import OfferGoneError
+
+    respx.put(f"{VAST_BASE}/asks/111/").mock(
+        return_value=httpx.Response(410, json={"success": False, "msg": "no_such_ask"})
+    )
+    with pytest.raises(OfferGoneError) as exc:
+        vast_backend()._create_instance(spec, vast_offer())
+    assert exc.value.offer_key == "111"
+
+
+@respx.mock
+def test_vast_create_labels_instance_with_job_key(spec):
+    """The rent payload carries the deterministic adopt label (SCHED-8)."""
+    route = respx.put(f"{VAST_BASE}/asks/111/").mock(
+        return_value=httpx.Response(200, json={"success": True, "new_contract": 99})
+    )
+    inst = vast_backend()._create_instance(spec, vast_offer())
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["label"] == f"omnirun-{spec.job_id}"
+    assert inst.label == f"omnirun-{spec.job_id}"
+
+
+@respx.mock
+def test_vast_find_resource_adopts_by_label(spec):
+    respx.get(f"{VAST_BASE}/instances/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "instances": [
+                    {
+                        "id": 99,
+                        "label": f"omnirun-{spec.job_id}",
+                        "actual_status": "running",
+                        "public_ipaddr": "1.2.3.4",
+                        "ports": {"22/tcp": [{"HostPort": "2222"}]},
+                    },
+                    {"id": 12, "label": "someone-else", "actual_status": "running"},
+                ]
+            },
+        )
+    )
+    handle = vast_backend().find_resource(spec)
+    assert handle is not None
+    assert handle.data["instance_id"] == "99"
+    assert handle.data["ssh_target"] == "root@1.2.3.4"
+    assert (
+        vast_backend().find_resource(spec.model_copy(update={"job_id": "other-xyz"}))
+        is None
+    )
+
+
+@respx.mock
+def test_stall_watchdog_destroys_wedged_instance(monkeypatch):
+    """COST-4: a rental whose provider status never changes AND never becomes
+    ready for provision_stall_s is dead NOW — resource_ready destroys it first
+    and raises (an infra failure), instead of billing until the full timeout."""
+    from omnirun.backends.marketplace import InstanceUnreachable
+    from omnirun.models import JobHandle
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(marketplace, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        marketplace, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + 10.0)
+    )
+    respx.get(f"{VAST_BASE}/instances/").mock(
+        return_value=httpx.Response(
+            200, json={"instances": [{"id": 99, "actual_status": "loading"}]}
+        )
+    )
+    destroy = respx.delete(f"{VAST_BASE}/instances/99/").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    backend = vast_backend(provision_stall_s=90, provision_timeout_s=600)
+    handle = JobHandle(
+        backend="vast", job_id="j1", data={"instance_id": "99", "provisioning": True}
+    )
+    with pytest.raises(InstanceUnreachable, match="no provisioning progress"):
+        backend.resource_ready(handle)
+    assert destroy.called  # destroyed FIRST, before the failure propagates
+    assert clock["t"] < 200  # died at the stall watchdog, not the 600s timeout
+
+
+@respx.mock
+def test_marketplace_observe_batch_lists_once(fake_ssh):
+    """OBS-12: one account-wide instance list per observation cycle; an id
+    missing from it is positive death evidence (LOST)."""
+    from omnirun.models import JobHandle
+
+    route = respx.get(f"{VAST_BASE}/instances/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "instances": [
+                    {"id": 1, "label": "omnirun-a", "actual_status": "loading"}
+                ]
+            },
+        )
+    )
+    backend = vast_backend()
+    live = JobHandle(backend="vast", job_id="a", data={"instance_id": "1"})
+    gone = JobHandle(
+        backend="vast", job_id="b", data={"instance_id": "2", "job_dir": "/x"}
+    )
+    reports = backend.observe_batch([live, gone])
+    assert route.call_count == 1
+    assert reports[0].status is JobStatus.PROVISIONING
+    assert reports[1].status is JobStatus.LOST
+
+
+def test_rent_resource_returns_provisioning_stub(fake_ssh, spec):
+    """The staged rent creates the instance ONLY: the handle is a provisioning
+    stub (no ssh yet) and the on_provisioning sink saw it before return."""
+    with respx.mock:
+        respx.put(f"{VAST_BASE}/asks/111/").mock(
+            return_value=httpx.Response(200, json={"success": True, "new_contract": 7})
+        )
+        seen: list = []
+        handle = vast_backend().rent_resource(spec, vast_offer(), seen.append)
+    assert handle.data == {"instance_id": "7", "provisioning": True}
+    assert seen and seen[0].data["instance_id"] == "7"

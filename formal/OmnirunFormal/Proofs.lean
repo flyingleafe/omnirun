@@ -375,6 +375,29 @@ theorem preservation {m m' : M} (h : Step m m') (inv : Inv m) : Inv m' := by
         hj inv.placing_intent ?_ k hk hkp
       intro hp
       simp at hp
+  | failQueued pre post j hj hq =>
+    have hids : ((pre ++ j :: post).map Job.id).Nodup := hj ▸ inv.wf_ids
+    have hcap' := inv.cap_ok
+    rw [M.active_def, hj, active_surgery] at hcap'
+    refine ⟨wf_ids_surgery hids rfl, inv.budget_ok, ?_, inv.ext_nodup, ?_, ?_, ?_⟩
+    · show (pre ++ { j with st := .failed } :: post).countP
+          (fun k => k.st.activeB) ≤ m.cap
+      rw [active_surgery]
+      simp
+      omega
+    · intro rid hr
+      have hold := inv.ext_tracked rid hr
+      rw [hj] at hold
+      exact tracked_mono hold rfl (.inl (by simp)) (fun r hrI => hrI)
+    · intro k hk
+      refine pointwise_surgery (P := fun k => k.reaped = true → k.captured = true)
+        hj inv.reap_captured ?_ k hk
+      exact inv.reap_captured j (by rw [hj]; exact self_mem pre post)
+    · intro k hk hkp
+      refine pointwise_surgery (P := fun k => k.st = .placing → k.id ∈ m.intents)
+        hj inv.placing_intent ?_ k hk hkp
+      intro hp
+      simp at hp
   | capture pre post j hj hp =>
     have hids : ((pre ++ j :: post).map Job.id).Nodup := hj ▸ inv.wf_ids
     have hcap' := inv.cap_ok
@@ -533,6 +556,12 @@ theorem terminal_absorbing {m m' : M} (h : Step m m') :
     · exact ⟨k, side_mem (.inl hs), rfl, rfl⟩
     · rw [ht] at hnt; cases hnt
     · exact ⟨k, side_mem (.inr hs), rfl, rfl⟩
+  | failQueued pre post j0 hj hq =>
+    intro k hk ht
+    rcases mem_surgery (hj ▸ hk) with hs | rfl | hs
+    · exact ⟨k, side_mem (.inl hs), rfl, rfl⟩
+    · rw [hq] at ht; simp at ht
+    · exact ⟨k, side_mem (.inr hs), rfl, rfl⟩
   | capture pre post j0 hj hp =>
     intro k hk ht
     rcases mem_surgery (hj ▸ hk) with hs | rfl | hs
@@ -604,6 +633,12 @@ theorem log_monotone {m m' : M} (h : Step m m') :
     rcases mem_surgery (hj ▸ hk) with hs | rfl | hs
     · exact ⟨k, side_mem (.inl hs), rfl, Nat.le_refl _⟩
     · exact ⟨{ k with st := .cancelled }, self_mem pre post, rfl, Nat.le_refl _⟩
+    · exact ⟨k, side_mem (.inr hs), rfl, Nat.le_refl _⟩
+  | failQueued pre post j0 hj hq =>
+    intro k hk
+    rcases mem_surgery (hj ▸ hk) with hs | rfl | hs
+    · exact ⟨k, side_mem (.inl hs), rfl, Nat.le_refl _⟩
+    · exact ⟨{ k with st := .failed }, self_mem pre post, rfl, Nat.le_refl _⟩
     · exact ⟨k, side_mem (.inr hs), rfl, Nat.le_refl _⟩
   | capture pre post j0 hj hp =>
     intro k hk

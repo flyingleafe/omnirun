@@ -13,6 +13,7 @@ from omnirun.backends import jobdir
 from omnirun.backends.base import (
     Backend,
     BackendError,
+    BackendUnreachable,
     ProvisioningSink,
     SSHEndpoint,
     register,
@@ -241,8 +242,77 @@ class SshBackend(Backend):
         offer: Offer | None = None,
         on_provisioning: ProvisioningSink | None = None,
     ) -> JobHandle:
+        return self._stage_and_launch(spec, attempt=1, adopt_existing=False)
+
+    # --- staged placement seam (v2 engine) ------------------------------------
+
+    def rent_resource(
+        self,
+        spec: JobSpec,
+        offer: Offer | None = None,
+        on_provisioning: ProvisioningSink | None = None,
+        *,
+        attempt: int = 1,
+    ) -> JobHandle:
+        # The host itself is the (non-billable) resource; nothing to create.
+        # The payload is delivered by launch_job.
+        return JobHandle(
+            backend=self.name, job_id=spec.job_id, data={"host": self.config.host}
+        )
+
+    def launch_job(
+        self, spec: JobSpec, handle: JobHandle, *, attempt: int = 1
+    ) -> JobHandle:
+        try:
+            return self._stage_and_launch(spec, attempt=attempt, adopt_existing=True)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt an already-launched job: the recorded pid on the worker IS the
+        deterministic evidence a prior placer launched this job (its dir is
+        ``<root>/jobs/<job_id>``, keyed by job id)."""
+        try:
+            ex = self.exec_
+            root = jobdir.remote_root(ex, self.config.root)
+            job_dir = jobdir.job_dir_of(root, spec.job_id)
+            pid = self._recorded_pid(job_dir)
+            if pid is None:
+                return None
+            return self._handle(spec, job_dir, root, pid)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def _recorded_pid(self, job_dir: str) -> int | None:
+        r = self.exec_.run(f"cat {shell_quote(f'{job_dir}/pid')} 2>/dev/null")
+        pid = (r.stdout.strip().splitlines() or [""])[-1].strip() if r.ok else ""
+        return int(pid) if pid.isdigit() else None
+
+    def _handle(self, spec: JobSpec, job_dir: str, root: str, pid: int) -> JobHandle:
+        return JobHandle(
+            backend=self.name,
+            job_id=spec.job_id,
+            data={
+                "job_dir": job_dir,
+                "root": root,
+                "slug": spec.repo.slug,
+                "host": self.config.host,
+                "pid": pid,
+            },
+        )
+
+    def _stage_and_launch(
+        self, spec: JobSpec, *, attempt: int, adopt_existing: bool
+    ) -> JobHandle:
         ex = self.exec_
         root = jobdir.remote_root(ex, self.config.root)
+        if adopt_existing:
+            # Idempotent launch (SCHED-8): a bootstrap already started (pid
+            # recorded) is adopted, never re-executed.
+            job_dir = jobdir.job_dir_of(root, spec.job_id)
+            pid = self._recorded_pid(job_dir)
+            if pid is not None:
+                return self._handle(spec, job_dir, root, pid)
         project_root = jobdir.resolve_project_root(
             ex, root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
         )
@@ -251,7 +321,9 @@ class SshBackend(Backend):
             project_root=project_root,
             setup_lines=list(self.config.env_setup),
         )
-        job_dir = jobdir.stage_job(ex, spec, local_root_of(spec.repo), params, root)
+        job_dir = jobdir.stage_job(
+            ex, spec, local_root_of(spec.repo), params, root, attempt=attempt
+        )
         pid_file = shell_quote(f"{job_dir}/pid")
         script = shell_quote(f"{job_dir}/bootstrap.sh")
         r = ex.run(
@@ -265,60 +337,106 @@ class SshBackend(Backend):
             raise BackendError(
                 f"could not launch job on {ex.describe()}: {r.stdout!r} {r.stderr!r}"
             )
-        return JobHandle(
-            backend=self.name,
-            job_id=spec.job_id,
-            data={
-                "job_dir": job_dir,
-                "root": root,
-                "slug": spec.repo.slug,
-                "host": self.config.host,
-                "pid": int(pid),
-            },
-        )
+        return self._handle(spec, job_dir, root, int(pid))
 
     def status(self, handle: JobHandle) -> StatusReport:
-        job_dir = handle.data["job_dir"]
         try:
-            report = jobdir.derive_status(
-                self.exec_, job_dir, absent_means=JobStatus.LOST
-            )
-            if report.status in (JobStatus.RUNNING, JobStatus.STARTING):
-                liveness = self._pid_liveness(job_dir)
-                if liveness == "dead":
-                    return StatusReport(
-                        status=JobStatus.LOST,
-                        detail="worker process died without writing result.json",
-                    )
-            return report
+            return self._status_report(handle, raise_unreachable=False)
         except ExecError as e:
             return StatusReport(status=JobStatus.LOST, detail=str(e))
 
-    def _pid_liveness(self, job_dir: str) -> str:
-        """'alive' | 'dead' | 'nopid' according to the remote pidfile."""
+    def observe_status(self, handle: JobHandle) -> StatusReport:
+        """Observer poll (COST-3): a dead transport raises ``BackendUnreachable``
+        (state unknown, freeze) — LOST from here is positive death evidence
+        (job dir gone / heartbeat stale / worker pid dead)."""
+        try:
+            return self._status_report(handle, raise_unreachable=True)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+
+    def _status_report(
+        self, handle: JobHandle, *, raise_unreachable: bool
+    ) -> StatusReport:
+        job_dir = handle.data["job_dir"]
+        report = jobdir.derive_status(
+            self.exec_,
+            job_dir,
+            absent_means=JobStatus.LOST,
+            raise_unreachable=raise_unreachable,
+        )
+        if report.status in (JobStatus.RUNNING, JobStatus.STARTING):
+            liveness = self._pid_liveness(job_dir)
+            if liveness == "dead":
+                return StatusReport(
+                    status=JobStatus.LOST,
+                    detail="worker process died without writing result.json",
+                )
+        return report
+
+    @staticmethod
+    def _pid_liveness_cmd(job_dir: str) -> str:
         q = shell_quote(f"{job_dir}/pid")
-        r = self.exec_.run(
+        return (
             f"p=$(cat {q} 2>/dev/null); "
             f'if [ -z "$p" ]; then echo nopid; '
             f'elif kill -0 "$p" 2>/dev/null; then echo alive; else echo dead; fi'
         )
+
+    def _pid_liveness(self, job_dir: str) -> str:
+        """'alive' | 'dead' | 'nopid' according to the remote pidfile."""
+        r = self.exec_.run(self._pid_liveness_cmd(job_dir))
         return r.stdout.strip() if r.ok else "nopid"
+
+    def observe_batch(self, handles: list[JobHandle]) -> list[StatusReport]:
+        """ONE ``run_batch`` invocation for every observed job on this host
+        (status triple + pid liveness per job) — reconcile cost O(hosts), not
+        O(jobs). A batch that did not survive the transport is unreachable."""
+        if not handles:
+            return []
+        commands: list[str] = []
+        for h in handles:
+            job_dir = h.data["job_dir"]
+            commands.append(jobdir.status_command(job_dir))
+            commands.append(self._pid_liveness_cmd(job_dir))
+        try:
+            results = self.exec_.run_batch(commands)
+        except ExecError as e:
+            raise BackendUnreachable(str(e)) from e
+        reports: list[StatusReport] = []
+        for i in range(len(handles)):
+            status_r, pid_r = results[2 * i], results[2 * i + 1]
+            report = jobdir.parse_status_result(
+                status_r, absent_means=JobStatus.LOST, raise_unreachable=True
+            )
+            if report.status in (JobStatus.RUNNING, JobStatus.STARTING):
+                liveness = pid_r.stdout.strip() if pid_r.ok else "nopid"
+                if liveness == "dead":
+                    report = StatusReport(
+                        status=JobStatus.LOST,
+                        detail="worker process died without writing result.json",
+                    )
+            reports.append(report)
+        return reports
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         job_dir = handle.data["job_dir"]
         return jobdir.tail_logs(self.exec_, job_dir, follow=follow)
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
+        job_dir = handle.data.get("job_dir")
+        if not job_dir:  # pre-launch handle (staged placement): nothing to kill
+            return
         sig = "KILL" if mode is CancelMode.FORCE else "TERM"
-        jobdir.signal_job(self.exec_, handle.data["job_dir"], sig)
+        jobdir.signal_job(self.exec_, job_dir, sig)
 
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         return jobdir.pull_outputs(self.exec_, handle.data["job_dir"], dest)
 
     def gc(self, handle: JobHandle) -> None:
-        jobdir.gc_job(
-            self.exec_, handle.data["job_dir"], handle.data["slug"], handle.data["root"]
-        )
+        job_dir = handle.data.get("job_dir")
+        if not job_dir:  # pre-launch handle: nothing was staged
+            return
+        jobdir.gc_job(self.exec_, job_dir, handle.data["slug"], handle.data["root"])
 
     def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
         """Return SSH connection params for this job.

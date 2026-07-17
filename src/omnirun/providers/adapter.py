@@ -91,6 +91,19 @@ class BackendProvider:
             backend.config.extra("cancel_grace_s", cancel_grace_s)
         )
 
+    @property
+    def backend(self) -> Backend:
+        """The wrapped ``Backend`` — for the async staged adapter
+        (``providers.asyncadapter``), which drives the staged placement seam
+        directly while reusing this provider's offer/capture plumbing."""
+        return self._backend
+
+    def prepare_spec(self, spec: JobSpec) -> JobSpec:
+        """Placer-side spec preparation before any payload delivery: injects
+        the transient deploy-key material for a private code plan (see
+        ``_inject_deploy_key``). Public for the async staged adapter."""
+        return self._inject_deploy_key(spec)
+
     def discover(self) -> ProviderFacts:
         return self._backend.discover()
 

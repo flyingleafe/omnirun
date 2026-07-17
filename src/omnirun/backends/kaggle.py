@@ -37,6 +37,8 @@ from typing import Any
 from omnirun.backends.base import (
     Backend,
     BackendError,
+    BackendUnreachable,
+    CapacityError,
     ProvisioningSink,
     SSHEndpoint,
     register,
@@ -221,6 +223,17 @@ def _remaining_from_quota(q: object) -> tuple[float | None, str | None]:
     return remaining_h, (refresh.isoformat() if refresh else None)
 
 
+def _is_session_cap(message: str) -> bool:
+    """True when a kernel push was refused because the ACCOUNT is at its
+    concurrent batch-session cap (observed live: "Maximum batch GPU session
+    count of 2 reached") — transient capacity, not a defect: the scheduler
+    defers and retries when a session frees up."""
+    m = message.lower()
+    if "session" not in m:
+        return False
+    return "maximum batch" in m or "session count" in m or "too many" in m
+
+
 def _load_kaggle_api_class() -> Any:
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
@@ -329,10 +342,25 @@ sys.exit(0)  # result.json carries the real exit code; keep kernel "complete"
 
 @register("kaggle")
 class KaggleBackend(Backend):
+    #: Kaggle's concurrent batch-session limit — a structural platform fact
+    #: (SCHED-3), observed live as "Maximum batch GPU session count of 2
+    #: reached". Overridable via the `structural_sessions` config extra.
+    STRUCTURAL_SESSIONS = 2
+
     def __init__(self, name: str, config: Any) -> None:
         super().__init__(name, config)
         self._api_obj: Any = None
         self._terminal: dict[str, StatusReport] = {}
+
+    def _active_sessions_here(self) -> int | None:
+        """Best-effort count of the batch sessions THIS placer holds (Kaggle
+        exposes no session-list API, so our active jobs are the closest live
+        proxy). None = unknown (no injected store)."""
+        try:
+            with self.state_store() as store:
+                return store.count_active_jobs(self.name)
+        except Exception:
+            return None
 
     # ---- api plumbing --------------------------------------------------------
 
@@ -405,6 +433,14 @@ class KaggleBackend(Backend):
                 max_vram_gb=16,
                 max_walltime=timedelta(hours=11.5),
             )
+            # Structural session cap (SCHED-3): Kaggle refuses pushes past its
+            # concurrent batch-session limit (observed live: "Maximum batch GPU
+            # session count of 2 reached") — a platform fact independent of the
+            # config's max_parallel (which stays an ADDITIONAL min at the seam).
+            structural = int(
+                self.config.extra("structural_sessions", self.STRUCTURAL_SESSIONS)
+            )
+            active = self._active_sessions_here()
             return ProviderFacts(
                 backend=self.name,
                 discovered_at=now,
@@ -412,6 +448,12 @@ class KaggleBackend(Backend):
                 health=Health.DEGRADED if exhausted else Health.OK,
                 health_detail="weekly GPU quota exhausted" if exhausted else "quota ok",
                 budget_state=budget,
+                max_parallel=structural,
+                active=active if active is not None else 0,
+                available=(
+                    max(0, structural - active) if active is not None else structural
+                ),
+                capacity_at=now,
             )
         except Exception as e:  # discover never raises
             return ProviderFacts(
@@ -691,11 +733,21 @@ class KaggleBackend(Backend):
             try:
                 resp = api.kernels_push(str(k_dir))
             except Exception as e:
+                if _is_session_cap(str(e)):
+                    raise CapacityError(
+                        f"kaggle is at its concurrent batch-session cap: {e} — "
+                        "the job will place when a session frees up"
+                    ) from e
                 raise BackendError(f"kernels_push failed for {kernel_ref}: {e}") from e
             err = getattr(resp, "error", None)
             if err is None and isinstance(resp, dict):
                 err = resp.get("error")
             if err:
+                if _is_session_cap(str(err)):
+                    raise CapacityError(
+                        f"kaggle is at its concurrent batch-session cap: {err} — "
+                        "the job will place when a session frees up"
+                    )
                 hint = (
                     f" ({PREMIUM_NOTE})"
                     if shape and not offer.details.get("free", True)
@@ -708,6 +760,34 @@ class KaggleBackend(Backend):
             job_id=job_id,
             data={"kernel_ref": kernel_ref, "machine_shape": shape},
         )
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt by the deterministic kernel slug ``omnirun-<job_id>``
+        (SCHED-8): a queued/running kernel with our slug is OUR push from a
+        prior placer; a COMPLETE one is a finished job that must settle from
+        its durable result, never be re-pushed. Errored/cancelled kernels are
+        not adopted — a fresh push (new kernel version) reuses the slug."""
+        try:
+            api = self._api()
+            user = self._username(api)
+        except BackendError as e:
+            raise BackendUnreachable(str(e)) from e
+        ref = f"{user}/omnirun-{spec.job_id}"
+        try:
+            resp = api.kernels_status(ref)
+        except Exception:
+            return None  # no such kernel (or listing failed) — rent decides
+        raw = getattr(resp, "status", None)
+        if raw is None and isinstance(resp, dict):
+            raw = resp.get("status")
+        s = str(raw or "").lower()
+        if "queued" in s or "running" in s or "complete" in s:
+            return JobHandle(
+                backend=self.name,
+                job_id=spec.job_id,
+                data={"kernel_ref": ref, "machine_shape": None},
+            )
+        return None
 
     def render_payload(self, spec: JobSpec, offer: Offer | None = None) -> str:
         """The bootstrap `omnirun submit --dry-run` prints — with the real code
@@ -739,7 +819,35 @@ class KaggleBackend(Backend):
             return StatusReport(
                 status=JobStatus.LOST, detail=f"kernels_status failed: {e}"
             )
+        return self._fold_status(handle, api, ref, resp)
 
+    def observe_status(self, handle: JobHandle) -> StatusReport:
+        """Observer poll (COST-3): a failing status/output API call means the
+        platform could not be asked — raise ``BackendUnreachable`` (freeze)
+        instead of folding it into LOST; LOST/terminal verdicts from here are
+        the platform's own positive answers."""
+        if cached := self._terminal.get(handle.job_id):
+            return cached
+        try:
+            api = self._api()
+        except BackendError as e:
+            raise BackendUnreachable(str(e)) from e
+        ref = handle.data["kernel_ref"]
+        try:
+            resp = api.kernels_status(ref)
+        except Exception as e:
+            raise BackendUnreachable(f"kernels_status failed: {e}") from e
+        return self._fold_status(handle, api, ref, resp, raise_unreachable=True)
+
+    def _fold_status(
+        self,
+        handle: JobHandle,
+        api: Any,
+        ref: str,
+        resp: Any,
+        *,
+        raise_unreachable: bool = False,
+    ) -> StatusReport:
         raw = getattr(resp, "status", None)
         if raw is None and isinstance(resp, dict):
             raw = resp.get("status")
@@ -758,14 +866,18 @@ class KaggleBackend(Backend):
             # Kaggle reaps a completed kernel's session, so a successful run whose
             # slot was reclaimed would otherwise mis-report as CANCELLED. Only a
             # kernel with NO durable result (cancelled mid-run) is truly CANCELLED.
-            durable = self._try_durable_result(api, ref)
+            durable = self._try_durable_result(
+                api, ref, raise_unreachable=raise_unreachable
+            )
             report = durable or StatusReport(
                 status=JobStatus.CANCELLED, detail=str(raw)
             )
         elif "error" in s:
             report = StatusReport(status=JobStatus.FAILED, detail=str(fail_msg or raw))
         elif "complete" in s:
-            report = self._result_from_output(api, ref)
+            report = self._result_from_output(
+                api, ref, raise_unreachable=raise_unreachable
+            )
         elif "running" in s:
             return StatusReport(status=JobStatus.RUNNING)
         elif "queued" in s:
@@ -778,13 +890,17 @@ class KaggleBackend(Backend):
             self._terminal[handle.job_id] = report
         return report
 
-    def _result_from_output(self, api: Any, kernel_ref: str) -> StatusReport:
+    def _result_from_output(
+        self, api: Any, kernel_ref: str, *, raise_unreachable: bool = False
+    ) -> StatusReport:
         """Kernel completed; the real verdict lives in result.json inside the tar.
 
         Used by the ``complete`` status branch: a completed kernel with NO durable
         result means the harness/bootstrap crashed before writing it → FAILED.
         """
-        durable = self._try_durable_result(api, ref=kernel_ref)
+        durable = self._try_durable_result(
+            api, ref=kernel_ref, raise_unreachable=raise_unreachable
+        )
         if durable is not None:
             return durable
         return StatusReport(
@@ -793,19 +909,27 @@ class KaggleBackend(Backend):
             "(harness or bootstrap crashed before writing results)",
         )
 
-    def _try_durable_result(self, api: Any, ref: str) -> StatusReport | None:
+    def _try_durable_result(
+        self, api: Any, ref: str, *, raise_unreachable: bool = False
+    ) -> StatusReport | None:
         """Read the durable ``result.json`` verdict from the kernel's output tar.
 
         Returns the terminal ``StatusReport`` (SUCCEEDED/FAILED per ``exit_code``,
         or FAILED for a corrupt result) when a result.json is present; a LOST
-        report when the output DOWNLOAD fails transiently (retry); and ``None``
-        when the download succeeds but there is genuinely no durable result yet
-        (no tar / no result.json) — so the caller can decide the fallback
-        (CANCELLED for a cancelled kernel, FAILED for a 'complete' one)."""
+        report when the output DOWNLOAD fails transiently (retry) — or
+        ``BackendUnreachable`` on the observer path (``raise_unreachable``, a
+        failed download is no death evidence); and ``None`` when the download
+        succeeds but there is genuinely no durable result yet (no tar / no
+        result.json) — so the caller can decide the fallback (CANCELLED for a
+        cancelled kernel, FAILED for a 'complete' one)."""
         with tempfile.TemporaryDirectory(prefix="omnirun-kaggle-out-") as td:
             try:
                 api.kernels_output(ref, path=td)
             except Exception as e:
+                if raise_unreachable:
+                    raise BackendUnreachable(
+                        f"kernel output download failed: {e}"
+                    ) from e
                 return StatusReport(
                     status=JobStatus.LOST,
                     detail=f"kernel output download failed: {e}",

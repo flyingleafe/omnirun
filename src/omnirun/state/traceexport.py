@@ -21,11 +21,16 @@ Line grammar (one action per line, matching the checker's ``Action``):
     submit <nid> <cost>
     finish <nid> <0|1>
     <action> <nid>            # reserve provision activate rollback cancel
-                              # capture reap release-lost requeue
+                              # fail capture reap release-lost requeue
 
 ``<nid>`` is a per-trace DENSE alias of ``job_id`` assigned in first-contact
 order starting at 0. Actions outside the checker alphabet (diagnostic events —
 adoption breadcrumbs, ``unreachable-poll`` handling notes) are skipped.
+
+``fail`` (attempts exhausted, QUEUED → FAILED) happens while the job is
+UNBOUND — after any rollback — so, exactly like a ``cancel`` of an unbound
+job, it appears in the global view but in no provider view (the binding rule
+covers both uniformly).
 
 With ``with_asserts=True`` a trailing checkpoint block cross-validates the
 replayed model state against α (``Store.abstract_state``, CONFORMANCE.md §3):
@@ -54,6 +59,7 @@ ALPHABET = frozenset(
         "rollback",
         "finish",
         "cancel",
+        "fail",
         "capture",
         "reap",
         "release-lost",

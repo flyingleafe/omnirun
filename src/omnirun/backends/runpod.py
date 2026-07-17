@@ -139,6 +139,9 @@ class RunpodBackend(MarketplaceBackend):
             if e.status_code == 404:
                 return None
             raise
+        return self._parse_pod(data, instance_id)
+
+    def _parse_pod(self, data: dict, instance_id: str) -> Instance:
         ip = data.get("publicIp") or None
         mappings = data.get("portMappings") or {}
         port = mappings.get("22") or mappings.get(22)
@@ -149,8 +152,18 @@ class RunpodBackend(MarketplaceBackend):
             ssh_port=int(port) if port else None,
             status=str(data.get("desiredStatus") or "").lower(),
             cost_per_hour=data.get("costPerHr"),
+            label=data.get("name") or None,  # pods are created name=omnirun-<job_id>
             raw=data,
         )
+
+    def _list_instances(self) -> list[Instance]:
+        data = self._request("GET", f"{REST_BASE}/pods").json()
+        pods = data if isinstance(data, list) else data.get("pods", [])
+        return [
+            self._parse_pod(raw, str(raw.get("id")))
+            for raw in pods
+            if isinstance(raw, dict) and raw.get("id")
+        ]
 
     def _terminate(self, instance_id: str) -> None:
         try:

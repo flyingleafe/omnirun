@@ -729,3 +729,120 @@ def test_check_missing_partition_raises():
     fake.add(r"sinfo -p nope", stdout="")
     with pytest.raises(BackendError, match="nope"):
         make_backend(fake, partition="nope").check()
+
+
+# ---- staged placement seam + typed observation (P5) --------------------------
+
+
+def make_status_handle() -> JobHandle:
+    return JobHandle(
+        backend="uni",
+        job_id="train-abc123",
+        data={"job_dir": JOB_DIR, "root": ROOT, "slug": "proj", "slurm_job_id": "777"},
+    )
+
+
+def test_find_resource_adopts_by_job_name():
+    fake = FakeExec()
+    fake.add(r"squeue --me -h -n", stdout="777\n")
+    fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    handle = make_backend(fake).find_resource(make_spec())
+    assert handle is not None
+    assert handle.data["slurm_job_id"] == "777"
+    assert handle.data["job_dir"] == JOB_DIR
+
+
+def test_find_resource_none_when_not_queued():
+    fake = FakeExec()
+    fake.add(r"squeue --me -h -n", stdout="")
+    fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    assert make_backend(fake).find_resource(make_spec()) is None
+
+
+def test_find_resource_dead_transport_is_unreachable():
+    from omnirun.backends.base import BackendUnreachable
+
+    fake = FakeExec()
+    fake.master_ok = False
+    with pytest.raises(BackendUnreachable):
+        make_backend(fake).find_resource(make_spec())
+
+
+def test_rent_resource_dead_transport_is_unreachable():
+    """COST-3: the staged rent maps a dead ssh master to BackendUnreachable —
+    freeze, never an attempt-burning infra failure."""
+    from omnirun.backends.base import BackendUnreachable
+
+    fake = FakeExec()
+    fake.master_ok = False
+    with pytest.raises(BackendUnreachable):
+        make_backend(fake).rent_resource(make_spec(), None)
+
+
+def test_observe_status_unreachable_vs_status_lost():
+    """The same failing status round: status() folds to LOST (v1 behavior),
+    observe_status raises BackendUnreachable (the observer freeze, COST-3)."""
+    from omnirun.backends.base import BackendUnreachable
+
+    fake = FakeExec()
+    fake.add(r".", returncode=1, stderr="mux_client_request_session failed")
+    b = make_backend(fake)
+    handle = make_status_handle()
+    assert b.status(handle).status == JobStatus.LOST
+    with pytest.raises(BackendUnreachable):
+        b.observe_status(handle)
+
+
+class BatchFakeExec(FakeExec):
+    """FakeExec whose run_batch answers each command via the pattern table and
+    records one entry per BATCH (not per command)."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches: list[list[str]] = []
+
+    def run_batch(self, commands, *, timeout=None):
+        self.batches.append(list(commands))
+        return [self.run(c) for c in commands]
+
+
+def test_observe_batch_one_invocation_squeue_plus_triples():
+    """OBS-12: one composed remote round — a single squeue over every job name
+    plus one status triple per job dir."""
+    fake = BatchFakeExec()
+    fake.add(r"squeue --me -h -n", stdout="omnirun-train-abc123|RUNNING\n")
+    fake.add(
+        r"jobs/train-abc123/result\.json",
+        stdout=derive_stdout(phase="running", heartbeat=fresh_heartbeat()),
+    )
+    fake.add(r"jobs/other-def456/result\.json", stdout=derive_stdout(exists=False))
+    b = make_backend(fake)
+    h1 = make_status_handle()
+    h2 = JobHandle(
+        backend="uni",
+        job_id="other-def456",
+        data={
+            "job_dir": f"{ROOT}/jobs/other-def456",
+            "root": ROOT,
+            "slug": "proj",
+            "slurm_job_id": "778",
+        },
+    )
+    reports = b.observe_batch([h1, h2])
+    assert len(fake.batches) == 1  # ONE remote invocation for everything
+    assert "omnirun-train-abc123,omnirun-other-def456" in fake.batches[0][0]
+    assert reports[0].status == JobStatus.RUNNING
+    # gone from squeue + no durable result = positive death evidence
+    assert reports[1].status == JobStatus.LOST
+    assert "no durable result" in reports[1].detail
+
+
+def test_observe_batch_durable_result_outranks_squeue_absence():
+    fake = BatchFakeExec()
+    fake.add(r"squeue --me -h -n", stdout="")
+    fake.add(
+        r"result\.json",
+        stdout=derive_stdout(result='{"exit_code": 0}', phase="done"),
+    )
+    reports = make_backend(fake).observe_batch([make_status_handle()])
+    assert reports[0].status == JobStatus.SUCCEEDED

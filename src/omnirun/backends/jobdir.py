@@ -13,14 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnirun.backends.base import BackendError
+from omnirun.backends.base import BackendError, BackendUnreachable
 from omnirun.bootstrap import (
     HEARTBEAT_STALE_S,
     BootstrapParams,
     CodeSource,
     generate_bootstrap,
 )
-from omnirun.execlayer.base import Exec, shell_quote
+from omnirun.execlayer.base import Exec, ExecResult, shell_quote
 from omnirun.models import JobSpec, JobStatus, StatusReport
 from omnirun.progress import report
 
@@ -158,25 +158,79 @@ def stage_env_file(exec_: Exec, job_dir: str, content: str | None) -> None:
         exec_.write_file(f"{job_dir}/.env", content, mode="600")
 
 
-def derive_status(
-    exec_: Exec, job_dir: str, *, absent_means: JobStatus = JobStatus.LOST
-) -> StatusReport:
-    """One round-trip status read: result.json > heartbeat freshness > phase."""
+def status_command(job_dir: str) -> str:
+    """The one-round status read for a job dir (fed to ``run``/``run_batch``).
+
+    The trailing ``true`` keeps the command's exit code 0 even when the job
+    dir is absent (``test -d`` failing is a STATUS answer, not a transport
+    failure) — a non-zero rc from this command therefore genuinely means the
+    worker could not be asked."""
     q = shell_quote(job_dir)
-    r = exec_.run(
+    return (
         f"cat {q}/result.json 2>/dev/null; echo ---OMNIRUN---; "
         f"cat {q}/phase 2>/dev/null; echo ---OMNIRUN---; "
         f"cat {q}/heartbeat 2>/dev/null; echo ---OMNIRUN---; "
-        f"test -d {q} && echo exists"
+        f"test -d {q} && echo exists; true"
     )
+
+
+def derive_status(
+    exec_: Exec,
+    job_dir: str,
+    *,
+    absent_means: JobStatus = JobStatus.LOST,
+    raise_unreachable: bool = False,
+) -> StatusReport:
+    """One round-trip status read: result.json > heartbeat freshness > phase.
+
+    ``raise_unreachable=True`` (the observer path, COST-3): a failed status
+    round means the WORKER could not be asked — its state is unknown — so
+    raise ``BackendUnreachable`` instead of reporting LOST; a LOST report then
+    stays positive death evidence (job dir gone, heartbeat stale)."""
+    return parse_status_result(
+        exec_.run(status_command(job_dir)),
+        absent_means=absent_means,
+        raise_unreachable=raise_unreachable,
+    )
+
+
+def derive_status_batch(
+    exec_: Exec,
+    job_dirs: list[str],
+    *,
+    absent_means: JobStatus = JobStatus.LOST,
+) -> list[StatusReport]:
+    """The batched observation read: ONE remote invocation for every job dir
+    on this endpoint (``Exec.run_batch`` — reconcile cost O(hosts), not
+    O(jobs)). A batch envelope that did not survive the transport raises
+    ``ExecError`` (callers map it to unreachable)."""
+    results = exec_.run_batch([status_command(d) for d in job_dirs])
+    return [
+        parse_status_result(r, absent_means=absent_means, raise_unreachable=False)
+        for r in results
+    ]
+
+
+def parse_status_result(
+    r: ExecResult,
+    *,
+    absent_means: JobStatus = JobStatus.LOST,
+    raise_unreachable: bool = False,
+) -> StatusReport:
+    """Fold one ``status_command`` result into a report (shared by the single
+    and batched reads)."""
     if not r.ok:
-        return StatusReport(
-            status=JobStatus.LOST,
-            detail=f"worker unreachable: {r.stderr.strip()[:200]}",
-        )
-    result_raw, phase, heartbeat, exists = (
-        p.strip() for p in r.stdout.split("---OMNIRUN---")
-    )
+        detail = f"worker unreachable: {r.stderr.strip()[:200]}"
+        if raise_unreachable:
+            raise BackendUnreachable(detail)
+        return StatusReport(status=JobStatus.LOST, detail=detail)
+    parts = [p.strip() for p in r.stdout.split("---OMNIRUN---")]
+    if len(parts) < 4:
+        detail = f"malformed status read: {r.stdout.strip()[:200]!r}"
+        if raise_unreachable:
+            raise BackendUnreachable(detail)
+        return StatusReport(status=JobStatus.LOST, detail=detail)
+    result_raw, phase, heartbeat, exists = parts[:4]
 
     if result_raw:
         try:

@@ -4,9 +4,12 @@ One single-threaded asyncio process. ``run_pass`` reads a store snapshot
 (lock-free), computes the pure :func:`omnirun.scheduler.schedule`, enacts
 Reserves serially (each a short CAS transaction; a lost race is skipped and
 re-derived next pass), and spawns work items for the ``Start*`` decisions —
-it NEVER awaits provider I/O. Observation (the P3 poll stub) runs between
-passes. Wakeups: work-item completion, external writes (``wake()``), and the
-``poll_interval`` timer.
+it NEVER awaits provider I/O. Observation (the P4 stream spine: per-PLACED-job
+:class:`~omnirun.engine.jobstream.JobStreams` tasks + the
+:class:`~omnirun.engine.observer.Observer` cycle with its silence ladder)
+runs between passes; stream/observe I/O lives in those tasks, never in the
+pass. Wakeups: work-item completion, stream exit sentinels, external writes
+(``wake()``), and the ``poll_interval`` timer.
 
 Entrypoints:
 
@@ -29,7 +32,8 @@ from pathlib import Path
 
 from omnirun.budget import BudgetLedger
 from omnirun.engine import workitems as wi
-from omnirun.engine.observer import observe
+from omnirun.engine.jobstream import JobStreams
+from omnirun.engine.observer import Observer, finish_job
 from omnirun.engine.providertypes import AsyncProvider
 from omnirun.engine.supervisor import Supervisor, cas_step
 from omnirun.models import (
@@ -61,6 +65,7 @@ from omnirun.state.store import IntentWrite, Store
 _log = logging.getLogger("omnirun.engine")
 
 _SHUTDOWN_BUDGET_S = 4.0  # task-group cancellation budget (< 5 s exit, ROBUST-3)
+_SETTLE_YIELDS = 25  # event-loop turns granted to stream tasks at quiescence
 
 
 def _utcnow() -> datetime:
@@ -89,6 +94,11 @@ class Engine:
         place_limit: int = 4,
         cancel_grace_s: float = 30.0,
         capture_tries: int = 3,
+        silence_threshold_s: float = 120.0,
+        silence_thresholds: Mapping[str, float] | None = None,
+        ladder_cooldown_s: float = 30.0,
+        stream_backoff_s: float = 1.0,
+        follow_queue: int = 64,
     ) -> None:
         typed: dict[str, AsyncProvider] = dict(providers)
         self._store = store
@@ -102,17 +112,46 @@ class Engine:
         self._wake = asyncio.Event()
         self._cancels: set[str] = set()
         self._adopted_boot = False
+        artifacts = artifacts_dir or Path("artifacts")
         self._sup = Supervisor(
             store,
             typed,
             wake=self.wake,
-            artifacts_dir=artifacts_dir or Path("artifacts"),
+            artifacts_dir=artifacts,
             slots=slots,
             now=self._now,
             cancels=self._cancels,
             place_limit=place_limit,
             cancel_grace_s=cancel_grace_s,
         )
+        self._streams = JobStreams(
+            typed,
+            artifacts,
+            on_exit=self._on_stream_exit,
+            now=self._now,
+            restart_backoff_s=stream_backoff_s,
+            follow_queue=follow_queue,
+        )
+        self._observer = Observer(
+            store,
+            typed,
+            self._streams,
+            skip=self._sup.live,
+            now=self._now,
+            silence_threshold_s=silence_threshold_s,
+            silence_thresholds=silence_thresholds,
+            ladder_cooldown_s=ladder_cooldown_s,
+        )
+
+    @property
+    def streams(self) -> JobStreams:
+        """The per-job stream owner (durable logs, ``follow``, substate)."""
+        return self._streams
+
+    def _on_stream_exit(self, job_id: str, code: int) -> None:
+        """Exit sentinel on a job's stream: the ``finish`` transition."""
+        finish_job(self._store, job_id, code == 0, self._now())
+        self.wake()
 
     # ------------------------------------------------------------------
     # Client-facing writes (both wake the loop)
@@ -320,8 +359,9 @@ class Engine:
     def _enact_fail(self, d: Fail) -> int:
         """Attempts exhausted: the deliberate give-up.
 
-        `fail` is a diagnostic token (the formal model has no queued→failed
-        edge — see ENGINE.md/CONFORMANCE scale-downs); the exporter skips it.
+        `fail` is a validated action: the formal model's ``failQueued``
+        transition (QUEUED → FAILED) admits it, and the exporter emits it in
+        the global trace view.
         """
 
         def _mut(rec: JobRecord) -> JobRecord | None:
@@ -399,13 +439,14 @@ class Engine:
         return 1
 
     # ------------------------------------------------------------------
-    # Observation (P3 stub — poll-derived; the stream spine is P4)
+    # Observation (the P4 stream spine)
     # ------------------------------------------------------------------
 
     async def observe_once(self) -> int:
-        return await observe(
-            self._store, self._providers, skip=self._sup.live, now=self._now
-        )
+        """One observer cycle: reconcile streams with the store (start on
+        PLACED — including boot-adopted jobs, from persisted offsets — stop
+        on terminal) and run the silence ladder."""
+        return await self._observer.cycle()
 
     # ------------------------------------------------------------------
     # Entrypoints
@@ -433,6 +474,15 @@ class Engine:
                     )
                 continue
             if not acted and not observed:
+                # Give the background stream tasks a few event-loop turns: an
+                # exit sentinel finishes the job and wakes us. A stream that
+                # stays quiet (a genuinely still-running job) is quiescent.
+                for _ in range(_SETTLE_YIELDS):
+                    await asyncio.sleep(0)
+                    if self._wake.is_set():
+                        break
+                if self._wake.is_set():
+                    continue
                 return
         raise RuntimeError(f"engine did not quiesce within {max_passes} passes")
 
@@ -469,5 +519,7 @@ class Engine:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        """Cancel every work item within the shutdown budget (intents persist)."""
+        """Cancel every work item and stream within the shutdown budget
+        (intents and stream offsets persist; a successor engine adopts)."""
         await self._sup.shutdown(timeout=_SHUTDOWN_BUDGET_S)
+        await self._streams.shutdown(timeout=_SHUTDOWN_BUDGET_S)

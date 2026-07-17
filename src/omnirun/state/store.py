@@ -865,7 +865,23 @@ class Store:
         data: dict[str, Any] | None,
     ) -> None:
         """Conn-level mint shared by :meth:`mint_resource` and the same-tx
-        ``mint`` path of :meth:`transition` (I5: mint atomic with its event)."""
+        ``mint`` path of :meth:`transition` (I5: mint atomic with its event).
+
+        A row whose ``released_at`` is set may be REVIVED (a later placement
+        arc re-mints the same deterministic key): released_at cleared,
+        minted_at bumped. Duplicating an UNRELEASED key stays an error (I7).
+        """
+        revived = conn.execute(
+            update(resources)
+            .where(
+                resources.c.provider == provider,
+                resources.c.external_key == external_key,
+                resources.c.released_at.is_not(None),
+            )
+            .values(minted_at=_now_iso(), released_at=None, job_id=job_id, data=data)
+        )
+        if revived.rowcount:
+            return
         try:
             conn.execute(
                 insert(resources).values(

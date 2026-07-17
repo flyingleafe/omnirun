@@ -56,6 +56,40 @@ class BackendUnreachable(BackendError):
     """
 
 
+class EntitlementError(BackendError):
+    """The ACCOUNT can never run this request as-asked on this backend (an
+    accelerator/plan entitlement the provider rejected) — distinct from a
+    transient capacity blip (``CapacityError``): retrying the same ask cannot
+    help. Carries the rejected resource class and how long the rejection
+    should be remembered (the backend's learned-block TTL), so the caller can
+    avoid the (backend, resource-class) pair without string matching (JOB-4).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource_class: str | None = None,
+        ttl_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.resource_class = resource_class
+        self.ttl_s = ttl_s
+
+
+class OfferGoneError(BackendError):
+    """The concrete ask/offer chosen for a rent no longer exists — the market
+    moved between probe and rent (marketplace offers churn). Not the job's
+    fault and not a backend defect: the caller should re-shop a fresh offer
+    (typed as capacity contention at the provider seam — no attempt counted,
+    no backend avoidance). Carries the taken offer's key so re-shops can
+    exclude it."""
+
+    def __init__(self, message: str, *, offer_key: str | None = None) -> None:
+        super().__init__(message)
+        self.offer_key = offer_key
+
+
 @dataclass
 class SSHEndpoint:
     """SSH connection parameters for ``omnirun ssh <job>``.
@@ -192,6 +226,79 @@ class Backend(ABC):
     def pull_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
         """Copy the job's collected outputs into dest; return copied paths."""
         ...
+
+    def capture_outputs(self, handle: JobHandle, dest: Path) -> list[Path]:
+        """The engine's capture-work-item output pull: identical to
+        ``pull_outputs`` but MUST NEVER release/terminate the resource —
+        capture precedes release (I6) and the reap work item owns teardown.
+        Default: plain ``pull_outputs``; backends whose ``pull_outputs``
+        auto-releases override this with the pull-only variant."""
+        return self.pull_outputs(handle, dest)
+
+    # --- staged placement seam (the v2 async engine; v1 keeps calling
+    # ``submit``). Stages map onto the engine's place work item: rent
+    # (``rent_resource``) → boot (``resource_ready``) → launch
+    # (``launch_job``), with ``find_resource`` as the adopt-by-deterministic-
+    # key probe (SCHED-8). The defaults collapse everything into ``submit``
+    # (rent does it all, boot/launch are no-ops) so a backend only overrides
+    # the stages it can genuinely separate. ------------------------------------
+
+    def find_resource(self, spec: JobSpec) -> JobHandle | None:
+        """Adopt-by-deterministic-key probe (SCHED-8): if this backend already
+        holds the resource for ``spec.job_id`` (keyed ``omnirun-<job_id>``),
+        return a handle for it; else None. A crashed placer calls this before
+        renting so a resource is never duplicated. May raise
+        ``BackendUnreachable`` when the backend cannot be asked at all.
+        Default: no adoption support (nothing durable to find)."""
+        return None
+
+    def rent_resource(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None = None,
+        *,
+        attempt: int = 1,
+    ) -> JobHandle:
+        """Stage 1 (rent): create the job's provider-side resource.
+
+        Default: the whole blocking ``submit()`` — rent, boot, and launch
+        collapse into one call and the later stages are no-ops. ``attempt``
+        is the placement attempt number (baked into the bootstrap's start
+        sentinel by backends that thread it through)."""
+        return self.submit(spec, offer, on_provisioning)
+
+    def resource_ready(self, handle: JobHandle) -> JobHandle:
+        """Stage 2 (boot): block until the resource can take work; return the
+        (possibly enriched) handle. Default: no-op — the resource returned by
+        ``rent_resource`` is already ready."""
+        return handle
+
+    def launch_job(
+        self, spec: JobSpec, handle: JobHandle, *, attempt: int = 1
+    ) -> JobHandle:
+        """Stage 3 (launch): deliver the payload and start the bootstrap;
+        returns the final handle. MUST be idempotent — an already-launched job
+        is adopted, never re-executed (SCHED-8). Default: no-op — the payload
+        rode ``rent_resource``."""
+        return handle
+
+    def observe_status(self, handle: JobHandle) -> StatusReport:
+        """``status()`` for the engine's observer: SHOULD raise
+        ``BackendUnreachable`` when the backend/worker cannot be contacted
+        (its state is unknown — COST-3) instead of folding that into a LOST
+        report, so unreachable freezes instead of counting as death evidence.
+        A LOST report from this method is POSITIVE death evidence. Default:
+        plain ``status()``."""
+        return self.status(handle)
+
+    def observe_batch(self, handles: list[JobHandle]) -> list[StatusReport]:
+        """Batched ``observe_status`` for one observer cycle: backends whose
+        transport can compose reads override this to ONE remote round for the
+        lot (``Exec.run_batch`` on an ssh endpoint; one account-wide list call
+        on a provider API) — reconcile cost O(endpoints), not O(jobs)
+        (OBS-12). Default: the per-handle walk (per-job APIs)."""
+        return [self.observe_status(h) for h in handles]
 
     def gc(self, handle: JobHandle) -> None:
         """Release everything the job holds remotely (worktrees, instances).

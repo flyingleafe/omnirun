@@ -722,3 +722,77 @@ def test_submit_without_bore_launcher_is_byte_unchanged(cli, backend, monkeypatc
     assert "OMNIRUN_BORE_PUBLIC_HOST" not in launcher
     assert "OMNIRUN_BORE_SECRET" not in launcher
     assert "OMNIRUN_SSH_PUBKEY" not in launcher
+
+
+# ---- typed outcomes + structural capacity + adoption (P5) --------------------
+
+
+def test_submit_ladder_exhaust_raises_typed_entitlement_error(
+    cli, backend, colab_state
+):
+    """When every fitting accelerator is rejected as un-entitled, submit raises
+    the TYPED EntitlementError (JOB-4) carrying the resource class and the
+    learned-block TTL — not a bare BackendError."""
+    from omnirun.backends.base import EntitlementError
+
+    cli.handlers["new"] = lambda argv, stdin: (
+        1,
+        "",
+        "[colab] Backend rejected accelerator 'T4'. You may not have quota or "
+        "entitlement for this accelerator.",
+    )
+    cli.handlers["stop"] = lambda argv, stdin: (0, "", "")
+    spec = make_spec(gpu_type="T4")
+    offer = backend.probe(spec.resources)[0]
+    with pytest.raises(EntitlementError, match="not entitled") as exc:
+        backend.submit(spec, offer)
+    assert exc.value.resource_class == "T4"
+    assert exc.value.ttl_s == backend._blocked_ttl_s()
+
+
+def test_discover_reports_structural_session_capacity(cli, backend, colab_state):
+    """SCHED-3: colab facts report available = the ~1-session platform truth
+    minus sessions Colab itself lists active (ours or not), independent of
+    config max_parallel."""
+    cli.handlers["version"] = lambda argv, stdin: (0, "colab 0.6.0\n", "")
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        "[?] m-s-abc | Hardware: T4 | Variant: GPU\n",
+        "",
+    )
+    facts = backend.discover()
+    assert facts.max_parallel == ColabBackend.STRUCTURAL_SESSIONS == 1
+    assert facts.active == 1
+    assert facts.available == 0  # a foreign session squats the only slot
+
+
+def test_discover_empty_sessions_reports_full_capacity(cli, backend, colab_state):
+    cli.handlers["version"] = lambda argv, stdin: (0, "colab 0.6.0\n", "")
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        "[colab] No active sessions found on server.\n",
+        "",
+    )
+    facts = backend.discover()
+    assert facts.available == 1
+
+
+def test_find_resource_adopts_named_session(cli, backend):
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        f"[?] {SESSION} | Hardware: T4 | Variant: GPU\n",
+        "",
+    )
+    handle = backend.find_resource(make_spec(gpu_type="T4"))
+    assert handle is not None
+    assert handle.data["session"] == SESSION
+    assert handle.data["job_dir"] == JOB_DIR
+
+
+def test_find_resource_none_when_session_absent(cli, backend):
+    cli.handlers["sessions"] = lambda argv, stdin: (
+        0,
+        "[?] m-s-other | Hardware: CPU | Variant: DEFAULT\n",
+        "",
+    )
+    assert backend.find_resource(make_spec()) is None

@@ -407,7 +407,9 @@ def test_migration_v7_to_v8_idempotent(tmp_path: Path) -> None:
 
 def _seed_two_provider_scenario(store: Store) -> None:
     """Job A runs to reaped success on uni; job B rolls back off uni, then runs
-    on vast and is cancelled+captured there. Interleaved to exercise ordering."""
+    on vast and is cancelled+captured there; job C rolls back off uni and is
+    then failed by the scheduler (attempts exhausted) while unbound.
+    Interleaved to exercise ordering."""
     ap = store.append_event
     ap("A", actor="client", action="submit", data={"cost_cents": 250})
     ap("A", actor="scheduler", action="reserve", data={"provider": "uni"})
@@ -425,6 +427,10 @@ def _seed_two_provider_scenario(store: Store) -> None:
     ap("B", actor="client", action="cancel")
     ap("B", actor="supervisor", action="capture")
     ap("B", actor="observer", action="poll-note", cause="diagnostic")  # skipped
+    ap("C", actor="client", action="submit", data={"cost_cents": 50})
+    ap("C", actor="scheduler", action="reserve", data={"provider": "uni"})
+    ap("C", actor="supervisor", action="rollback")
+    ap("C", actor="scheduler", action="fail", cause="attempts exhausted")
 
 
 def test_export_global_trace_golden(store: Store) -> None:
@@ -447,6 +453,10 @@ def test_export_global_trace_golden(store: Store) -> None:
         "activate 1\n"
         "cancel 1\n"
         "capture 1\n"
+        "submit 2 50\n"
+        "reserve 2\n"
+        "rollback 2\n"
+        "fail 2\n"
     )
 
 
@@ -454,7 +464,8 @@ def test_export_provider_traces_golden(store: Store) -> None:
     _seed_two_provider_scenario(store)
     uni = export_provider_trace(store, "uni", budget_cents=10_000, cap=2)
     # B's submit is replayed on first contact; its arc here ends at rollback,
-    # leaving it re-reservable in vast's trace.
+    # leaving it re-reservable in vast's trace. C's unbound `fail` (after its
+    # rollback) is global-only — same rule as a cancel of an unbound job.
     assert uni == (
         "init 10000 2\n"
         "submit 0 250\n"
@@ -467,6 +478,9 @@ def test_export_provider_traces_golden(store: Store) -> None:
         "rollback 1\n"
         "capture 0\n"
         "reap 0\n"
+        "submit 2 50\n"
+        "reserve 2\n"
+        "rollback 2\n"
     )
     vast = export_provider_trace(store, "vast", budget_cents=10_000, cap=2)
     assert vast == (

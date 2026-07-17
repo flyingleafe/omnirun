@@ -14,6 +14,7 @@ from pathlib import Path
 
 from omnirun import budget, control, daemon, scheduler
 from omnirun.engine import engine as engine_engine
+from omnirun.engine import jobstream as engine_jobstream
 from omnirun.engine import observer as engine_observer
 from omnirun.engine import outcomes as engine_outcomes
 from omnirun.engine import providertypes as engine_providertypes
@@ -36,6 +37,7 @@ _CORE_MODULES = (
     engine_workitems,
     engine_supervisor,
     engine_observer,
+    engine_jobstream,
     engine_engine,
 )
 

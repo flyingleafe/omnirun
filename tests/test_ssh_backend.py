@@ -456,3 +456,82 @@ def test_missing_host_raises():
     b = SshBackend("rig", config)
     with pytest.raises(BackendError, match="host"):
         _ = b.exec_
+
+
+# ---- staged placement seam + typed observation (P5) --------------------------
+
+
+def test_rent_resource_is_trivial_and_free():
+    """The host itself is the (non-billable) resource: rent creates nothing
+    and runs nothing — the payload rides launch_job."""
+    fake = FakeExec()
+    b = make_backend(fake)
+    handle = b.rent_resource(make_spec(), None)
+    assert handle.data == {"host": "rig"}
+    assert fake.commands == []
+
+
+def test_find_resource_adopts_recorded_pid():
+    fake = FakeExec()
+    fake.add(r"eval echo", stdout="/h/.omnirun\n")
+    fake.add(r"cat .*pid", stdout="4242\n")
+    handle = make_backend(fake).find_resource(make_spec())
+    assert handle is not None
+    assert handle.data["pid"] == 4242
+    assert handle.data["job_dir"] == "/h/.omnirun/jobs/train-abc123"
+
+
+def test_find_resource_none_without_pid():
+    fake = FakeExec()
+    fake.add(r"eval echo", stdout="/h/.omnirun\n")
+    fake.add(r"cat .*pid", returncode=1)
+    assert make_backend(fake).find_resource(make_spec()) is None
+
+
+def test_launch_job_adopts_already_launched(monkeypatch):
+    """SCHED-8: a replayed launch stage (crash between launch and activate)
+    adopts the recorded pid instead of re-executing the job."""
+    fake = FakeExec()
+    fake.add(r"eval echo", stdout="/h/.omnirun\n")
+    fake.add(r"cat .*pid", stdout="4242\n")
+    b = make_backend(fake)
+    handle = b.launch_job(make_spec(), b.rent_resource(make_spec(), None))
+    assert handle.data["pid"] == 4242
+    assert not any("setsid" in c for c in fake.commands)
+
+
+def test_observe_status_unreachable_vs_status_lost():
+    from omnirun.backends.base import BackendUnreachable
+
+    fake = FakeExec()
+    fake.add(r".", returncode=1, stderr="Connection refused")
+    b = make_backend(fake)
+    assert b.status(HANDLE).status == JobStatus.LOST
+    with pytest.raises(BackendUnreachable):
+        b.observe_status(HANDLE)
+
+
+class BatchFakeExec(FakeExec):
+    def __init__(self):
+        super().__init__()
+        self.batches: list[list[str]] = []
+
+    def run_batch(self, commands, *, timeout=None):
+        self.batches.append(list(commands))
+        return [self.run(c) for c in commands]
+
+
+def test_observe_batch_one_invocation_with_pid_liveness():
+    """OBS-12: one composed remote round covers every observed job (status
+    triple + pid liveness each); a dead worker pid downgrades RUNNING to LOST."""
+    fake = BatchFakeExec()
+    fake.add(
+        r"result\.json",
+        stdout=derive_stdout(phase="running", heartbeat=fresh_heartbeat()),
+    )
+    fake.add(r"echo nopid", stdout="dead\n")
+    reports = make_backend(fake).observe_batch([HANDLE])
+    assert len(fake.batches) == 1
+    assert len(fake.batches[0]) == 2
+    assert reports[0].status == JobStatus.LOST
+    assert "died without writing result.json" in reports[0].detail

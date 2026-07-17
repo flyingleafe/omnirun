@@ -92,10 +92,9 @@ _GATE_CAP = 1_000_000
 def run_trace_gate(store: Store, tmp_path: Path) -> None:
     """Export the global + per-provider traces and run ``trace-check`` on each.
 
-    α checkpoint asserts are included in the global view unless a diagnostic
-    ``fail`` event exists (attempts-exhausted has no model edge — the Python
-    row says FAILED while the model still says queued, a documented
-    scale-down; the event path itself is still fully validated)."""
+    α checkpoint asserts are always included in the global view: ``fail`` is
+    a validated model action (``failQueued``), so a FAILED row and the model
+    agree."""
     events = []
     cursor = 0
     while True:
@@ -111,7 +110,7 @@ def run_trace_gate(store: Store, tmp_path: Path) -> None:
             if ev.action == "reserve" and (ev.data or {}).get("provider")
         }
     )
-    with_asserts = not any(ev.action == "fail" for ev in events)
+    with_asserts = True
     traces = {
         "global.trace": export_global_trace(
             store,

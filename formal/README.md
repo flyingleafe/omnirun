@@ -23,9 +23,12 @@ the budget ledger, and a monotone event counter — with the transition relation
 `Step`: submit, reserve (atomic cap+budget check + intent), provision
 (create-if-absent under the job key), activate (adopt) / rollback (the two
 intent resolutions — a crash between them needs no extra constructor),
-stream append, exit-sentinel finish, cancel, live/terminal capture, reap and
-releaseLost (both capture-gated), requeue (budget voided, log kept), and
-unreachablePoll (records an event, changes nothing).
+stream append, exit-sentinel finish, cancel, failQueued (the scheduler's
+give-up after the placement-attempts budget is exhausted: QUEUED → FAILED —
+the job holds no slot or resource, so only its state and the event counter
+change), live/terminal capture, reap and releaseLost (both capture-gated),
+requeue (budget voided, log kept), and unreachablePoll (records an event,
+changes nothing).
 
 Deliberate scale-downs, documented in the file header: one provider, log
 content abstracted to length, events to a counter, gc out of scope.

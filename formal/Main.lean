@@ -11,7 +11,7 @@ Format (whitespace-separated tokens; blank lines and `#`-lines skipped):
   init <budget> <cap>              -- must be the first effective line
   submit <id> <cost> | reserve <id> | provision <id> | activate <id>
   rollback <id> | log-append <id> | finish <id> <0|1> | cancel <id>
-  capture <id> | reap <id> | release-lost <id> | requeue <id>
+  fail <id> | capture <id> | reap <id> | release-lost <id> | requeue <id>
   unreachable-poll
   assert-job <id> <state> | assert-spent <n> | assert-active <n>
   assert-ext-count <n> | assert-events <n>
@@ -57,6 +57,7 @@ def parseAction : List String → Option Action
     | some i, "1" => some (.finish i true)
     | _, _ => none
   | ["cancel", i] => (i.toNat?).map .cancel
+  | ["fail", i] => (i.toNat?).map .fail
   | ["capture", i] => (i.toNat?).map .capture
   | ["reap", i] => (i.toNat?).map .reap
   | ["release-lost", i] => (i.toNat?).map .releaseLost

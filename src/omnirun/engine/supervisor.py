@@ -58,7 +58,13 @@ from omnirun.models import (
     StatusReport,
 )
 from omnirun.scheduler import offer_key
-from omnirun.state.store import IntentRow, IntentWrite, StaleTransition, Store
+from omnirun.state.store import (
+    IntentRow,
+    IntentWrite,
+    StaleTransition,
+    Store,
+    StoreError,
+)
 
 _log = logging.getLogger("omnirun.engine.supervisor")
 
@@ -469,26 +475,49 @@ class Supervisor:
             r.external_key == result.external_key
             for r in self._store.unreleased_resources(data.provider)
         )
-        provisioned = any(
-            e.action == "provision" for e in self._store.job_events_for(job_id)
+        # "Provisioned" is scoped to the CURRENT placement arc (events after
+        # the last reserve): a job re-placed after a requeue owes the model a
+        # fresh `provision` event even though earlier arcs emitted one.
+        events = self._store.job_events_for(job_id)
+        last_reserve = max(
+            (i for i, e in enumerate(events) if e.action == "reserve"), default=-1
         )
+        provisioned = any(e.action == "provision" for e in events[last_reserve + 1 :])
+        provision_data = {
+            "provider": data.provider,
+            "external_key": result.external_key,
+            "adopted": not result.created,
+        }
         if not provisioned:
-            cas_step(
-                self._store,
-                job_id,
-                lambda r: r if r.state is JobState.PLACING else None,
-                actor=_ACTOR,
-                action="provision",
-                data={
-                    "provider": data.provider,
-                    "external_key": result.external_key,
-                    "adopted": not result.created,
-                },
-                mint=None if minted else (data.provider, result.external_key),
-            )
+            try:
+                cas_step(
+                    self._store,
+                    job_id,
+                    lambda r: r if r.state is JobState.PLACING else None,
+                    actor=_ACTOR,
+                    action="provision",
+                    data=provision_data,
+                    mint=None if minted else (data.provider, result.external_key),
+                )
+            except StoreError:
+                # The deterministic key was already minted (and released) by a
+                # PREVIOUS attempt: the resources row (PK provider+key) still
+                # records this provider-side resource, so commit the provision
+                # event without a second insert.
+                cas_step(
+                    self._store,
+                    job_id,
+                    lambda r: r if r.state is JobState.PLACING else None,
+                    actor=_ACTOR,
+                    action="provision",
+                    data=provision_data,
+                )
         elif not minted:
             # Crash-gap repair: the event committed but the mint tx did not.
-            self._store.mint_resource(data.provider, result.external_key, job_id)
+            try:
+                self._store.mint_resource(data.provider, result.external_key, job_id)
+            except StoreError:
+                pass  # a prior attempt's released row already records the key
         self._store.put_intent(
             job_id,
             wi.WorkKind.PLACE.value,
