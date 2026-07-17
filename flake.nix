@@ -138,6 +138,6 @@
       # System-agnostic outputs: an overlay that adds `omnirun` to a pkgs set,
       # and the NixOS module that runs the daemon (`services.omnirun`).
       overlays.default = final: _prev: { omnirun = mkOmnirun final; };
-      nixosModules.default = { ... }@args: import ./nix/module.nix args;
+      nixosModules.default = import ./nix/module.nix;
     };
 }
