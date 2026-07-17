@@ -36,7 +36,7 @@ import logging
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, NamedTuple, TypeVar
 
 from omnirun.models import (
     Deadline,
@@ -67,6 +67,16 @@ _log = logging.getLogger("omnirun.control")
 
 _ItemT = TypeVar("_ItemT")
 _ResultT = TypeVar("_ResultT")
+
+
+class _PlaceReservation(NamedTuple):
+    """A capacity reservation ready for its slow ``provider.place`` submit — the
+    hand-off between the serial reserve phase and the parallel place phase."""
+
+    decision: Decision
+    rec: JobRecord
+    slot: Slot
+    provider: Provider
 
 
 def resolve_meta_cap(store: Store, window: str, default: float | None) -> float | None:
@@ -141,6 +151,7 @@ class Control:
         outputs_dir: Path | None = None,
         poll_timeout_s: float = 30.0,
         max_poll_workers: int = 8,
+        max_place_workers: int = 32,
         place_io: AbstractContextManager[object] | None = None,
     ) -> None:
         self._store = store
@@ -165,6 +176,11 @@ class Control:
         # never allowed to hang a read command.
         self._poll_timeout_s = poll_timeout_s
         self._max_poll_workers = max_poll_workers
+        # Placement fan-out: many QUEUED jobs' slow ``provider.place`` submits
+        # (instance provisioning — minutes each) run CONCURRENTLY across this many
+        # threads, so ten jobs provision at once instead of serially. Reserve and
+        # ledger accounting stay serial on the tick thread; only the I/O parallels.
+        self._max_place_workers = max_place_workers
         # Durable local cache the reconciler collects a terminal job's outputs
         # into BEFORE releasing its held resource (the resource's disk is gone
         # once released). ``pull`` then serves from here. ``None`` disables the
@@ -416,8 +432,13 @@ class Control:
         slots = self._gather_slots(jobs)
         ledger = self._store.load_ledger(self._budget_window, self._resolve_cap(), now)
         decisions = tick(jobs, slots, ledger, now, policy=self._policy)
+        # Non-placement decisions are cheap store flips — enact them inline. The
+        # placement decisions carry the minutes-long provisioning I/O, so batch
+        # them and run their ``provider.place`` submits in parallel.
         for decision in decisions:
-            self._enact(decision, now)
+            if decision.kind != "place":
+                self._enact(decision, now)
+        self._enact_places([d for d in decisions if d.kind == "place"], now)
         return decisions
 
     # ------------------------------------------------------------------
@@ -1092,24 +1113,87 @@ class Control:
         self._store.save_job(rec.model_copy(update={"state": JobState.HELD}))
 
     def _enact_place(self, decision: Decision, now: datetime) -> None:
-        """Reserve capacity atomically, then place — with crash isolation.
+        """Enact a single ``place`` decision (reserve → place → finish).
+
+        A thin front to the batch path so any single-decision caller behaves
+        exactly as the batch does for one job (no thread pool spun up)."""
+        self._enact_places([decision], now)
+
+    def _enact_places(self, decisions: list[Decision], now: datetime) -> None:
+        """Enact many ``place`` decisions, running the slow provider submits in
+        PARALLEL so ten queued jobs provision at once instead of one-after-another.
+
+        Three phases keep correctness intact: (1) reserve + the weekly-budget gate
+        run SERIALLY on this thread — capacity (#12 atomic ``reserve``) and the
+        ledger can never be double-counted by a race; (2) every reserved job's
+        ``provider.place`` — the minutes-long provisioning submit — runs
+        concurrently in a thread pool; (3) results are committed serially (ledger +
+        RUNNING save, or release/defer). The daemon's store lock (``_place_io``) is
+        dropped around the whole parallel batch so client reads/cancels are never
+        starved; the store is concurrency-safe (row-locked reserve, per-op
+        connections) and the only in-``place`` store writes are the per-job
+        provisioning-stub persist and the deploy-key read, safe to run off-thread.
+        """
+        reservations = [
+            r for d in decisions if (r := self._reserve_place(d, now)) is not None
+        ]
+        if not reservations:
+            return
+        outcomes: list[tuple[_PlaceReservation, Placement | Exception]]
+        if len(reservations) == 1:
+            r = reservations[0]
+            with self._place_io:
+                outcomes = [(r, self._place_io_call(r))]
+        else:
+            workers = min(len(reservations), self._max_place_workers)
+            with self._place_io:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers
+                ) as executor:
+                    fut_to_res = {
+                        executor.submit(self._place_io_call, r): r for r in reservations
+                    }
+                    outcomes = []
+                    for future in concurrent.futures.as_completed(fut_to_res):
+                        exc = future.exception()
+                        if exc is not None and not isinstance(exc, Exception):
+                            raise exc  # BaseException — never swallowed as a fault
+                        res = fut_to_res[future]
+                        outcomes.append(
+                            (res, exc if exc is not None else future.result())
+                        )
+        for res, outcome in outcomes:
+            self._finish_place(res, outcome, now)
+
+    @staticmethod
+    def _place_io_call(res: _PlaceReservation) -> Placement | Exception:
+        """Run one ``provider.place`` in a worker thread, returning the placement
+        or the exception it raised (so ``_finish_place`` handles it on the main
+        thread — a raising future must not tear down the whole batch)."""
+        try:
+            return res.provider.place(res.rec, res.slot)
+        except Exception as e:
+            return e
+
+    def _reserve_place(
+        self, decision: Decision, now: datetime
+    ) -> _PlaceReservation | None:
+        """Phase 1 (serial): atomically reserve capacity for one place decision.
 
         ``reserve`` (Store, #12 guard) flips the persisted row QUEUED→PLACING and
         writes a stub placement in ONE transaction; only the winner of any race
-        proceeds to the real ``place`` I/O. A ``place`` that raises releases the
-        reservation back to QUEUED (``attempts+1``) so the job retries next tick.
-        On success the row is flipped to RUNNING with the real placement.
+        proceeds. Returns the reservation to place, or None (nothing reserved).
         """
         slot = decision.slot
         if slot is None:
-            return
+            return None
         rec = self._store.load_job(decision.job_id)
         # A ``place`` decision is emitted for a QUEUED job OR a HELD one that has
         # become satisfiable this round (the pure tick re-derives HELD each tick).
         # Both are placeable now; requiring QUEUED would wedge the held job (it
         # would get a ``place`` decision every tick yet never reserve/transition).
         if rec is None or rec.state not in (JobState.QUEUED, JobState.HELD):
-            return
+            return None
         # Weekly budget gate (enforced ALONGSIDE the day cap the tick already
         # applied). For a PAID slot with a knowable cost, if a weekly cap is set
         # and this week's ledger cannot afford the estimate, SKIP the place BEFORE
@@ -1123,25 +1207,37 @@ class Control:
             if week_cost is not None and not self._store.load_ledger(
                 "week", week_cap, now
             ).can_afford(week_cost, now):
-                return
+                return None
         # Atomic reserve (#12): flips the row (QUEUED/HELD) to PLACING + stub
         # placement. A lost race / gone capacity returns False; the job keeps its
         # current state, retries next tick.
         if not self._store.reserve(slot, rec):
-            return
+            return None
         provider = self._providers.get(slot.provider_name)
         if provider is None:
             # Reserved onto a provider we cannot drive — release the reservation.
             self._release(decision.job_id, rec)
-            return
-        try:
-            # Drop the daemon's store lock (if any) for just this slow submit so a
-            # concurrent client write (a cancel) is not starved behind it. Safe:
-            # the reservation above is committed, and we re-load below to honor any
-            # cancel that lands during the yield.
-            with self._place_io:
-                placement = provider.place(rec, slot)
-        except CapacityError as e:
+            return None
+        return _PlaceReservation(
+            decision=decision, rec=rec, slot=slot, provider=provider
+        )
+
+    def _finish_place(
+        self,
+        res: _PlaceReservation,
+        outcome: Placement | Exception,
+        now: datetime,
+    ) -> None:
+        """Phase 3 (serial): commit a completed placement.
+
+        ``outcome`` is the ``Placement`` a successful submit produced, or the
+        exception it raised. A ``CapacityError`` defers (release, learn cap); any
+        other exception releases with the reason (retried next tick, capped after
+        too many attempts); a success commits the ledger and flips to RUNNING —
+        unless a cancel landed mid-place, in which case it is reaped, not run.
+        """
+        decision, rec, slot = res.decision, res.rec, res.slot
+        if isinstance(outcome, CapacityError):
             # Provider had no room right now (a concurrency/quota cap `offer` could
             # not foresee). Expected and transient — release the reservation and
             # retry next tick, logged as one quiet line (no traceback, job not
@@ -1150,7 +1246,7 @@ class Control:
                 "deferring job %s: %s has no capacity now (%s); will retry next tick",
                 decision.job_id,
                 slot.provider_name,
-                e,
+                outcome,
             )
             # Release FIRST (job → QUEUED) so it is not counted among the live
             # jobs when LEARN-CAP reads the backend's true ceiling.
@@ -1165,20 +1261,23 @@ class Control:
                 f"backing off {backoff:.0f}s before retry"
             )
             return
-        except Exception as e:
+        if isinstance(outcome, Exception):
             # Backend submit failed: release the reservation so a later tick can
             # retry (spec §7b — misbehaving provider degraded, tick not crashed).
             # Record the reason so the tick's attempts-cap can fail a job whose
             # placement keeps raising, and read commands can show WHY.
             _log.warning(
-                "place raised for job %s on %s; releasing reservation",
+                "place raised for job %s on %s; releasing reservation (%s)",
                 decision.job_id,
                 slot.provider_name,
-                exc_info=True,
+                outcome,
             )
-            self._release(decision.job_id, rec, error=f"{slot.provider_name}: {e}")
+            self._release(
+                decision.job_id, rec, error=f"{slot.provider_name}: {outcome}"
+            )
             return
 
+        placement = outcome
         # Commit the budget for a PAID placement with a knowable cost. Free slots
         # (per_hour None) and unknowable costs never touch the ledger. The commit
         # lands in every enforced window (day always; week too when a weekly cap is

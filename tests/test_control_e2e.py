@@ -15,6 +15,7 @@ terminal reconcile is a pure state transition.
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,6 +74,48 @@ def _free_slot() -> Slot:
         cost=Cost(),  # per_hour None → free
         capacity=1,
     )
+
+
+def test_placements_run_in_parallel(tmp_path: Path) -> None:
+    """Many QUEUED jobs' slow ``provider.place`` submits run CONCURRENTLY within a
+    single tick, not one-after-another. Proved by a barrier that only releases when
+    all N places are in flight at once: had placement serialized, the first place
+    would block on the barrier until it timed out (BrokenBarrierError → the jobs
+    never reach RUNNING)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        n = 5
+        barrier = threading.Barrier(n, timeout=8.0)
+
+        def _await_all(_rec: JobRecord) -> None:
+            barrier.wait()  # all N places must be in flight before any returns
+
+        slots = [
+            Slot(
+                provider_name="free",
+                capabilities=Capabilities(),
+                cost=Cost(),
+                capacity=n,
+            )
+            for _ in range(n)
+        ]
+        provider = FakeProvider(
+            "free",
+            slots=slots,
+            discover_available=n,
+            place_hook=_await_all,
+        )
+        control = Control(store, {"free": provider})
+        for i in range(n):
+            control.submit(_spec(f"par-{i:06d}"), now=T0)
+
+        control.run_tick(T0)
+
+        running = [j for j in store.list_jobs() if j.state is JobState.RUNNING]
+        assert len(running) == n, "all placements should have completed in parallel"
+        assert sorted(provider.place_calls) == [f"par-{i:06d}" for i in range(n)]
+    finally:
+        store.close()
 
 
 def test_happy_path_free_slot_lifecycle(tmp_path: Path) -> None:

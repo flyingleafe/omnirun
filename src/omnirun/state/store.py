@@ -857,7 +857,15 @@ def _ensure_sqlite_parent(url: str) -> None:
 def open_store(url: str | None = None) -> Store:
     url = url or default_db_url()
     _ensure_sqlite_parent(url)
-    engine = create_engine(url, future=True)
+    # SQLite: allow the pooled connections to be used from the daemon's placement
+    # worker threads. Cross-thread use is safe here because writes are serialized
+    # by ``BEGIN IMMEDIATE`` + the busy_timeout retry (postgres uses row locks and
+    # is thread-safe natively). Without this pysqlite's check_same_thread guard
+    # would reject a connection reused on a different thread.
+    connect_args: dict[str, Any] = {}
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+    engine = create_engine(url, future=True, connect_args=connect_args)
     if engine.dialect.name not in _SUPPORTED_DIALECTS:
         engine.dispose()
         supported = ", ".join(_SUPPORTED_DIALECTS)
