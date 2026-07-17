@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from omnirun.state.store import (
     STATE_SCHEMA_VERSION,
+    EventRow,
+    IntentRow,
+    ResourceRow,
+    StaleTransition,
     Store,
     StoreError,
     default_db_url,
@@ -18,6 +22,10 @@ from omnirun.state.store import (
 
 __all__ = [
     "STATE_SCHEMA_VERSION",
+    "EventRow",
+    "IntentRow",
+    "ResourceRow",
+    "StaleTransition",
     "Store",
     "StoreError",
     "default_db_url",

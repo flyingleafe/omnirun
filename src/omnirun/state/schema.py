@@ -48,8 +48,69 @@ jobs = Table(
     Column("project", Text, nullable=True),
     Column("submitted_at", Text, nullable=True),
     Column("schema_version", Integer, nullable=False),
+    # Last APPLIED event seq for this job — the compare-and-set token for
+    # ``Store.transition`` (ROBUST-4) and the I11 fold cursor: the job row is the
+    # fold of ``job_events`` rows 1..seq. Legacy rows get it via migration 7→8.
+    Column("seq", Integer, nullable=False, server_default="0"),
     Column("data", JSON, nullable=False),
     Index("ix_jobs_project", "project"),
+)
+
+# Append-only per-job event log (DESIGN-V2 §6, JOB-8) — the refinement interface
+# to the formal model. ``action`` uses exactly the trace-checker tokens
+# (docs/redesign/CONFORMANCE.md §1): submit/reserve/provision/activate/rollback/
+# finish/cancel/capture/reap/release-lost/requeue; diagnostic tokens (e.g.
+# adoption breadcrumbs, ``unreachable-poll``) are allowed but are NOT part of the
+# validated alphabet — the trace exporter skips them. ``seq`` is per-job,
+# starting at 1; ``at`` is ISO-8601 UTC; ``actor`` is one of
+# client|scheduler|supervisor|observer|migration.
+job_events = Table(
+    "job_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("job_id", Text, nullable=False),
+    Column("seq", Integer, nullable=False),
+    Column("at", Text),
+    Column("actor", Text),
+    Column("action", Text),
+    Column("cause", Text, nullable=True),
+    Column("data", JSON, nullable=True),
+    Index("ux_job_events_job_seq", "job_id", "seq", unique=True),
+    Index("ix_job_events_job_id", "job_id"),
+)
+
+# Write-ahead work items (DESIGN-V2 §6): at most ONE live intent per job (the
+# primary key enforces I7's one-live-placement discipline at the store level).
+# ``kind`` is place|cancel|capture|reap; ``stage`` is the item's last durably
+# reached step (crash recovery re-enters here); ``poisoned_until`` quarantines a
+# repeatedly-crashing item until the given ISO-8601 time.
+intents = Table(
+    "intents",
+    metadata,
+    Column("job_id", Text, primary_key=True),
+    Column("kind", Text),
+    Column("stage", Text),
+    Column("provider", Text, nullable=True),
+    Column("created_at", Text),
+    Column("updated_at", Text),
+    Column("poisoned_until", Text, nullable=True),
+    Column("data", JSON, nullable=False),
+)
+
+# Provider-side resource registry (DESIGN-V2 §6, I5 no-untracked-money): every
+# billable external resource is recorded here from BEFORE its creation completes
+# (write-ahead mint), keyed by (provider, external_key) — the deterministic
+# naming that lets a crashed placer adopt instead of duplicate. ``released_at``
+# set = confirmed released (reap/release-lost); NULL = money may be burning.
+resources = Table(
+    "resources",
+    metadata,
+    Column("provider", Text, primary_key=True),
+    Column("external_key", Text, primary_key=True),
+    Column("job_id", Text, nullable=True),
+    Column("minted_at", Text),
+    Column("released_at", Text, nullable=True),
+    Column("data", JSON, nullable=True),
 )
 
 wait_samples = Table(
@@ -104,4 +165,14 @@ deploy_keys = Table(
     Column("data", JSON, nullable=False),
 )
 
-ALL_TABLES = (meta, jobs, wait_samples, facts, ledger, deploy_keys)
+ALL_TABLES = (
+    meta,
+    jobs,
+    wait_samples,
+    facts,
+    ledger,
+    deploy_keys,
+    job_events,
+    intents,
+    resources,
+)

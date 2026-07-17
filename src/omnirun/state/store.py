@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import (
     Connection,
@@ -40,6 +40,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 
 from omnirun.budget import BudgetLedger, LedgerEntry
 from omnirun.models import (
@@ -56,10 +57,13 @@ from omnirun.state.schema import (
     ALL_TABLES,
     deploy_keys,
     facts,
+    intents,
+    job_events,
     jobs,
     ledger,
     meta,
     metadata,
+    resources,
     wait_samples,
 )
 
@@ -88,7 +92,14 @@ _SUPPORTED_DIALECTS = ("sqlite", "postgresql")
 # private repos on the worker). Purely additive — ``create_all`` creates the new
 # table on an existing DB before ``_migrate`` runs, so there is no data migration,
 # only the version bump (an older omnirun refuses a v7 DB via the guard).
-STATE_SCHEMA_VERSION = 7
+# v8 (redesign P1): adds ``job_events``/``intents``/``resources`` and the jobs
+# ``seq`` CAS column, and emits a synthetic RECONSTRUCTION event prefix per
+# existing job (actor="migration") — the shortest trace-checker action sequence
+# reaching the job's current state, so production replay validation starts from
+# ``init`` and stays a valid model path across the upgrade (CONFORMANCE.md §5;
+# the doc labels this step "6→7" — it was written before the deploy_keys bump
+# claimed v7, so it lands here as 7→8).
+STATE_SCHEMA_VERSION = 8
 
 # Scheduler states that occupy a provider slot (the #12 capacity guard counts
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
@@ -103,6 +114,53 @@ _RESERVABLE_JOB_STATES = frozenset({_JobState.QUEUED, _JobState.HELD})
 
 class StoreError(RuntimeError):
     """Raised for state-store failures that are not plain lookups."""
+
+
+class StaleTransition(StoreError):
+    """A compare-and-set ``transition`` lost the race: ``jobs.seq`` no longer
+    equals the caller's ``expected_seq`` (another actor applied an event first).
+    The caller must reload the record and re-derive its step (ROBUST-4)."""
+
+
+class EventRow(NamedTuple):
+    """One ``job_events`` row — the refinement interface to the formal model."""
+
+    id: int
+    job_id: str
+    seq: int
+    at: str
+    actor: str
+    action: str
+    cause: str | None
+    data: dict[str, Any] | None
+
+
+class IntentRow(NamedTuple):
+    """One live work item (``intents`` row); at most one per job."""
+
+    job_id: str
+    kind: str
+    stage: str
+    provider: str | None
+    created_at: str
+    updated_at: str
+    poisoned_until: str | None
+    data: dict[str, Any]
+
+
+class ResourceRow(NamedTuple):
+    """One provider-side resource (``resources`` row); released_at NULL = live."""
+
+    provider: str
+    external_key: str
+    job_id: str | None
+    minted_at: str
+    released_at: str | None
+    data: dict[str, Any] | None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def default_store_dir() -> Path:
@@ -262,6 +320,8 @@ class Store:
         table: Table,
         pk_cols: list[str],
         values: dict[str, Any],
+        *,
+        set_cols: list[str] | None = None,
     ) -> None:
         """Execute an upsert (INSERT … ON CONFLICT DO UPDATE) for *table*.
 
@@ -269,12 +329,16 @@ class Store:
         available: SQLite and PostgreSQL both provide it (with identical
         ``index_elements=`` / ``set_=`` kwargs). *pk_cols* names the
         conflict-target columns (the primary key, or a unique index); *values* is
-        the full row dict, which is also used as the update set.
+        the full row dict, which is also used as the update set. *set_cols*, when
+        given, restricts the conflict-update to those columns (insert-only fields
+        like ``created_at`` keep their original value on conflict).
         """
         dialect = self._engine.dialect.name
         insert_fn = sqlite_insert if dialect == "sqlite" else postgresql_insert
         stmt = insert_fn(table).values(**values)
         non_pk = {k: v for k, v in values.items() if k not in pk_cols}
+        if set_cols is not None:
+            non_pk = {k: v for k, v in non_pk.items() if k in set_cols}
         upsert_stmt = stmt.on_conflict_do_update(
             index_elements=pk_cols,
             set_=non_pk,
@@ -298,8 +362,18 @@ class Store:
         These columns are internal (counting/filtering only); the full record —
         including the human-facing ``last_status`` — lives in the ``data`` blob.
         """
+        values = self._job_row_values(rec)
+        with self.transaction() as conn:
+            self._upsert(conn, jobs, ["job_id"], values)
+
+    def _job_row_values(self, rec: JobRecord) -> dict[str, Any]:
+        """The jobs-row dict for *rec* (shared by ``save_job``/``transition``).
+
+        Stamps ``rec.schema_version``. Does NOT include ``seq`` — a plain save
+        leaves the CAS token alone (column default 0 on first insert);
+        ``transition`` adds it explicitly.
+        """
         rec.schema_version = STATE_SCHEMA_VERSION
-        job_id = rec.spec.job_id
         backend: str | None = None
         if rec.placement is not None:
             backend = rec.placement.provider_name
@@ -307,25 +381,21 @@ class Store:
             backend = rec.handle.backend
         elif rec.offer is not None:
             backend = rec.offer.backend
-        state: str | None = rec.state.value
         submitted_at: str | None = (
             rec.submitted_at.isoformat() if rec.submitted_at is not None else None
         )
-        data = rec.model_dump(mode="json")
-        values: dict[str, Any] = {
-            "job_id": job_id,
+        return {
+            "job_id": rec.spec.job_id,
             "name": rec.spec.name,
             "backend": backend,
-            "state": state,
+            "state": rec.state.value,
             # ``project`` scopes ps/queue/gc: the submitting repo's slug. Stamped
             # on every write so scoping and the migration backfill never disagree.
             "project": rec.spec.repo.slug,
             "submitted_at": submitted_at,
             "schema_version": STATE_SCHEMA_VERSION,
-            "data": data,
+            "data": rec.model_dump(mode="json"),
         }
-        with self.transaction() as conn:
-            self._upsert(conn, jobs, ["job_id"], values)
 
     def load_job(self, job_id: str) -> JobRecord | None:
         """Return the ``JobRecord`` for *job_id*, or ``None`` if not found.
@@ -500,6 +570,332 @@ class Store:
                 )
             )
             return True
+
+    # ------------------------------------------------------------------
+    # Event log (job_events) + CAS transitions — DESIGN-V2 §6, CONFORMANCE.md.
+    # ------------------------------------------------------------------
+
+    def _insert_event(
+        self,
+        conn: Connection,
+        job_id: str,
+        seq: int,
+        *,
+        actor: str,
+        action: str,
+        cause: str | None,
+        data: dict[str, Any] | None,
+    ) -> None:
+        conn.execute(
+            insert(job_events).values(
+                job_id=job_id,
+                seq=seq,
+                at=_now_iso(),
+                actor=actor,
+                action=action,
+                cause=cause,
+                data=data,
+            )
+        )
+
+    def append_event(
+        self,
+        job_id: str,
+        *,
+        actor: str,
+        action: str,
+        cause: str | None = None,
+        data: dict[str, Any] | None = None,
+        conn: Connection | None = None,
+    ) -> int:
+        """Append one event for *job_id*; returns its per-job ``seq``.
+
+        Standalone (no *conn*): opens its own transaction and takes
+        ``max(job_events.seq) + 1`` — the path for diagnostic/cause-annotated
+        events that do not move the job row (adoption breadcrumbs,
+        ``unreachable-poll``); ``jobs.seq`` is deliberately NOT bumped, so a
+        later ``transition`` still folds from the last APPLIED event.
+
+        With *conn* (called inside a ``transition``-style transaction): computes
+        ``jobs.seq + 1`` on that connection, sharing its lock.
+
+        Lifecycle transitions must go through :meth:`transition` instead — this
+        method never writes the job row.
+        """
+        if conn is not None:
+            row = conn.execute(
+                select(jobs.c.seq).where(jobs.c.job_id == job_id)
+            ).fetchone()
+            seq = (int(row[0]) if row is not None else 0) + 1
+            self._insert_event(
+                conn, job_id, seq, actor=actor, action=action, cause=cause, data=data
+            )
+            return seq
+        with self.transaction() as tx:
+            top = tx.execute(
+                select(func.max(job_events.c.seq)).where(job_events.c.job_id == job_id)
+            ).scalar_one_or_none()
+            seq = (int(top) if top is not None else 0) + 1
+            self._insert_event(
+                tx, job_id, seq, actor=actor, action=action, cause=cause, data=data
+            )
+            return seq
+
+    def transition(
+        self,
+        job_id: str,
+        record: JobRecord,
+        *,
+        expected_seq: int,
+        actor: str,
+        action: str,
+        cause: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> int:
+        """Compare-and-set save + event append in ONE transaction (ROBUST-4/I11).
+
+        Verifies ``jobs.seq == expected_seq`` under the write lock (else raises
+        :class:`StaleTransition`), writes *record* through the same serialization
+        path as ``save_job``, sets ``jobs.seq = expected_seq + 1``, and inserts
+        the event with that same ``seq`` — so the job row is, transactionally,
+        the fold of its event log. A missing row is valid only for
+        ``expected_seq == 0`` (the ``submit`` transition creates it). Returns the
+        new seq.
+        """
+        if record.spec.job_id != job_id:
+            raise StoreError(
+                f"transition job_id {job_id!r} does not match record "
+                f"{record.spec.job_id!r}"
+            )
+        new_seq = expected_seq + 1
+        values = self._job_row_values(record)
+        values["seq"] = new_seq
+        with self.transaction() as conn:
+            row = conn.execute(
+                select(jobs.c.seq).where(jobs.c.job_id == job_id).with_for_update()
+            ).fetchone()
+            if row is None:
+                if expected_seq != 0:
+                    raise StaleTransition(
+                        f"job {job_id}: expected seq {expected_seq} but no row exists"
+                    )
+            elif int(row[0]) != expected_seq:
+                raise StaleTransition(
+                    f"job {job_id}: expected seq {expected_seq}, store has {row[0]}"
+                )
+            self._upsert(conn, jobs, ["job_id"], values)
+            self._insert_event(
+                conn,
+                job_id,
+                new_seq,
+                actor=actor,
+                action=action,
+                cause=cause,
+                data=data,
+            )
+        return new_seq
+
+    def events_after(self, global_id: int, limit: int = 1000) -> list[EventRow]:
+        """Events with ``id > global_id`` in global order — the replay-validator
+        and SSE-feed cursor read. Page with the last row's ``id``."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(job_events)
+                .where(job_events.c.id > global_id)
+                .order_by(job_events.c.id)
+                .limit(limit)
+            ).fetchall()
+        return [EventRow(*row) for row in rows]
+
+    def job_events_for(self, job_id: str) -> list[EventRow]:
+        """All events of *job_id* in seq order (its full lifecycle history)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(job_events)
+                .where(job_events.c.job_id == job_id)
+                .order_by(job_events.c.seq)
+            ).fetchall()
+        return [EventRow(*row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Intents — write-ahead work items, one live per job (DESIGN-V2 §6).
+    # ------------------------------------------------------------------
+
+    def put_intent(
+        self,
+        job_id: str,
+        kind: str,
+        stage: str,
+        provider: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Upsert the live intent for *job_id*; bumps ``updated_at``.
+
+        ``created_at`` and ``poisoned_until`` survive an update — only
+        :meth:`poison_intent` sets the quarantine, and creation time is the
+        item's identity for crash-age accounting.
+        """
+        now = _now_iso()
+        values: dict[str, Any] = {
+            "job_id": job_id,
+            "kind": kind,
+            "stage": stage,
+            "provider": provider,
+            "created_at": now,
+            "updated_at": now,
+            "poisoned_until": None,
+            "data": data or {},
+        }
+        with self.transaction() as conn:
+            self._upsert(
+                conn,
+                intents,
+                ["job_id"],
+                values,
+                set_cols=["kind", "stage", "provider", "updated_at", "data"],
+            )
+
+    def get_intent(self, job_id: str) -> IntentRow | None:
+        """The live intent for *job_id*, or ``None``."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(intents).where(intents.c.job_id == job_id)
+            ).fetchone()
+        return None if row is None else IntentRow(*row)
+
+    def open_intents(self) -> list[IntentRow]:
+        """All live intents, oldest first (crash recovery walks these)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(intents).order_by(intents.c.created_at, intents.c.job_id)
+            ).fetchall()
+        return [IntentRow(*row) for row in rows]
+
+    def close_intent(self, job_id: str) -> bool:
+        """Delete the live intent for *job_id*; True if a row was removed."""
+        with self.transaction() as conn:
+            result = conn.execute(delete(intents).where(intents.c.job_id == job_id))
+        return bool(result.rowcount)
+
+    def poison_intent(self, job_id: str, until: datetime) -> bool:
+        """Quarantine the intent until *until* (a crash-looping work item is
+        parked, not retried hot). True if the intent existed."""
+        with self.transaction() as conn:
+            result = conn.execute(
+                update(intents)
+                .where(intents.c.job_id == job_id)
+                .values(poisoned_until=until.isoformat(), updated_at=_now_iso())
+            )
+        return bool(result.rowcount)
+
+    # ------------------------------------------------------------------
+    # Resources — provider-side money registry (I5 no-untracked-money).
+    # ------------------------------------------------------------------
+
+    def mint_resource(
+        self,
+        provider: str,
+        external_key: str,
+        job_id: str | None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a provider-side resource BEFORE its creation completes.
+
+        A plain INSERT: minting the same ``(provider, external_key)`` twice is an
+        error (``StoreError``) — the deterministic-key adopt-don't-duplicate
+        guard (I7), never an upsert.
+        """
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    insert(resources).values(
+                        provider=provider,
+                        external_key=external_key,
+                        job_id=job_id,
+                        minted_at=_now_iso(),
+                        released_at=None,
+                        data=data,
+                    )
+                )
+        except IntegrityError as e:
+            raise StoreError(
+                f"resource ({provider}, {external_key}) is already minted"
+            ) from e
+
+    def release_resource(self, provider: str, external_key: str) -> None:
+        """Mark the resource released now. Idempotent: an already-released row
+        keeps its original ``released_at``; a missing row is a no-op."""
+        with self.transaction() as conn:
+            conn.execute(
+                update(resources)
+                .where(resources.c.provider == provider)
+                .where(resources.c.external_key == external_key)
+                .where(resources.c.released_at.is_(None))
+                .values(released_at=_now_iso())
+            )
+
+    def unreleased_resources(self, provider: str | None = None) -> list[ResourceRow]:
+        """Resources with no confirmed release — the money-may-be-burning set."""
+        stmt = select(resources).where(resources.c.released_at.is_(None))
+        if provider is not None:
+            stmt = stmt.where(resources.c.provider == provider)
+        stmt = stmt.order_by(resources.c.minted_at, resources.c.external_key)
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return [ResourceRow(*row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # α — the abstraction dump (CONFORMANCE.md §3). The ONLY unproved mapping:
+    # store rows → model state, cross-validated against the checker's replayed
+    # state at every checkpoint. Keep it small and obvious.
+    # ------------------------------------------------------------------
+
+    def abstract_state(self, provider: str | None = None) -> dict[str, Any]:
+        """Model-view snapshot: jobs (model state + committed cost in cents),
+        open intents, unreleased resources, and model spend.
+
+        *provider* filters to jobs/intents/resources bound to that backend (the
+        per-provider validation view); ``None`` is the global view. Cost comes
+        from each job's ``submit`` event (``data.cost_cents``); model spend is
+        the sum over jobs whose reserve was never returned (rollback/requeue):
+        PLACING/RUNNING jobs plus terminal jobs that actually placed.
+        """
+        stmt = select(jobs.c.job_id, jobs.c.state, cast(jobs.c.data, Text))
+        if provider is not None:
+            stmt = stmt.where(jobs.c.backend == provider)
+        with self._engine.connect() as conn:
+            job_rows = conn.execute(stmt).fetchall()
+            cost_rows = conn.execute(
+                select(job_events.c.job_id, job_events.c.data).where(
+                    job_events.c.action == "submit"
+                )
+            ).fetchall()
+        costs: dict[str, int] = {}
+        for job_id, data in cost_rows:
+            if job_id not in costs:
+                costs[job_id] = int((data or {}).get("cost_cents", 0))
+        out_jobs: dict[str, dict[str, Any]] = {}
+        spent = 0
+        active = 0
+        for job_id, state, raw in job_rows:
+            model_state = _MODEL_STATE.get(state or "", "queued")
+            cost = costs.get(job_id, 0)
+            out_jobs[job_id] = {"state": model_state, "cost_cents": cost}
+            if model_state in ("placing", "placed"):
+                active += 1
+                spent += cost
+            elif model_state in ("succeeded", "failed", "cancelled"):
+                if _record_data_placed(raw):
+                    spent += cost
+        open_ = [it for it in self.open_intents() if provider in (None, it.provider)]
+        unreleased = self.unreleased_resources(provider)
+        return {
+            "jobs": out_jobs,
+            "intents": [it.job_id for it in open_],
+            "resources": [(r.provider, r.external_key, r.job_id) for r in unreleased],
+            "spent_cents": spent,
+            "active": active,
+        }
 
     # ------------------------------------------------------------------
     # Wait-history CRUD
@@ -767,6 +1163,31 @@ def _validate_job_row(job_id: str, raw: Any) -> JobRecord | None:
         return None
 
 
+# Scheduler ``JobState`` value → formal-model state token (CONFORMANCE.md §3).
+# HELD is a chooser refinement of queued; RUNNING is the model's ``placed``.
+_MODEL_STATE: dict[str, str] = {
+    _JobState.QUEUED.value: "queued",
+    _JobState.HELD.value: "queued",
+    _JobState.PLACING.value: "placing",
+    _JobState.RUNNING.value: "placed",
+    _JobState.SUCCEEDED.value: "succeeded",
+    _JobState.FAILED.value: "failed",
+    _JobState.CANCELLED.value: "cancelled",
+}
+
+
+def _record_data_placed(raw: Any) -> bool:
+    """Whether a stored job ``data`` blob carries a placement (ever reserved).
+
+    Used by ``abstract_state``'s spend rule for terminal jobs; a corrupt blob
+    counts as never-placed rather than raising."""
+    try:
+        data = _decode_json_column(raw)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and data.get("placement") is not None
+
+
 def _in_ledger_window(window: str, at: datetime, now: datetime) -> bool:
     """Whether *at* is in the same *window* as *now* — the SAME rule as
     ``BudgetLedger._in_window``: same UTC calendar date for ``"day"``, same ISO
@@ -788,6 +1209,10 @@ def _run_migrations(conn: Connection, from_version: int) -> None:
     """
     if from_version < 6:
         _migrate_to_6(conn)
+    # 7 was purely additive (the deploy_keys table, created by create_all before
+    # this runner is entered) — no data step.
+    if from_version < 8:
+        _migrate_to_8(conn)
 
 
 def _migrate_to_6(conn: Connection) -> None:
@@ -816,6 +1241,105 @@ def _migrate_to_6(conn: Connection) -> None:
         conn.execute(text("CREATE INDEX ix_jobs_project ON jobs (project)"))
 
     conn.execute(text("DROP TABLE IF EXISTS queue"))
+
+
+def _migrate_to_8(conn: Connection) -> None:
+    """…→8: the event-sourcing bootstrap (DESIGN-V2 P1; CONFORMANCE.md §5).
+
+    The ``job_events``/``intents``/``resources`` tables themselves are created by
+    ``create_all`` (idempotently) before this runner is entered — this step adds
+    the guarded ``jobs.seq`` CAS column and emits, per existing job, a synthetic
+    RECONSTRUCTION event prefix (actor=``migration``): the shortest checker
+    action sequence reaching the job's current state, so replay validation stays
+    a valid model path across the upgrade. Idempotent on both dialects: the ADD
+    COLUMN is inspector-guarded, and a job that already has events is skipped.
+    A corrupt job row gets no events (seq stays 0) — consistent with the read
+    paths' corrupt-row tolerance.
+    """
+    inspector = inspect(conn)
+    columns = {c["name"] for c in inspector.get_columns("jobs")}
+    if "seq" not in columns:
+        # Plain ALTER TABLE ADD COLUMN with a constant default works identically
+        # on sqlite and postgres.
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN seq INTEGER NOT NULL DEFAULT 0"))
+
+    have_events = {
+        row[0]
+        for row in conn.execute(select(job_events.c.job_id).distinct()).fetchall()
+    }
+    rows = conn.execute(select(jobs.c.job_id, cast(jobs.c.data, Text))).fetchall()
+    now = _now_iso()
+    for job_id, raw in rows:
+        if job_id in have_events:
+            continue
+        rec = _validate_job_row(job_id, raw)
+        if rec is None:
+            continue
+        actions = _reconstruction_actions(rec)
+        for seq, (action, data) in enumerate(actions, start=1):
+            conn.execute(
+                insert(job_events).values(
+                    job_id=job_id,
+                    seq=seq,
+                    at=now,
+                    actor="migration",
+                    action=action,
+                    cause="v1-state-reconstruction",
+                    data=data,
+                )
+            )
+        conn.execute(
+            update(jobs).where(jobs.c.job_id == job_id).values(seq=len(actions))
+        )
+
+
+def _reconstruction_actions(
+    rec: JobRecord,
+) -> list[tuple[str, dict[str, Any] | None]]:
+    """The shortest checker action sequence reaching *rec*'s current state.
+
+    Follows the model's guards exactly (formal/OmnirunFormal/Exec.lean): finish
+    requires ``placed``; cancel is legal from queued or placed (never placing);
+    ``reap`` requires ``captured``, so a reaped job ALWAYS gets a ``capture``
+    first (an empty capture, per CONFORMANCE.md §1) even when no cache path was
+    recorded. Reconstructed jobs carry ``cost_cents=0`` — the v1 store has no
+    committed-estimate column, and a zero cost keeps the replayed budget fold
+    consistent with α.
+    """
+    provider = rec.placement.provider_name if rec.placement is not None else None
+    reserve_data = {"provider": provider} if provider is not None else None
+    submit: tuple[str, dict[str, Any] | None] = ("submit", {"cost_cents": 0})
+    placed_chain: list[tuple[str, dict[str, Any] | None]] = [
+        submit,
+        ("reserve", reserve_data),
+        ("provision", None),
+        ("activate", None),
+    ]
+    state = rec.state
+    actions: list[tuple[str, dict[str, Any] | None]]
+    if state in (_JobState.QUEUED, _JobState.HELD):
+        actions = [submit]
+    elif state is _JobState.PLACING:
+        actions = [submit, ("reserve", reserve_data)]
+    elif state is _JobState.RUNNING:
+        actions = list(placed_chain)
+    elif state is _JobState.SUCCEEDED:
+        actions = [*placed_chain, ("finish", {"ok": 1})]
+    elif state is _JobState.FAILED:
+        actions = [*placed_chain, ("finish", {"ok": 0})]
+    else:  # CANCELLED: through the placed chain only if it ever placed
+        if rec.placement is None:
+            actions = [submit, ("cancel", None)]
+        else:
+            actions = [*placed_chain, ("cancel", None)]
+    # capture is legal on placed/terminal only; reap additionally requires it.
+    capturable = state is _JobState.RUNNING or state.terminal
+    cached = rec.outputs_cached_to is not None or rec.logs_cached_to is not None
+    if capturable and (cached or rec.reaped):
+        actions.append(("capture", None))
+    if rec.reaped and state.terminal:
+        actions.append(("reap", None))
+    return actions
 
 
 def _slug_from_record_data(data: Any) -> str | None:
@@ -854,8 +1378,39 @@ def _ensure_sqlite_parent(url: str) -> None:
     Path(db).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _guard_single_store(url: str) -> None:
+    """ROBUST-7/H48 single-store guard: refuse to open the DEFAULT SQLite path
+    while the loaded config points the state store somewhere else.
+
+    The H48 dual-store bug: a component resolved ``default_db_url()`` instead of
+    receiving the configured store, silently creating a second (SQLite) store
+    next to the configured (Postgres) one. The primary fix is injection — every
+    component gets the configured ``Store`` — and this guard is the backstop:
+    it fires only when *url* IS the default path AND the config EXPLICITLY
+    configures ``[state]`` ``url``/``path`` elsewhere, and it fires before any
+    engine (or database file) is created. An unreadable config is skipped — the
+    guard must never block a plain default-config open.
+    """
+    if url != default_db_url():
+        return
+    from omnirun.config import load_config  # deferred: config imports this module
+
+    try:
+        state = load_config().state
+    except Exception:
+        return
+    if (state.url or state.path) and state.resolved_url() != url:
+        raise StoreError(
+            f"refusing to open the default state DB ({url}): the configured "
+            f"[state] store is {state.resolved_url()!r} — this component must "
+            "be handed the configured store/URL instead of resolving a default "
+            "(single-store rule, ROBUST-7)"
+        )
+
+
 def open_store(url: str | None = None) -> Store:
     url = url or default_db_url()
+    _guard_single_store(url)
     _ensure_sqlite_parent(url)
     # SQLite: allow the pooled connections to be used from the daemon's placement
     # worker threads. Cross-thread use is safe here because writes are serialized

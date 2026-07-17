@@ -106,6 +106,22 @@
         packages.default = mkOmnirun pkgs;
         packages.omnirun = mkOmnirun pkgs;
         packages.google-colab-cli = mkColabCli pkgs;
+        # The proved trace checker (formal/ Lean model, DEPLOY-V2.md §1):
+        # validates job_events traces against the formal kernel model. Used
+        # by the omnirun-validator service and the conformance test suites.
+        packages.trace-check = pkgs.stdenv.mkDerivation {
+          pname = "omnirun-trace-check";
+          version = "0.1.0";
+          src = ./formal;
+          nativeBuildInputs = [ pkgs.lean4 ];
+          buildPhase = ''
+            export HOME=$TMPDIR
+            lake build trace-check
+          '';
+          installPhase = ''
+            install -Dm755 .lake/build/bin/trace-check $out/bin/trace-check
+          '';
+        };
 
         formatter =
           let

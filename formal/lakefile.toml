@@ -1,0 +1,9 @@
+name = "omnirun-formal"
+defaultTargets = ["OmnirunFormal", "trace-check"]
+
+[[lean_lib]]
+name = "OmnirunFormal"
+
+[[lean_exe]]
+name = "trace-check"
+root = "Main"
