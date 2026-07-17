@@ -408,27 +408,62 @@ class MarketplaceBackend(Backend, ABC):
         attempts = max(
             1, int(self.config.extra("provision_attempts", DEFAULT_PROVISION_ATTEMPTS))
         )
+        current = offer
+        tried: set[str] = set()
         last: InstanceUnreachable | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return self._submit_once(spec, offer, on_provisioning)
+                return self._submit_once(spec, current, on_provisioning)
             except InstanceUnreachable as e:
-                # The RENTAL was dead-on-arrival (never ran / no sshd); the failed
-                # instance is already terminated. Rent a fresh one rather than
-                # failing the placement — unless we've exhausted our attempts.
+                # The RENTAL was dead-on-arrival (never ran / no sshd) or the offer
+                # churned before we could rent it; the failed instance is already
+                # terminated. Re-PROBE for a fresh cheapest offer (re-renting the
+                # same, now-stale ask just fails again) and try that — unless we've
+                # exhausted our attempts or nothing else is on the market.
                 last = e
-                if attempt < attempts:
-                    _log.warning(
-                        "%s: %s — re-provisioning a fresh instance (attempt %d/%d)",
-                        self.name,
-                        e,
-                        attempt + 1,
-                        attempts,
-                    )
+                tried.add(self._offer_key(current))
+                if attempt >= attempts:
+                    break
+                fresh = self._reprobe_offer(spec, tried)
+                if fresh is None:
+                    break
+                _log.warning(
+                    "%s: %s — re-provisioning on a fresh offer %s (attempt %d/%d)",
+                    self.name,
+                    e,
+                    self._offer_key(fresh),
+                    attempt + 1,
+                    attempts,
+                )
+                current = fresh
         raise BackendError(
             f"{self.name}: could not get a usable instance after {attempts} "
             f"attempts (last: {last})"
         )
+
+    @staticmethod
+    def _offer_key(offer: Offer) -> str:
+        """A stable identifier for an offer so re-provisioning can avoid re-picking
+        the exact rental that just failed."""
+        d = offer.details or {}
+        return str(d.get("ask_id") or d.get("gpu_type_id") or offer.label)
+
+    def _reprobe_offer(self, spec: JobSpec, exclude: set[str]) -> Offer | None:
+        """Re-probe the market and return the cheapest fitting offer, preferring one
+        not already tried (probe returns cheapest-first). If every fitting offer has
+        been tried — e.g. a provider that lists one reusable instance type rather
+        than per-host asks — fall back to the cheapest so the retry still happens.
+        None only when nothing fits. Best-effort: a probe failure ends the loop."""
+        try:
+            fitting = [o for o in self.probe(spec.resources) if o.fits]
+        except Exception:
+            return None
+        if not fitting:
+            return None
+        for o in fitting:
+            if self._offer_key(o) not in exclude:
+                return o
+        return fitting[0]
 
     def _submit_once(
         self,

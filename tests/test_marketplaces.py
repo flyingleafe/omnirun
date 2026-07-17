@@ -507,8 +507,12 @@ def test_submit_reprovisions_when_first_instance_never_boots(
     spec, fake_ssh, fake_stage
 ):
     """A rented instance that never becomes usable is the RENTAL's fault, not the
-    job's — submit destroys it and rents a fresh one, succeeding on the retry
+    job's — submit destroys it and re-probes a fresh offer, succeeding on the retry
     rather than failing the placement (#24)."""
+    # Re-provisioning re-probes the market for a fresh offer each retry.
+    respx.post(GRAPHQL_URL).mock(
+        return_value=httpx.Response(200, json=GPU_TYPES_RESPONSE)
+    )
     respx.post(f"{REST_BASE}/pods").mock(
         side_effect=[
             httpx.Response(200, json={"id": "pod-bad"}),
@@ -546,6 +550,9 @@ def test_submit_reprovisions_when_first_instance_never_boots(
 def test_submit_gives_up_after_provision_attempts_exhausted(spec, fake_ssh, fake_stage):
     """Re-provisioning is bounded: after ``provision_attempts`` dead rentals submit
     stops renting and fails the placement (so the job can be re-scheduled)."""
+    respx.post(GRAPHQL_URL).mock(
+        return_value=httpx.Response(200, json=GPU_TYPES_RESPONSE)
+    )
     respx.post(f"{REST_BASE}/pods").mock(
         return_value=httpx.Response(200, json={"id": "pod-bad"})
     )

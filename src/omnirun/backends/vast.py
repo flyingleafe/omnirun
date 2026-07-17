@@ -27,6 +27,7 @@ from omnirun.backends.base import BackendError, register
 from omnirun.backends.marketplace import (
     HTTPBackendError,
     Instance,
+    InstanceUnreachable,
     MarketplaceBackend,
 )
 from omnirun.models import (
@@ -147,11 +148,13 @@ class VastBackend(MarketplaceBackend):
                 "PUT", f"{BASE}/asks/{ask_id}/", json_body=payload
             ).json()
         except HTTPBackendError as e:
+            # A churned/taken offer (4xx) is retryable: raise InstanceUnreachable so
+            # submit re-probes a FRESH offer rather than failing the placement.
             if e.status_code is not None and 400 <= e.status_code < 500:
-                raise BackendError(f"{taken_msg} ({e})") from e
+                raise InstanceUnreachable(f"{taken_msg} ({e})") from e
             raise
         if not data.get("success"):
-            raise BackendError(f"{taken_msg} (response: {str(data)[:200]})")
+            raise InstanceUnreachable(f"{taken_msg} (response: {str(data)[:200]})")
         contract = data.get("new_contract")
         if contract is None:
             raise BackendError(
