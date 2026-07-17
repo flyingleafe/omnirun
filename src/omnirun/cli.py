@@ -868,9 +868,9 @@ def ps(
     # Daemonless, the client drives the machine itself: reconcile live placements,
     # self-GC stale sessions, and place any queued job onto a free backend, so
     # `ps` gives the same answer a running daemon would. With a daemon configured
-    # the daemon is the catch-up and the client just reads. The tick is parallel,
-    # so a momentarily-slow backend degrades it (skipped this round), never hangs.
-    for event in client.tick():
+    # the daemon's scheduler IS the catch-up, so `catch_up()` is a no-op and `ps`
+    # just reads (sub-second) instead of forcing a slow backend-probing tick.
+    for event in client.catch_up():
         console.print(f"[dim]· {event}[/dim]")
     scope = None if all_projects else _current_project()
     records = client.list_jobs(project=scope)

@@ -138,6 +138,7 @@ class Client(Protocol):
         self, spec: JobSpec, *, backend: str | None = None, count: int = 1
     ) -> list[str]: ...
     def tick(self) -> list[str]: ...
+    def catch_up(self) -> list[str]: ...
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]: ...
     def resolve_job(self, ref: str) -> JobRecord: ...
     def status(self, ref: str) -> JobRecord: ...
@@ -399,6 +400,11 @@ class LocalClient:
         control = self._control()
         control.run_tick(datetime.now(timezone.utc))
         return control.take_events()
+
+    def catch_up(self) -> list[str]:
+        # Daemonless: a read command must reconcile/place itself (no scheduler),
+        # so catch-up IS a tick.
+        return self.tick()
 
     def status(self, ref: str) -> JobRecord:
         rec = self._store().resolve_job(ref)
@@ -706,6 +712,12 @@ class RemoteClient:
 
     def tick(self) -> list[str]:
         return list(self._post("/tick")["events"])
+
+    def catch_up(self) -> list[str]:
+        # A daemon is configured: its scheduler continuously reconciles/places,
+        # so a read command need NOT force a (slow, backend-probing) tick — just
+        # read. `omnirun tick` remains available to force one explicitly.
+        return []
 
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
         params = {"project": project} if project else {}
