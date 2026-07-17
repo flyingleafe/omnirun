@@ -553,6 +553,20 @@ class Daemon:
             d.wake()
             return _json({"job": updated.model_dump(mode="json")})
 
+        @app.post("/jobs/<jid>/retry")
+        def _retry(jid: str) -> str:
+            # Re-queue a terminal job for a fresh run (pure store flip, no backend
+            # I/O) — lock-free, like enqueue, then wake the scheduler.
+            with d._lock:
+                rec = d._core.resolve_job(jid)
+                try:
+                    updated = d._core.retry(rec)
+                except ValueError as e:
+                    bottle.response.status = 409
+                    return _json({"error": str(e)})
+            d.wake()
+            return _json({"job": updated.model_dump(mode="json")})
+
         @app.post("/gc")
         def _gc() -> str:
             from omnirun import wire

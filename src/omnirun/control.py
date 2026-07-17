@@ -353,6 +353,41 @@ class Control:
         shortcut over :meth:`edit_job` that only touches ``only_backend``."""
         return self.edit_job(job_id, updates={"only_backend": backend})
 
+    def retry(self, job_id: str) -> JobRecord:
+        """Re-queue a TERMINAL job (failed/cancelled/succeeded) for a fresh run.
+
+        Resets all scheduler + capture state — attempts, placement, last error/
+        status, the avoid set, the reaped flag, and the durable log/output pointers
+        — so the next tick places it anew and the fresh run is captured cleanly. The
+        SPEC (repo/sha, command, resources, pin) is untouched: it re-runs exactly as
+        submitted. Refuses a job that is not terminal (it is already live)."""
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            raise ValueError(f"unknown job {job_id!r}")
+        if not rec.state.terminal:
+            raise ValueError(
+                f"job {job_id!r} is {rec.state.value}, not terminal — nothing to "
+                "retry (it is already queued/running)"
+            )
+        updated = rec.model_copy(
+            update={
+                "state": JobState.QUEUED,
+                "placement": None,
+                "last_status": None,
+                "last_error": None,
+                "attempts": 0,
+                "avoid_backends": {},
+                "reaped": False,
+                "logs_cached_to": None,
+                "outputs_cached_to": None,
+                "outputs_pulled_to": None,
+                "log_offset": 0,
+                "log_offset_attempt": -1,
+            }
+        )
+        self._store.save_job(updated)
+        return updated
+
     # ------------------------------------------------------------------
     # Submission
     # ------------------------------------------------------------------

@@ -1228,6 +1228,51 @@ def edit(
         client.close()
 
 
+@app.command(
+    help="Re-queue a failed/cancelled job for a fresh run: `omnirun retry <job>`, "
+    "or `retry --failed` for all failed jobs."
+)
+@friendly_errors
+def retry(
+    job: str | None = typer.Argument(
+        None, help="Job id/prefix. Omit and use --failed to retry all failed jobs."
+    ),
+    failed: bool = typer.Option(
+        False, "--failed", "--all-failed", help="Retry ALL failed jobs."
+    ),
+    all_projects: bool = typer.Option(
+        False, "--all-projects", "-A", help="With --failed, across every project."
+    ),
+) -> None:
+    if (job is None) == (not failed):
+        _die("pass exactly one of a JOB argument or --failed")
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        if job is not None:
+            targets = [client.resolve_job(job)]
+        else:
+            scope = None if all_projects else _current_project()
+            targets = [
+                r for r in client.list_jobs(project=scope) if r.state is JobState.FAILED
+            ]
+        if not targets:
+            console.print("[dim]no matching jobs to retry[/dim]")
+            return
+        done = 0
+        for rec in targets:
+            try:
+                client.retry(rec)
+                console.print(f"[green]re-queued[/green] {rec.spec.job_id}")
+                done += 1
+            except Exception as e:
+                console.print(f"[yellow]skipped[/yellow] {rec.spec.job_id}: {e}")
+        if len(targets) > 1:
+            console.print(f"re-queued {done}/{len(targets)} job(s)")
+    finally:
+        client.close()
+
+
 @app.command(help="Change a queued/running job's scheduling policy.")
 @friendly_errors
 def reprioritize(

@@ -156,6 +156,52 @@ def test_edit_job_updates_params_and_requeues_placed_job(tmp_path: Path) -> None
         store.close()
 
 
+def test_retry_requeues_a_failed_job_for_a_fresh_run(tmp_path: Path) -> None:
+    """`retry` resurrects a terminal (failed) job to QUEUED with all scheduler +
+    capture state reset, so the next tick places it anew; the spec is untouched."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        control = Control(store, {"a": FakeProvider("a", slots=[])})
+        store.save_job(
+            JobRecord(
+                spec=_spec("rt-000001"),
+                state=JobState.FAILED,
+                submitted_at=T0,
+                attempts=3,
+                last_error="a: boom",
+                last_status=StatusReport(status=JobStatus.FAILED, detail="boom"),
+                avoid_backends={"a": T0},
+                logs_cached_to="/x.log",
+            )
+        )
+
+        updated = control.retry("rt-000001")
+
+        assert updated.state is JobState.QUEUED
+        assert updated.attempts == 0
+        assert updated.last_error is None
+        assert updated.last_status is None
+        assert not updated.avoid_backends
+        assert updated.logs_cached_to is None
+        assert updated.spec.job_id == "rt-000001"  # spec preserved
+
+    finally:
+        store.close()
+
+
+def test_retry_refuses_a_live_job(tmp_path: Path) -> None:
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        control = Control(store, {"a": FakeProvider("a", slots=[])})
+        store.save_job(
+            JobRecord(spec=_spec("live-1"), state=JobState.QUEUED, submitted_at=T0)
+        )
+        with pytest.raises(ValueError, match="not terminal"):
+            control.retry("live-1")
+    finally:
+        store.close()
+
+
 def test_repin_refuses_a_started_job(tmp_path: Path) -> None:
     """Repin only moves jobs that have NOT started — a job actually RUNNING at its
     backend must be cancelled instead (moving it would discard live work)."""
