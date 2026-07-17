@@ -899,6 +899,16 @@ class Control:
                     "state": JobState.QUEUED,
                     "attempts": rec.attempts + 1,
                     "placement": None,
+                    # Clear the durable pointers: a re-placement runs a FRESH session,
+                    # so the retry's terminal snapshot must be captured anew rather
+                    # than the pre-empted attempt's pointer shadowing it. The
+                    # pre-empted output is NOT lost — the daemon's live log file
+                    # (`<id>.live.log`) keeps every attempt's segment on disk, and the
+                    # retry appends below it; the terminal merge stitches the prior
+                    # segments back onto the complete final capture.
+                    "logs_cached_to": None,
+                    "outputs_cached_to": None,
+                    "reaped": False,
                 }
             )
         )

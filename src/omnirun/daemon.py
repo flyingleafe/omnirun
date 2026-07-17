@@ -33,8 +33,8 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.client import LocalClient, handle_of
 from omnirun.config import Config, ConfigError
-from omnirun.logingest import HEARTBEAT, LogIngestManager, tail_file
-from omnirun.models import DeployKey, JobSpec, JobState, ResourceSpec
+from omnirun.logingest import HEARTBEAT, LogIngestManager, StartSpec, tail_file
+from omnirun.models import DeployKey, JobRecord, JobSpec, JobState, ResourceSpec
 from omnirun.repo import RepoError
 from omnirun.state import default_store_dir
 
@@ -297,36 +297,103 @@ class Daemon:
 
         return _tail
 
-    def _sync_ingestors(self) -> None:
-        """Reconcile the live ingestor set with the RUNNING jobs, and — for a job
-        whose ingestor just finished — point ``logs_cached_to`` at the durable live
-        file UNLESS the reconciler already captured an authoritative snapshot.
+    @staticmethod
+    def _segment_header(rec: JobRecord) -> str:
+        """Separator written above a re-placed attempt's log segment, so a reader
+        sees where the pre-empted run ended and the retry began."""
+        where = rec.placement.provider_name if rec.placement is not None else "?"
+        return f"\n===== omnirun: attempt {rec.attempts + 1} on {where} =====\n"
 
-        For a hold-on-terminal backend the reconciler reads the complete log once
-        at terminal (into ``<id>.log``) and sets ``logs_cached_to`` before reaping,
-        so we leave that in place; for a non-holding backend nothing else captures
-        the log, so the ingestor's ``<id>.live.log`` becomes the durable copy."""
+    def _sync_ingestors(self) -> None:
+        """Reconcile the live ingestor set with the RUNNING jobs.
+
+        The durable ``<id>.live.log`` ACCUMULATES across placement attempts: a
+        re-placed job appends a fresh segment below the pre-empted one (separated by
+        a header), while a daemon restart rewrites only the in-flight segment. The
+        per-attempt boundary lives in ``log_offset``/``log_offset_attempt`` on the
+        record; we compute it here. For a job whose ingestor just finished we
+        finalise its durable log: a multi-attempt job stitches the pre-empted
+        segments (still on disk below ``log_offset``) onto the reconciler's complete
+        final-attempt snapshot; a single-attempt job adopts the live file only when
+        no authoritative snapshot already has content."""
         with self._lock:
-            running = {
-                rec.spec.job_id
+            running = [
+                rec
                 for rec in self._core._store().list_jobs()
                 if rec.state is JobState.RUNNING and rec.placement is not None
-            }
-        for job_id, path in self._ingest.sync(running):
-            if not (path.is_file() and path.stat().st_size > 0):
-                continue  # the live file has nothing to contribute
+            ]
+        specs: dict[str, StartSpec] = {}
+        for rec in running:
+            job_id = rec.spec.job_id
+            if self._ingest.is_active(job_id):
+                continue
+            path = self._ingest.path_for(job_id)
+            size = path.stat().st_size if path.is_file() else 0
+            if rec.log_offset_attempt != rec.attempts:
+                # A new attempt: append its segment after whatever prior attempts
+                # already wrote, and persist the boundary so a restart is idempotent.
+                start = size
+                with self._lock:
+                    cur = self._core._store().load_job(job_id)
+                    if cur is not None:
+                        rec = cur.model_copy(
+                            update={
+                                "log_offset": start,
+                                "log_offset_attempt": cur.attempts,
+                            }
+                        )
+                        self._core._store().save_job(rec)
+            else:
+                start = min(rec.log_offset, size)  # restart: rewrite this segment
+            header = self._segment_header(rec) if start > 0 else None
+            specs[job_id] = StartSpec(
+                attempt=rec.attempts, start_offset=start, header=header
+            )
+        for job_id, path in self._ingest.sync(specs):
             with self._lock:
                 rec = self._core._store().load_job(job_id)
                 if rec is None:
                     continue
-                # Adopt the live-ingested file as the durable log when the
-                # reconciler captured no snapshot OR captured an empty one (an
-                # ephemeral backend can race its teardown and re-fetch nothing).
-                # A non-empty authoritative snapshot is left untouched.
-                if not _cache_has_content(rec.logs_cached_to):
+                durable = self._finalize_log(rec, path)
+                if durable is not None and durable != rec.logs_cached_to:
                     self._core._store().save_job(
-                        rec.model_copy(update={"logs_cached_to": str(path)})
+                        rec.model_copy(update={"logs_cached_to": durable})
                     )
+
+    def _finalize_log(self, rec: JobRecord, live_path: Path) -> str | None:
+        """Settle the durable log for a job whose ingestor just finished.
+
+        Multi-attempt (``log_offset > 0``): the pre-empted attempts are on disk in
+        ``live_path`` below ``log_offset``; stitch them onto the COMPLETE final
+        attempt — the reconciler's pre-reap snapshot when it captured one (a
+        non-live ``logs_cached_to``, complete even if the live tail was cut by the
+        reap), else the live file already holds every segment. Single-attempt: adopt
+        the live file only when nothing authoritative was captured. Returns the
+        durable path, or None when the live file has nothing to contribute."""
+        has_live = live_path.is_file() and live_path.stat().st_size > 0
+        cached = rec.logs_cached_to
+        snapshot = (
+            Path(cached)
+            if cached and cached != str(live_path) and _cache_has_content(cached)
+            else None
+        )
+        if rec.log_offset > 0 and has_live:
+            if snapshot is None:
+                return str(live_path)  # live already carries prior + final segments
+            # Prior attempts (on disk, below log_offset) + a re-generated separator
+            # + the complete final-attempt snapshot → one accumulating durable file.
+            try:
+                with live_path.open("rb") as f:
+                    prior = f.read(rec.log_offset)
+                header = self._segment_header(rec).encode("utf-8")
+                live_path.write_bytes(prior + header + snapshot.read_bytes())
+            except OSError:
+                return str(snapshot)  # fall back to the complete final attempt alone
+            return str(live_path)
+        # Single attempt: an authoritative snapshot wins; else adopt the live file.
+        if snapshot is not None:
+            return None  # leave the existing (complete) snapshot pointer in place
+        return str(live_path) if has_live else None
 
     # --- HTTP app ---------------------------------------------------------
 

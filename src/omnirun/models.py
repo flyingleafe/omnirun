@@ -413,6 +413,15 @@ class JobRecord(BaseModel):
     # ephemeral session — so ``logs`` can serve the finished job's output hours
     # after its compute was freed. Set alongside ``outputs_cached_to``.
     logs_cached_to: str | None = None
+    # The durable live log accumulates ACROSS placement attempts (a pre-empted
+    # attempt's output is kept, the retry is appended below a separator). These
+    # track the current attempt's segment within that one file so a daemon restart
+    # rewrites only the in-flight segment (idempotent) while a re-placement appends
+    # a fresh one. ``log_offset`` = byte offset where the current attempt's segment
+    # begins; ``log_offset_attempt`` = the ``attempts`` value it was computed for (a
+    # mismatch means a new attempt started → append after prior segments).
+    log_offset: int = 0
+    log_offset_attempt: int = -1
     # Post-terminal housekeeping done: the held session (notebook VM) has been
     # collected + reaped, so reconcile must not revisit it. Distinct from the
     # terminal STATUS — a job can be SUCCEEDED yet still hold a leaked session.

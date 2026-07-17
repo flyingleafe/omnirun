@@ -294,6 +294,50 @@ def test_capacity_error_learns_cap(tmp_path: Path) -> None:
         store.close()
 
 
+def test_requeue_clears_durable_pointers_for_fresh_capture(tmp_path: Path) -> None:
+    """A LOST job is requeued for a fresh placement. The durable pointers
+    (``logs_cached_to``/``outputs_cached_to``/``reaped``) belonged to the abandoned
+    attempt and must reset so the retry captures anew — the pre-empted OUTPUT is
+    reconstructed at terminal by the daemon's segment merge from the on-disk live
+    log, not by keeping the stale pointer."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "free",
+            slots=[],
+            poll_script={"req-000001": [JobStatus.LOST]},
+            reap=ReapPolicy(release_lost=False),  # just requeue, no reap
+        )
+        control = Control(store, {"free": provider})
+        store.save_job(
+            JobRecord(
+                spec=_spec("req-000001"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="free",
+                    job_id="req-000001",
+                    handle={"id": "req-000001"},
+                    state=JobStatus.RUNNING,
+                ),
+                logs_cached_to="/state/logs/req-000001.live.log",  # accumulating file
+                outputs_cached_to="/state/outputs/req-000001",
+                reaped=True,
+            )
+        )
+
+        control.run_tick(T0)
+
+        after = store.load_job("req-000001")
+        assert after is not None
+        assert after.state is JobState.QUEUED and after.placement is None
+        assert after.logs_cached_to is None  # re-captured fresh at the retry's terminal
+        assert after.outputs_cached_to is None
+        assert after.reaped is False
+    finally:
+        store.close()
+
+
 def test_reconcile_reaps_lost_session_before_requeue(tmp_path: Path) -> None:
     """A RUNNING job whose poll returns LOST must have its abandoned placement
     REAPED (force-cancel + gc, freeing the leaked session/instance) BEFORE being

@@ -96,6 +96,11 @@ SSH_WAIT_POLL_S = 5.0
 DEFAULT_PROVISION_TIMEOUT_S = 600.0
 DEFAULT_SSH_WAIT_TIMEOUT_S = 120.0
 DEFAULT_FAILSAFE_GRACE_S = 24 * 3600
+# How many times submit will destroy a dead-on-arrival instance and rent a fresh
+# one before giving up. Marketplace instances (esp. vast) not uncommonly rent but
+# never boot ssh; a bad rental is the instance's fault, not the job's, so the
+# backend re-provisions rather than failing the whole placement.
+DEFAULT_PROVISION_ATTEMPTS = 3
 WAIT_ESTIMATE_S = 150.0  # honest ballpark: instance provisioning + image pull
 WAIT_NOTE = "instance provisioning + image pull, typically 2-3 min"
 
@@ -109,6 +114,13 @@ class HTTPBackendError(BackendError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class InstanceUnreachable(BackendError):
+    """The rented instance never became usable (never reported running, or sshd
+    never accepted connections). Distinct from a job/staging failure because the
+    fault is the RENTAL, not the work — so ``submit`` destroys it and re-provisions
+    a fresh instance instead of failing the placement."""
 
 
 class Instance(BaseModel):
@@ -323,6 +335,37 @@ class MarketplaceBackend(Backend, ABC):
         offer: Offer,
         on_provisioning: ProvisioningSink | None = None,
     ) -> JobHandle:
+        attempts = max(
+            1, int(self.config.extra("provision_attempts", DEFAULT_PROVISION_ATTEMPTS))
+        )
+        last: InstanceUnreachable | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._submit_once(spec, offer, on_provisioning)
+            except InstanceUnreachable as e:
+                # The RENTAL was dead-on-arrival (never ran / no sshd); the failed
+                # instance is already terminated. Rent a fresh one rather than
+                # failing the placement — unless we've exhausted our attempts.
+                last = e
+                if attempt < attempts:
+                    _log.warning(
+                        "%s: %s — re-provisioning a fresh instance (attempt %d/%d)",
+                        self.name,
+                        e,
+                        attempt + 1,
+                        attempts,
+                    )
+        raise BackendError(
+            f"{self.name}: could not get a usable instance after {attempts} "
+            f"attempts (last: {last})"
+        )
+
+    def _submit_once(
+        self,
+        spec: JobSpec,
+        offer: Offer,
+        on_provisioning: ProvisioningSink | None,
+    ) -> JobHandle:
         inst = self._create_instance(spec, offer)
         instance_id = inst.instance_id
         # The instance is now billing but the handle isn't ready yet. Hand the
@@ -364,6 +407,9 @@ class MarketplaceBackend(Backend, ABC):
                 self._terminate(instance_id)
             except Exception:
                 pass
+            # A dead rental (unreachable) propagates so submit re-provisions a fresh
+            # instance; a BackendError or interrupt propagates as-is; anything else
+            # is the job's/config's fault and is wrapped (not retried).
             if isinstance(e, BackendError) or not isinstance(e, Exception):
                 raise
             raise BackendError(
@@ -396,7 +442,7 @@ class MarketplaceBackend(Backend, ABC):
                 if inst.ssh_target and inst.status.lower() == "running":
                     return inst
             if time.monotonic() >= deadline:
-                raise BackendError(
+                raise InstanceUnreachable(
                     f"{self.name}: instance {instance_id} not ready after "
                     f"{timeout:.0f}s (last status: "
                     f"{last.status if last else 'not visible yet'})"
@@ -415,7 +461,7 @@ class MarketplaceBackend(Backend, ABC):
             except Exception:
                 pass
             if time.monotonic() >= deadline:
-                raise BackendError(
+                raise InstanceUnreachable(
                     f"{self.name}: sshd on {ex.describe()} did not accept "
                     f"connections within {timeout:.0f}s"
                 )

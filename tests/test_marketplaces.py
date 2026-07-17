@@ -475,6 +475,66 @@ def test_runpod_submit_provision_timeout_terminates(spec, fake_ssh, fake_stage):
 
 
 @respx.mock
+def test_submit_reprovisions_when_first_instance_never_boots(
+    spec, fake_ssh, fake_stage
+):
+    """A rented instance that never becomes usable is the RENTAL's fault, not the
+    job's — submit destroys it and rents a fresh one, succeeding on the retry
+    rather than failing the placement (#24)."""
+    respx.post(f"{REST_BASE}/pods").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": "pod-bad"}),
+            httpx.Response(200, json={"id": "pod-good"}),
+        ]
+    )
+    # pod-bad never leaves CREATED (no ip) → provision times out (0s) → unreachable.
+    respx.get(f"{REST_BASE}/pods/pod-bad").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "CREATED"})
+    )
+    bad_delete = respx.delete(f"{REST_BASE}/pods/pod-bad").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    # pod-good is RUNNING with ssh straight away → the retry succeeds.
+    respx.get(f"{REST_BASE}/pods/pod-good").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "desiredStatus": "RUNNING",
+                "publicIp": "5.6.7.8",
+                "portMappings": {"22": 40022},
+            },
+        )
+    )
+
+    handle = runpod_backend(provision_timeout_s=0).submit(spec, h100_offer())
+
+    assert handle.data["instance_id"] == "pod-good"
+    assert handle.data["ssh_target"] == "root@5.6.7.8"
+    assert bad_delete.called  # the dead rental was destroyed before re-provisioning
+    assert len(fake_stage) == 1  # only the good instance got staged
+
+
+@respx.mock
+def test_submit_gives_up_after_provision_attempts_exhausted(spec, fake_ssh, fake_stage):
+    """Re-provisioning is bounded: after ``provision_attempts`` dead rentals submit
+    stops renting and fails the placement (so the job can be re-scheduled)."""
+    respx.post(f"{REST_BASE}/pods").mock(
+        return_value=httpx.Response(200, json={"id": "pod-bad"})
+    )
+    respx.get(f"{REST_BASE}/pods/pod-bad").mock(
+        return_value=httpx.Response(200, json={"desiredStatus": "CREATED"})
+    )
+    delete = respx.delete(f"{REST_BASE}/pods/pod-bad").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    backend = runpod_backend(provision_timeout_s=0, provision_attempts=2)
+    with pytest.raises(BackendError, match="after 2 attempts"):
+        backend.submit(spec, h100_offer())
+    assert delete.call_count == 2  # one destroy per exhausted attempt
+    assert not fake_stage
+
+
+@respx.mock
 def test_runpod_submit_failure_after_provision_terminates(spec, fake_ssh, monkeypatch):
     respx.post(f"{REST_BASE}/pods").mock(
         return_value=httpx.Response(200, json={"id": "pod123"})

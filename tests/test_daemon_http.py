@@ -360,6 +360,62 @@ def test_unreachable_daemon_raises_connection_error() -> None:
         client.close()
 
 
+def test_finalize_log_stitches_prior_attempts_onto_final_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A re-placed job's durable log = the pre-empted segments (on disk in
+    ``.live.log`` below ``log_offset``) + a separator + the reconciler's COMPLETE
+    final-attempt snapshot (captured pre-reap, so it holds the 'end' the live tail
+    may have missed). Proves append semantics survive to terminal."""
+    from omnirun.models import JobRecord, Placement
+
+    cfg = Config(daemon=DaemonConfig(host="127.0.0.1", port=0))
+    daemon = Daemon(cfg, state_dir=tmp_path)
+    try:
+        job_id = "replaced-000001"
+        live = daemon._ingest.path_for(job_id)
+        live.parent.mkdir(parents=True, exist_ok=True)
+        # attempt 0 (colab) output, then attempt 1's segment begins at log_offset;
+        # the live tail of attempt 1 was cut short by the reap (missing 'end').
+        prior = "colab: start\ncolab: killed\n"
+        live.write_text(prior + "\n===== attempt 2 on kaggle =====\nkaggle: start\n")
+        # The reconciler captured the COMPLETE attempt-1 log pre-reap into a snapshot.
+        snap = daemon.state_root / "logs" / f"{job_id}.log"
+        snap.write_text("kaggle: start\nkaggle: end\n")
+        rec = JobRecord(
+            spec=JobSpec(
+                job_id=job_id,
+                name="replaced",
+                command="x",
+                repo=RepoRef(remote_url="", sha="a" * 40, branch="main", slug="proj"),
+                code=CodePlan(kind="local", origin=""),
+            ),
+            state=JobState.SUCCEEDED,
+            attempts=1,
+            log_offset=len(prior.encode("utf-8")),
+            log_offset_attempt=1,
+            logs_cached_to=str(snap),
+            placement=Placement(
+                provider_name="kaggle",
+                job_id=job_id,
+                handle={"id": job_id},
+                state=JobStatus.SUCCEEDED,
+            ),
+        )
+
+        durable = daemon._finalize_log(rec, live)
+
+        assert durable == str(live)
+        text = live.read_text()
+        assert "colab: killed" in text  # pre-empted attempt preserved
+        assert "attempt 2 on kaggle" in text  # separator regenerated
+        assert text.rstrip().endswith("kaggle: end")  # complete final attempt
+        # exactly one separator (no double header)
+        assert text.count("attempt 2 on kaggle") == 1
+    finally:
+        daemon.shutdown()
+
+
 def test_daemon_json_removed_on_shutdown(tmp_path: Path) -> None:
     cfg = Config(daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.05))
     daemon = Daemon(cfg, state_dir=tmp_path)
