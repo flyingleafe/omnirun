@@ -89,6 +89,9 @@ class SSHExec(Exec):
         self.ssh_command = list(ssh_command)
         self.control_master = control_master
         self.batch_mode = batch_mode
+        # Wall-clock budget for a daemon's non-interactive auto-reconnect (a stuck
+        # auth prompt can never exceed this; the backend degrades to unfit instead).
+        self._auto_reconnect_timeout_s = 45.0
 
     # --- option assembly ------------------------------------------------
 
@@ -134,8 +137,13 @@ class SSHExec(Exec):
     def ensure_master(self, interactive: bool = True) -> None:
         """Make sure a live ControlMaster session to the target exists.
 
-        interactive=True may prompt (2FA/Duo/password) in the user's terminal;
-        interactive=False fails fast with a reconnect hint instead.
+        interactive=True may prompt (2FA/Duo/password) in the user's terminal.
+        interactive=False (a daemon) instead AUTO-RECONNECTS non-interactively: a
+        key/agent, or a password-supplying ssh wrapper, connects with no prompt —
+        so `ssh <target>` is all it takes to re-establish an expired session and the
+        daemon recovers on its own, no human `backends check` needed. Bounded by a
+        connect timeout so a stuck auth prompt can never hang the caller; only when
+        even that fails does it raise the reconnect hint.
         """
         self._ensure_control_dir()
         check = subprocess.run(
@@ -145,17 +153,45 @@ class SSHExec(Exec):
         )
         if check.returncode == 0:
             return
-        if not interactive:
-            raise ExecError(f"ssh session to {self.target} expired — {RECONNECT_HINT}")
-        # Establish the master inheriting the user's terminal so keyboard-
-        # interactive auth (Duo, TOTP, passwords) works. No BatchMode here.
-        proc = subprocess.run(
-            [*self.ssh_command, *self._ssh_opts(), "-tt", self.target, "true"]
-        )
-        if proc.returncode != 0:
+        if interactive:
+            # Inherit the user's terminal so keyboard-interactive auth (Duo, TOTP,
+            # passwords) works. No BatchMode here.
+            proc = subprocess.run(
+                [*self.ssh_command, *self._ssh_opts(), "-tt", self.target, "true"]
+            )
+            if proc.returncode != 0:
+                raise ExecError(
+                    f"could not establish ssh connection to {self.target} "
+                    f"(ssh exited {proc.returncode})"
+                )
+            return
+        # Daemon path: (re)establish the master WITHOUT a terminal — relies on a
+        # key/agent or the configured ssh wrapper to supply auth silently. A bounded
+        # timeout keeps a backend whose auth genuinely needs a human from hanging
+        # the scheduler tick (it degrades to an unfit offer this round instead).
+        try:
+            proc = subprocess.run(
+                [
+                    *self.ssh_command,
+                    *self._ssh_opts(),
+                    "-oConnectTimeout=20",
+                    self.target,
+                    "true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self._auto_reconnect_timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
             raise ExecError(
-                f"could not establish ssh connection to {self.target} "
-                f"(ssh exited {proc.returncode})"
+                f"ssh session to {self.target} expired and auto-reconnect timed out "
+                f"after {self._auto_reconnect_timeout_s:.0f}s — {RECONNECT_HINT}"
+            ) from e
+        if proc.returncode != 0:
+            last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
+            raise ExecError(
+                f"ssh session to {self.target} expired; auto-reconnect failed "
+                f"({last.strip()}) — {RECONNECT_HINT}"
             )
 
     # --- Exec protocol -----------------------------------------------------

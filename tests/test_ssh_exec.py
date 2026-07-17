@@ -186,13 +186,36 @@ def test_ensure_master_alive_checks_only(ex, recorder):
 
 
 def test_ensure_master_noninteractive_dead_raises_hint(ex, recorder):
+    # Both the check AND the auto-reconnect attempt fail (auth genuinely needs a
+    # human): only then does the daemon path raise the reconnect hint.
     recorder.behavior = lambda argv, kw: subprocess.CompletedProcess(
-        argv, 255, stdout="", stderr=""
+        argv, 255, stdout="", stderr="auth failed"
     )
     with pytest.raises(ExecError, match="omnirun backends check"):
         ex.ensure_master(interactive=False)
-    # must NOT have attempted an interactive connect
+    # It TRIED to reconnect (a connect after the failed check) but never with a TTY.
     assert not any("-tt" in argv for argv, _ in recorder.calls)
+    assert any(
+        argv[-1] == "true" and "-tt" not in argv for argv, _ in recorder.calls[1:]
+    ), "daemon must attempt a non-interactive reconnect before giving up"
+
+
+def test_ensure_master_noninteractive_auto_reconnects(ex, recorder):
+    """A daemon whose session expired re-establishes it itself: the `-O check`
+    fails, but a plain (no-TTY) connect succeeds via key/agent/ssh-wrapper — so no
+    human `backends check` is needed and no error is raised."""
+
+    def behavior(argv, kwargs):
+        if "-O" in argv:  # the liveness check fails (session expired)
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0)  # the reconnect connects
+
+    recorder.behavior = behavior
+    ex.ensure_master(interactive=False)  # must NOT raise
+    argv, kwargs = recorder.calls[1]
+    assert argv[-1] == "true" and "-tt" not in argv  # no terminal
+    assert any("ConnectTimeout=20" in a for a in argv)  # bounded connect
+    assert kwargs.get("timeout")  # bounded wall-clock so it can't hang
 
 
 def test_ensure_master_interactive_reconnects_with_tty(ex, recorder):
