@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from omnirun.backends.base import Backend, ProvisioningSink
+from omnirun.backends.base import Backend, BackendError, ProvisioningSink
 from omnirun.client import RemoteClient
 from omnirun.config import BackendConfig, Config, DaemonConfig
-from omnirun.daemon import Daemon, _daemon_json_path
+from omnirun.daemon import Daemon, _daemon_json_path, _LockYield
 from omnirun.models import (
     CancelMode,
     CodePlan,
@@ -373,3 +373,81 @@ def test_daemon_json_removed_on_shutdown(tmp_path: Path) -> None:
     daemon.shutdown()
     thread.join(timeout=5.0)
     assert not _daemon_json_path(tmp_path).exists()
+
+
+def test_lock_yield_releases_when_held_and_noops_when_not() -> None:
+    """``_LockYield`` drops the daemon's store lock for the duration of a slow
+    placement so a concurrent write is not starved — but ONLY when the caller
+    actually holds it (a unit test driving ``core.tick()`` directly does not),
+    where it must be a harmless no-op rather than raising."""
+    lock = threading.RLock()
+    yielder = _LockYield(lock)
+
+    # Held on entry: the block runs with the lock RELEASED (another thread can
+    # take it), then it is re-acquired on exit.
+    lock.acquire()
+    with yielder:
+        got = lock.acquire(blocking=False)  # succeeds only if truly released
+        assert got is True
+        lock.release()
+    assert lock.acquire(blocking=False) is True  # re-acquired on exit → reentrant
+    lock.release()
+    lock.release()
+
+    # NOT held on entry: no exception, nothing to yield, still not held after.
+    with yielder:
+        pass
+    assert lock.acquire(blocking=False) is True
+    lock.release()
+
+
+class _UnfitBackend(_FakeBackend):
+    """Never fits any request, so a submitted job stays QUEUED (never placed) —
+    it has no handle, so a `logs` read falls through to a tail that raises."""
+
+    def probe(self, res: ResourceSpec) -> list[Offer]:
+        return [
+            Offer(
+                backend=self.name,
+                label=f"{self.name}: full",
+                fits=False,
+                unfit_reasons=["no capacity in this test"],
+            )
+        ]
+
+
+def test_logs_backend_error_surfaces_cleanly_not_500(tmp_path: Path) -> None:
+    """When a log source raises mid-stream (e.g. the worker host is unreachable),
+    the SSE 200 is already sent — the daemon must emit a clean `error` frame the
+    client re-raises as a typed error, NOT let the WSGI server append a 500 HTML
+    page. A QUEUED (never-placed) job has no handle, so the fallback tail raises:
+    the RemoteClient must see a BackendError, not an unhandled 500."""
+    cfg = Config(
+        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=0.02),
+        backends={"full": BackendConfig(type="full", max_parallel=1)},
+    )
+    daemon = Daemon(
+        cfg, state_dir=tmp_path, backend_factory=lambda n, b: _UnfitBackend(n, b)
+    )
+    thread = threading.Thread(target=daemon.serve, daemon=True)
+    thread.start()
+    port = None
+    for _ in range(500):
+        p = _daemon_json_path(tmp_path)
+        if p.exists():
+            port = json.loads(p.read_text())["port"]
+            break
+        time.sleep(0.01)
+    assert port is not None
+    client = RemoteClient(f"http://127.0.0.1:{port}")
+    try:
+        ids = client.enqueue(_spec("noplace"))
+        rec = client.resolve_job(ids[0])
+        # A few ticks confirm it can never be placed (stays QUEUED, no handle).
+        time.sleep(0.1)
+        with pytest.raises(BackendError, match="never submitted|no logs"):
+            list(client.logs(rec, follow=False))
+    finally:
+        client.close()
+        daemon.shutdown()
+        thread.join(timeout=5.0)

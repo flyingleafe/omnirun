@@ -21,10 +21,11 @@ from __future__ import annotations
 import concurrent.futures
 import shutil
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
@@ -252,12 +253,18 @@ class LocalClient:
         config_path: Path | None = None,
         backend_factory: BackendFactory = make_backend,
         outputs_dir: Path | None = None,
+        place_io: AbstractContextManager[object] | None = None,
     ) -> None:
         self.cfg = cfg
         self._config_path = config_path
         self._backend_factory = backend_factory
         self._outputs_dir = outputs_dir or (default_store_dir() / "outputs")
         self._store_obj: Store | None = None
+        # Passed to every Control this client builds: a context manager wrapped
+        # around the slow ``provider.place`` submit so the daemon can drop its
+        # store lock there (so a concurrent cancel is not starved). Daemonless:
+        # None → no-op.
+        self._place_io = place_io
 
     # -- infra --
     def _store(self) -> Store:
@@ -288,6 +295,7 @@ class LocalClient:
             budget_cap=self.cfg.budget.daily,
             week_cap=self.cfg.budget.weekly,
             outputs_dir=self._outputs_dir,
+            place_io=self._place_io,
         )
 
     def backend_for(self, name: str) -> Backend:
@@ -622,6 +630,12 @@ class RemoteClient:
             etype = payload.get("type", "BackendError")
         except Exception:
             message, etype = resp.text or f"HTTP {resp.status_code}", "BackendError"
+        self._raise_error(message, etype)
+
+    def _raise_error(self, message: str, etype: str) -> NoReturn:
+        """Map a daemon error ``(message, type)`` to the matching client
+        exception. Shared by the JSON-body errors and the SSE mid-stream error
+        frame (a backend that fails partway through a log stream)."""
         if etype == "KeyError":
             raise KeyError(message)
         if etype == "ConfigError":
@@ -760,12 +774,30 @@ class RemoteClient:
             if resp.status_code >= 400:
                 resp.read()
                 self._raise_typed(resp)
+            error_next = False
             for raw in resp.iter_lines():
-                # SSE frames: `data: <line>` payloads, a terminal `event: eof`.
+                # SSE frames: `data: <line>` payloads, a terminal `event: eof`,
+                # and `event: error` (backend failed mid-stream — the next
+                # `data:` frame carries the typed error JSON, since the 200 is
+                # already sent and the status can no longer be changed).
                 if raw.startswith("event: eof"):
                     break
+                if raw.startswith("event: error"):
+                    error_next = True
+                    continue
                 if raw.startswith("data:"):
-                    yield raw[len("data:") :].lstrip(" ")
+                    payload = raw[len("data:") :].lstrip(" ")
+                    if error_next:
+                        import json as _json
+
+                        try:
+                            err = _json.loads(payload)
+                        except ValueError:
+                            err = {"error": payload, "type": "BackendError"}
+                        self._raise_error(
+                            err.get("error", payload), err.get("type", "BackendError")
+                        )
+                    yield payload
 
     def pull(self, rec: JobRecord, dest: Path) -> tuple[list[Path], Path]:
         import io

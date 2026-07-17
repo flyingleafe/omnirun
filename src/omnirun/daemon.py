@@ -51,6 +51,47 @@ def _daemon_json_path(state_dir: Path | None = None) -> Path:
     return _state_root(state_dir) / "daemon.json"
 
 
+class _LockYield:
+    """Context manager that RELEASES a held lock for the duration of its block,
+    re-acquiring it on exit. Passed to ``Control`` as ``place_io`` so the tick
+    drops the daemon's store lock around a slow ``provider.place`` submit — a
+    concurrent client write (a cancel) then runs instead of blocking past its
+    timeout. The scheduler thread already holds the lock at that point (every
+    tick-running path acquires it), so the release is always valid; a second tick
+    cannot start meanwhile because those paths also hold ``_tick_lock``."""
+
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+        # LIFO of "did we actually release?" — so a caller that holds the lock
+        # yields it, while a caller that does NOT (a unit test driving
+        # ``core.tick()`` directly, with no daemon lock) gets a harmless no-op.
+        self._released: list[bool] = []
+
+    def __enter__(self) -> "_LockYield":
+        try:
+            self._lock.release()
+            self._released.append(True)
+        except RuntimeError:
+            self._released.append(False)  # not held here — nothing to yield
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        if self._released.pop():
+            self._lock.acquire()
+        return False
+
+
+def _cache_has_content(path: str | None) -> bool:
+    """True if *path* names an existing, non-empty file. A logs cache that points
+    at a missing or empty file is not a real durable copy and should be replaced."""
+    if not path:
+        return False
+    try:
+        return Path(path).stat().st_size > 0
+    except OSError:
+        return False
+
+
 class _QuietWSGIRequestHandler(WSGIRequestHandler):
     """A WSGI request handler that routes access logs through the module logger at
     DEBUG (bottle/wsgiref default is a noisy stderr line per request)."""
@@ -132,13 +173,20 @@ class Daemon:
                 cache[name] = be
             return be
 
+        # ``_lock`` serializes store-mutating work (the tick's writes and client
+        # writes) against each other. ``_tick_lock`` serializes ticks against
+        # ticks — held for the WHOLE of any tick-running verb so that when the
+        # scheduler DROPS ``_lock`` around a slow placement (``_LockYield``, so a
+        # cancel is not starved), no other verb starts a concurrent tick.
+        self._lock = threading.RLock()
+        self._tick_lock = threading.Lock()
         self._core = LocalClient(
             cfg,
             config_path=None,
             backend_factory=_cached_factory,
             outputs_dir=self.state_root / "outputs",
+            place_io=_LockYield(self._lock),
         )
-        self._lock = threading.RLock()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._server: WSGIServer | None = None
@@ -211,7 +259,10 @@ class Daemon:
     def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                with self._lock:
+                # _tick_lock (whole tick) blocks a concurrent tick; _lock (store
+                # writes) is DROPPED inside by _LockYield around each slow
+                # placement so client cancels are not starved behind it.
+                with self._tick_lock, self._lock:
                     for event in self._core.tick():
                         _log.info("%s", event)
                 self._sync_ingestors()
@@ -262,9 +313,17 @@ class Daemon:
                 if rec.state is JobState.RUNNING and rec.placement is not None
             }
         for job_id, path in self._ingest.sync(running):
+            if not (path.is_file() and path.stat().st_size > 0):
+                continue  # the live file has nothing to contribute
             with self._lock:
                 rec = self._core._store().load_job(job_id)
-                if rec is not None and not rec.logs_cached_to and path.is_file():
+                if rec is None:
+                    continue
+                # Adopt the live-ingested file as the durable log when the
+                # reconciler captured no snapshot OR captured an empty one (an
+                # ephemeral backend can race its teardown and re-fetch nothing).
+                # A non-empty authoritative snapshot is left untouched.
+                if not _cache_has_content(rec.logs_cached_to):
                     self._core._store().save_job(
                         rec.model_copy(update={"logs_cached_to": str(path)})
                     )
@@ -295,7 +354,7 @@ class Daemon:
 
         @app.post("/tick")
         def _tick() -> str:
-            with d._lock:
+            with d._tick_lock, d._lock:
                 events = d._core.tick()
             return _json({"events": events})
 
@@ -306,16 +365,27 @@ class Daemon:
             body = _body()
             spec = JobSpec.model_validate(body["spec"])
             backend = body.get("backend")
-            with d._lock:
-                if body.get("mode") == "enqueue":
-                    ids = d._core.enqueue(
-                        spec, backend=backend, count=int(body.get("count", 1))
-                    )
-                    d.wake()
-                    return _json({"job_ids": ids})
-                outcome = d._core.submit(spec, backend=backend)
+            # ENQUEUE is LOCK-FREE: it only INSERTs fresh, unique job_id rows
+            # (pure bookkeeping — Control with no providers, no tick, no backend
+            # I/O), and the store serializes concurrent writers itself (BEGIN
+            # IMMEDIATE + busy_timeout). Not taking d._lock means a client enqueue
+            # never blocks behind a slow tick that holds the lock through a
+            # placement — which otherwise starved writes past the client timeout
+            # and, worse, risked the daemon committing a job the client already
+            # gave up on (an orphan). A lock-free insert commits in milliseconds.
+            if body.get("mode") == "enqueue":
+                ids = d._core.enqueue(
+                    spec, backend=backend, count=int(body.get("count", 1))
+                )
                 d.wake()
-                return _json(wire.submit_outcome_to_json(outcome))
+                return _json({"job_ids": ids})
+            # SUBMIT runs a synchronous placing tick (backend I/O), so it MUST
+            # serialize against the scheduler under _tick_lock — two concurrent
+            # ticks are not safe. Daemon users should prefer `enqueue`.
+            with d._tick_lock, d._lock:
+                outcome = d._core.submit(spec, backend=backend)
+            d.wake()
+            return _json(wire.submit_outcome_to_json(outcome))
 
         # Pure reads are LOCK-FREE: they hit the independently-transactional store
         # directly, so a slow scheduler tick (a placement that blocks tens of
@@ -375,7 +445,9 @@ class Daemon:
             from omnirun import wire
 
             body = _body()
-            with d._lock:
+            # gc runs a reconciling tick, so it holds _tick_lock like the other
+            # tick-running verbs (no concurrent tick with the scheduler).
+            with d._tick_lock, d._lock:
                 out = d._core.gc(
                     all_=bool(body.get("all")), project=body.get("project")
                 )
@@ -481,20 +553,28 @@ class Daemon:
                 # its ingest file; a finished job prefers the authoritative cached
                 # snapshot (complete even when the live tail was cut short by reap),
                 # then the live file, then a direct one-shot tail.
-                if active:
-                    for line in tail_file(
-                        live_path, lambda: follow and d._ingest.is_active(job_id)
-                    ):
+                try:
+                    if active:
+                        src = tail_file(
+                            live_path, lambda: follow and d._ingest.is_active(job_id)
+                        )
+                    elif cached is not None:
+                        src = tail_file(cached, lambda: False)
+                    elif live_path.is_file():
+                        src = tail_file(live_path, lambda: False)
+                    else:
+                        src = d._core.logs(rec, follow=follow)
+                    for line in src:
                         yield f"data: {line.rstrip(chr(10))}\n\n"
-                elif cached is not None:
-                    for line in tail_file(cached, lambda: False):
-                        yield f"data: {line.rstrip(chr(10))}\n\n"
-                elif live_path.is_file():
-                    for line in tail_file(live_path, lambda: False):
-                        yield f"data: {line.rstrip(chr(10))}\n\n"
-                else:
-                    for line in d._core.logs(rec, follow=follow):
-                        yield f"data: {line.rstrip(chr(10))}\n\n"
+                except Exception as e:
+                    # A backend error mid-stream (e.g. the worker's host is
+                    # unreachable when we fall back to a direct tail) cannot change
+                    # the already-sent 200 + headers. Surface it as a clean SSE
+                    # `error` frame the RemoteClient re-raises as a typed error,
+                    # rather than letting the WSGI server append a 500 HTML page.
+                    payload = json.dumps({"error": str(e), "type": type(e).__name__})
+                    yield f"event: error\ndata: {payload}\n\n"
+                    return
                 yield "event: eof\ndata: \n\n"
 
             return _events()

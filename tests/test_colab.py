@@ -444,31 +444,33 @@ def test_status_missing_job_dir_is_lost(cli, backend):
 # ---- logs --------------------------------------------------------------------
 
 
-def test_logs_incremental_offsets(cli, backend):
+def test_logs_nonfollow_reads_the_complete_log_each_time(cli, backend):
     # logs reads only bootstrap.log — the canonical merged log; the run step tees
     # the command's stdout/stderr into it, so reading the per-stream files too
     # would double every line.
-    first = {f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n"}
+    #
+    # A one-shot (non-follow) read — the terminal snapshot taken before reap, or
+    # `omnirun logs` without -f — must return the COMPLETE log from the start
+    # EVERY time, never a delta since a prior read. The persistent per-job
+    # offsets belong to the live-follow tail (the daemon's ingestor); if a
+    # non-follow read reused them it would return only the bytes the live tail
+    # had not yet consumed, truncating the durable snapshot of a finished (or
+    # cancelled/failed) job.
+    full = {f"{JOB_DIR}/logs/bootstrap.log": "line1\nline2\n"}
     cli.handlers["exec"] = lambda argv, stdin: (
         0,
-        "OMNIRUN_LOGS " + json.dumps(first) + "\n",
+        "OMNIRUN_LOGS " + json.dumps(full) + "\n",
         "",
     )
     handle = make_handle()
     assert list(backend.logs(handle)) == ["line1", "line2"]
-
-    # second read sends the advanced offset and yields nothing new
-    empty = dict.fromkeys(first, "")
-    cli.handlers["exec"] = lambda argv, stdin: (
-        0,
-        "OMNIRUN_LOGS " + json.dumps(empty) + "\n",
-        "",
-    )
-    assert list(backend.logs(handle)) == []
-    # the snippet embeds the offsets as json.loads('<json>') — dig them out
+    # a SECOND non-follow read starts again from offset 0 → the full log again.
+    assert list(backend.logs(handle)) == ["line1", "line2"]
+    # the snippet embeds the offsets as json.loads('<json>') — dig them out and
+    # confirm the read was requested from the start, not an advanced offset.
     inner = cli.calls[-1]["stdin"].split("json.loads(", 1)[1].split(")\n", 1)[0]
     sent_offsets = json.loads(ast.literal_eval(inner))
-    assert sent_offsets[f"{JOB_DIR}/logs/bootstrap.log"] == len("line1\nline2\n")
+    assert sent_offsets[f"{JOB_DIR}/logs/bootstrap.log"] == 0
 
 
 def test_logs_over_ssh_uses_shared_exec_and_streams(backend, monkeypatch):

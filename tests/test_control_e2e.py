@@ -388,6 +388,85 @@ def test_terminal_notebook_session_collected_then_reaped(tmp_path: Path) -> None
         store.close()
 
 
+def test_place_runs_inside_the_place_io_context(tmp_path: Path) -> None:
+    """``provider.place`` (the one slow submit) must run INSIDE the ``place_io``
+    context manager, so the daemon can drop its store lock for exactly that call
+    and a concurrent cancel is not starved behind a placement."""
+    events: list[str] = []
+
+    class _RecordingCM:
+        def __enter__(self) -> "_RecordingCM":
+            events.append("enter")
+            return self
+
+        def __exit__(self, *_exc: object) -> bool:
+            events.append("exit")
+            return False
+
+    class _RecordingProvider(FakeProvider):
+        def place(self, rec: JobRecord, slot: Slot) -> Placement:
+            events.append("place")
+            return super().place(rec, slot)
+
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = _RecordingProvider("free", slots=[_free_slot()])
+        control = Control(store, {"free": provider}, place_io=_RecordingCM())
+        control.submit(_spec("p1"), now=T0)
+        control.run_tick(T0)
+        assert events == ["enter", "place", "exit"]
+    finally:
+        store.close()
+
+
+def test_terminal_empty_snapshot_is_not_cached_as_the_durable_log(
+    tmp_path: Path,
+) -> None:
+    """If the terminal (no-follow) log re-fetch returns nothing — an ephemeral
+    session racing its own teardown — the reconciler must NOT accept the empty
+    snapshot as the durable log. ``logs_cached_to`` stays unset (and the empty
+    file is removed) so the daemon's live-ingested copy can win instead; a
+    silently-empty cache would lose a finished job's output."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider(
+            "nb",
+            slots=[_free_slot()],
+            poll_script={"nb-000001": [JobStatus.SUCCEEDED]},
+            reap=ReapPolicy(hold_on_terminal=True),
+            empty_capture=True,  # the teardown race: capture writes an empty file
+        )
+        outputs_dir = tmp_path / "cache"
+        control = Control(store, {"nb": provider}, outputs_dir=outputs_dir)
+        store.save_job(
+            JobRecord(
+                spec=_spec("nb-000001"),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="nb",
+                    job_id="nb-000001",
+                    handle={"id": "nb-000001"},
+                    state=JobStatus.RUNNING,
+                ),
+            )
+        )
+
+        control.run_tick(T0)
+
+        after = store.load_job("nb-000001")
+        assert after is not None
+        assert after.state is JobState.SUCCEEDED
+        assert after.reaped is True  # the session is still freed
+        # The empty snapshot was NOT accepted as the durable log …
+        assert after.logs_cached_to is None
+        # … and the empty file was not left lying around.
+        log_path = outputs_dir.parent / "logs" / "nb-000001.log"
+        assert not log_path.exists()
+    finally:
+        store.close()
+
+
 def test_terminal_reap_is_idempotent_across_ticks(tmp_path: Path) -> None:
     """Once a terminal job is collected+reaped, later ticks must NOT collect or
     reap it again — ``reaped`` gates the revisit, so a series of CLI calls doesn't
@@ -727,6 +806,33 @@ def test_control_cancel_force_uses_force_mode(tmp_path: Path) -> None:
     after = store.load_job("cxl-2")
     assert after is not None and after.state is JobState.CANCELLED
     store.close()
+
+
+def test_cancel_captures_partial_log_before_teardown(tmp_path: Path) -> None:
+    """A cancelled job must keep the log it produced up to the cancellation point.
+    ``cancel`` captures the log to the durable cache BEFORE the provider tears the
+    session down, so the user can come back and see how far the job got — the same
+    guarantee a SUCCEEDED job gets, extended to CANCELLED."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        provider = FakeProvider("free", slots=[_free_slot()])
+        outputs_dir = tmp_path / "cache"
+        control = Control(store, {"free": provider}, outputs_dir=outputs_dir)
+        control.submit(_spec("cxl-log"), now=T0)
+        control.run_tick(T0)  # place it (RUNNING)
+
+        control.cancel("cxl-log", T1)
+
+        after = store.load_job("cxl-log")
+        assert after is not None and after.state is JobState.CANCELLED
+        # The partial log was captured to the durable cache before the reap …
+        log_path = outputs_dir.parent / "logs" / "cxl-log.log"
+        assert after.logs_cached_to == str(log_path)
+        assert log_path.read_text() == "fake log for cxl-log\n"
+        # … and the capture happened before the teardown (collect-then-kill order).
+        assert provider.capture_calls == [("cxl-log", log_path)]
+    finally:
+        store.close()
 
 
 def test_control_cancel_unknown_and_terminal_are_noops(tmp_path: Path) -> None:

@@ -67,6 +67,7 @@ class FakeProvider:
         discover_available: int | None = None,
         collect_error: Exception | None = None,
         capture_error: Exception | None = None,
+        empty_capture: bool = False,
         place_error: Exception | None = None,
         place_error_script: list[Exception | None] | None = None,
         place_hook: Callable[[JobRecord], None] | None = None,
@@ -98,6 +99,11 @@ class FakeProvider:
         )
         self._collect_error = collect_error
         self._capture_error = capture_error
+        # Model an ephemeral backend whose terminal (no-follow) log re-fetch
+        # races its own session teardown and returns NOTHING — capture writes an
+        # empty file instead of raising. The reconciler must not accept that
+        # empty snapshot as the durable log.
+        self._empty_capture = empty_capture
         # ``place`` failure injection. ``place_error`` (when set) is raised on
         # EVERY place. ``place_error_script`` is a per-call sequence popped in
         # order (a ``None`` entry = that call succeeds); once exhausted the last
@@ -198,7 +204,7 @@ class FakeProvider:
         if self._capture_error is not None:
             raise self._capture_error
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(f"fake log for {p.job_id}\n")
+        dest.write_text("" if self._empty_capture else f"fake log for {p.job_id}\n")
 
     def collect_outputs(self, p: Placement, dest: Path) -> None:
         self.collect_calls.append((p.job_id, dest))

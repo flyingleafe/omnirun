@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -140,10 +141,20 @@ class Control:
         outputs_dir: Path | None = None,
         poll_timeout_s: float = 30.0,
         max_poll_workers: int = 8,
+        place_io: AbstractContextManager[object] | None = None,
     ) -> None:
         self._store = store
         self._providers = providers
         self._policy = policy
+        # A context manager wrapped around the single slow backend call in
+        # ``_enact_place`` (``provider.place`` — a submit that can block for tens
+        # of seconds). The daemon passes one that DROPS its store
+        # lock for the duration, so a concurrent client write (a cancel) is not
+        # starved behind a placement. Default: a no-op (daemonless / unit Control,
+        # where there is no shared lock to yield). The placement is already
+        # store-race-safe — it reserves atomically and re-loads after place — so
+        # yielding the lock around only the I/O introduces no new race.
+        self._place_io: AbstractContextManager[object] = place_io or nullcontext()
         self._budget_window = budget_window
         self._budget_cap = budget_cap
         self._week_cap = week_cap
@@ -325,9 +336,17 @@ class Control:
             return
         mode = CancelMode.FORCE if force else CancelMode.GRACEFUL
         cancel_ok = True
+        logs_cached_to = rec.logs_cached_to
         if rec.placement is not None and rec.placement.handle:
             provider = self._providers.get(rec.placement.provider_name)
             if provider is not None:
+                # Capture the log up to the cancellation point BEFORE tearing the
+                # session down, so a cancelled job keeps the output it produced
+                # (the user comes back to see how far it got / why they killed
+                # it). Works in daemonless mode too, not only via the daemon's
+                # live ingestor. Best-effort — a failed capture returns None and
+                # the cancel still proceeds.
+                logs_cached_to = self._capture_logs(rec, rec.placement, provider)
                 try:
                     provider.cancel(rec.placement, mode, wait=wait)
                 except Exception:
@@ -351,6 +370,9 @@ class Control:
                     "last_status": StatusReport(
                         status=JobStatus.CANCELLED, detail="cancelled by user"
                     ),
+                    # The partial log captured just above the teardown, so the
+                    # cancelled job's output survives its reaped session.
+                    "logs_cached_to": logs_cached_to,
                     # wait=True force-reaps the placement above, so the held
                     # resource is gone — mark it reaped so reconcile's terminal
                     # catch-up doesn't try to collect from a released placement.
@@ -662,6 +684,18 @@ class Control:
                 e,
             )
             return None
+        # An empty snapshot is not authoritative. Some ephemeral sessions race
+        # their own teardown and return nothing from the terminal (no-follow)
+        # re-fetch even when the job produced output — the reap already tore the
+        # session down. Treat that as "no snapshot" (unlink it) so the daemon's
+        # live-ingested copy, which followed the job to completion, becomes the
+        # durable log instead of this empty file silently winning.
+        try:
+            if dest.stat().st_size == 0:
+                dest.unlink(missing_ok=True)
+                return None
+        except OSError:
+            return None
         return str(dest)
 
     def _reap(self, placement: Placement) -> bool:
@@ -720,11 +754,20 @@ class Control:
             self._collect_and_reap(rec, placement, provider, now, give_up=True)
             return
         if rec.state is JobState.CANCELLED:
+            # A no-wait cancel only signalled; the session is still up here, so
+            # capture the partial log before this reap tears it down (unless the
+            # inline cancel already cached it). Best-effort — a failed capture
+            # must not block the teardown.
+            logs_cached_to = self._capture_logs(rec, placement, provider)
             # Mark reaped only when the release actually went through; a raising
             # provider leaves the record un-reaped so the next tick retries the
             # escalation instead of silently leaking the placement.
             if self._reap(placement):
-                self._store.save_job(rec.model_copy(update={"reaped": True}))
+                self._store.save_job(
+                    rec.model_copy(
+                        update={"reaped": True, "logs_cached_to": logs_cached_to}
+                    )
+                )
                 self._tick_events.append(
                     f"released cancelled placement of {rec.spec.job_id} on "
                     f"{placement.provider_name}"
@@ -1082,7 +1125,12 @@ class Control:
             self._release(decision.job_id, rec)
             return
         try:
-            placement = provider.place(rec, slot)
+            # Drop the daemon's store lock (if any) for just this slow submit so a
+            # concurrent client write (a cancel) is not starved behind it. Safe:
+            # the reservation above is committed, and we re-load below to honor any
+            # cancel that lands during the yield.
+            with self._place_io:
+                placement = provider.place(rec, slot)
         except CapacityError as e:
             # Provider had no room right now (a concurrency/quota cap `offer` could
             # not foresee). Expected and transient — release the reservation and

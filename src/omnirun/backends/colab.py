@@ -766,7 +766,18 @@ class ColabBackend(Backend):
         double every command line (those stay on disk for `pull`)."""
         job_dir = handle.data["job_dir"]
         files = [f"{job_dir}/logs/bootstrap.log"]
-        offsets = self._log_offsets.setdefault(handle.job_id, dict.fromkeys(files, 0))
+        if follow:
+            offsets = self._log_offsets.setdefault(
+                handle.job_id, dict.fromkeys(files, 0)
+            )
+        else:
+            # A one-shot read (the terminal snapshot taken before reap, or any
+            # `logs` without --follow) must return the COMPLETE log from the
+            # start. The persistent per-job offsets belong to the live-follow
+            # tail (the daemon's ingestor); reusing them here would return only
+            # the delta since that tail's last read, truncating a finished (or
+            # cancelled/failed) job's durable log to its trailing bytes.
+            offsets = dict.fromkeys(files, 0)
         while True:
             try:
                 out = self._colab(

@@ -239,6 +239,7 @@ class SSHExec(Exec):
                 "-O",
                 "-r",
                 "-q",
+                *self._scp_ssh_flag(),
                 *self._scp_opts(),
                 str(local),
                 f"{self.target}:{remote}",
@@ -265,11 +266,24 @@ class SSHExec(Exec):
                 "-O",
                 "-r",
                 "-q",
+                *self._scp_ssh_flag(),
                 *self._scp_opts(),
                 f"{self.target}:{src}",
                 str(local),
             ]
         self._transfer(argv, f"download {self.target}:{remote} -> {local}")
+
+    def _scp_ssh_flag(self) -> list[str]:
+        """``-S <program>`` so scp drives its connection through the SAME ssh
+        program the rest of this Exec uses (``rsync -e`` already does). Without
+        it, scp invokes its compiled-in ``ssh`` (e.g. ``/usr/bin/ssh``) and
+        SILENTLY bypasses a configured ``ssh_command`` — a PATH wrapper that
+        supplies a host's password/2FA, a pinned ``-F`` config — so an
+        rsync-less host fails every ``put``/``pull`` with "Permission denied".
+        scp's ``-S`` takes a single program, so any extra ``ssh_command`` args
+        (rare; rsync covers that case) are dropped — the program itself, the
+        part that matters for auth, is still honored."""
+        return ["-S", self.ssh_command[0]] if self.ssh_command else []
 
     def _scp_opts(self) -> list[str]:
         batch = ["-oBatchMode=yes"] if self.batch_mode else []

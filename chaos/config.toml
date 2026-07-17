@@ -1,0 +1,48 @@
+# Chaos-test config: the four real backends from the goal, isolated from the
+# user's normal runs (apocrita root under an -chaos suffix; notebook sessions are
+# container-local via copied creds). The daemon owns all of this; CLIs point at
+# 127.0.0.1:8787 via OMNIRUN_DAEMON_ADDRESS.
+
+[policy]
+auto_wait_threshold = "15m"
+max_hourly_default = 2.0
+probe_timeout_s = 60.0
+
+[daemon]
+host = "127.0.0.1"
+port = 8787
+poll_interval_s = 5.0
+
+# QMUL Apocrita — short GPU jobs (1h limit), usually starts sooner.
+[backends.uni-gpushort]
+type = "slurm"
+host = "apocrita"
+partition = "gpushort"
+account = "pilot"
+root = "/data/scratch/acw592/omnirun-chaos"
+max_parallel = 4
+gpu_map = { "H100" = "gres:nvidia_h100_pcie:{n}", "A100-80" = "gres:nvidia_a100_80gb_pcie:{n}", "A100-40" = "gres:nvidia_a100-pcie-40gb:{n}", "V100" = "gres:tesla_v100-pcie-32gb:{n}" }
+time_default = "1:00:00"
+
+# QMUL Apocrita — CPU jobs.
+[backends.uni-cpu]
+type = "slurm"
+host = "apocrita"
+partition = "compute"
+account = "pilot"
+root = "/data/scratch/acw592/omnirun-chaos"
+max_parallel = 8
+has_gpus = false
+time_default = "1:00:00"
+
+# Kaggle free GPU quota — OAuth creds in ~/.kaggle/credentials.json.
+[backends.kaggle]
+type = "kaggle"
+weekly_gpu_hours = 200
+max_parallel = 2
+
+# Colab — official google-colab-cli, OAuth token in ~/.config/colab-cli/.
+[backends.colab]
+type = "colab"
+default_gpu = "T4"
+max_parallel = 1

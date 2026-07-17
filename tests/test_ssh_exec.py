@@ -247,6 +247,9 @@ def test_put_falls_back_to_scp(recorder, cm_dir, monkeypatch, tmp_path):
     assert argv[0] == "scp" and "-O" in argv and "-r" in argv
     assert argv[argv.index("-P") + 1] == "2222"  # scp spells the port -P
     assert "BatchMode=yes" in opt_pairs(argv)
+    # scp must be told which ssh program to use (-S), or it invokes its
+    # compiled-in ssh and bypasses a configured ssh_command / PATH wrapper.
+    assert argv[argv.index("-S") + 1] == "ssh"
 
 
 def test_get_dir_contents_semantics_rsync(ex, recorder, monkeypatch, tmp_path):
@@ -268,6 +271,19 @@ def test_get_dir_contents_semantics_scp(ex, recorder, monkeypatch, tmp_path):
     argv = recorder.last
     assert argv[0] == "scp"
     assert "user@box:/j/outputs/." in argv  # dir/. == contents for scp
+    assert argv[argv.index("-S") + 1] == "ssh"  # routes through the ssh program
+
+
+def test_scp_uses_custom_ssh_command_program(recorder, cm_dir, monkeypatch, tmp_path):
+    """A configured ``ssh_command`` (e.g. a PATH wrapper that supplies a host's
+    password) must reach the scp fallback via ``-S`` — otherwise an rsync-less
+    host silently bypasses it and every transfer fails on auth."""
+    monkeypatch.setattr("omnirun.execlayer.ssh.shutil.which", lambda name: None)
+    ex = SSHExec("user@box", control_dir=cm_dir, ssh_command=["/opt/uni/ssh-wrapper"])
+    ex.get("/j/outputs/", tmp_path / "out")
+    argv = recorder.last
+    assert argv[0] == "scp"
+    assert argv[argv.index("-S") + 1] == "/opt/uni/ssh-wrapper"
 
 
 def test_get_single_file_creates_parents(ex, recorder, monkeypatch, tmp_path):
