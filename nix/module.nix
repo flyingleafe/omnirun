@@ -20,7 +20,25 @@ in
     user = lib.mkOption {
       type = lib.types.str;
       default = "omnirun";
-      description = "System user the daemon runs as.";
+      description = "User the daemon runs as.";
+    };
+
+    createUser = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether to create `user` as a dedicated system user. Set false to run as
+        an EXISTING user (e.g. a login user that already holds the backend
+        credentials in its home — kaggle/colab/gh/ssh config), so the daemon
+        inherits them instead of re-provisioning secrets.
+      '';
+    };
+
+    group = lib.mkOption {
+      type = lib.types.str;
+      default = cfg.user;
+      defaultText = lib.literalExpression "config.services.omnirun.user";
+      description = "Group the daemon runs as (an existing user's primary group when createUser = false).";
     };
 
     stateDir = lib.mkOption {
@@ -66,14 +84,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    users.users.${cfg.user} = {
-      isSystemUser = true;
-      group = cfg.user;
-      home = cfg.stateDir;
-      createHome = true;
-      description = "omnirun scheduler daemon";
+    users.users = lib.mkIf cfg.createUser {
+      ${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.group;
+        home = cfg.stateDir;
+        createHome = true;
+        description = "omnirun scheduler daemon";
+      };
     };
-    users.groups.${cfg.user} = { };
+    users.groups = lib.mkIf cfg.createUser { ${cfg.group} = { }; };
 
     systemd.services.omnirun = {
       description = "omnirun scheduler daemon";
@@ -99,7 +119,7 @@ in
         Restart = "on-failure";
         RestartSec = "5";
         User = cfg.user;
-        Group = cfg.user;
+        Group = cfg.group;
         StateDirectory = "omnirun";
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
       };
