@@ -162,7 +162,9 @@ class Client(Protocol):
     ) -> JobPolicy: ...
     def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord: ...
     def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord: ...
-    def retry(self, rec: JobRecord) -> JobRecord: ...
+    def retry(
+        self, rec: JobRecord, *, only_backend: str | None = None, repin: bool = False
+    ) -> JobRecord: ...
     def budget_set(self, window: str, cap: float) -> None: ...
     def budget_status(self) -> list[BudgetRow]: ...
     def gc(self, *, all_: bool, project: str | None) -> GcOutcome: ...
@@ -448,9 +450,13 @@ class LocalClient:
     def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord:
         return self._control().edit_job(rec.spec.job_id, updates=updates)
 
-    def retry(self, rec: JobRecord) -> JobRecord:
+    def retry(
+        self, rec: JobRecord, *, only_backend: str | None = None, repin: bool = False
+    ) -> JobRecord:
         # Pure store flip (terminal → QUEUED); no backend I/O, so no providers.
-        return Control(self._store(), {}).retry(rec.spec.job_id)
+        return Control(self._store(), {}).retry(
+            rec.spec.job_id, only_backend=only_backend, repin=repin
+        )
 
     def budget_set(self, window: str, cap: float) -> None:
         Control(self._store(), {}).budget(window, cap)
@@ -785,8 +791,11 @@ class RemoteClient:
         data = self._post(f"/jobs/{rec.spec.job_id}/edit", json={"updates": payload})
         return JobRecord.model_validate(data["job"])
 
-    def retry(self, rec: JobRecord) -> JobRecord:
-        data = self._post(f"/jobs/{rec.spec.job_id}/retry")
+    def retry(
+        self, rec: JobRecord, *, only_backend: str | None = None, repin: bool = False
+    ) -> JobRecord:
+        body = {"repin": repin, "backend": only_backend} if repin else {}
+        data = self._post(f"/jobs/{rec.spec.job_id}/retry", json=body)
         return JobRecord.model_validate(data["job"])
 
     def reprioritize(

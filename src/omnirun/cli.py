@@ -1243,9 +1243,18 @@ def retry(
     all_projects: bool = typer.Option(
         False, "--all-projects", "-A", help="With --failed, across every project."
     ),
+    to: str | None = typer.Option(
+        None, "--to", help="Also pin the retry to this backend (atomic — no race)."
+    ),
+    any_backend: bool = typer.Option(
+        False, "--any", help="Also unpin the retry (any backend)."
+    ),
 ) -> None:
     if (job is None) == (not failed):
         _die("pass exactly one of a JOB argument or --failed")
+    if to is not None and any_backend:
+        _die("pass at most one of --to <backend> or --any")
+    repin = to is not None or any_backend
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     try:
@@ -1262,7 +1271,7 @@ def retry(
         done = 0
         for rec in targets:
             try:
-                client.retry(rec)
+                client.retry(rec, only_backend=to, repin=repin)
                 console.print(f"[green]re-queued[/green] {rec.spec.job_id}")
                 done += 1
             except Exception as e:

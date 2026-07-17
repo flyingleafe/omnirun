@@ -556,11 +556,15 @@ class Daemon:
         @app.post("/jobs/<jid>/retry")
         def _retry(jid: str) -> str:
             # Re-queue a terminal job for a fresh run (pure store flip, no backend
-            # I/O) — lock-free, like enqueue, then wake the scheduler.
+            # I/O) — lock-free, like enqueue, then wake the scheduler. An optional
+            # atomic re-pin avoids a separate edit racing the re-placement.
+            body = _body()
+            repin = bool(body.get("repin"))
+            backend = body.get("backend")
             with d._lock:
                 rec = d._core.resolve_job(jid)
                 try:
-                    updated = d._core.retry(rec)
+                    updated = d._core.retry(rec, only_backend=backend, repin=repin)
                 except ValueError as e:
                     bottle.response.status = 409
                     return _json({"error": str(e)})

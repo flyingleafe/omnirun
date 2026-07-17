@@ -353,14 +353,21 @@ class Control:
         shortcut over :meth:`edit_job` that only touches ``only_backend``."""
         return self.edit_job(job_id, updates={"only_backend": backend})
 
-    def retry(self, job_id: str) -> JobRecord:
+    def retry(
+        self, job_id: str, *, only_backend: str | None = None, repin: bool = False
+    ) -> JobRecord:
         """Re-queue a TERMINAL job (failed/cancelled/succeeded) for a fresh run.
 
         Resets all scheduler + capture state — attempts, placement, last error/
         status, the avoid set, the reaped flag, and the durable log/output pointers
         — so the next tick places it anew and the fresh run is captured cleanly. The
-        SPEC (repo/sha, command, resources, pin) is untouched: it re-runs exactly as
-        submitted. Refuses a job that is not terminal (it is already live)."""
+        SPEC (repo/sha, command, resources) is untouched: it re-runs as submitted.
+        Refuses a job that is not terminal (it is already live).
+
+        ``repin`` (with ``only_backend``) sets the pin ATOMICALLY as part of the
+        re-queue — pin to a name, or unpin with ``None`` — so a caller wanting to
+        retry onto a specific backend needs no separate ``edit`` (whose reap could
+        race the scheduler placing the re-queued job). Otherwise the pin is kept."""
         rec = self._store.load_job(job_id)
         if rec is None:
             raise ValueError(f"unknown job {job_id!r}")
@@ -369,8 +376,17 @@ class Control:
                 f"job {job_id!r} is {rec.state.value}, not terminal — nothing to "
                 "retry (it is already queued/running)"
             )
+        if repin and only_backend is not None and only_backend not in self._providers:
+            known = ", ".join(sorted(self._providers)) or "(none configured)"
+            raise ValueError(f"unknown backend {only_backend!r} (known: {known})")
+        spec = (
+            rec.spec.model_copy(update={"only_backend": only_backend})
+            if repin
+            else rec.spec
+        )
         updated = rec.model_copy(
             update={
+                "spec": spec,
                 "state": JobState.QUEUED,
                 "placement": None,
                 "last_status": None,
