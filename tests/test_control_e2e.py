@@ -199,6 +199,42 @@ def test_repin_unpins_a_queued_job(tmp_path: Path) -> None:
         store.close()
 
 
+def test_placement_error_fails_over_to_another_backend(tmp_path: Path) -> None:
+    """A placement that ERRORS on one backend must not re-pick that broken backend
+    every tick until the attempts-cap fails a job that fits elsewhere. The failed
+    backend is avoided briefly, so the retry fails OVER to a different fitting one."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        slot_a = Slot(
+            provider_name="a", capabilities=Capabilities(), cost=Cost(), capacity=1
+        )
+        slot_b = Slot(
+            provider_name="b", capabilities=Capabilities(), cost=Cost(), capacity=1
+        )
+        prov_a = FakeProvider(
+            "a", slots=[slot_a], place_error=RuntimeError("a: ssh auth down")
+        )
+        prov_b = FakeProvider("b", slots=[slot_b])
+        control = Control(store, {"a": prov_a, "b": prov_b})
+        control.submit(_spec("fo-000001"), now=T0)
+
+        control.run_tick(T0)  # picks 'a' (first), it errors → release + avoid 'a'
+        rec = store.load_job("fo-000001")
+        assert rec is not None
+        assert rec.state is JobState.QUEUED
+        assert "a" in rec.avoid_backends
+        assert prov_a.place_calls == ["fo-000001"]
+
+        control.run_tick(T0)  # 'a' avoided → fails OVER to 'b'
+        rec = store.load_job("fo-000001")
+        assert rec is not None
+        assert rec.state is JobState.RUNNING
+        assert rec.placement is not None and rec.placement.provider_name == "b"
+        assert not rec.avoid_backends  # cleared on successful placement
+    finally:
+        store.close()
+
+
 def test_placements_run_in_parallel(tmp_path: Path) -> None:
     """Many QUEUED jobs' slow ``provider.place`` submits run CONCURRENTLY within a
     single tick, not one-after-another. Proved by a barrier that only releases when

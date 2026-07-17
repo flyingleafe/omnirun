@@ -272,16 +272,24 @@ def tick(
             if pin is None
             else {idx for idx, s in enumerate(slots) if s.provider_name == pin}
         )
-
         # Candidate slots: fit (capabilities), local remaining capacity > 0, and
         # (when pinned) in the job's eligible provider set.
-        candidates = [
+        fitting = [
             (idx, slot)
             for idx, slot in enumerate(slots)
             if remaining[idx] > 0
             and slot.fits(req)
             and (eligible_idx is None or idx in eligible_idx)
         ]
+        # Backends this job is temporarily avoiding (a placement just ERRORED on
+        # them). PREFER non-avoided fitting slots so a broken backend does not get
+        # re-picked every tick — but fall back to the avoided ones if that leaves
+        # nothing, so a job whose ONLY fit is a flaky backend still retries it (and
+        # eventually hits the attempts-cap) instead of wedging QUEUED forever.
+        avoided = rec.eligible_backends_excluded(now)
+        candidates = [
+            c for c in fitting if c[1].provider_name not in avoided
+        ] or fitting
 
         chosen: tuple[int, Slot] | None = None
         paid_cost: float | None = None  # set only when a PAID slot is chosen

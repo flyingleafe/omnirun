@@ -1,6 +1,6 @@
 [project]
 name = "omnirun"
-version = "0.5.13"
+version = "0.5.14"
 description = "Run jobs from your repo anywhere: Slurm over SSH, any SSH box, Kaggle, Colab, or marketplace GPUs"
 readme = "README.md"
 requires-python = ">=3.12"

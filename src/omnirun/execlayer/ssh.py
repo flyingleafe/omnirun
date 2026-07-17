@@ -260,20 +260,46 @@ class SSHExec(Exec):
             shell_quote(command),
         ]
         _log.debug("ssh %s: run %r (timeout=%s)", self.target, command[:200], timeout)
-        try:
-            proc = subprocess.run(
-                argv, input=stdin, capture_output=True, text=True, timeout=timeout
-            )
-        except subprocess.TimeoutExpired as e:
-            _log.debug(
-                "ssh %s: run %r TIMED OUT after %ss", self.target, command[:80], timeout
-            )
-            return ExecResult(
-                returncode=124,
-                stdout=_text(e.output),
-                stderr=_text(e.stderr) or f"timed out after {timeout}s",
-            )
-        result = ExecResult(proc.returncode, proc.stdout, proc.stderr)
+        healed = False
+        while True:
+            try:
+                proc = subprocess.run(
+                    argv, input=stdin, capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.TimeoutExpired as e:
+                _log.debug(
+                    "ssh %s: run %r TIMED OUT after %ss",
+                    self.target,
+                    command[:80],
+                    timeout,
+                )
+                return ExecResult(
+                    returncode=124,
+                    stdout=_text(e.output),
+                    stderr=_text(e.stderr) or f"timed out after {timeout}s",
+                )
+            result = ExecResult(proc.returncode, proc.stdout, proc.stderr)
+            if proc.returncode == 255 and self._transport_failed(proc.stderr):
+                # The shared ControlMaster is down (expired, dropped, or a BatchMode
+                # run could not password-auth a MISSING master). Re-auth it ONCE —
+                # serialized under the shared lock, so a burst of callers can't storm
+                # the host — and retry, so ANY operation (status polls, submit, logs)
+                # self-heals and keeps reusing the one connection instead of failing.
+                if not healed and self.control_master:
+                    healed = True
+                    try:
+                        self.ensure_master(interactive=False)
+                    except ExecError:
+                        pass  # cannot re-establish → fall through and surface it
+                    else:
+                        continue
+                last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
+                raise ExecError(
+                    f"ssh connection to {self.target} is down ({last.strip()}) — "
+                    f"{RECONNECT_HINT}",
+                    result,
+                )
+            break
         if result.returncode != 0:
             _log.debug(
                 "ssh %s: run %r -> rc=%d stderr=%r",
@@ -281,12 +307,6 @@ class SSHExec(Exec):
                 command[:80],
                 result.returncode,
                 (result.stderr or "").strip()[:300],
-            )
-        if proc.returncode == 255 and self._transport_failed(proc.stderr):
-            last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
-            raise ExecError(
-                f"ssh connection to {self.target} is down ({last.strip()}) — {RECONNECT_HINT}",
-                result,
             )
         if check and not result.ok:
             raise ExecError(

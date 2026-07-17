@@ -34,7 +34,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 from contextlib import AbstractContextManager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, TypeVar
 
@@ -152,11 +152,16 @@ class Control:
         poll_timeout_s: float = 30.0,
         max_poll_workers: int = 8,
         max_place_workers: int = 32,
+        placement_avoid_s: float = 180.0,
         place_io: AbstractContextManager[object] | None = None,
     ) -> None:
         self._store = store
         self._providers = providers
         self._policy = policy
+        # After a placement ERRORS on a backend, the job avoids that backend for
+        # this long, so a retry tries a DIFFERENT fitting backend rather than
+        # re-picking the broken one until the attempts-cap fails a placeable job.
+        self._placement_avoid_s = placement_avoid_s
         # A context manager wrapped around the single slow backend call in
         # ``_enact_place`` (``provider.place`` — a submit that can block for tens
         # of seconds). The daemon passes one that DROPS its store
@@ -1328,13 +1333,20 @@ class Control:
             # Record the reason so the tick's attempts-cap can fail a job whose
             # placement keeps raising, and read commands can show WHY.
             _log.warning(
-                "place raised for job %s on %s; releasing reservation (%s)",
+                "place raised for job %s on %s; releasing + avoiding it briefly (%s)",
                 decision.job_id,
                 slot.provider_name,
                 outcome,
             )
+            # Avoid this backend on the retry so a broken one (e.g. ssh auth down)
+            # does not get re-picked every tick until the attempts-cap fails a job
+            # that fits elsewhere — fail OVER, not OUT.
             self._release(
-                decision.job_id, rec, error=f"{slot.provider_name}: {outcome}"
+                decision.job_id,
+                rec,
+                error=f"{slot.provider_name}: {outcome}",
+                avoid=slot.provider_name,
+                now=now,
             )
             return
 
@@ -1379,9 +1391,11 @@ class Control:
                 update={
                     "state": JobState.RUNNING,
                     "placement": placement,
-                    # Clear any stale placement error so it cannot linger into a
-                    # later retry cycle and trip the attempts-cap.
+                    # Clear any stale placement error / avoid set so they cannot
+                    # linger into a later retry cycle (trip the attempts-cap, or
+                    # keep skipping a backend that is fine now).
                     "last_error": None,
+                    "avoid_backends": {},
                 }
             )
         )
@@ -1416,6 +1430,8 @@ class Control:
         *,
         count: bool = True,
         error: str | None = None,
+        avoid: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         """Release a reservation: PLACING→QUEUED (no placement).
 
@@ -1427,6 +1443,10 @@ class Control:
         the record's ``last_error`` — read by the tick's attempts-cap rule and
         surfaced by read commands. A capacity defer never sets it (a defer is not
         a failure; recording one would let the cap kill a merely-waiting job).
+
+        ``avoid`` (a provider name, with ``now``) marks that backend to be SKIPPED
+        for ``placement_avoid_s`` — set when a placement ERRORED there, so the retry
+        tries a DIFFERENT fitting backend rather than re-picking the broken one.
         """
         rec = self._store.load_job(job_id) or fallback
         update: dict[str, Any] = {
@@ -1436,6 +1456,10 @@ class Control:
         }
         if error is not None:
             update["last_error"] = error
+        if avoid is not None and now is not None:
+            avoids = dict(rec.avoid_backends)
+            avoids[avoid] = now + timedelta(seconds=self._placement_avoid_s)
+            update["avoid_backends"] = avoids
         self._store.save_job(rec.model_copy(update=update))
 
     # ------------------------------------------------------------------

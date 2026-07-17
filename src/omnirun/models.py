@@ -435,6 +435,15 @@ class JobRecord(BaseModel):
     # raised). Cleared on a successful placement. Read by the tick's attempts-cap
     # rule and surfaced by read commands.
     last_error: str | None = None
+    # Backends this job should SKIP until the given time — set when a placement
+    # ERRORED on that backend (e.g. its ssh auth was down), so the next tick tries a
+    # DIFFERENT fitting backend instead of re-picking the broken one until the
+    # attempts-cap fails the job. Entries past their time are ignored (re-eligible).
+    avoid_backends: dict[str, datetime] = Field(default_factory=dict)
+
+    def eligible_backends_excluded(self, now: datetime) -> set[str]:
+        """Provider names still within their avoid window at *now*."""
+        return {name for name, until in self.avoid_backends.items() if now < until}
 
     def urgency(self, now: datetime) -> float:
         """Higher value = more urgent; used to rank QUEUED jobs within a priority tier.
