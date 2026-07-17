@@ -47,6 +47,7 @@ from omnirun.models import (
     ResourceSpec,
 )
 from omnirun.progress import report, reporting
+from omnirun.sentinels import strip_sentinels
 
 app = typer.Typer(
     name="omnirun",
@@ -1006,12 +1007,20 @@ def logs(
     follow: bool = typer.Option(
         False, "--follow", "-f", help="Tail until the job finishes."
     ),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Include the structured @omnirun: sentinel lines (hidden by default).",
+    ),
 ) -> None:
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     rec = client.resolve_job(job)
-    for line in client.logs(rec, follow=follow):
-        typer.echo(line.rstrip("\n"))
+    # Human display filters the lifecycle sentinels; durable files and the SSE
+    # wire keep them (they are the live channel machines read).
+    lines = (line.rstrip("\n") for line in client.logs(rec, follow=follow))
+    for line in lines if raw else strip_sentinels(lines):
+        typer.echo(line)
 
 
 @app.command(help="Cancel a running job (graceful by default; --force = hard kill).")

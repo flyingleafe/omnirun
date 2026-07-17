@@ -99,6 +99,7 @@ class StubBackend(Backend):
         return StatusReport(status=JobStatus.RUNNING)
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
+        yield '@omnirun:{"ev":"phase","phase":"run","t":1}'
         yield "hello from stub"
         yield f"following={follow}"
 
@@ -549,6 +550,25 @@ def test_logs_follow_flag(env):
     result = runner.invoke(app, ["logs", "-f", job_id])
     assert result.exit_code == 0, result.output
     assert "following=True" in result.output
+
+
+def test_logs_hides_sentinels_by_default(env):
+    """Human display filters @omnirun: lifecycle sentinel lines (both modes go
+    through the same rendering path); user lines pass untouched."""
+    job_id = submit_one()
+    for args in (["logs", job_id], ["logs", "-f", job_id]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+        assert "@omnirun:" not in result.output
+        assert "hello from stub" in result.output
+
+
+def test_logs_raw_shows_sentinels(env):
+    job_id = submit_one()
+    result = runner.invoke(app, ["logs", "--raw", job_id])
+    assert result.exit_code == 0, result.output
+    assert '@omnirun:{"ev":"phase","phase":"run","t":1}' in result.output
+    assert "hello from stub" in result.output
 
 
 def test_logs_served_from_cache_for_reaped_job(env, tmp_path):

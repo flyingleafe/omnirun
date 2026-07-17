@@ -159,6 +159,17 @@ class ResourceRow(NamedTuple):
     data: dict[str, Any] | None
 
 
+class IntentWrite(NamedTuple):
+    """An intents-row upsert to apply INSIDE a :meth:`Store.transition`
+    transaction (the engine's reserve step opens its place intent atomically
+    with the ``reserve`` event — ENGINE.md choreography)."""
+
+    kind: str
+    stage: str
+    provider: str | None = None
+    data: dict[str, Any] | None = None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -651,6 +662,10 @@ class Store:
         action: str,
         cause: str | None = None,
         data: dict[str, Any] | None = None,
+        open_intent: IntentWrite | None = None,
+        close_intent: bool = False,
+        mint: tuple[str, str] | None = None,
+        release: tuple[str, str] | None = None,
     ) -> int:
         """Compare-and-set save + event append in ONE transaction (ROBUST-4/I11).
 
@@ -661,6 +676,15 @@ class Store:
         the fold of its event log. A missing row is valid only for
         ``expected_seq == 0`` (the ``submit`` transition creates it). Returns the
         new seq.
+
+        The optional work-item/resource bookkeeping runs in the SAME transaction
+        (ENGINE.md choreography): *open_intent* upserts the job's intents row
+        (``reserve`` opens the place item with its event), *close_intent* deletes
+        it (``activate``/``rollback`` resolve the item with their event), *mint*
+        = ``(provider, external_key)`` records the provider resource atomically
+        with its ``provision`` event (I5), and *release* = ``(provider,
+        external_key)`` marks it released with ``reap``/``release-lost``. All
+        default to no-op, so every pre-engine caller is unchanged.
         """
         if record.spec.job_id != job_id:
             raise StoreError(
@@ -693,7 +717,34 @@ class Store:
                 cause=cause,
                 data=data,
             )
+            if open_intent is not None:
+                self._put_intent(
+                    conn,
+                    job_id,
+                    open_intent.kind,
+                    open_intent.stage,
+                    open_intent.provider,
+                    open_intent.data,
+                )
+            if close_intent:
+                conn.execute(delete(intents).where(intents.c.job_id == job_id))
+            if mint is not None:
+                self._mint(conn, mint[0], mint[1], job_id, None)
+            if release is not None:
+                self._release(conn, release[0], release[1])
         return new_seq
+
+    def job_seq(self, job_id: str) -> int:
+        """The current CAS token (``jobs.seq``) for *job_id*; 0 when absent.
+
+        The engine reads this alongside ``load_job`` to build its
+        ``expected_seq`` for :meth:`transition` (a lost race surfaces as
+        :class:`StaleTransition`, never a silent overwrite)."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(jobs.c.seq).where(jobs.c.job_id == job_id)
+            ).fetchone()
+        return 0 if row is None else int(row[0])
 
     def events_after(self, global_id: int, limit: int = 1000) -> list[EventRow]:
         """Events with ``id > global_id`` in global order — the replay-validator
@@ -721,6 +772,36 @@ class Store:
     # Intents — write-ahead work items, one live per job (DESIGN-V2 §6).
     # ------------------------------------------------------------------
 
+    def _put_intent(
+        self,
+        conn: Connection,
+        job_id: str,
+        kind: str,
+        stage: str,
+        provider: str | None,
+        data: dict[str, Any] | None,
+    ) -> None:
+        """The conn-level intent upsert shared by :meth:`put_intent` and the
+        same-transaction ``open_intent`` path of :meth:`transition`."""
+        now = _now_iso()
+        values: dict[str, Any] = {
+            "job_id": job_id,
+            "kind": kind,
+            "stage": stage,
+            "provider": provider,
+            "created_at": now,
+            "updated_at": now,
+            "poisoned_until": None,
+            "data": data or {},
+        }
+        self._upsert(
+            conn,
+            intents,
+            ["job_id"],
+            values,
+            set_cols=["kind", "stage", "provider", "updated_at", "data"],
+        )
+
     def put_intent(
         self,
         job_id: str,
@@ -735,25 +816,8 @@ class Store:
         :meth:`poison_intent` sets the quarantine, and creation time is the
         item's identity for crash-age accounting.
         """
-        now = _now_iso()
-        values: dict[str, Any] = {
-            "job_id": job_id,
-            "kind": kind,
-            "stage": stage,
-            "provider": provider,
-            "created_at": now,
-            "updated_at": now,
-            "poisoned_until": None,
-            "data": data or {},
-        }
         with self.transaction() as conn:
-            self._upsert(
-                conn,
-                intents,
-                ["job_id"],
-                values,
-                set_cols=["kind", "stage", "provider", "updated_at", "data"],
-            )
+            self._put_intent(conn, job_id, kind, stage, provider, data)
 
     def get_intent(self, job_id: str) -> IntentRow | None:
         """The live intent for *job_id*, or ``None``."""
@@ -792,6 +856,32 @@ class Store:
     # Resources — provider-side money registry (I5 no-untracked-money).
     # ------------------------------------------------------------------
 
+    def _mint(
+        self,
+        conn: Connection,
+        provider: str,
+        external_key: str,
+        job_id: str | None,
+        data: dict[str, Any] | None,
+    ) -> None:
+        """Conn-level mint shared by :meth:`mint_resource` and the same-tx
+        ``mint`` path of :meth:`transition` (I5: mint atomic with its event)."""
+        try:
+            conn.execute(
+                insert(resources).values(
+                    provider=provider,
+                    external_key=external_key,
+                    job_id=job_id,
+                    minted_at=_now_iso(),
+                    released_at=None,
+                    data=data,
+                )
+            )
+        except IntegrityError as e:
+            raise StoreError(
+                f"resource ({provider}, {external_key}) is already minted"
+            ) from e
+
     def mint_resource(
         self,
         provider: str,
@@ -805,34 +895,25 @@ class Store:
         error (``StoreError``) — the deterministic-key adopt-don't-duplicate
         guard (I7), never an upsert.
         """
-        try:
-            with self.transaction() as conn:
-                conn.execute(
-                    insert(resources).values(
-                        provider=provider,
-                        external_key=external_key,
-                        job_id=job_id,
-                        minted_at=_now_iso(),
-                        released_at=None,
-                        data=data,
-                    )
-                )
-        except IntegrityError as e:
-            raise StoreError(
-                f"resource ({provider}, {external_key}) is already minted"
-            ) from e
+        with self.transaction() as conn:
+            self._mint(conn, provider, external_key, job_id, data)
+
+    def _release(self, conn: Connection, provider: str, external_key: str) -> None:
+        """Conn-level release shared by :meth:`release_resource` and the same-tx
+        ``release`` path of :meth:`transition`."""
+        conn.execute(
+            update(resources)
+            .where(resources.c.provider == provider)
+            .where(resources.c.external_key == external_key)
+            .where(resources.c.released_at.is_(None))
+            .values(released_at=_now_iso())
+        )
 
     def release_resource(self, provider: str, external_key: str) -> None:
         """Mark the resource released now. Idempotent: an already-released row
         keeps its original ``released_at``; a missing row is a no-op."""
         with self.transaction() as conn:
-            conn.execute(
-                update(resources)
-                .where(resources.c.provider == provider)
-                .where(resources.c.external_key == external_key)
-                .where(resources.c.released_at.is_(None))
-                .values(released_at=_now_iso())
-            )
+            self._release(conn, provider, external_key)
 
     def unreleased_resources(self, provider: str | None = None) -> list[ResourceRow]:
         """Resources with no confirmed release — the money-may-be-burning set."""

@@ -112,6 +112,8 @@ def stage_job(
     local_repo_root: Path,
     params: BootstrapParams,
     root: str,
+    *,
+    attempt: int = 1,
 ) -> str:
     """Deliver code + stage any .env/deploy-key + write bootstrap.sh; returns the
     worker job dir.
@@ -122,7 +124,9 @@ def stage_job(
     ``local``/None → the placer pushes the exact sha from its own checkout into
     the worker object store (the co-located/daemonless fallback).
 
-    params.project_root must be the resolved (absolute) shared project dir."""
+    params.project_root must be the resolved (absolute) shared project dir.
+    ``attempt`` is baked into the bootstrap's ``start`` sentinel (callers with a
+    ``JobRecord`` pass its placement attempt number; defaults to 1)."""
     project_root = params.project_root or project_root_of(root, spec.repo.slug, None)
     git_dir = remote_git_dir(exec_, project_root)
     job_dir = job_dir_of(root, spec.job_id)
@@ -140,7 +144,7 @@ def stage_job(
         push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
         params.code = CodeSource(kind="bare")
     stage_env_file(exec_, job_dir, spec.env_dotenv)
-    script = generate_bootstrap(spec, params)
+    script = generate_bootstrap(spec, params, attempt=attempt)
     exec_.write_file(f"{job_dir}/bootstrap.sh", script, mode="755")
     return job_dir
 

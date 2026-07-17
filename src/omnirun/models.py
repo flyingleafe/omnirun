@@ -440,6 +440,10 @@ class JobRecord(BaseModel):
     # DIFFERENT fitting backend instead of re-picking the broken one until the
     # attempts-cap fails the job. Entries past their time are ignored (re-eligible).
     avoid_backends: dict[str, datetime] = Field(default_factory=dict)
+    # Earliest time the v2 scheduler pass may try placing this job again — the
+    # placement backoff stamped by a work item's failure path (ENGINE.md). None =
+    # no backoff. The v1 tick ignores it; ``schedule()`` filters on it.
+    not_before: datetime | None = None
 
     def eligible_backends_excluded(self, now: datetime) -> set[str]:
         """Provider names still within their avoid window at *now*."""

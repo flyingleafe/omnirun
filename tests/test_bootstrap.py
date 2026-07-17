@@ -15,6 +15,7 @@ from pathlib import Path
 
 from omnirun.bootstrap import BootstrapParams, CodeSource, generate_bootstrap
 from omnirun.models import EnvKind, EnvSpec, JobSpec
+from omnirun.sentinels import ExitEv, PhaseEv, StartEv, parse_sentinel
 from tests.conftest import git
 
 
@@ -132,6 +133,13 @@ def test_full_bootstrap_run(
     assert "JOB OK" in (job_dir / "logs" / "stdout.log").read_text()
     out = job_dir / "outputs" / "out" / "result.txt"
     assert out.read_text() == "hello from job\n"
+
+    # lifecycle sentinels on the canonical stream: start first, exit last,
+    # phases in stage order (detailed assertions live in test_sentinels.py)
+    events = [
+        e for e in map(parse_sentinel, bootstrap_log.splitlines()) if e is not None
+    ]
+    assert [type(e) for e in events] == [StartEv, PhaseEv, PhaseEv, PhaseEv, ExitEv]
 
 
 def test_failing_command_propagates_exit_code(

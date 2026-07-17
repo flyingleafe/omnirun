@@ -9,7 +9,10 @@ On-worker layout (the contract all backends and status logic rely on):
         bootstrap.sh                   this script
         .env                           (optional) uncommitted secrets, sourced pre-run
         bundle.git                     (notebook backends) git bundle with the sha
-        logs/bootstrap.log             everything the bootstrap itself prints
+        logs/bootstrap.log             everything the bootstrap itself prints —
+                                       the canonical merged stream, including
+                                       single-line "@omnirun:{...}" lifecycle
+                                       sentinels (see omnirun.sentinels)
         logs/stdout.log, stderr.log    the user command's streams
         outputs/                       collected outputs ($OMNIRUN_OUTPUT)
         phase                          one word: preparing|env|running|collecting|done
@@ -362,9 +365,16 @@ def notebook_env_spec(spec: JobSpec) -> JobSpec:
     )
 
 
-def generate_bootstrap(spec: JobSpec, params: BootstrapParams | None = None) -> str:
+def generate_bootstrap(
+    spec: JobSpec, params: BootstrapParams | None = None, attempt: int = 1
+) -> str:
     """Render bootstrap.sh for a job. POSIX-ish bash, no python required on the
-    worker beyond what env setup brings."""
+    worker beyond what env setup brings.
+
+    ``attempt`` is the placement attempt number this script belongs to; it is
+    baked into the ``start`` sentinel at generation time (callers with a
+    ``JobRecord`` in hand pass its attempt count; everything else defaults to 1).
+    """
     params = params or BootstrapParams()
     project_root = params.project_root or _default_project_root(spec.repo.slug)
     setup = "\n".join(params.setup_lines + spec.env.setup) or ": # no setup lines"
@@ -435,13 +445,20 @@ exec >> "$JOB_DIR/logs/bootstrap.log" 2>&1
 ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' > "$JOB_DIR/pgid" || echo "$$" > "$JOB_DIR/pgid"
 
 now() {{ date -u +%Y-%m-%dT%H:%M:%SZ; }}
+# Structured lifecycle sentinels on the canonical stream (this log). Emitted
+# ONLY from this sequential wrapper between stages — never from the background
+# heartbeat loop, whose concurrent writes could interleave mid-user-line. One
+# printf with a trailing \\n per sentinel keeps each line-atomic. result.json
+# stays the authoritative durable truth; the exit sentinel mirrors it live.
+sentinel_phase() {{ printf '@omnirun:{{"ev":"phase","phase":"%s","t":%s}}\\n' "$1" "$(date +%s)"; }}
+sentinel_exit() {{ printf '@omnirun:{{"ev":"exit","code":%s,"t":%s}}\\n' "$1" "$(date +%s)"; }}
 status() {{ echo "$1" > "$JOB_DIR/phase"; echo "OMNIRUN: [$(now)] $1 ${{2:-}}"; }}
 write_result() {{
   printf '{{"exit_code": %s, "started_at": "%s", "finished_at": "%s", "hostname": "%s", "error": "%s"}}\\n' \\
     "$1" "${{STARTED_AT:-}}" "$(now)" "$(hostname)" "${{2:-}}" > "$JOB_DIR/result.json.tmp"
   mv "$JOB_DIR/result.json.tmp" "$JOB_DIR/result.json"
 }}
-fail() {{ echo "OMNIRUN: FATAL: $1"; write_result 1 "$1"; exit 1; }}
+fail() {{ echo "OMNIRUN: FATAL: $1"; write_result 1 "$1"; sentinel_exit 1; exit 1; }}
 
 # atomic lock using mkdir — works on NFS/GPFS unlike flock.
 # Spins until acquired; steals stale locks whose heartbeat is older than timeout.
@@ -471,6 +488,11 @@ omnirun_unlock() {{
   rm -rf "$1"
 }}
 
+# First line on the stream: the start sentinel (attempt baked at generation).
+printf '@omnirun:{{"ev":"start","attempt":{attempt},"job":"%s","host":"%s","t":%s}}\\n' \\
+  "$JOB_ID" "$(hostname)" "$(date +%s)"
+
+sentinel_phase checkout
 status preparing
 # ---- code (shared worktree per revision, created once under a per-sha lock) -----
 command -v git >/dev/null 2>&1 || fail "git not available on worker"
@@ -486,6 +508,7 @@ omnirun_unlock "$PROJECT_ROOT/.locks/tree-$SHORT.d"
 {setup}
 
 # ---- env (shared $PROJECT_ROOT/.venv) ---------------------------------------
+sentinel_phase env
 status env
 cd "$TREE_DIR" || fail "cd tree failed"
 {_env_block(spec.env.kind)}\
@@ -518,6 +541,7 @@ HB_PID=$!
 trap 'kill "$HB_PID" 2>/dev/null; _omnirun_tunnel_down' EXIT
 
 # ---- run -----------------------------------------------------------------------
+sentinel_phase run
 status running
 STARTED_AT=$(now)
 # Stream the command's output live. Two things otherwise hold it back until the
@@ -557,5 +581,6 @@ fi
 write_result "$EXIT_CODE"
 status done
 echo "OMNIRUN: [$(now)] finished with exit code $EXIT_CODE"
+sentinel_exit "$EXIT_CODE"
 exit "$EXIT_CODE"
 """

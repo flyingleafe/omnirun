@@ -23,12 +23,14 @@ to ``PLACING`` they drop out of the pending set, so the tick converges.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
 
 from omnirun.budget import BudgetLedger
-from omnirun.models import Decision, JobRecord, JobState, Slot
+from omnirun.models import Decision, JobRecord, JobState, JobStatus, Slot
 
 
 class SchedPolicy(BaseModel):
@@ -337,3 +339,321 @@ def tick(
             decisions.append(Decision(kind="place", job_id=rec.spec.job_id, slot=slot))
 
     return decisions
+
+
+# ---------------------------------------------------------------------------
+# v2 pass (ENGINE.md) — the engine's pure decision function. Same ranking rules
+# as ``tick`` (the helpers above are shared), plus lifecycle follow-ups. Still
+# a pure function: no I/O, no wall clock, no backend names.
+# ---------------------------------------------------------------------------
+
+
+def offer_key(slot: Slot, idx: int) -> str:
+    """The distinct-offer identity of *slot* (SCHED-11).
+
+    Providers that shop concrete asks stamp ``provider_ref["offer_key"]``; a
+    slot without one gets a synthetic per-pass key from its position. The pass
+    consumes keys as it assigns, so one key never backs two Reserves.
+    """
+    key = slot.provider_ref.get("offer_key")
+    if key is not None:
+        return str(key)
+    return f"{slot.provider_name}#{idx}"
+
+
+@dataclass(frozen=True)
+class Reserve:
+    """Begin placement: flip to PLACING, open the place work item."""
+
+    job_id: str
+    provider: str
+    offer_key: str
+    est_cost: float
+    slot: Slot
+
+
+@dataclass(frozen=True)
+class Hold:
+    """Provably-unsatisfiable bookkeeping: QUEUED → HELD with the reason."""
+
+    job_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Unhold:
+    """A held job's requirement became satisfiable: HELD → QUEUED."""
+
+    job_id: str
+
+
+@dataclass(frozen=True)
+class Fail:
+    """Attempts exhausted — the deliberate give-up (JOB-11)."""
+
+    job_id: str
+    cause: str
+
+
+@dataclass(frozen=True)
+class Requeue:
+    """A dead placement, captured and with its resource confirmed released,
+    returns to the pool (guard mirrors the model's requeue: placed ∧ ext-free).
+    """
+
+    job_id: str
+    cause: str
+
+
+@dataclass(frozen=True)
+class StartCancel:
+    """Spawn the cancel work item (preempts an in-flight place item)."""
+
+    job_id: str
+
+
+@dataclass(frozen=True)
+class StartCapture:
+    """Spawn the capture work item (durable logs+outputs; gates reap)."""
+
+    job_id: str
+
+
+@dataclass(frozen=True)
+class StartReap:
+    """Spawn the reap work item for a terminal, captured placement."""
+
+    job_id: str
+
+
+@dataclass(frozen=True)
+class StartRelease:
+    """Spawn the release work item for a DEAD placed placement (release-lost)."""
+
+    job_id: str
+
+
+SchedDecision = (
+    Reserve
+    | Hold
+    | Unhold
+    | Fail
+    | Requeue
+    | StartCancel
+    | StartCapture
+    | StartReap
+    | StartRelease
+)
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """The consistent store view ``schedule`` decides over.
+
+    ``intents`` maps job_id → open work-item kind (one live item per job —
+    a job with an open item gets no new decision except a preempting cancel).
+    ``unreleased`` is the set of job_ids holding an unreleased provider
+    resource (the Requeue guard reads it). ``cancels`` is the set of
+    cancel-requested job_ids.
+    """
+
+    jobs: list[JobRecord] = field(default_factory=list)
+    intents: Mapping[str, str] = field(default_factory=dict)
+    unreleased: frozenset[str] = frozenset()
+    cancels: frozenset[str] = frozenset()
+
+
+def _captured(rec: JobRecord) -> bool:
+    """Whether a durable capture exists for the job's placement."""
+    return rec.logs_cached_to is not None or rec.outputs_cached_to is not None
+
+
+def _dead(rec: JobRecord) -> bool:
+    """Positive worker-death evidence on a live placement (observer-marked)."""
+    return (
+        rec.state is JobState.RUNNING
+        and rec.last_status is not None
+        and rec.last_status.status is JobStatus.LOST
+    )
+
+
+def _backing_off(rec: JobRecord, now: datetime) -> bool:
+    """Whether the record's ``not_before`` backoff is still in the future."""
+    not_before = rec.not_before
+    if not_before is None:
+        return False
+    if (not_before.tzinfo is None) != (now.tzinfo is None):
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        else:
+            now = now.replace(tzinfo=timezone.utc)
+    return not_before > now
+
+
+def schedule(
+    snapshot: Snapshot,
+    slots: list[Slot],
+    ledger: BudgetLedger,
+    now: datetime,
+    *,
+    policy: SchedPolicy | None = None,
+) -> list[SchedDecision]:
+    """One pure scheduling pass over a store snapshot (ENGINE.md).
+
+    Emits, per job, at most one lifecycle follow-up (StartCancel preempting
+    everything; then the terminal capture→reap ladder; then the dead-placement
+    capture→release→requeue ladder), and for the pending set the same
+    Hold/Fail/ranking/matching rules as :func:`tick` — with two v2 additions:
+    ``not_before`` backoff filtering and collision-free offer assignment
+    (SCHED-11: a slot's ``offer_key`` never appears in two Reserves of one
+    pass; a Reserve consumes one unit of its provider's remaining capacity
+    across ALL of that provider's slots).
+    """
+    policy = policy or SchedPolicy()
+    out: list[SchedDecision] = []
+    pending: list[JobRecord] = []
+
+    for rec in snapshot.jobs:
+        jid = rec.spec.job_id
+        kind = snapshot.intents.get(jid)
+        # Cancel preempts everything, including an open place item; a live
+        # cancel item is never doubled.
+        if jid in snapshot.cancels and not rec.state.terminal:
+            if kind != "cancel":
+                out.append(StartCancel(jid))
+            continue
+        if kind is not None:
+            continue  # one work item per job
+        if rec.state.terminal:
+            if rec.placement is None or rec.reaped:
+                continue
+            if not _captured(rec):
+                out.append(StartCapture(jid))
+            else:
+                out.append(StartReap(jid))
+            continue
+        if _dead(rec):
+            # The dead-placement ladder: capture (possibly sacrificed) →
+            # release-lost → requeue once the resource is confirmed gone.
+            if not _captured(rec):
+                out.append(StartCapture(jid))
+            elif jid in snapshot.unreleased:
+                out.append(StartRelease(jid))
+            else:
+                out.append(Requeue(jid, cause="worker-dead"))
+            continue
+        if rec.state in _PENDING_STATES:
+            pending.append(rec)
+
+    # Attempts-cap / hold / unhold over the pending set (same rules as tick).
+    admittable: list[JobRecord] = []
+    for rec in pending:
+        jid = rec.spec.job_id
+        if rec.attempts >= policy.max_attempts and rec.last_error is not None:
+            out.append(
+                Fail(
+                    jid,
+                    cause=(
+                        f"placement failed {rec.attempts} times; "
+                        f"last error: {rec.last_error}"
+                    ),
+                )
+            )
+            continue
+        if _backing_off(rec, now):
+            continue  # backoff window: retried by a later pass
+        eligible = _pinned_slots(rec, slots)
+        if not eligible:
+            admittable.append(rec)  # can't prove impossible; waits
+            continue
+        unfit_reasons = [
+            slot.capabilities.satisfies(rec.spec.resources) for slot in eligible
+        ]
+        if any(not reasons for reasons in unfit_reasons):
+            if rec.state is JobState.HELD:
+                out.append(Unhold(jid))
+            admittable.append(rec)
+            continue
+        if rec.state is not JobState.HELD:
+            out.append(Hold(jid, reason="; ".join(min(unfit_reasons, key=len))))
+        # An already-HELD, still-unsatisfiable job stays held: no decision.
+
+    admittable.sort(key=lambda rec: _rank_key(rec, now))
+
+    # Match with per-provider remaining capacity and distinct offer keys. A
+    # provider's remaining room = slot capacity minus its PLACING/RUNNING jobs;
+    # each Reserve decrements every slot of the chosen provider.
+    active: dict[str, int] = {}
+    for rec in snapshot.jobs:
+        if rec.state in (JobState.PLACING, JobState.RUNNING):
+            name = rec.placement.provider_name if rec.placement is not None else None
+            if name is not None:
+                active[name] = active.get(name, 0) + 1
+    remaining = [
+        max(0, slot.capacity - active.get(slot.provider_name, 0)) for slot in slots
+    ]
+    used_keys: set[str] = set()
+    working = ledger
+
+    for rec in admittable:
+        req = rec.spec.resources
+        pin = rec.spec.only_backend
+        eligible_idx = (
+            None
+            if pin is None
+            else {idx for idx, s in enumerate(slots) if s.provider_name == pin}
+        )
+        fitting = [
+            (idx, slot)
+            for idx, slot in enumerate(slots)
+            if remaining[idx] > 0
+            and offer_key(slot, idx) not in used_keys
+            and slot.fits(req)
+            and (eligible_idx is None or idx in eligible_idx)
+        ]
+        avoided = rec.eligible_backends_excluded(now)
+        candidates = [
+            c for c in fitting if c[1].provider_name not in avoided
+        ] or fitting
+
+        chosen: tuple[int, Slot] | None = None
+        paid_cost: float | None = None
+        free_ok = [
+            (idx, slot)
+            for idx, slot in candidates
+            if _is_free(slot) and _meets_deadline(slot, rec, now)
+        ]
+        if free_ok:
+            chosen = min(free_ok, key=lambda pair: _wait_key(pair[1]))
+        elif policy.allow_paid:
+            chosen = _pick_paid_slot(candidates, rec, working, now)
+            if chosen is not None:
+                paid_cost = chosen[1].cost.total(req.time)
+        if chosen is None:
+            free_late = [(idx, slot) for idx, slot in candidates if _is_free(slot)]
+            if free_late:
+                chosen = min(free_late, key=lambda pair: _wait_key(pair[1]))
+
+        if chosen is not None:
+            idx, slot = chosen
+            key = offer_key(slot, idx)
+            used_keys.add(key)
+            for i, s in enumerate(slots):
+                if s.provider_name == slot.provider_name and remaining[i] > 0:
+                    remaining[i] -= 1
+            if paid_cost is not None:
+                working = working.commit(
+                    rec.spec.job_id, slot.provider_name, paid_cost, now
+                )
+            est = slot.cost.total(req.time)
+            out.append(
+                Reserve(
+                    job_id=rec.spec.job_id,
+                    provider=slot.provider_name,
+                    offer_key=key,
+                    est_cost=est if est is not None else 0.0,
+                    slot=slot,
+                )
+            )
+
+    return out
