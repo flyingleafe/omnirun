@@ -1282,6 +1282,11 @@ def deploy_key_add(
     finally:
         client.close()
     console.print(f"[green]registered[/green] deploy key for {origin}")
+    console.print(
+        "[dim]reminder: the matching PUBLIC key must be registered as a "
+        "read-only deploy key on the forge (e.g. GitHub → repo → Settings → "
+        "Deploy keys) or the worker's clone will fail.[/dim]"
+    )
 
 
 @deploy_key_app.command("rm", help="Forget the deploy key registered for an origin.")

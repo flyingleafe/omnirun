@@ -99,6 +99,22 @@ def test_private_no_key_no_gh_falls_back_to_local(monkeypatch):
     assert not keys.registered
 
 
+def test_private_no_key_no_gh_remote_daemon_refuses_local_fallback(monkeypatch):
+    # A REMOTE daemon can't use the client's local checkout, so the local
+    # fallback is refused HERE (at submit) with the actionable message — not
+    # deferred to a cryptic [Errno 2] at placement (issue #23).
+    monkeypatch.setattr(repo, "remote_is_public", lambda url: False)
+    monkeypatch.setattr(repo, "gh_can_admin", lambda slug: False)
+    keys = _Keys()
+    with pytest.raises(RepoError, match="remote.*deploy-key add|deploy-key add"):
+        deploykey.resolve_code_plan(
+            _ref(local_root="/repo"),
+            get_key=keys.get,
+            register_key=keys.register,
+            allow_local_fallback=False,
+        )
+
+
 def test_private_no_key_no_gh_no_local_raises(monkeypatch):
     monkeypatch.setattr(repo, "remote_is_public", lambda url: False)
     monkeypatch.setattr(repo, "gh_can_admin", lambda slug: False)

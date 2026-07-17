@@ -871,3 +871,21 @@ def test_thunder_get_instance_parsing():
     assert (inst.ssh_target, inst.ssh_port, inst.status) == ("9.8.7.6", 22, "running")
     assert inst.gpu_type == "A100-80"
     assert backend._get_instance("tc-2") is None
+
+
+def test_ops_on_provisioning_stub_raise_actionable_not_keyerror(tmp_path):
+    """A provisioning stub handle (no ssh_target — interrupted submit, or ssh
+    never came up) must make logs/pull raise a clear BackendError, not a raw
+    KeyError('ssh_target') leaking to the user (issue #24)."""
+    from omnirun.models import JobHandle
+
+    be = vast_backend()
+    stub = JobHandle(
+        backend="vast",
+        job_id="j-000001",
+        data={"instance_id": "42", "provisioning": True},
+    )
+    with pytest.raises(BackendError, match="no ssh yet"):
+        be.logs(stub)
+    with pytest.raises(BackendError, match="no ssh yet"):
+        be.pull_outputs(stub, tmp_path)

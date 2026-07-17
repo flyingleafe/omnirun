@@ -54,7 +54,11 @@ RegisterKey = Callable[["DeployKey"], None]
 
 
 def resolve_spec_code(
-    spec: JobSpec, get_key: GetKey, register_key: RegisterKey
+    spec: JobSpec,
+    get_key: GetKey,
+    register_key: RegisterKey,
+    *,
+    allow_local_fallback: bool = True,
 ) -> JobSpec:
     """Stamp the client-side-resolved bits onto *spec*: the ``CodePlan`` and the
     gitignored ``.env`` content.
@@ -67,7 +71,10 @@ def resolve_spec_code(
     updates: dict[str, object] = {}
     if spec.code is None:
         updates["code"] = resolve_code_plan(
-            spec.repo, get_key=get_key, register_key=register_key
+            spec.repo,
+            get_key=get_key,
+            register_key=register_key,
+            allow_local_fallback=allow_local_fallback,
         )
     if spec.env_dotenv is None and spec.repo.local_root:
         from omnirun.repo import env_file
@@ -684,7 +691,20 @@ class RemoteClient:
         return bool(self._request("DELETE", f"/deploy-keys/{origin}").json()["removed"])
 
     def _plan_code(self, spec: JobSpec) -> JobSpec:
-        return resolve_spec_code(spec, self.deploy_key_get, self.deploy_key_register)
+        # The placer is this (remote) daemon; it can honor a `kind="local"`
+        # fallback only when co-located with the client — i.e. a loopback daemon.
+        return resolve_spec_code(
+            spec,
+            self.deploy_key_get,
+            self.deploy_key_register,
+            allow_local_fallback=self._is_loopback(),
+        )
+
+    def _is_loopback(self) -> bool:
+        from urllib.parse import urlparse
+
+        host = (urlparse(self._base).hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
     # -- lifecycle --
     def submit(self, spec: JobSpec, *, backend: str | None = None) -> SubmitOutcome:

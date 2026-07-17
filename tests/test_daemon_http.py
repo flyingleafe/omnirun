@@ -451,3 +451,12 @@ def test_logs_backend_error_surfaces_cleanly_not_500(tmp_path: Path) -> None:
         client.close()
         daemon.shutdown()
         thread.join(timeout=5.0)
+
+
+def test_remoteclient_is_loopback_detection() -> None:
+    """A loopback daemon is co-located with the client (can honor kind=local);
+    a WireGuard/remote address is not (issue #23)."""
+    assert RemoteClient("http://127.0.0.1:8787")._is_loopback() is True
+    assert RemoteClient("http://localhost:8787")._is_loopback() is True
+    assert RemoteClient("http://10.100.0.1:8787")._is_loopback() is False
+    assert RemoteClient("https://omnirun.example.com")._is_loopback() is False

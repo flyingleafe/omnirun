@@ -252,7 +252,7 @@ def env(tmp_path, monkeypatch):
     # resolution has its own dedicated tests in test_deploykey.py).
     monkeypatch.setattr(
         "omnirun.client.resolve_code_plan",
-        lambda ref, *, get_key, register_key: CodePlan(
+        lambda ref, *, get_key, register_key, allow_local_fallback=True: CodePlan(
             kind="local", origin=ref.remote_url
         ),
     )

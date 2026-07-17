@@ -46,7 +46,11 @@ def _public_clone_url(ref: RepoRef, root: Path | None) -> str | None:
 
 
 def resolve_code_plan(
-    ref: RepoRef, *, get_key: GetKey, register_key: RegisterKey
+    ref: RepoRef,
+    *,
+    get_key: GetKey,
+    register_key: RegisterKey,
+    allow_local_fallback: bool = True,
 ) -> CodePlan:
     """Decide how the worker gets the code for *ref*.
 
@@ -54,7 +58,12 @@ def resolve_code_plan(
     public + reachable origin → anonymous https clone; a private origin we can
     provision for (github + `gh` admin) → auto-create a read-only deploy key →
     ssh clone; otherwise fall back to the placer's local objects (``local``), or
-    raise with actionable guidance when there is nothing to fall back to."""
+    raise with actionable guidance when there is nothing to fall back to.
+
+    ``allow_local_fallback`` is False when the placer is a REMOTE daemon (it has
+    no access to this client's filesystem): the ``local`` fallback is then
+    refused HERE, at submit, with the actionable message — rather than the daemon
+    failing placement later with a cryptic ``[Errno 2]`` on the client's path."""
     origin = ref.remote_url
     root = Path(ref.local_root) if ref.local_root else None
 
@@ -84,16 +93,31 @@ def resolve_code_plan(
             )
             return CodePlan(kind="private", clone_url=ssh_url, origin=origin)
 
-    # Fallback: deliver from the placer's local objects (co-located only).
-    if root is not None:
+    # Fallback: the placer delivers from its OWN local objects. Only a co-located
+    # placer (daemonless, or a loopback daemon) can — a remote daemon has no
+    # access to this client's filesystem.
+    if root is not None and allow_local_fallback:
         return CodePlan(kind="local", origin=origin)
 
+    # Nothing worked — raise the most actionable message for the situation.
     if origin:
+        remote_note = (
+            " and the configured daemon is remote (it cannot use this machine's "
+            "local checkout)"
+            if root
+            is not None  # we HAVE a checkout, but the remote placer can't use it
+            else ", and this process has no local checkout to fall back to"
+        )
         raise RepoError(
-            f"{origin} is private and no deploy key is registered, and this "
-            "process has no local checkout to fall back to. Authenticate `gh` as "
-            "a repo admin and retry, or register a key manually: "
-            f"omnirun deploy-key add {origin} <keyfile>"
+            f"{origin} is private, no deploy key is registered{remote_note}. "
+            "Authenticate `gh` as a repo admin and retry, or register a key "
+            f"manually: omnirun deploy-key add {origin} <keyfile>"
+        )
+    if root is not None:  # local-only repo (no origin) but the placer is remote
+        raise RepoError(
+            "this repo has no origin remote to clone from, so only a co-located "
+            "placer can deliver it — but the configured daemon is remote. Add a "
+            "remote the worker can clone, or run daemonless (omnirun --local)."
         )
     raise RepoError(
         "cannot determine how to deliver the repo to the worker (no origin remote "

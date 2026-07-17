@@ -263,7 +263,19 @@ class MarketplaceBackend(Backend, ABC):
         )
 
     def _exec_from_handle(self, handle: JobHandle) -> Exec:
-        return self._make_exec(handle.data["ssh_target"], handle.data.get("ssh_port"))
+        # A provisioning stub (interrupted submit, or ssh details never
+        # materialized) carries no ssh_target. Fail with an actionable message
+        # instead of leaking a raw KeyError('ssh_target') to `logs`/`pull` (#24).
+        target = handle.data.get("ssh_target")
+        if not target:
+            instance_id = handle.data.get("instance_id", "?")
+            raise BackendError(
+                f"{self.name}: instance {instance_id} has no ssh yet — it is still "
+                "provisioning or never came up (check `omnirun status`; if the "
+                f"account's ssh key isn't registered on {self.name}, ssh never "
+                f"materializes). Cancel {handle.job_id} or `omnirun gc` to reclaim it."
+            )
+        return self._make_exec(target, handle.data.get("ssh_port"))
 
     # ---- Backend protocol ----------------------------------------------------------
 
