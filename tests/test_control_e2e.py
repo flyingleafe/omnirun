@@ -37,6 +37,7 @@ from omnirun.models import (
     RepoRef,
     ResourceSpec,
     Slot,
+    StatusReport,
 )
 from omnirun.state.store import open_store
 from tests.fakes import FakeProvider, FlakyProvider
@@ -74,6 +75,81 @@ def _free_slot() -> Slot:
         cost=Cost(),  # per_hour None → free
         capacity=1,
     )
+
+
+def test_repin_moves_a_not_started_job_to_another_backend(tmp_path: Path) -> None:
+    """A job placed on one backend but still QUEUED there (not started) can be
+    repinned: its pending placement is reaped and it returns to QUEUED with the new
+    pin, so the next tick re-places it — e.g. off a 4-day Slurm queue onto vast."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        prov_a = FakeProvider("a", slots=[], reap=ReapPolicy(release_lost=True))
+        prov_b = FakeProvider("b", slots=[])
+        control = Control(store, {"a": prov_a, "b": prov_b})
+        spec = _spec("pin-000001").model_copy(update={"only_backend": "a"})
+        store.save_job(
+            JobRecord(
+                spec=spec,
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="a", job_id="pin-000001", state=JobStatus.QUEUED
+                ),
+                last_status=StatusReport(status=JobStatus.QUEUED, detail="Priority"),
+            )
+        )
+
+        updated = control.repin("pin-000001", backend="b")
+
+        assert updated.spec.only_backend == "b"
+        assert updated.state is JobState.QUEUED
+        assert updated.placement is None
+        assert prov_a.cancel_calls, "the pending placement on 'a' must be reaped"
+    finally:
+        store.close()
+
+
+def test_repin_refuses_a_started_job(tmp_path: Path) -> None:
+    """Repin only moves jobs that have NOT started — a job actually RUNNING at its
+    backend must be cancelled instead (moving it would discard live work)."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        control = Control(store, {"a": FakeProvider("a", slots=[])})
+        store.save_job(
+            JobRecord(
+                spec=_spec("run-000001").model_copy(update={"only_backend": "a"}),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="a", job_id="run-000001", state=JobStatus.RUNNING
+                ),
+                last_status=StatusReport(status=JobStatus.RUNNING),
+            )
+        )
+        with pytest.raises(ValueError, match="already STARTED"):
+            control.repin("run-000001", backend="b")
+    finally:
+        store.close()
+
+
+def test_repin_unpins_a_queued_job(tmp_path: Path) -> None:
+    """Unpin (backend=None) a not-yet-placed QUEUED job — it stays QUEUED with the
+    pin cleared, and the next tick may place it on any fitting backend."""
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        control = Control(store, {"a": FakeProvider("a", slots=[])})
+        store.save_job(
+            JobRecord(
+                spec=_spec("q-000001").model_copy(update={"only_backend": "a"}),
+                state=JobState.QUEUED,
+                submitted_at=T0,
+            )
+        )
+        updated = control.repin("q-000001", backend=None)
+        assert updated.spec.only_backend is None
+        assert updated.state is JobState.QUEUED
+    finally:
+        store.close()
 
 
 def test_placements_run_in_parallel(tmp_path: Path) -> None:

@@ -507,6 +507,22 @@ class Daemon:
                 d._core.cancel(rec, force=force, wait=wait)
             return _json({"ok": True})
 
+        @app.post("/jobs/<jid>/repin")
+        def _repin(jid: str) -> str:
+            # Re-pin/unpin a not-yet-started job to another backend and requeue it.
+            # Reaping the old (queued) placement is backend I/O, so serialize under
+            # `_tick_lock` like a submit — two concurrent placers are not safe.
+            backend = _body().get("backend")
+            with d._tick_lock, d._lock:
+                rec = d._core.resolve_job(jid)
+                try:
+                    updated = d._core.repin(rec, backend=backend)
+                except ValueError as e:
+                    bottle.response.status = 409
+                    return _json({"error": str(e)})
+            d.wake()
+            return _json({"job": updated.model_dump(mode="json")})
+
         @app.post("/gc")
         def _gc() -> str:
             from omnirun import wire

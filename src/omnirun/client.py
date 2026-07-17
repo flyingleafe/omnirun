@@ -160,6 +160,7 @@ class Client(Protocol):
         deadline: Deadline | None,
         allow_paid: bool | None,
     ) -> JobPolicy: ...
+    def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord: ...
     def budget_set(self, window: str, cap: float) -> None: ...
     def budget_status(self) -> list[BudgetRow]: ...
     def gc(self, *, all_: bool, project: str | None) -> GcOutcome: ...
@@ -436,6 +437,11 @@ class LocalClient:
         return Control(self._store(), {}).reprioritize(
             job_id, priority=priority, deadline=deadline, allow_paid=allow_paid
         )
+
+    def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord:
+        # Needs real providers: reaping a not-yet-started placement (cancelling the
+        # queued backend job) is backend I/O — the same driver `cancel` uses.
+        return self._control().repin(rec.spec.job_id, backend=backend)
 
     def budget_set(self, window: str, cap: float) -> None:
         Control(self._store(), {}).budget(window, cap)
@@ -755,6 +761,10 @@ class RemoteClient:
     def cancel(self, rec: JobRecord, *, force: bool = False, wait: bool = True) -> None:
         params = {"force": "1" if force else "0", "wait": "1" if wait else "0"}
         self._post(f"/jobs/{rec.spec.job_id}/cancel", params=params)
+
+    def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord:
+        data = self._post(f"/jobs/{rec.spec.job_id}/repin", json={"backend": backend})
+        return JobRecord.model_validate(data["job"])
 
     def reprioritize(
         self,

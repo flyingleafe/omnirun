@@ -1055,6 +1055,68 @@ def cancel(
         console.print(f"cancelled {rec.spec.job_id}")
 
 
+@app.command(
+    help="Move a not-yet-started job to another backend, or unpin it. "
+    "`omnirun repin <job> --to vast` | `--any`; or `repin --from uni --any` for all."
+)
+@friendly_errors
+def repin(
+    job: str | None = typer.Argument(
+        None, help="Job id/prefix. Omit and use --from to move a whole backend's jobs."
+    ),
+    to: str | None = typer.Option(
+        None, "--to", help="Repin to this backend (its provider name)."
+    ),
+    any_backend: bool = typer.Option(
+        False, "--any", help="Unpin: let the scheduler pick any fitting backend."
+    ),
+    from_backend: str | None = typer.Option(
+        None,
+        "--from",
+        help="Select ALL not-yet-started jobs currently pinned to this backend.",
+    ),
+) -> None:
+    if (to is None) == (not any_backend):
+        _die("pass exactly one of --to <backend> or --any")
+    if (job is None) == (from_backend is None):
+        _die("pass exactly one of a JOB argument or --from <backend>")
+    new_backend = None if any_backend else to
+    dest = new_backend or "any backend"
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        if job is not None:
+            targets = [client.resolve_job(job)]
+        else:
+            # Bulk: every non-terminal, not-yet-started job pinned to --from, across
+            # all projects (a batch is often pinned in a repo you're not cd'd into).
+            targets = [
+                r
+                for r in client.list_jobs(project=None)
+                if r.spec.only_backend == from_backend
+                and not r.state.terminal
+                and not (
+                    r.last_status is not None
+                    and r.last_status.status is JobStatus.RUNNING
+                )
+            ]
+        if not targets:
+            console.print("[dim]no matching not-yet-started jobs to repin[/dim]")
+            return
+        moved = 0
+        for rec in targets:
+            try:
+                client.repin(rec, backend=new_backend)
+                console.print(f"[green]repinned[/green] {rec.spec.job_id} -> {dest}")
+                moved += 1
+            except Exception as e:  # a job that started between select and repin
+                console.print(f"[yellow]skipped[/yellow] {rec.spec.job_id}: {e}")
+        if len(targets) > 1:
+            console.print(f"repinned {moved}/{len(targets)} job(s) -> {dest}")
+    finally:
+        client.close()
+
+
 @app.command(help="Change a queued/running job's scheduling policy.")
 @friendly_errors
 def reprioritize(

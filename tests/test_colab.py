@@ -10,6 +10,7 @@ import ast
 import json
 import subprocess
 import tarfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -133,6 +134,60 @@ def cli(monkeypatch) -> FakeColabCLI:
 @pytest.fixture
 def backend(cli) -> ColabBackend:
     return ColabBackend("colab", BackendConfig(type="colab"))
+
+
+@pytest.fixture
+def colab_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIRUN_STATE_DIR", str(tmp_path / "state"))
+    return tmp_path
+
+
+def test_is_accel_rejected_classifier():
+    from omnirun.backends.colab import _is_accel_rejected
+
+    assert _is_accel_rejected(
+        "[colab] Backend rejected accelerator 'L4'. You may not have quota or "
+        "entitlement for this accelerator on your account."
+    )
+    # capacity / transient errors are NOT entitlement rejections
+    assert not _is_accel_rejected("503 Service Unavailable")
+    assert not _is_accel_rejected("TooManyAssignmentsError: Precondition Failed")
+
+
+def test_accel_candidates_ladder_for_vram_floor(backend):
+    # 24GB VRAM (no specific type) → every tier at/above 24GB, cheapest-first.
+    cands = backend._accel_candidates(ResourceSpec(gpus=1, min_vram_gb=24))
+    assert cands[0] == "L4"  # cheapest 24GB tier first
+    assert "A100" in cands and "T4" not in cands  # T4 (16GB) excluded
+
+
+def test_probe_skips_learned_unentitled_accelerator(cli, backend, colab_state):
+    """A tier the account has proven un-entitled to is no longer offered — the
+    ranker can't pick a GPU that will only fail at `colab new`."""
+    req = ResourceSpec(gpus=1, min_vram_gb=24)
+    before = [o.gpu_type for o in backend.probe(req) if o.fits]
+    assert "L4" in before and "A100" in before
+
+    backend._record_blocked_accel("L4")  # learned: no L4 entitlement
+    after = [o.gpu_type for o in backend.probe(req) if o.fits]
+    assert "L4" not in after
+    assert "A100" in after  # still offers the next fitting tier
+
+
+def test_blocked_accelerator_respects_ttl(backend, colab_state):
+    """Learned entitlement facts expire: an old block is ignored (re-tried), a
+    fresh one is honored — entitlements change (quota resets, plan changes)."""
+    from omnirun.state import default_db_url, open_store
+
+    store = open_store(default_db_url())
+    old = time.time() - backend._blocked_ttl_s() - 100  # past the TTL
+    fresh = time.time()
+    store.set_meta(backend._blocked_key(), json.dumps({"L4": old, "A100": fresh}))
+    store.close()
+
+    blocked = backend._blocked_accels()
+    assert "A100" in blocked  # fresh block honored
+    assert "L4" not in blocked  # expired block re-tried
 
 
 def test_colab_declares_full_reap_contract():

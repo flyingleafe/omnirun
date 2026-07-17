@@ -285,6 +285,54 @@ class Control:
         )
         return new_policy
 
+    def repin(self, job_id: str, *, backend: str | None) -> JobRecord:
+        """Re-pin a NOT-YET-STARTED job to a different backend (``backend`` name),
+        or UNPIN it (``backend=None`` → any backend), and requeue it for placement.
+
+        Refuses a terminal job, or one that has actually STARTED running — moving a
+        live job would discard its work, so the caller must cancel it instead. A job
+        that is merely *placed but still waiting* at its backend (queued in a batch
+        scheduler, or an instance still provisioning — anything not yet RUNNING) has
+        that placement REAPED first (its still-queued backend job is cancelled, the
+        reservation freed), then is returned to ``QUEUED`` with the new pin so the
+        next tick re-places it — e.g. off a long queue onto free/cheap compute.
+        """
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            raise ValueError(f"unknown job {job_id!r}")
+        if rec.state.terminal:
+            raise ValueError(
+                f"job {job_id!r} is {rec.state.value}; cannot repin a finished job"
+            )
+        started = (
+            rec.last_status is not None and rec.last_status.status is JobStatus.RUNNING
+        )
+        if started:
+            where = rec.placement.provider_name if rec.placement is not None else "?"
+            raise ValueError(
+                f"job {job_id!r} has already STARTED running on {where}; cancel it "
+                "instead — repin only moves jobs that have not started yet"
+            )
+        if backend is not None and backend not in self._providers:
+            known = ", ".join(sorted(self._providers)) or "(none configured)"
+            raise ValueError(f"unknown backend {backend!r} (known: {known})")
+        # Reap a not-yet-started placement (cancel the queued backend job, free the
+        # reservation) so the re-pin re-places from scratch.
+        if rec.placement is not None:
+            self._reap(rec.placement)
+        updated = rec.model_copy(
+            update={
+                "spec": rec.spec.model_copy(update={"only_backend": backend}),
+                "state": JobState.QUEUED,
+                "placement": None,
+                "last_status": None,
+                "attempts": 0,  # a fresh target gets a fresh placement-attempt cap
+                "last_error": None,
+            }
+        )
+        self._store.save_job(updated)
+        return updated
+
     # ------------------------------------------------------------------
     # Submission
     # ------------------------------------------------------------------

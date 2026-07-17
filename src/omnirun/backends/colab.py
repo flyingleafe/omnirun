@@ -51,6 +51,7 @@ from omnirun.bootstrap import (
 )
 from omnirun.config import BoreConfig
 from omnirun.progress import report
+from omnirun.state import default_db_url, open_store
 from omnirun.models import (
     CancelMode,
     JobHandle,
@@ -79,6 +80,16 @@ COLAB_TIERS: list[tuple[str, float]] = [
     ("H100", 80),
     ("RTX-PRO-6000", 96),
 ]
+
+
+def _is_accel_rejected(message: str) -> bool:
+    """True when `colab new --gpu X` failed because the ACCOUNT is not entitled to
+    that accelerator (no quota/entitlement) — distinct from a transient capacity
+    503 or a real defect. Such an accelerator is remembered as unavailable so the
+    backend never offers or tries it again."""
+    m = message.lower()
+    return "rejected accelerator" in m or ("entitlement" in m and "accelerator" in m)
+
 
 SESSION_CAP_H = 11.5  # headroom under the ~12h session reclaim
 COLAB_ROOT = "/content/omnirun"
@@ -352,6 +363,74 @@ class ColabBackend(Backend):
     def _session(job_id: str) -> str:
         return f"omnirun-{job_id}"
 
+    # ---- learned accelerator entitlements --------------------------------------
+    #
+    # Colab exposes no "list my entitlements" API, so we LEARN which `--gpu` flags
+    # the account cannot use from `colab new`'s "Backend rejected accelerator"
+    # errors and remember them (per backend) so probe stops offering — and submit
+    # stops trying — a tier that will only fail. Facts carry a TTL: entitlements
+    # change (quota resets, plan changes), so a block expires and the tier is
+    # re-tried after ``accel_block_ttl_s`` (default 6h).
+
+    def _blocked_key(self) -> str:
+        return f"{self.name}:blocked_accelerators"
+
+    def _blocked_ttl_s(self) -> float:
+        return float(self.config.extra("accel_block_ttl_s", 6 * 3600.0))
+
+    def _blocked_accels(self) -> set[str]:
+        """The `--gpu` flags currently known un-entitled (within TTL)."""
+        now = time.time()
+        ttl = self._blocked_ttl_s()
+        try:
+            store = open_store(default_db_url())
+            try:
+                raw = store.get_meta(self._blocked_key())
+            finally:
+                store.close()
+        except Exception:
+            return set()
+        try:
+            data = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            return set()
+        return {flag for flag, ts in data.items() if now - float(ts) < ttl}
+
+    def _record_blocked_accel(self, flag: str) -> None:
+        """Remember *flag* as un-entitled (best-effort); prune expired entries."""
+        now = time.time()
+        ttl = self._blocked_ttl_s()
+        try:
+            store = open_store(default_db_url())
+            try:
+                raw = store.get_meta(self._blocked_key())
+                try:
+                    data = json.loads(raw) if raw else {}
+                except (ValueError, TypeError):
+                    data = {}
+                data = {f: ts for f, ts in data.items() if now - float(ts) < ttl}
+                data[flag] = now
+                store.set_meta(self._blocked_key(), json.dumps(data))
+            finally:
+                store.close()
+        except Exception:
+            pass
+
+    def _accel_candidates(self, res: ResourceSpec) -> list[str]:
+        """The `--gpu` flags that satisfy *res* (a specific type, or every tier at
+        or above the VRAM floor), cheapest-first — the ladder submit walks, falling
+        back to the next when the account is not entitled to one."""
+        floor = res.vram_floor_gb()
+        want = res.gpu_type
+        flags: list[str] = []
+        for tier, vram in COLAB_TIERS:
+            if want is not None and tier != want:
+                continue
+            if want is None and floor is not None and vram < floor:
+                continue
+            flags.append(COLAB_GPU_FLAGS[tier])
+        return flags
+
     # ---- probe -----------------------------------------------------------------
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
@@ -394,12 +473,17 @@ class ColabBackend(Backend):
 
         floor = res.vram_floor_gb()
         want = res.gpu_type
+        # Accelerators the account has proven un-entitled to (within TTL) are not
+        # offered — the ranker can't pick a tier that will only fail at `colab new`.
+        blocked = self._blocked_accels()
         tiers = []
         for tier, vram in COLAB_TIERS:
             if want is not None:
                 if tier != want:
                     continue
             elif floor is not None and vram < floor:
+                continue
+            if COLAB_GPU_FLAGS[tier] in blocked:
                 continue
             tiers.append(tier)
         if want is None and floor is None:
@@ -477,14 +561,54 @@ class ColabBackend(Backend):
             default = normalize_gpu_type(str(self.config.extra("default_gpu", "T4")))
             gpu_flag = COLAB_GPU_FLAGS.get(default, "T4")
 
-        new_args = ["new", "-s", session]
-        if gpu_flag:
-            new_args += ["--gpu", gpu_flag]
-        report(
-            f"colab: provisioning {gpu_flag or 'CPU'} VM "
-            "(cold start, can take ~30-90s)…"
-        )
-        self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
+        # Accelerator ladder to try, cheapest-first: the offer's chosen flag then
+        # the rest of the fitting tiers, dropping any the account is (per learned,
+        # TTL'd facts) not entitled to. If `colab new --gpu X` STILL reports X
+        # un-entitled, remember it and fall back to the next — so a request for 24GB
+        # VRAM that can't use L4 lands on A100 instead of failing repeatedly on L4.
+        if gpu_flag is None:  # CPU runtime: one GPU-less attempt
+            ladder: list[str | None] = [None]
+        else:
+            blocked = self._blocked_accels()
+            fitting = [
+                f for f in self._accel_candidates(spec.resources) if f not in blocked
+            ]
+            ordered = ([gpu_flag] if gpu_flag not in blocked else []) + fitting
+            ladder = list(dict.fromkeys(ordered)) or [gpu_flag]  # dedup, keep order
+
+        last_reject: BackendError | None = None
+        placed = False
+        for i, flag in enumerate(ladder):
+            new_args = ["new", "-s", session] + (["--gpu", flag] if flag else [])
+            report(f"colab: provisioning {flag or 'CPU'} VM (cold start, ~30-90s)…")
+            try:
+                self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
+                gpu_flag = flag
+                placed = True
+                break
+            except BackendError as e:
+                # An un-entitled accelerator: remember it, tear down any half-made
+                # session, and fall back to the next fitting tier. Any other error
+                # (capacity 503/412, a real defect) propagates unchanged.
+                if flag is not None and _is_accel_rejected(str(e)):
+                    self._record_blocked_accel(flag)
+                    last_reject = e
+                    try:
+                        self._colab("stop", "-s", session, timeout=EXEC_TIMEOUT_S)
+                    except Exception:
+                        pass
+                    if i + 1 < len(ladder):
+                        report(
+                            f"colab: not entitled to {flag}; trying {ladder[i + 1]}…"
+                        )
+                    continue
+                raise
+        if not placed:
+            tried = ", ".join(str(f) for f in ladder)
+            raise BackendError(
+                f"colab: account is not entitled to any fitting accelerator "
+                f"({tried}) — last: {last_reject}"
+            )
 
         # bore env — generated at submit time; empty when bore is disabled so
         # the launcher never touches it and the script is byte-unchanged.
