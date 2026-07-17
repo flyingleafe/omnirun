@@ -56,16 +56,26 @@ RegisterKey = Callable[["DeployKey"], None]
 def resolve_spec_code(
     spec: JobSpec, get_key: GetKey, register_key: RegisterKey
 ) -> JobSpec:
-    """Stamp a resolved ``CodePlan`` onto *spec* if it has none yet.
+    """Stamp the client-side-resolved bits onto *spec*: the ``CodePlan`` and the
+    gitignored ``.env`` content.
 
-    Runs client-side in BOTH modes (it needs the caller's local ``gh``/git): the
-    daemon never re-resolves — it receives a spec whose ``code`` is already set and
-    only injects the deploy-key MATERIAL from its store at place time. Idempotent:
-    a spec that already carries a plan is returned unchanged."""
-    if spec.code is not None:
-        return spec
-    plan = resolve_code_plan(spec.repo, get_key=get_key, register_key=register_key)
-    return spec.model_copy(update={"code": plan})
+    Runs client-side in BOTH modes (it needs the caller's local ``gh``/git AND its
+    filesystem — the PLACER, which may be a remote daemon, has neither): the daemon
+    never re-resolves. It reads ``<repo.local_root>/.env`` HERE so the placer can
+    deliver the secret to the worker without the client's filesystem. Idempotent:
+    a spec already carrying both is returned unchanged."""
+    updates: dict[str, object] = {}
+    if spec.code is None:
+        updates["code"] = resolve_code_plan(
+            spec.repo, get_key=get_key, register_key=register_key
+        )
+    if spec.env_dotenv is None and spec.repo.local_root:
+        from omnirun.repo import env_file
+
+        envf = env_file(Path(spec.repo.local_root))
+        if envf is not None:
+            updates["env_dotenv"] = envf.read_text()
+    return spec.model_copy(update=updates) if updates else spec
 
 
 def handle_of(rec: JobRecord) -> JobHandle | None:

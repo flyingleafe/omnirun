@@ -125,13 +125,6 @@ def _remote_clone_plan(ref: RepoRef, root: Path) -> str | None:
     return repo.remote_clone_plan(ref, root)
 
 
-def _env_file(spec: JobSpec):
-    """Local uncommitted .env to ship as a blob, or None (lazy, monkeypatched)."""
-    from omnirun import repo
-
-    return repo.env_file(_local_root(spec))
-
-
 def _bore_cfg() -> BoreConfig:
     """Load the global bore config (lazy, monkeypatched in tests).
 
@@ -622,10 +615,13 @@ class KaggleBackend(Backend):
                     )
                 deploy_key_b64 = base64.b64encode(key_material.encode()).decode()
 
-            # uncommitted, gitignored .env ships as its own blob (never via git)
-            envf = _env_file(spec)
+            # uncommitted, gitignored .env ships as its own blob (never via git);
+            # its content was read client-side into spec.env_dotenv so it works
+            # even when the placer is a remote daemon.
             env_b64 = (
-                base64.b64encode(envf.read_text().encode()).decode() if envf else ""
+                base64.b64encode(spec.env_dotenv.encode()).decode()
+                if spec.env_dotenv
+                else ""
             )
 
             # ssh-everywhere is intentionally DISABLED on Kaggle. A Kaggle kernel

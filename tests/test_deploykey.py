@@ -124,3 +124,39 @@ def test_non_github_private_only_manual(monkeypatch):
 
 def test_code_plan_default_is_remote():
     assert CodePlan().kind == "remote"
+
+
+def test_resolve_spec_code_stamps_env_dotenv_from_local_dotenv(tmp_path):
+    """The gitignored <local_root>/.env is read CLIENT-SIDE into spec.env_dotenv,
+    so the placer (possibly a remote daemon with no access to this filesystem)
+    can deliver it. `code` is pre-set so only the .env read runs."""
+    from omnirun.client import resolve_spec_code
+    from omnirun.models import JobSpec
+
+    (tmp_path / ".env").write_text("SECRET=hunter2\n")
+    keys = _Keys()
+    spec = JobSpec(
+        job_id="j-000001",
+        name="j",
+        command="echo hi",
+        repo=_ref(local_root=str(tmp_path)),
+        code=CodePlan(kind="remote", clone_url="https://x"),
+    )
+    out = resolve_spec_code(spec, keys.get, keys.register)
+    assert out.env_dotenv == "SECRET=hunter2\n"
+
+
+def test_resolve_spec_code_no_dotenv_leaves_env_none(tmp_path):
+    from omnirun.client import resolve_spec_code
+    from omnirun.models import JobSpec
+
+    keys = _Keys()  # tmp_path has no .env
+    spec = JobSpec(
+        job_id="j-000002",
+        name="j",
+        command="echo hi",
+        repo=_ref(local_root=str(tmp_path)),
+        code=CodePlan(kind="remote", clone_url="https://x"),
+    )
+    out = resolve_spec_code(spec, keys.get, keys.register)
+    assert out.env_dotenv is None

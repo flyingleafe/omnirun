@@ -139,20 +139,19 @@ def stage_job(
         report(f"pushing {spec.repo.sha[:12]} to {exec_.describe()}…")
         push_repo(exec_, local_repo_root, spec.repo.sha, git_dir)
         params.code = CodeSource(kind="bare")
-    stage_env_file(exec_, local_repo_root, job_dir)
+    stage_env_file(exec_, job_dir, spec.env_dotenv)
     script = generate_bootstrap(spec, params)
     exec_.write_file(f"{job_dir}/bootstrap.sh", script, mode="755")
     return job_dir
 
 
-def stage_env_file(exec_: Exec, local_repo_root: Path, job_dir: str) -> None:
-    """Ship an uncommitted, gitignored <root>/.env out-of-band (not via git, not
-    baked into bootstrap.sh) so secrets reach the worker without being committed."""
-    from omnirun.repo import env_file
-
-    envf = env_file(local_repo_root)
-    if envf is not None:
-        exec_.write_file(f"{job_dir}/.env", envf.read_text(), mode="600")
+def stage_env_file(exec_: Exec, job_dir: str, content: str | None) -> None:
+    """Ship the client's uncommitted, gitignored ``.env`` *content* out-of-band
+    (not via git, not baked into bootstrap.sh) so secrets reach the worker without
+    being committed. ``content`` is read client-side at submit (``spec.env_dotenv``)
+    so this works even when the placer is a remote daemon; ``None`` = no file."""
+    if content is not None:
+        exec_.write_file(f"{job_dir}/.env", content, mode="600")
 
 
 def derive_status(

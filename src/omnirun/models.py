@@ -266,6 +266,12 @@ class JobSpec(BaseModel):
     # How the worker materializes the repo (resolved client-side at submit). None
     # for legacy/hand-built specs → backends fall back to the local-objects path.
     code: CodePlan | None = None
+    # Content of the repo's gitignored ``.env``, read CLIENT-SIDE at submit and
+    # carried here so the PLACER (which may be a daemon on another host, with no
+    # access to the client's filesystem) can deliver it out-of-band to the
+    # worker's ``$JOB_DIR/.env``. None = no such file. Never committed, never in
+    # the sha; a secret blob like a deploy key.
+    env_dotenv: str | None = None
 
     @staticmethod
     def make_job_id(name: str) -> str:

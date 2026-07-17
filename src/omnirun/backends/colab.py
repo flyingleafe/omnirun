@@ -122,13 +122,6 @@ def _local_root(spec: JobSpec) -> Path:
     return repo.local_root_of(spec.repo)
 
 
-def _env_file(spec: JobSpec):
-    """Local uncommitted .env to ship, or None (lazy import, monkeypatched)."""
-    from omnirun import repo
-
-    return repo.env_file(_local_root(spec))
-
-
 def _remote_clone_plan(spec: JobSpec) -> str | None:
     """Anonymous https url a public repo's sha can be cloned from, else None
     (lazy import, monkeypatched in tests)."""
@@ -592,13 +585,16 @@ class ColabBackend(Backend):
                         f"{job_dir}/deploy_key",
                         timeout=UPLOAD_TIMEOUT_S,
                     )
-                envf = _env_file(spec)
-                if envf is not None:
+                # gitignored .env content, read client-side into spec.env_dotenv
+                # (so it works when the placer is a remote daemon) — staged out-of-
+                # band into $JOB_DIR/.env, exactly like the deploy key above.
+                if spec.env_dotenv is not None:
+                    (local / ".env").write_text(spec.env_dotenv)
                     self._colab(
                         "upload",
                         "-s",
                         session,
-                        str(envf),
+                        str(local / ".env"),
                         f"{job_dir}/.env",
                         timeout=UPLOAD_TIMEOUT_S,
                     )

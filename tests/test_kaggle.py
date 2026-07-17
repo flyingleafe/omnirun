@@ -179,10 +179,11 @@ def fake_bundle(monkeypatch):
         return dest
 
     monkeypatch.setattr(kaggle_mod, "_create_bundle", create)
-    # default: private repo (ship a bundle), no .env — keeps submit hermetic
-    # (no gh/curl/ls-remote to the network). Tests override these per-case.
+    # default: private repo (ship a bundle) — keeps submit hermetic (no
+    # gh/curl/ls-remote to the network). Tests override this per-case. No .env by
+    # default: make_spec leaves spec.env_dotenv None (the only source the backend
+    # reads).
     monkeypatch.setattr(kaggle_mod, "_remote_clone_plan", lambda ref, root: None)
-    monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: None)
     # default: bore disabled — keeps harness byte-identical to non-bore baseline.
     from omnirun.config import BoreConfig
 
@@ -451,10 +452,11 @@ def test_render_payload_private_repo_shows_bundle_without_submit(
 
 
 def test_submit_embeds_env_file(fake_api, backend, monkeypatch, tmp_path):
-    envf = tmp_path / ".env"
-    envf.write_text("SECRET=hunter2\n")
-    monkeypatch.setattr(kaggle_mod, "_env_file", lambda spec: envf)
-    spec = make_spec(gpu_type="P100")
+    # The gitignored .env content is read client-side into spec.env_dotenv; the
+    # backend embeds THAT (not a local file), so it works from a remote daemon.
+    spec = make_spec(gpu_type="P100").model_copy(
+        update={"env_dotenv": "SECRET=hunter2\n"}
+    )
     offer = backend.probe(spec.resources)[0]
     backend.submit(spec, offer)
     run_py = fake_api.kernel_folders[0]["run_py"]

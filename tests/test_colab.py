@@ -154,9 +154,8 @@ def fake_bundle(monkeypatch):
     # default: private repo (upload a bundle) — keeps submit hermetic (no
     # gh/curl/ls-remote to the network). The public-repo test overrides this.
     monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
-    # default: no .env file — prevents picking up a real repo .env on the
-    # developer's machine (env_file calls git ls-files on the cwd).
-    monkeypatch.setattr(colab_mod, "_env_file", lambda spec: None)
+    # No .env by default: make_spec leaves spec.env_dotenv None, and the backend
+    # reads only that (never the developer's filesystem).
     # default: bore disabled — keeps submit byte-identical to non-bore baseline.
     from omnirun.config import BoreConfig
 
