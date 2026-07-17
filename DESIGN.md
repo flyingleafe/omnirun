@@ -255,16 +255,49 @@ Submit-time invariant: working tree clean (always enforced — a dirty tree is
 refused, with no escape hatch, so a job only ever runs a real, reproducible
 revision), HEAD pushed to remote (offer to push).
 
-Worker access to private repos — **no git credentials ever leave the laptop**:
-- **ssh/slurm/marketplace**: at submit time the client `git push`es the exact sha
-  over its own SSH connection into the worker-side object store — an existing
-  checkout's `.git` if `project_root` points at one, else a managed bare repo
-  (`$PROJECT_ROOT/repo.git`, created on demand). The push targets a **non-branch
-  ref** `refs/omnirun/<sha12>`, so pushing into a live checkout never disturbs its
-  branches; the sha stays alive against gc and the worktree detaches from it. Nothing
-  on the worker can or needs to reach the origin remote. (Documented alternatives:
-  agent-forwarded `git fetch origin` for huge repos; per-repo deploy keys.)
-- **kaggle/colab**: the client picks one of two code-delivery modes at submit time
+**Worker always clones from origin (relaxed invariant #3).** The original model
+kept *all* git objects on the laptop (ssh push of the sha; a notebook bundle).
+That broke once the **daemon** — not the laptop — became the placer: a daemon on
+another host has none of the local objects. So the delivery model was unified:
+the worker **clones the exact sha from the origin remote**, and the placer hands
+it `(clone_url, sha, optional deploy key)` — never repo objects. The decision is
+made **client-side** at submit (`repo.resolve_code_plan` → a `CodePlan` of kind
+`remote`/`private`/`local`, §3), because the git/`gh` credentials live where the
+user is, not on the daemon:
+
+- **public repo → anonymous clone** (`kind="remote"`). The worker clones over its
+  own connection from an anonymous `https://` URL — no credentials, unchanged from
+  before. A remote plan is emitted only when the sha is provably reachable on a
+  public origin (`remote_is_public` via `gh`/`curl`; `git merge-base --is-ancestor`
+  against the remote tip), so a credential-less clone can't succeed-then-not-find
+  the commit.
+- **private repo → read-only deploy key** (`kind="private"`). The client resolves a
+  per-origin **deploy key** (asked of the `Client`, so `LocalClient` hits the store
+  and `RemoteClient` asks the daemon): if absent and `gh` is authenticated as a
+  repo admin, it auto-generates an ed25519 keypair, registers the public half as a
+  **read-only** deploy key via the `gh` API, and remembers the private half in the
+  store (`deploy_keys` table, §9). The worker clones over ssh with
+  `GIT_SSH_COMMAND="ssh -i $JOB_DIR/deploy_key …"`. The **placer** injects the
+  private key from the store into the job dir at `place` time (never persisted to
+  the shared tree, delivered like `.env` below); if no key can be resolved the
+  submit fails with an actionable error (`gh auth login` as admin, or
+  `omnirun deploy-key add`). The concrete cost of relaxing #3: a read-only,
+  per-repo key reaches third-party workers (Kaggle/Colab VMs) — bounded and
+  revocable (`gh` delete + `omnirun deploy-key rm`).
+- **local-only repo → client push fallback** (`kind="local"`, **daemonless only**).
+  When there is no usable origin (a purely local repo) the daemonless
+  `LocalClient` still has the objects, so ssh/slurm fall back to the old push of
+  the sha into a worker-side object store at a **non-branch ref**
+  `refs/omnirun/<sha12>`. A remote daemon has no local objects, so this path is not
+  available to it — a daemon-placed job needs a reachable origin.
+
+Deploy keys and all backend credentials live wherever the placer runs: on the
+**laptop** in daemonless mode, on the **daemon host** in daemon mode. The thin
+client (in daemon mode) holds neither — it does local git work, provisions a
+deploy key through the user's own `gh`, and hands the daemon a spec + code plan.
+
+The notebook backends keep a second delivery mode for the case a clone can't be
+credential-lessly satisfied — the client picks it at submit time
   (`repo.remote_clone_plan(ref, root) -> str | None`):
   - **public repo → direct clone (default when it applies).** The worker clones the repo
     itself over its own internet connection from an anonymous `https://` URL — no bundle
@@ -713,54 +746,76 @@ Phase 4's orphan-recovery lands.
 ## 11. Queue & scheduler daemon (optional)
 
 Direct `submit` stays daemonless (§10). For fan-out — many jobs, or spreading a
-batch across backends with per-backend concurrency caps — an *optional*
-long-lived scheduler daemon is available (`daemon.py`). It owns **nothing new**:
-the durable job store (§9) IS the queue (there is no `QueueEntry`, no queue
-table), and it drives the SAME pure `Control.run_tick` the daemonless path runs.
+batch across backends with per-backend concurrency caps — or to run the placer
+on an always-on host, an *optional* long-lived scheduler daemon is available
+(`daemon.py`). It drives the SAME pure `Control.run_tick` the daemonless path
+runs; the durable job store (§9) IS the queue (no `QueueEntry`, no queue table).
 
-- **`omnirun serve`** runs the daemon in the foreground: a localhost TCP socket
-  (default `127.0.0.1:8787`), newline-delimited JSON request/response, plus a
-  scheduler thread that drives `Control.run_tick` every `poll_interval_s`
-  (default 10s) on a **wakeable sleep** — a `tick` request (or the stop path)
-  short-circuits the interval so a just-enqueued job places immediately. Job
-  writes go straight through the shared `Store`; a restart re-reads and resumes
-  (an empty-handle PLACING stub is reverted to QUEUED by the first tick's
-  reconcile). `serve` configures INFO logging and logs the drained tick events
-  (releases, defers, failures) — journald/the log file is the daemon's only
-  observable surface.
-- **Socket protocol** is exactly three verbs (one JSON object per line each way):
-  `ping` (returns pending/running/done counts; deliberately lock-free so a slow
-  tick can't wedge it), `tick` (wake the loop now), `shutdown`. Job creation,
-  listing and cancellation do **not** go over the socket — they go straight
-  through the shared store (`Control.submit` / `store.list_jobs` /
-  `Control.cancel`). There is no second front door.
-- **Scheduler tick** (§10): reconcile → refresh facts → gather slots → load
-  ledger → pure tick → enact. Placement reserves a backend slot atomically (§9
-  `Store.reserve`, state → PLACING) before `provider.place`; poll I/O during
-  reconcile fans out across a thread pool while every store write stays on the
-  main thread. Each backend's `max_parallel` caps its concurrent non-terminal
-  jobs. A job pinned via `spec.only_backend` rides one unscoped `run_tick` — the
-  pure tick honors the pin as a provider-name match.
+**Thin client / daemon-owns-state.** The CLI is a **thin `Client`**
+(`client.py`): it does only *local* work — git-repo checks, capturing the
+`RepoRef`, provisioning a deploy key through the user's own `gh`, spooling a
+gitignored `.env` — then translates each command into a request. Two
+implementations behind one `Client` protocol, selected purely by whether a daemon
+address is configured (`[daemon].address` / `OMNIRUN_DAEMON_ADDRESS` /
+`--daemon`; never by probing for a pid):
+- **`LocalClient`** (daemonless): an in-process `Control` over a local `Store`,
+  holding the backend credentials. Exactly the old behavior, relocated.
+- **`RemoteClient`** (a daemon is configured): every verb is an HTTP call to the
+  daemon; the client opens **no** store and holds **no** backend credentials.
+The **daemon owns** the store, all `Control` ticks, all backend credentials, and
+the deploy keys. `make_client(cfg)` picks one; the CLI command bodies are
+`client.<verb>(...)` after their local work.
+
+- **`omnirun serve`** runs the daemon as an **HTTP server** (bottle under a
+  threaded stdlib WSGI server — sync, thread-per-request, matching the
+  scheduler-thread + row-locked `Store` model; no async). It binds
+  `[daemon].host:port` (default `127.0.0.1:8787`) and runs a scheduler thread
+  driving `Control.run_tick` every `poll_interval_s` on a **wakeable sleep** — a
+  write wakes it so a just-enqueued job places without waiting out the interval.
+  On restart it re-reads the store and resumes (an empty-handle PLACING stub is
+  reverted to QUEUED by the first reconcile). A `daemon.json` breadcrumb
+  (host/port/pid) is written for humans/`serve`, never for client routing.
+- **REST surface** (chosen over a bespoke socket so `curl`, a future web UI, or
+  any language works, and so it can sit behind Caddy for TLS + a bearer token):
+  `POST /jobs` (submit/enqueue), `GET /jobs` (ps), `GET /jobs/{id}` (status),
+  `PATCH /jobs/{id}` (reprioritize), `POST /jobs/{id}/cancel`,
+  `GET /jobs/{id}/logs` (SSE stream), `GET /jobs/{id}/outputs` (chunked tar),
+  `POST /gc|/tick|/offers`, `GET|POST /backends/*`, `…/deploy-keys[/{origin}]`,
+  `GET /healthz`. Errors map a core exception to a typed JSON body
+  (`{error,type}`) the `RemoteClient` re-raises as the same class, so the CLI
+  renders a daemon error exactly as the daemonless path would; a backend that
+  fails mid-log-stream is surfaced as an SSE `error` frame (the 200 is already
+  sent). `[daemon].address` becomes the base URL: bare `host:port` →
+  `http://host:port`, or a value with `://` used verbatim (e.g. a Caddy
+  `https://…`).
+- **Concurrency.** Reads (`ps`/`status`/`logs`/deploy-key/outputs resolve) are
+  **lock-free** — the `Store` is independently transactional, so a slow tick
+  never blocks a read. Writes: `enqueue` is **lock-free** too (a store-serialized
+  insert of a fresh id — no read-modify-write against a row the tick mutates,
+  and no orphan from a client-timeout mid-lock). The scheduler holds a store lock
+  for tick correctness but **drops it around the slow `provider.place` submit**
+  (already race-safe via the atomic reserve + a re-load after place), so a
+  concurrent `cancel` is never starved behind a placement; a separate tick-lock
+  keeps two ticks from overlapping. Reconcile poll I/O fans out across a thread
+  pool with every store write on the main thread.
+- **Durable capture + immediate reap.** The daemon is the **sole tailer** of any
+  worker: a per-RUNNING-job **ingestor** appends the backend's follow-stream to a
+  durable `$STATE/logs/<id>.log`, and `logs` fans that one file out to every
+  viewer over SSE (with `Last-Event-ID` resume) — never a second tail. When a job
+  finishes the daemon collects outputs to a durable cache and **reaps the compute
+  immediately** (stop notebook session, terminate paid instance, clean the ssh
+  worktree); the user reads the full logs and pulls outputs hours later from the
+  daemon's store. Cancel/failed jobs capture their partial log **before** the
+  reap. (`ReapPolicy.hold_on_terminal` still governs scarce notebook sessions.)
 - **Job lifecycle**: QUEUED → (HELD) → PLACING → RUNNING → SUCCEEDED / FAILED /
-  CANCELLED.
-- **Commands** (§12): `enqueue [--count N] [--backend NAME] -- CMD...` writes
-  jobs to the shared store via `Control.submit` and nudges the daemon with one
-  `tick` — it **requires a live daemon** (nothing would advance otherwise).
-  `queue` renders the store's jobs; `queue --wait` polls the store until all
-  terminal (also daemon-required); `queue --cancel <job-prefix|all>` cancels via
-  `Control.cancel` directly (works with or without a daemon). `all` is
-  **project-scoped** (the current repo unless `-A`); an explicit id prefix is
-  never scoped, since job ids are globally unique.
-- **Daemon-aware reads.** `submit` under a live daemon persists the job QUEUED
-  and nudges rather than running its own tick; `submit --wait` then polls until
-  RUNNING/terminal. The read commands (`ps` / `status` / `queue`) skip their
-  local catch-up tick when a live daemon answers `ping` within 2s (`_live_daemon`
-  in `cli.py`) — the daemonless-catch-up invariant means a running daemon has
-  already converged the store, so a plain store read suffices. A wedged daemon
-  (no `ping`) falls back to the local tick.
-- **Placement is greedy** — favors free-first, then cheapest-affordable-paid.
-  Assignment/least-loaded fairness and warm-worker reuse (every placement is
-  still a cold one-shot `provider.place`) are deferred refinements.
+  CANCELLED. Placement is greedy (free-first, then cheapest-affordable-paid) and
+  reserves a slot atomically (§9 `Store.reserve`) before `provider.place`; each
+  backend's `max_parallel` caps its concurrent non-terminal jobs; a
+  `spec.only_backend` pin rides one unscoped `run_tick`.
+- **Commands** (§12): `enqueue [--count N] [--backend NAME] -- CMD...` writes jobs
+  (lock-free) for the daemon's scheduler to place; `ps`/`status`/`queue` render
+  the store (project-scoped to the current repo unless `-A`; an explicit id prefix
+  is never scoped); `logs -f` and `pull` stream through the daemon.
 
 ## 12. CLI
 

@@ -6,17 +6,63 @@ job runs. This document is only for the **optional** scheduler daemon
 queued jobs across your backends under each backend's `max_parallel` cap. One
 daemon can serve jobs from any number of repos.
 
+**Thin client / daemon-owns-state.** When a client's config sets
+`[daemon].address` (or `OMNIRUN_DAEMON_ADDRESS`, or `--daemon host:port`), the
+CLI becomes a **thin HTTP client**: it does only local git work (repo checks,
+provisioning a read-only deploy key through your own `gh`) and sends each command
+to the daemon. The **daemon owns** the state store, all scheduling, all backend
+credentials, and the deploy keys — so a laptop pointed at a remote daemon holds
+**no** store and **no** provider secrets. Workers **clone the exact sha from the
+origin** (public anonymously; private via the auto-provisioned deploy key), so
+the daemon never needs the repo's git objects. Set `[daemon].address` to a bare
+`host:port` (→ `http://host:port`) or a full URL with `://` (e.g. a Caddy
+`https://…` endpoint for TLS + a bearer token).
+
+- [NixOS (flake module)](#nixos-flake-module)
 - [Daemon under systemd](#daemon-under-systemd)
 - [PostgreSQL store](#postgresql-store)
 - [Multi-project](#multi-project)
 
+## NixOS (flake module)
+
+omnirun's flake ships a package and a NixOS module. Add the input and enable the
+service on the daemon host:
+
+```nix
+# flake.nix
+inputs.omnirun.url = "github:flyingleafe/omnirun";      # or /vX.Y.Z to pin
+
+# in the host's module list:
+{ inputs, ... }: {
+  imports = [ inputs.omnirun.nixosModules.default ];
+  nixpkgs.overlays = [ inputs.omnirun.overlays.default ];  # provides pkgs.omnirun
+
+  services.omnirun = {
+    enable = true;
+    configFile = ./omnirun-config.toml;   # [daemon] bind, [backends.*], [state]
+    stateDir = "/var/lib/omnirun";
+    # Secrets as KEY=value lines (sops-nix decrypted): backend API keys, and for
+    # a Postgres store the PGPASSWORD / a ~/.pgpass reference.
+    environmentFile = config.sops.secrets.omnirun-env.path;
+  };
+}
+```
+
+The module runs `omnirun serve` as a hardened system user with
+`Restart=on-failure`, `StateDirectory=omnirun`, and `git`/`gh`/`openssh`/`rsync`/
+`uv`/`colab` on the service PATH (the packaged `omnirun` bundles the `colab` CLI
+so the Colab backend works out of the box). Point `[daemon].host` at the address
+you want it to bind (e.g. a WireGuard IP), and firewall the port to that
+interface. Rebuild the host to apply.
+
 ## Daemon under systemd
 
-`omnirun serve` runs in the foreground and listens on a localhost TCP socket
+This section is the hand-rolled equivalent of the NixOS module above, for a
+non-NixOS host. `omnirun serve` runs in the foreground and serves an **HTTP API**
 (default `127.0.0.1:8787`, configurable via `[daemon]` in the config or the
-`--host`/`--port` flags). journald owns the logs — there is no log file to
-rotate; read them with `journalctl --user -u omnirun` (drop `--user` for a
-system unit).
+`--host`/`--port` flags) plus a scheduler thread. journald owns the logs — there
+is no log file to rotate; read them with `journalctl --user -u omnirun` (drop
+`--user` for a system unit).
 
 Reference unit (a user unit at `~/.config/systemd/user/omnirun.service`; adjust
 paths, then `systemctl --user daemon-reload && systemctl --user enable --now

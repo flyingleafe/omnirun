@@ -8,6 +8,55 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, git-hooks }:
+    let
+      # The omnirun package. Core deps + the daemon/postgres/kaggle extras are all
+      # in nixpkgs; the colab CLI is a runtime *binary* (not a Python dep), so the
+      # package builds without it — add it via `services.omnirun.extraPackages`.
+      # The `colab` CLI the Colab backend shells out to (packaged here — not in
+      # nixpkgs). Wrapped onto omnirun's PATH so the daemon has Colab support.
+      mkColabCli = pkgs: pkgs.callPackage ./nix/colab-cli.nix { };
+
+      mkOmnirun = pkgs: pkgs.python312Packages.buildPythonApplication {
+        pname = "omnirun";
+        version = "0.5.0";
+        pyproject = true;
+        src = self;
+        build-system = [ pkgs.python312Packages.hatchling ];
+        dependencies = with pkgs.python312Packages; [
+          typer
+          rich
+          httpx
+          pydantic
+          sqlalchemy
+          bottle
+          psycopg
+          kaggle
+        ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        # Tests are live-gated + run in CI; skip them in the build sandbox.
+        doCheck = false;
+        # Runtime helper binaries the daemon/CLI shells out to (the Colab backend
+        # invokes `colab`; ssh/slurm/deploy-key work needs git/gh/ssh/rsync; the
+        # worker env build uses uv).
+        postFixup = ''
+          wrapProgram $out/bin/omnirun \
+            --prefix PATH : ${pkgs.lib.makeBinPath [
+              pkgs.git
+              pkgs.gh
+              pkgs.openssh
+              pkgs.rsync
+              pkgs.uv
+              (mkColabCli pkgs)
+            ]}
+        '';
+        meta = with pkgs.lib; {
+          description = "Run jobs from your repo anywhere: Slurm/SSH/Kaggle/Colab/marketplace GPUs";
+          homepage = "https://github.com/flyingleafe/omnirun";
+          license = licenses.mit;
+          mainProgram = "omnirun";
+        };
+      };
+    in
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -47,6 +96,10 @@
         };
       in
       {
+        packages.default = mkOmnirun pkgs;
+        packages.omnirun = mkOmnirun pkgs;
+        packages.google-colab-cli = mkColabCli pkgs;
+
         formatter =
           let
             inherit (pre-commit-check.config) package configFile;
@@ -80,5 +133,11 @@
             source .venv/bin/activate
           '';
         };
-      });
+      })
+    // {
+      # System-agnostic outputs: an overlay that adds `omnirun` to a pkgs set,
+      # and the NixOS module that runs the daemon (`services.omnirun`).
+      overlays.default = final: _prev: { omnirun = mkOmnirun final; };
+      nixosModules.default = { ... }@args: import ./nix/module.nix args;
+    };
 }

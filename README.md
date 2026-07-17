@@ -42,15 +42,16 @@ your working tree is clean and HEAD is pushed (with a `--push` escape hatch that
 pushes for you), then every backend executes the same generated `bootstrap.sh`
 on the worker:
 
-1. keep the repo's object store under a per-project `project_root` (default
-   `$OMNIRUN_ROOT/projects/<slug>`; you can point it at an existing checkout to
-   reuse its `.git` and `.venv`) — a bare `repo.git` mirror, or that checkout's
-   own `.git`. The client pushes the exact sha to a non-branch ref
-   `refs/omnirun/<sha12>` over its own SSH connection; for Kaggle/Colab a
-   **public** repo is cloned directly by the worker over its own connection
-   (no credentials needed) and a **private** repo instead rides as a `git
-   bundle`, so **git credentials never leave your laptop** and pushing
-   into an existing checkout is safe;
+1. get the exact sha onto the worker by **cloning from origin**: a **public**
+   repo clones anonymously; a **private** repo clones over ssh with an
+   auto-provisioned **read-only deploy key** (generated and registered through
+   your own `gh`, remembered per-origin by whoever runs the placer — your laptop
+   daemonless, or the daemon host). A purely local repo with no usable origin
+   falls back to the old daemonless client push of the sha to a non-branch ref
+   `refs/omnirun/<sha12>`. So the placer only ever needs `(clone_url, sha,
+   optional deploy key)` — never your local git objects — which is what lets a
+   remote daemon place jobs. A gitignored `.env` still rides out-of-band, never
+   through git;
 2. check out a worktree **shared per git revision** at `.trees/<sha12>` (guarded
    by a `.locks/` flock) — jobs at the same sha reuse the checkout instead of
    each getting their own;
@@ -108,9 +109,13 @@ omnirun state path             # print the active database URL
 ## Queueing many jobs (optional)
 
 `omnirun serve` runs an always-on scheduler daemon in the foreground (background
-it yourself — it's meant to live on a small VPS under `mosh`/`tmux`). It listens
-on a localhost TCP socket (default `127.0.0.1:8787`) and owns a durable queue
-persisted in the SQL state store, so a restart resumes where it left off.
+it yourself — it's meant to live on a small VPS under `mosh`/`tmux`, or as a
+NixOS/systemd service — see [`docs/deploy.md`](docs/deploy.md)). It serves an
+**HTTP API** (default `127.0.0.1:8787`) and owns the durable job store, so a
+restart resumes where it left off. Point a client at it with `[daemon].address`
+and the CLI becomes a **thin HTTP client** that holds no store or backend
+credentials — the daemon owns them; workers clone the code from origin (private
+repos via an auto-provisioned read-only deploy key).
 
 ```bash
 omnirun serve &                              # start the daemon (localhost only)
@@ -175,7 +180,7 @@ probe_timeout_s = 10.0       # per-backend probe budget
 
 # ---- optional queue daemon (only used by `omnirun serve`) ----
 [daemon]
-host = "127.0.0.1"           # localhost socket; bind 0.0.0.0 + auth to go remote
+host = "127.0.0.1"           # bind addr for the HTTP daemon; a wg IP or 0.0.0.0 (+ Caddy auth) to go remote
 port = 8787
 poll_interval_s = 10.0       # scheduler tick: refresh running + place pending
 
@@ -305,7 +310,7 @@ offer table without submitting (same resource flags as `submit`, minus policy
 flags). Use this to inspect options before committing.
 
 **`omnirun serve [--host H] [--port P]`** — run the optional scheduler daemon in
-the foreground (background it yourself). Listens on a localhost TCP socket
+the foreground (background it yourself). Serves an HTTP API
 (default `127.0.0.1:8787`, overridable in config or with these flags).
 
 **`omnirun enqueue [OPTIONS] [--count N] -- COMMAND...`** — hand a job to the

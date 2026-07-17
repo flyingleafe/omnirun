@@ -80,6 +80,31 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   the marketplace code is transcribed from docs/research, not observed — hence
   §3.
 
+### 2026-07-17 — HTTP-daemon chaos validation (Docker, all four real backends)
+
+Ran the `chaos/` Docker harness (see `chaos/README.md`): one `omnirun serve` HTTP
+daemon + several thin CLI clients stochastically enqueue/cancel/resubmit short
+jobs (random resources, random backend) over localhost, against **real** Kaggle,
+Colab, and Apocrita Slurm (cpu + gpushort). Across runs it confirmed, no matter
+how chaotically jobs were submitted/cancelled:
+
+- **No job lost, no dangling session** — every client-submitted job was known to
+  the daemon and reached a terminal state; `squeue` stayed clean of chaos jobs;
+  notebook sessions reaped on finish.
+- **Durable logs + artifacts** — every succeeded job's logs were complete and
+  retrievable and its output artifact pulled back (verified 21/21, 13/13, …);
+  cancelled jobs that produced output kept their partial log.
+- **No write starvation** — under 4 concurrent clients, no `enqueue`/`cancel`
+  failed for daemon-unreachable (0 starved), after the lock-free-enqueue +
+  place-release fixes.
+
+The harness surfaced (and this branch fixes) four defects: truncated notebook
+terminal logs, no log capture on cancel, the scp-fallback bypassing a configured
+ssh wrapper, and daemon write-starvation under placement load. One environmental
+caveat: a shared HPC login node can rate-limit password auth under a burst of
+concurrent ssh/scp — pace slurm load tests (`CHAOS_BACKENDS=kaggle,colab` to
+exercise the daemon without touching the cluster).
+
 ### 2026-07-15 — daemon live validation (local, SQLite)
 
 Ran the unified-job-model daemon for real on this machine — SQLite store, a
