@@ -109,6 +109,53 @@ def test_repin_moves_a_not_started_job_to_another_backend(tmp_path: Path) -> Non
         store.close()
 
 
+def test_edit_job_updates_params_and_requeues_placed_job(tmp_path: Path) -> None:
+    """The generic edit changes any mutable spec params (resources, deadline,
+    priority, pin) of a not-yet-started job. A placed-but-not-started job is reaped
+    and requeued so the new params re-place it (e.g. adding a finish_by so the
+    chooser can escalate to paid)."""
+    from datetime import timedelta
+
+    from omnirun.models import Deadline, JobPolicy
+
+    store = open_store(f"sqlite:///{tmp_path / 'state.db'}")
+    try:
+        prov = FakeProvider("a", slots=[], reap=ReapPolicy(release_lost=True))
+        control = Control(store, {"a": prov})
+        store.save_job(
+            JobRecord(
+                spec=_spec("edit-000001").model_copy(
+                    update={"resources": ResourceSpec(gpus=1)}
+                ),
+                state=JobState.RUNNING,
+                submitted_at=T0,
+                placement=Placement(
+                    provider_name="a", job_id="edit-000001", state=JobStatus.QUEUED
+                ),
+                last_status=StatusReport(status=JobStatus.QUEUED, detail="Priority"),
+            )
+        )
+
+        deadline = Deadline(finish_by=T0 + timedelta(hours=2))
+        updated = control.edit_job(
+            "edit-000001",
+            updates={
+                "resources": ResourceSpec(gpus=1, min_vram_gb=24.0),
+                "policy": JobPolicy(deadline=deadline, priority=5),
+            },
+        )
+
+        assert updated.state is JobState.QUEUED  # requeued to re-place
+        assert updated.placement is None
+        assert prov.cancel_calls  # the pending placement was reaped
+        assert updated.spec.resources.min_vram_gb == 24.0
+        assert updated.spec.policy.priority == 5
+        assert updated.spec.policy.deadline is not None
+        assert updated.spec.policy.deadline.finish_by == T0 + timedelta(hours=2)
+    finally:
+        store.close()
+
+
 def test_repin_refuses_a_started_job(tmp_path: Path) -> None:
     """Repin only moves jobs that have NOT started — a job actually RUNNING at its
     backend must be cancelled instead (moving it would discard live work)."""

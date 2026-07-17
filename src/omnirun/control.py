@@ -285,24 +285,29 @@ class Control:
         )
         return new_policy
 
-    def repin(self, job_id: str, *, backend: str | None) -> JobRecord:
-        """Re-pin a NOT-YET-STARTED job to a different backend (``backend`` name),
-        or UNPIN it (``backend=None`` → any backend), and requeue it for placement.
+    def edit_job(self, job_id: str, *, updates: dict[str, Any]) -> JobRecord:
+        """Edit a NOT-YET-STARTED job's mutable spec parameters and requeue it.
 
-        Refuses a terminal job, or one that has actually STARTED running — moving a
-        live job would discard its work, so the caller must cancel it instead. A job
-        that is merely *placed but still waiting* at its backend (queued in a batch
-        scheduler, or an instance still provisioning — anything not yet RUNNING) has
-        that placement REAPED first (its still-queued backend job is cancelled, the
-        reservation freed), then is returned to ``QUEUED`` with the new pin so the
-        next tick re-places it — e.g. off a long queue onto free/cheap compute.
+        ``updates`` maps ``JobSpec`` fields to already-typed values — the mutable
+        ones only: ``only_backend`` (a provider name, or ``None`` to unpin),
+        ``name``, ``resources`` (a :class:`ResourceSpec`), and ``policy`` (a
+        :class:`JobPolicy` carrying priority / deadline / max_cost). The immutable
+        identity (job_id, repo, command, code plan, ``.env``) is untouched.
+
+        Refuses a terminal job, or one that has actually STARTED running — changing
+        a live job's parameters is meaningless (cancel it instead). A job that is
+        merely *placed but still waiting* at its backend (batch-queued, or an
+        instance still provisioning — anything not yet RUNNING) has that placement
+        REAPED (its still-queued backend job cancelled, the reservation freed) and
+        is returned to ``QUEUED`` so the next tick re-places it with the new
+        parameters — e.g. adding a ``finish_by`` so the chooser escalates to paid.
         """
         rec = self._store.load_job(job_id)
         if rec is None:
             raise ValueError(f"unknown job {job_id!r}")
         if rec.state.terminal:
             raise ValueError(
-                f"job {job_id!r} is {rec.state.value}; cannot repin a finished job"
+                f"job {job_id!r} is {rec.state.value}; cannot edit a finished job"
             )
         started = (
             rec.last_status is not None and rec.last_status.status is JobStatus.RUNNING
@@ -311,27 +316,37 @@ class Control:
             where = rec.placement.provider_name if rec.placement is not None else "?"
             raise ValueError(
                 f"job {job_id!r} has already STARTED running on {where}; cancel it "
-                "instead — repin only moves jobs that have not started yet"
+                "instead — edit only changes jobs that have not started yet"
             )
-        if backend is not None and backend not in self._providers:
-            known = ", ".join(sorted(self._providers)) or "(none configured)"
-            raise ValueError(f"unknown backend {backend!r} (known: {known})")
-        # Reap a not-yet-started placement (cancel the queued backend job, free the
-        # reservation) so the re-pin re-places from scratch.
+        if "only_backend" in updates:
+            b = updates["only_backend"]
+            if b is not None and b not in self._providers:
+                known = ", ".join(sorted(self._providers)) or "(none configured)"
+                raise ValueError(f"unknown backend {b!r} (known: {known})")
+        new_spec = rec.spec.model_copy(update=updates)
+        fields: dict[str, Any] = {"spec": new_spec}
+        # A not-yet-started placement is reaped and the job requeued so the edited
+        # parameters actually re-place it; a still-QUEUED job just takes the new
+        # spec and is matched fresh next tick.
         if rec.placement is not None:
             self._reap(rec.placement)
-        updated = rec.model_copy(
-            update={
-                "spec": rec.spec.model_copy(update={"only_backend": backend}),
-                "state": JobState.QUEUED,
-                "placement": None,
-                "last_status": None,
-                "attempts": 0,  # a fresh target gets a fresh placement-attempt cap
-                "last_error": None,
-            }
-        )
+            fields.update(
+                {
+                    "state": JobState.QUEUED,
+                    "placement": None,
+                    "last_status": None,
+                    "attempts": 0,
+                    "last_error": None,
+                }
+            )
+        updated = rec.model_copy(update=fields)
         self._store.save_job(updated)
         return updated
+
+    def repin(self, job_id: str, *, backend: str | None) -> JobRecord:
+        """Re-pin (or unpin, ``backend=None``) a not-yet-started job — a thin
+        shortcut over :meth:`edit_job` that only touches ``only_backend``."""
+        return self.edit_job(job_id, updates={"only_backend": backend})
 
     # ------------------------------------------------------------------
     # Submission

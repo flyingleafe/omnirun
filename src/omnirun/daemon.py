@@ -34,7 +34,14 @@ from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.client import LocalClient, handle_of
 from omnirun.config import Config, ConfigError
 from omnirun.logingest import HEARTBEAT, LogIngestManager, StartSpec, tail_file
-from omnirun.models import DeployKey, JobRecord, JobSpec, JobState, ResourceSpec
+from omnirun.models import (
+    DeployKey,
+    JobPolicy,
+    JobRecord,
+    JobSpec,
+    JobState,
+    ResourceSpec,
+)
 from omnirun.repo import RepoError
 from omnirun.state import default_store_dir
 
@@ -517,6 +524,29 @@ class Daemon:
                 rec = d._core.resolve_job(jid)
                 try:
                     updated = d._core.repin(rec, backend=backend)
+                except ValueError as e:
+                    bottle.response.status = 409
+                    return _json({"error": str(e)})
+            d.wake()
+            return _json({"job": updated.model_dump(mode="json")})
+
+        @app.post("/jobs/<jid>/edit")
+        def _edit(jid: str) -> str:
+            # Edit a not-yet-started job's mutable params (resources/policy/pin/name)
+            # and requeue it. Reconstruct the typed nested values the client sent.
+            raw = _body().get("updates") or {}
+            updates: dict[str, Any] = {}
+            for key, value in raw.items():
+                if key == "resources":
+                    updates[key] = ResourceSpec.model_validate(value)
+                elif key == "policy":
+                    updates[key] = JobPolicy.model_validate(value)
+                else:
+                    updates[key] = value
+            with d._tick_lock, d._lock:
+                rec = d._core.resolve_job(jid)
+                try:
+                    updated = d._core.edit(rec, updates=updates)
                 except ValueError as e:
                     bottle.response.status = 409
                     return _json({"error": str(e)})

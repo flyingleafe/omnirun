@@ -161,6 +161,7 @@ class Client(Protocol):
         allow_paid: bool | None,
     ) -> JobPolicy: ...
     def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord: ...
+    def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord: ...
     def budget_set(self, window: str, cap: float) -> None: ...
     def budget_status(self) -> list[BudgetRow]: ...
     def gc(self, *, all_: bool, project: str | None) -> GcOutcome: ...
@@ -442,6 +443,9 @@ class LocalClient:
         # Needs real providers: reaping a not-yet-started placement (cancelling the
         # queued backend job) is backend I/O — the same driver `cancel` uses.
         return self._control().repin(rec.spec.job_id, backend=backend)
+
+    def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord:
+        return self._control().edit_job(rec.spec.job_id, updates=updates)
 
     def budget_set(self, window: str, cap: float) -> None:
         Control(self._store(), {}).budget(window, cap)
@@ -764,6 +768,16 @@ class RemoteClient:
 
     def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord:
         data = self._post(f"/jobs/{rec.spec.job_id}/repin", json={"backend": backend})
+        return JobRecord.model_validate(data["job"])
+
+    def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord:
+        # Serialize typed values (ResourceSpec/JobPolicy) to JSON; the daemon
+        # reconstructs them. Scalars (name, only_backend) pass through unchanged.
+        payload = {
+            k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v)
+            for k, v in updates.items()
+        }
+        data = self._post(f"/jobs/{rec.spec.job_id}/edit", json={"updates": payload})
         return JobRecord.model_validate(data["job"])
 
     def reprioritize(

@@ -1117,6 +1117,117 @@ def repin(
         client.close()
 
 
+@app.command(
+    help="Edit a not-yet-started job's parameters (pin, priority, deadline, "
+    "resources). Only the flags you pass change; the job requeues to re-place."
+)
+@friendly_errors
+def edit(
+    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    to: str | None = typer.Option(None, "--to", help="Pin to this backend."),
+    any_backend: bool = typer.Option(False, "--any", help="Unpin (any backend)."),
+    priority: int | None = typer.Option(None, "--priority", help="Higher = sooner."),
+    finish_by: str | None = typer.Option(
+        None, "--finish-by", help="Finish-by deadline: ISO-8601 or +<N>[dhm]."
+    ),
+    start_by: str | None = typer.Option(None, "--start-by", help="Start-by deadline."),
+    max_cost: float | None = typer.Option(
+        None, "--max-cost", help="Per-job USD ceiling for a paid placement."
+    ),
+    free_only: bool = typer.Option(
+        False, "--free-only", help="Never use paid compute (max_cost=0)."
+    ),
+    allow_paid: bool = typer.Option(
+        False, "--allow-paid", help="Clear the per-job cost ceiling."
+    ),
+    gpus: int | None = typer.Option(None, "--gpus", help="Number of GPUs."),
+    gpu_type: str | None = typer.Option(
+        None, "--gpu-type", help="Exact GPU, e.g. A100."
+    ),
+    vram: float | None = typer.Option(None, "--vram", help="Min per-GPU VRAM (GB)."),
+    time_: str | None = typer.Option(
+        None, "--time", help="Estimated duration ('15m', '2h30m')."
+    ),
+    cpus: int | None = typer.Option(None, "--cpus", help="CPU cores."),
+    mem: float | None = typer.Option(None, "--mem", help="RAM (GB)."),
+    disk: float | None = typer.Option(None, "--disk", help="Disk (GB)."),
+    min_cuda: str | None = typer.Option(None, "--min-cuda", help="Min host CUDA."),
+    name: str | None = typer.Option(None, "--name", help="Rename the job."),
+) -> None:
+    if to is not None and any_backend:
+        _die("pass at most one of --to <backend> or --any")
+    if free_only and allow_paid:
+        _die("pass at most one of --free-only or --allow-paid")
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        rec = client.resolve_job(job)
+        updates: dict[str, Any] = {}
+        if to is not None:
+            updates["only_backend"] = to
+        elif any_backend:
+            updates["only_backend"] = None
+        if name is not None:
+            updates["name"] = name
+
+        res_fields: dict[str, Any] = {}
+        if gpus is not None:
+            res_fields["gpus"] = gpus
+        if gpu_type is not None:
+            res_fields["gpu_type"] = gpu_type
+        if vram is not None:
+            res_fields["min_vram_gb"] = vram
+        if time_ is not None:
+            res_fields["time"] = _parse_time(time_)
+        if cpus is not None:
+            res_fields["cpus"] = cpus
+        if mem is not None:
+            res_fields["mem_gb"] = mem
+        if disk is not None:
+            res_fields["disk_gb"] = disk
+        if min_cuda is not None:
+            res_fields["min_cuda"] = min_cuda
+        if res_fields:
+            updates["resources"] = rec.spec.resources.model_copy(update=res_fields)
+
+        pol_fields: dict[str, Any] = {}
+        if priority is not None:
+            pol_fields["priority"] = priority
+        if finish_by is not None or start_by is not None:
+            cur_dl = rec.spec.policy.deadline
+            pol_fields["deadline"] = Deadline(
+                start_by=_parse_deadline(start_by)
+                if start_by is not None
+                else (cur_dl.start_by if cur_dl else None),
+                finish_by=_parse_deadline(finish_by)
+                if finish_by is not None
+                else (cur_dl.finish_by if cur_dl else None),
+            )
+        if free_only:
+            pol_fields["max_cost"] = 0.0
+        elif allow_paid:
+            pol_fields["max_cost"] = None
+        elif max_cost is not None:
+            pol_fields["max_cost"] = max_cost
+        if pol_fields:
+            updates["policy"] = rec.spec.policy.model_copy(update=pol_fields)
+
+        if not updates:
+            _die(
+                "nothing to change — pass one of --to/--any, --priority, "
+                "--finish-by, --gpus, --vram, --time, --max-cost, …"
+            )
+        updated = client.edit(rec, updates=updates)
+        console.print(
+            f"[green]edited[/green] {updated.spec.job_id} ({', '.join(updates)})"
+        )
+        console.print(
+            "[dim]it will re-place on the next tick with the new settings[/dim]"
+        )
+    finally:
+        client.close()
+
+
 @app.command(help="Change a queued/running job's scheduling policy.")
 @friendly_errors
 def reprioritize(
