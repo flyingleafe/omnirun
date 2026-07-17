@@ -406,7 +406,23 @@ class SlurmBackend(Backend):
         ]
 
     def _estimate_wait(self, res: ResourceSpec) -> tuple[float | None, str]:
-        """Three honest tiers: idle nodes -> own history -> unknown."""
+        """Honest wait, best source first:
+
+        0. SLURM's OWN start estimate via ``sbatch --test-only`` — it accounts for
+           priority / QOS / fairshare gating, so a partition whose nodes merely LOOK
+           idle but whose account is priority-gated reports its REAL delay instead of
+           a misleading 0 that lands the job PENDING with reason ``Priority`` (the
+           bug that made the chooser prefer a slow partition for a small short job).
+        1. idle matching nodes — a fallback only when test-only gives no estimate.
+        2. the median of your recent jobs here.
+        3. unknown.
+        """
+        try:
+            est = self._slurm_start_estimate(res)
+        except Exception:
+            est = None
+        if est is not None:
+            return est, ("starts ~now (slurm est.)" if est < 60 else "slurm est. start")
         try:
             if self._idle_matching_nodes(res) > 0:
                 return 0.0, "idle nodes available"
@@ -423,6 +439,53 @@ class SlurmBackend(Backend):
         if median is not None:
             return median, "median of your recent jobs"
         return None, WAIT_UNKNOWN_NOTE
+
+    def _testonly_flags(self, res: ResourceSpec) -> list[str]:
+        """The sbatch resource flags (time/partition/account/qos/cpu/mem/gres) a
+        ``--test-only`` dry-run needs for an accurate per-request estimate — the same
+        request the real submit renders as ``#SBATCH`` directives."""
+        cfg = self.config
+        flags: list[str] = []
+        if res.time is not None:
+            flags.append(f"--time={_fmt_time(res.time)}")
+        else:
+            flags.append(f"--time={cfg.extra('time_default', '1:00:00')}")
+        if cfg.partition:
+            flags.append(f"--partition={cfg.partition}")
+        if cfg.account:
+            flags.append(f"--account={cfg.account}")
+        if cfg.qos:
+            flags.append(f"--qos={cfg.qos}")
+        if res.cpus:
+            flags.append(f"--cpus-per-task={res.cpus}")
+        if res.mem_gb:
+            flags.append(f"--mem={math.ceil(res.mem_gb)}G")
+        gpu_lines, _ = gpu_directives(res, cfg)
+        for line in gpu_lines:
+            flag = line.replace("#SBATCH", "", 1).strip()
+            if flag:
+                flags.append(flag)
+        return flags
+
+    def _slurm_start_estimate(self, res: ResourceSpec) -> float | None:
+        """Seconds until SLURM estimates this exact request would START, from
+        ``sbatch --test-only`` (submits NOTHING). None when the cluster returns no
+        parseable estimate. Timezone-safe: the estimated start and 'now' are both
+        converted to epoch ON the cluster, so no local-tz assumption is made."""
+        flags = " ".join(shell_quote(f) for f in self._testonly_flags(res))
+        cmd = (
+            f'out="$(sbatch --test-only {flags} --wrap=true 2>&1)"; '
+            r"""ts="$(printf '%s\n' "$out" | sed -n 's/.*to start at \([0-9T:-]*\).*/\1/p' | head -n1)"; """
+            'if [ -n "$ts" ]; then '
+            'printf "OMNIRUN_START=%s\\nOMNIRUN_NOW=%s\\n" '
+            '"$(date -d "$ts" +%s 2>/dev/null)" "$(date +%s)"; fi'
+        )
+        r = self.exec_.run(cmd, timeout=20)
+        start = re.search(r"OMNIRUN_START=(\d+)", r.stdout)
+        now = re.search(r"OMNIRUN_NOW=(\d+)", r.stdout)
+        if not (start and now):
+            return None
+        return max(0.0, float(int(start.group(1)) - int(now.group(1))))
 
     def _idle_matching_nodes(self, res: ResourceSpec) -> int:
         part = (

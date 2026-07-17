@@ -560,6 +560,28 @@ def test_probe_unfit_for_gpu_job_when_cpu_only():
     assert offer.fits
 
 
+def test_probe_wait_uses_slurm_test_only_estimate():
+    """The honest primary tier: `sbatch --test-only` gives SLURM's own start
+    estimate (accounts for priority/QOS gating), used over the idle-node heuristic
+    even when nodes look idle — so a priority-gated partition isn't reported as 0."""
+    fake = FakeExec()
+    # Nodes LOOK idle, but SLURM's test-only says the job would not start for 20 min
+    # (priority-gated). The test-only estimate must win over the idle-node 0.
+    fake.add(r"sinfo -p gpu -t idle", stdout="node01 gpu:a100:4\n")
+    fake.add(
+        r"sbatch --test-only",
+        stdout="OMNIRUN_START=1000001200\nOMNIRUN_NOW=1000000000\n",
+    )
+    b = make_backend(fake, partition="gpu", gpu_map={"A100": "gres:a100:{n}"})
+    (offer,) = b.probe(ResourceSpec(gpus=1, gpu_type="A100"))
+    assert offer.fits
+    assert offer.wait_estimate_s == 1200.0
+    assert "slurm est" in offer.wait_note
+    # the request carried the real resource flags into the dry-run
+    testonly = next(c for c in fake.commands if "sbatch --test-only" in c)
+    assert "--partition=gpu" in testonly and "--gres=gpu:a100:1" in testonly
+
+
 def test_probe_wait_tier1_idle_nodes():
     fake = FakeExec()
     fake.add(r"sinfo -p gpu -t idle", stdout="node01 gpu:a100:4\nnode02 (null)\n")

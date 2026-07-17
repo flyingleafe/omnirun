@@ -42,6 +42,7 @@ from omnirun.models import (
     JobRecord,
     JobSpec,
     JobState,
+    JobStatus,
     Offer,
     ResourceSpec,
 )
@@ -82,6 +83,35 @@ _STATE_STYLE = {
     JobState.CANCELLED: "yellow",
     JobState.HELD: "yellow",
 }
+
+# Backend sub-status shown for a PLACED job (scheduler JobState.RUNNING) instead of
+# the coarse "running" — so a Slurm-pending or still-provisioning job reads honestly.
+_SUBSTATUS_STYLE = {
+    JobStatus.QUEUED: "yellow",
+    JobStatus.PROVISIONING: "blue",
+    JobStatus.STARTING: "blue",
+}
+
+
+def _display_status(rec: JobRecord) -> tuple[str, str | None]:
+    """User-facing status text + rich style for a job.
+
+    The scheduler's ``JobState.RUNNING`` means only "placed and holding a slot" — it
+    collapses the backend's own QUEUED/PROVISIONING/STARTING/RUNNING. So a job that
+    Slurm has merely QUEUED (e.g. reason ``Priority``), or a marketplace instance
+    still provisioning, would misleadingly read "running". For a placed job we
+    therefore surface the BACKEND sub-status (last poll, else the placement's
+    optimistic initial state): ``queued``/``provisioning``/``starting`` when it is
+    not yet actually running, ``running`` only when the backend says so."""
+    if rec.state is JobState.RUNNING:
+        sub = (
+            rec.last_status.status
+            if rec.last_status is not None
+            else (rec.placement.state if rec.placement is not None else None)
+        )
+        if sub is not None and sub in _SUBSTATUS_STYLE:
+            return sub.value, _SUBSTATUS_STYLE[sub]
+    return rec.state.value, _STATE_STYLE.get(rec.state)
 
 
 def _version_callback(value: bool) -> None:
@@ -796,10 +826,8 @@ def _queue_table(records: list[JobRecord], *, show_project: bool = False) -> Tab
     for col in cols:
         table.add_column(col)
     for rec in records:
-        style = _STATE_STYLE.get(rec.state)
-        state_txt = (
-            f"[{style}]{rec.state.value}[/{style}]" if style else rec.state.value
-        )
+        text, style = _display_status(rec)
+        state_txt = f"[{style}]{text}[/{style}]" if style else text
         if rec.state is JobState.QUEUED and rec.last_error:
             state_txt += f"\n[dim]last error: {_truncate(rec.last_error)}[/dim]"
         cells = [
@@ -902,10 +930,8 @@ def ps(
     table.add_column("submitted")
     table.add_column("command")
     for rec in records:
-        style = _STATE_STYLE.get(rec.state)
-        status_txt = (
-            f"[{style}]{rec.state.value}[/{style}]" if style else rec.state.value
-        )
+        text, style = _display_status(rec)
+        status_txt = f"[{style}]{text}[/{style}]" if style else text
         # A still-QUEUED job whose last placement raised: show WHY under its state
         # so a job stuck retrying is never silently stuck (a FAILED job's reason
         # rides its status detail, shown by `status`).
@@ -940,12 +966,17 @@ def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
         ("name", rec.spec.name),
         ("command", rec.spec.command),
         ("backend", backend),
-        ("state", rec.state.value),
+        ("status", _display_status(rec)[0]),
         (
             "repo",
             f"{rec.spec.repo.remote_url} @ {rec.spec.repo.sha[:12]} ({rec.spec.repo.branch})",
         ),
     ]
+    # When the backend sub-status differs from the scheduler state (a placed job
+    # still QUEUED at the backend), show the raw scheduler state too so the
+    # distinction — "omnirun has placed it; the backend has it queued" — is legible.
+    if _display_status(rec)[0] != rec.state.value:
+        rows.append(("scheduler state", rec.state.value))
     if st is not None and st.exit_code is not None:
         rows.append(("exit code", str(st.exit_code)))
     if st is not None and st.detail:

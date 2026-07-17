@@ -766,6 +766,53 @@ def test_ps_places_a_stranded_queued_job(env):
     assert rec.placement is not None and rec.placement.provider_name == "stub"
 
 
+def test_display_status_shows_backend_substatus_for_placed_jobs() -> None:
+    """A placed job (scheduler JobState.RUNNING) reports the BACKEND sub-status —
+    so a Slurm-pending job reads 'queued', a provisioning marketplace instance
+    reads 'provisioning', and only a genuinely running one reads 'running'."""
+    from omnirun.cli import _display_status
+    from omnirun.models import (
+        JobRecord,
+        JobSpec,
+        JobState,
+        JobStatus,
+        Placement,
+        RepoRef,
+        StatusReport,
+    )
+
+    def _rec(state: JobState, poll: JobStatus | None) -> JobRecord:
+        placement = (
+            Placement(provider_name="uni", job_id="j-000001", state=poll)
+            if poll is not None
+            else None
+        )
+        last = StatusReport(status=poll) if poll is not None else None
+        return JobRecord(
+            spec=JobSpec(
+                job_id="j-000001",
+                name="j",
+                command="x",
+                repo=RepoRef(remote_url="", sha="a" * 40, branch="m", slug="s"),
+            ),
+            state=state,
+            placement=placement,
+            last_status=last,
+        )
+
+    # Placed but Slurm still has it QUEUED (reason Priority) → "queued", not running.
+    assert _display_status(_rec(JobState.RUNNING, JobStatus.QUEUED))[0] == "queued"
+    # Marketplace instance still coming up.
+    assert (
+        _display_status(_rec(JobState.RUNNING, JobStatus.PROVISIONING))[0]
+        == "provisioning"
+    )
+    # Genuinely running.
+    assert _display_status(_rec(JobState.RUNNING, JobStatus.RUNNING))[0] == "running"
+    # Not-yet-placed omnirun queue is unaffected.
+    assert _display_status(_rec(JobState.QUEUED, None))[0] == "queued"
+
+
 def test_handle_of_derives_from_placement(env):
     """The live-I/O commands derive the backend handle from the job's placement —
     the single source of truth — and get None only for a never-placed job."""
