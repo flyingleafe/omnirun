@@ -38,6 +38,7 @@ class FakeExec(Exec):
         stdin: str | None = None,
         timeout: float | None = None,
         check: bool = False,
+        reconnect_retry: bool = True,
     ) -> ExecResult:
         for needle, result in self.table.items():
             if needle in command:
@@ -99,6 +100,7 @@ class RaisingExec(Exec):
         stdin: str | None = None,
         timeout: float | None = None,
         check: bool = False,
+        reconnect_retry: bool = True,
     ) -> ExecResult:
         raise RuntimeError("ssh transport failed")
 

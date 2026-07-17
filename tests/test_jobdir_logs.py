@@ -22,7 +22,15 @@ class FakeLogExec(Exec):
         self.run_calls = 0
         self.stream_calls = 0
 
-    def run(self, command: str, *, stdin=None, timeout=None, check=False) -> ExecResult:
+    def run(
+        self,
+        command: str,
+        *,
+        stdin=None,
+        timeout=None,
+        check=False,
+        reconnect_retry=True,
+    ) -> ExecResult:
         assert command.startswith("tail -n +1 "), command
         self.run_calls += 1
         body = "".join(f"{ln}\n" for ln in self._lines)

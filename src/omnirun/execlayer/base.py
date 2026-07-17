@@ -42,8 +42,15 @@ class Exec(ABC):
         stdin: str | None = None,
         timeout: float | None = None,
         check: bool = False,
+        reconnect_retry: bool = True,
     ) -> ExecResult:
-        """Run `command` through bash. check=True raises ExecError on rc != 0."""
+        """Run `command` through bash. check=True raises ExecError on rc != 0.
+
+        ``reconnect_retry`` (ssh only) controls whether a transport failure
+        auto-reconnects the shared master and retries the command. Pass ``False``
+        for a NON-IDEMPOTENT command (e.g. ``sbatch``) so a mid-flight drop is never
+        blindly retried into a duplicate — the caller recovers explicitly instead.
+        """
         ...
 
     def stream(self, command: str, *, timeout: float | None = None) -> Iterator[str]:

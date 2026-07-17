@@ -49,7 +49,9 @@ class FakeExec(Exec):
                 "ssh session to hpc expired — run `omnirun backends check` to (re)connect"
             )
 
-    def run(self, command, *, stdin=None, timeout=None, check=False):
+    def run(
+        self, command, *, stdin=None, timeout=None, check=False, reconnect_retry=True
+    ):
         self.commands.append(command)
         self.stdins.append(stdin)
         for pattern, result in self.responses:
@@ -226,6 +228,43 @@ def no_push(monkeypatch):
     pushes = []
     monkeypatch.setattr(jobdir, "push_repo", lambda *a, **kw: pushes.append(a))
     return pushes
+
+
+def test_submit_adopts_existing_slurm_job_instead_of_duplicating(no_push):
+    """If a Slurm job named omnirun-<id> already exists (a prior interrupted/retried
+    submit created it), submit ADOPTS it and does NOT run sbatch again — no
+    duplicate, no orphan."""
+    fake = FakeExec()
+    fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"squeue --me -h -n omnirun-train-abc123", stdout="18052491\n")
+    b = make_backend(fake, partition="gpu")
+    handle = b.submit(make_spec(gpus=1, gpu_type="A100"), offer=None)
+
+    assert handle.data["slurm_job_id"] == "18052491"  # adopted, not re-submitted
+    assert not any("sbatch --parsable" in c for c in fake.commands)
+
+
+def test_submit_recovers_orphan_after_sbatch_transport_drop(no_push):
+    """sbatch's ssh dropped mid-flight (it may have created the job). Submit must
+    NOT blindly retry (duplicate) — it recovers the job by its unique name."""
+    fake = FakeExec()
+    fake.add(r"eval echo", stdout=f"{ROOT}\n")
+    fake.add(r"git init --bare", stdout=f"{ROOT}/projects/proj/repo.git\n")
+    orig_run = fake.run
+    seen_sbatch = {"v": False}
+
+    def run(command, *, stdin=None, timeout=None, check=False, reconnect_retry=True):
+        if "sbatch --parsable" in command:  # the submit drops mid-flight
+            seen_sbatch["v"] = True
+            raise ExecError("ssh connection to hpc is down", ExecResult(255, "", "b"))
+        if "squeue --me -h -n omnirun-train-abc123" in command:
+            # empty before sbatch (pre-check), the created id after (recovery)
+            return ExecResult(0, "18052491\n" if seen_sbatch["v"] else "", "")
+        return orig_run(command, stdin=stdin, timeout=timeout, check=check)
+
+    fake.run = run  # type: ignore[method-assign]
+    handle = make_backend(fake).submit(make_spec(), offer=None)
+    assert handle.data["slurm_job_id"] == "18052491"  # recovered, not duplicated
 
 
 def test_submit_pipes_script_and_parses_id(no_push):

@@ -552,7 +552,35 @@ class SlurmBackend(Backend):
     ) -> JobHandle:
         self._enforce_walltime(spec)
         ex = self.exec_
+        # Ensure the shared master is up BEFORE sbatch, so the non-idempotent submit
+        # is not the call that first hits a dead master (and cannot be safely
+        # retried into a duplicate job).
+        self._connect(interactive=False)
         root = jobdir.remote_root(ex, self.config.root)
+
+        def _handle(slurm_job_id: str, job_dir: str) -> JobHandle:
+            return JobHandle(
+                backend=self.name,
+                job_id=spec.job_id,
+                data={
+                    "job_dir": job_dir,
+                    "root": root,
+                    "slug": spec.repo.slug,
+                    "slurm_job_id": slurm_job_id,
+                    "wait_key": self._wait_key(spec.resources.gpu_type),
+                },
+            )
+
+        # IDEMPOTENCY: sbatch is not idempotent, and a submit that created the Slurm
+        # job but whose bookkeeping then failed (a dropped ssh, an auth blip) would
+        # otherwise be retried into a DUPLICATE — or abandoned as an orphan omnirun
+        # marks failed while it runs. The sbatch --job-name is unique per omnirun job
+        # (omnirun-<job_id>), so ADOPT an already-queued/running one instead of
+        # re-submitting.
+        adopted = self._find_slurm_job(ex, spec.job_id)
+        if adopted is not None:
+            return _handle(adopted, jobdir.job_dir_of(root, spec.job_id))
+
         project_root = jobdir.resolve_project_root(
             ex, root, spec.repo.slug, self.config.project_root_for(spec.repo.slug)
         )
@@ -565,24 +593,42 @@ class SlurmBackend(Backend):
         script = render_sbatch(spec, self.config, job_dir, root)
         # keep a copy on the cluster for reproducibility/debugging
         ex.write_file(f"{job_dir}/job.sbatch", script)
-        r = ex.run("sbatch --parsable", stdin=script)
+        # reconnect_retry=False: a transport drop mid-sbatch must NOT be blindly
+        # retried (it may have already created the job) — recover by name instead.
+        try:
+            r = ex.run("sbatch --parsable", stdin=script, reconnect_retry=False)
+        except ExecError:
+            recovered = self._find_slurm_job(ex, spec.job_id)
+            if recovered is not None:
+                return _handle(recovered, job_dir)  # sbatch DID create it
+            raise
         if not r.ok:
+            recovered = self._find_slurm_job(ex, spec.job_id)
+            if recovered is not None:
+                return _handle(recovered, job_dir)
             raise BackendError(f"sbatch failed on {ex.describe()}:\n{r.stderr.strip()}")
         out = (r.stdout.strip().splitlines() or [""])[-1].strip()
         slurm_job_id = out.split(";")[0].strip()  # "123" or "123;cluster"
         if not slurm_job_id.isdigit():
             raise BackendError(f"cannot parse sbatch --parsable output: {r.stdout!r}")
-        return JobHandle(
-            backend=self.name,
-            job_id=spec.job_id,
-            data={
-                "job_dir": job_dir,
-                "root": root,
-                "slug": spec.repo.slug,
-                "slurm_job_id": slurm_job_id,
-                "wait_key": self._wait_key(spec.resources.gpu_type),
-            },
-        )
+        return _handle(slurm_job_id, job_dir)
+
+    def _find_slurm_job(self, ex: Exec, job_id: str) -> str | None:
+        """The Slurm id of a pending/running job named ``omnirun-<job_id>``, or None.
+
+        Makes submit idempotent + recovers an orphan: the sbatch job-name is unique
+        per omnirun job, so a job that a prior (interrupted/retried) submit already
+        created can be adopted instead of duplicated. Best-effort — any error → None
+        (treated as 'no existing job', i.e. submit proceeds)."""
+        name = f"omnirun-{job_id}"
+        try:
+            r = ex.run(f"squeue --me -h -n {shell_quote(name)} -o '%i'", timeout=15)
+        except ExecError:
+            return None
+        if not r.ok:
+            return None
+        first = (r.stdout.strip().splitlines() or [""])[0].strip()
+        return first if first.isdigit() else None
 
     def _enforce_walltime(self, spec: JobSpec) -> None:
         """Refuse a submit if the requested wall-time exceeds the effective cap;

@@ -57,7 +57,9 @@ class FakeSSHExec(Exec):
         self.commands: list[str] = []
         FakeSSHExec.instances.append(self)
 
-    def run(self, command, *, stdin=None, timeout=None, check=False):
+    def run(
+        self, command, *, stdin=None, timeout=None, check=False, reconnect_retry=True
+    ):
         self.commands.append(command)
         if command.startswith("eval echo"):
             return ExecResult(0, "/root/.omnirun\n", "")

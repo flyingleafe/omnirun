@@ -49,7 +49,9 @@ class FakeExec(Exec):
                 "ssh session to fakehost expired — run `omnirun backends check` to (re)connect"
             )
 
-    def run(self, command, *, stdin=None, timeout=None, check=False):
+    def run(
+        self, command, *, stdin=None, timeout=None, check=False, reconnect_retry=True
+    ):
         self.commands.append(command)
         self.stdins.append(stdin)
         for pattern, result in self.responses:

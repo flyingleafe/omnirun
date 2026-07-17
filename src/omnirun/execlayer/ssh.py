@@ -249,6 +249,7 @@ class SSHExec(Exec):
         stdin: str | None = None,
         timeout: float | None = None,
         check: bool = False,
+        reconnect_retry: bool = True,
     ) -> ExecResult:
         self._ensure_control_dir()
         argv = [
@@ -285,7 +286,7 @@ class SSHExec(Exec):
                 # serialized under the shared lock, so a burst of callers can't storm
                 # the host — and retry, so ANY operation (status polls, submit, logs)
                 # self-heals and keeps reusing the one connection instead of failing.
-                if not healed and self.control_master:
+                if not healed and self.control_master and reconnect_retry:
                     healed = True
                     try:
                         self.ensure_master(interactive=False)

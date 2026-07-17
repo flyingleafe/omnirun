@@ -30,7 +30,9 @@ class LocalExec(Exec):
         stdin: str | None = None,
         timeout: float | None = None,
         check: bool = False,
+        reconnect_retry: bool = True,
     ) -> ExecResult:
+        _ = reconnect_retry  # no transport to reconnect for a local exec
         try:
             proc = subprocess.run(
                 ["bash", "-c", command],
