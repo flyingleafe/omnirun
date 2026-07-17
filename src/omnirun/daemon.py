@@ -33,7 +33,7 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.client import LocalClient, handle_of
 from omnirun.config import Config, ConfigError
-from omnirun.logingest import LogIngestManager, tail_file
+from omnirun.logingest import HEARTBEAT, LogIngestManager, tail_file
 from omnirun.models import DeployKey, JobSpec, JobState, ResourceSpec
 from omnirun.repo import RepoError
 from omnirun.state import default_store_dir
@@ -554,9 +554,15 @@ class Daemon:
                 # snapshot (complete even when the live tail was cut short by reap),
                 # then the live file, then a direct one-shot tail.
                 try:
+                    src: Any
                     if active:
+                        # Follow the live file, emitting a keepalive during a quiet
+                        # stretch so a long silent step never looks like a dead
+                        # connection (and any proxy's idle timeout is reset).
                         src = tail_file(
-                            live_path, lambda: follow and d._ingest.is_active(job_id)
+                            live_path,
+                            lambda: follow and d._ingest.is_active(job_id),
+                            heartbeat_s=15.0,
                         )
                     elif cached is not None:
                         src = tail_file(cached, lambda: False)
@@ -565,7 +571,10 @@ class Daemon:
                     else:
                         src = d._core.logs(rec, follow=follow)
                     for line in src:
-                        yield f"data: {line.rstrip(chr(10))}\n\n"
+                        if line is HEARTBEAT:
+                            yield ": keepalive\n\n"  # SSE comment; clients ignore it
+                        else:
+                            yield f"data: {line.rstrip(chr(10))}\n\n"
                 except Exception as e:
                     # A backend error mid-stream (e.g. the worker's host is
                     # unreachable when we fall back to a direct tail) cannot change

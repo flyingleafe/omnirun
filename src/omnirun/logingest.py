@@ -29,6 +29,15 @@ _log = logging.getLogger("omnirun.logingest")
 TailFn = Callable[[], Iterator[str]]
 
 
+class _Heartbeat:
+    """Sentinel yielded by :func:`tail_file` during a quiet follow (no new line
+    for ``heartbeat_s``); the daemon renders it as an SSE keepalive comment so a
+    long-idle log stream is never mistaken for a dead connection."""
+
+
+HEARTBEAT = _Heartbeat()
+
+
 class LogIngestor:
     """One thread following a single job's backend log into a file.
 
@@ -123,14 +132,19 @@ def tail_file(
     should_continue: Callable[[], bool],
     *,
     poll_s: float = 0.2,
-) -> Iterator[str]:
+    heartbeat_s: float | None = None,
+) -> Iterator[str | _Heartbeat]:
     """Yield complete lines from *path*, following appends while
     ``should_continue()`` is true, then draining whatever remains.
 
     Offset-based so it survives partial writes: each pass reads from the last
     position, buffers a trailing partial line, and only emits on a newline. When
     ``should_continue`` flips false it does one final read pass so a last write
-    that landed after the flip is not lost, then flushes any partial tail."""
+    that landed after the flip is not lost, then flushes any partial tail.
+
+    When ``heartbeat_s`` is set, yield :data:`HEARTBEAT` after that many seconds
+    with no new line while still following — so a live-but-quiet stream keeps
+    signalling it is alive (the daemon turns it into an SSE keepalive)."""
     pos = 0
     buf = ""
 
@@ -147,11 +161,18 @@ def tail_file(
             line, buf = buf.split("\n", 1)
             yield line
 
+    last = time.monotonic()
     while True:
-        yield from _drain()
+        for line in _drain():
+            last = time.monotonic()
+            yield line
         if not should_continue():
-            yield from _drain()  # final pass: catch a write after the flip
+            for line in _drain():  # final pass: catch a write after the flip
+                yield line
             if buf:
                 yield buf
             return
         time.sleep(poll_s)
+        if heartbeat_s is not None and time.monotonic() - last >= heartbeat_s:
+            last = time.monotonic()
+            yield HEARTBEAT

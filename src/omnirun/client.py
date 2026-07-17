@@ -596,6 +596,12 @@ class RemoteClient:
 
         self._base = base_url.rstrip("/")
         self._http = httpx.Client(base_url=self._base, timeout=timeout)
+        # For a followed log the gap between lines is unbounded (a job can run a
+        # long step silently), so the SSE read must NOT time out — disable just
+        # the read timeout; connect/write/pool stay bounded so an unreachable
+        # daemon still fails fast. The daemon also sends periodic keepalive
+        # comments so a proxy in front never sees the connection as idle.
+        self._stream_timeout = httpx.Timeout(timeout, read=None)
 
     def close(self) -> None:
         self._http.close()
@@ -769,7 +775,10 @@ class RemoteClient:
     def logs(self, rec: JobRecord, *, follow: bool) -> Iterator[str]:
         params = {"follow": "1" if follow else "0"}
         with self._http.stream(
-            "GET", f"/jobs/{rec.spec.job_id}/logs", params=params
+            "GET",
+            f"/jobs/{rec.spec.job_id}/logs",
+            params=params,
+            timeout=self._stream_timeout,
         ) as resp:
             if resp.status_code >= 400:
                 resp.read()
@@ -780,6 +789,8 @@ class RemoteClient:
                 # and `event: error` (backend failed mid-stream — the next
                 # `data:` frame carries the typed error JSON, since the 200 is
                 # already sent and the status can no longer be changed).
+                if raw.startswith(":"):
+                    continue  # keepalive comment — resets idle timers, no output
                 if raw.startswith("event: eof"):
                     break
                 if raw.startswith("event: error"):
