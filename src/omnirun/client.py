@@ -453,8 +453,9 @@ class LocalClient:
     def retry(
         self, rec: JobRecord, *, only_backend: str | None = None, repin: bool = False
     ) -> JobRecord:
-        # Pure store flip (terminal → QUEUED); no backend I/O, so no providers.
-        return Control(self._store(), {}).retry(
+        # Store flip (terminal → QUEUED); a --to repin validates the target against
+        # the real providers, so build them (still no backend I/O is performed).
+        return self._control().retry(
             rec.spec.job_id, only_backend=only_backend, repin=repin
         )
 
