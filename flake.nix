@@ -16,13 +16,19 @@
       # nixpkgs). Wrapped onto omnirun's PATH so the daemon has Colab support.
       mkColabCli = pkgs: pkgs.callPackage ./nix/colab-cli.nix { };
 
+      # kaggle 2.2.x (nixpkgs ships an ancient 1.7.4.5 lacking OAuth support),
+      # built for omnirun's python since omnirun imports it.
+      mkKaggle = pkgs: pkgs.callPackage ./nix/kaggle.nix {
+        python3Packages = pkgs.python312Packages;
+      };
+
       mkOmnirun = pkgs: pkgs.python312Packages.buildPythonApplication {
         pname = "omnirun";
         version = "0.5.0";
         pyproject = true;
         src = self;
         build-system = [ pkgs.python312Packages.hatchling ];
-        dependencies = with pkgs.python312Packages; [
+        dependencies = (with pkgs.python312Packages; [
           typer
           rich
           httpx
@@ -30,8 +36,7 @@
           sqlalchemy
           bottle
           psycopg
-          kaggle
-        ];
+        ]) ++ [ (mkKaggle pkgs) ];
         nativeBuildInputs = [ pkgs.makeWrapper ];
         # Tests are live-gated + run in CI; skip them in the build sandbox.
         doCheck = false;

@@ -6,6 +6,23 @@
 let
   pp = python3Packages;
 
+  # google-colab-cli uses filelock.ReadWriteLock (added in 3.29); nixpkgs is on
+  # 3.20.3, so build the newer wheel rather than relaxing the version floor.
+  filelock = pp.buildPythonPackage rec {
+    pname = "filelock";
+    version = "3.30.2";
+    format = "wheel";
+    src = fetchPypi {
+      pname = "filelock";
+      inherit version format;
+      dist = "py3";
+      python = "py3";
+      sha256 = "a64b58f75048ec39589983e97f5117163f822261dcb6ba843e098f05aac9663f";
+    };
+    doCheck = false;
+    pythonImportsCheck = [ "filelock" ];
+  };
+
   jupyter-mimetypes = pp.buildPythonPackage rec {
     pname = "jupyter-mimetypes";
     version = "0.2.0";
@@ -59,7 +76,7 @@ pp.buildPythonApplication rec {
   };
   propagatedBuildInputs = [
     pp.click
-    pp.filelock
+    filelock
     pp.google-auth-oauthlib
     pp.google-auth
     pp.html2text
@@ -75,9 +92,9 @@ pp.buildPythonApplication rec {
     pp.typing-extensions
     pp.websocket-client
   ];
-  # nixpkgs is a hair behind the wheel's declared floors (filelock 3.20.3 vs
-  # >=3.29.2, typer 0.24.0 vs >=0.24.1) — patch-level, harmless; relax the check.
-  pythonRelaxDeps = [ "filelock" "typer" ];
+  # nixpkgs typer (0.24.0) is a hair behind the wheel's >=0.24.1 floor —
+  # patch-level, harmless; relax just that check (filelock is built above).
+  pythonRelaxDeps = [ "typer" ];
   doCheck = false;
   pythonImportsCheck = [ "colab_cli" ];
   meta = with lib; {
