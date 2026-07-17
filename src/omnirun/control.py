@@ -1127,43 +1127,41 @@ class Control:
         run SERIALLY on this thread — capacity (#12 atomic ``reserve``) and the
         ledger can never be double-counted by a race; (2) every reserved job's
         ``provider.place`` — the minutes-long provisioning submit — runs
-        concurrently in a thread pool; (3) results are committed serially (ledger +
-        RUNNING save, or release/defer). The daemon's store lock (``_place_io``) is
-        dropped around the whole parallel batch so client reads/cancels are never
-        starved; the store is concurrency-safe (row-locked reserve, per-op
-        connections) and the only in-``place`` store writes are the per-job
-        provisioning-stub persist and the deploy-key read, safe to run off-thread.
+        concurrently in a thread pool; (3) each result is committed (ledger +
+        RUNNING save, or release/defer) on THIS thread the moment its placement
+        finishes, so a fast job goes RUNNING without waiting on a slow neighbour.
+        The daemon's store lock (``_place_io``) is dropped around the whole parallel
+        batch so client reads/cancels are never starved; the store is
+        concurrency-safe (row-locked reserve, per-op connections) and the only
+        in-``place`` store writes are the per-job provisioning-stub persist and the
+        deploy-key read, safe to run off-thread.
         """
         reservations = [
             r for d in decisions if (r := self._reserve_place(d, now)) is not None
         ]
         if not reservations:
             return
-        outcomes: list[tuple[_PlaceReservation, Placement | Exception]]
         if len(reservations) == 1:
             r = reservations[0]
             with self._place_io:
-                outcomes = [(r, self._place_io_call(r))]
-        else:
-            workers = min(len(reservations), self._max_place_workers)
-            with self._place_io:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=workers
-                ) as executor:
-                    fut_to_res = {
-                        executor.submit(self._place_io_call, r): r for r in reservations
-                    }
-                    outcomes = []
-                    for future in concurrent.futures.as_completed(fut_to_res):
-                        exc = future.exception()
-                        if exc is not None and not isinstance(exc, Exception):
-                            raise exc  # BaseException — never swallowed as a fault
-                        res = fut_to_res[future]
-                        outcomes.append(
-                            (res, exc if exc is not None else future.result())
-                        )
-        for res, outcome in outcomes:
-            self._finish_place(res, outcome, now)
+                outcome = self._place_io_call(r)
+            self._finish_place(r, outcome, now)
+            return
+        workers = min(len(reservations), self._max_place_workers)
+        with self._place_io:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                fut_to_res = {
+                    executor.submit(self._place_io_call, r): r for r in reservations
+                }
+                for future in concurrent.futures.as_completed(fut_to_res):
+                    exc = future.exception()
+                    if exc is not None and not isinstance(exc, Exception):
+                        raise exc  # BaseException — never swallowed as a fault
+                    res = fut_to_res[future]
+                    outcome = exc if exc is not None else future.result()
+                    # Commit as soon as THIS placement lands (on the main thread),
+                    # so it flips to RUNNING without waiting for slower neighbours.
+                    self._finish_place(res, outcome, now)
 
     @staticmethod
     def _place_io_call(res: _PlaceReservation) -> Placement | Exception:

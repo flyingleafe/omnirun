@@ -603,14 +603,28 @@ def offers(
 def serve(
     host: str | None = typer.Option(None, "--host", help="Bind host override."),
     port: int | None = typer.Option(None, "--port", help="Bind port override."),
+    log_level: str | None = typer.Option(
+        None,
+        "--log-level",
+        help="Log verbosity: debug/info/warning/error. Overrides $OMNIRUN_LOG_LEVEL "
+        "(default info). 'debug' traces every backend/API/ssh action.",
+    ),
 ) -> None:
     # The daemon's log stream (journald / a redirected file) is its only
     # observable surface — configure INFO so tick events (releases, defers,
-    # failures) are visible. One-shot CLI commands keep the quiet default.
+    # failures) are visible; 'debug' additionally traces every ssh command, its
+    # stderr, and each provider-API body so a stuck placement is fully diagnosable.
+    # Level comes from --log-level, else $OMNIRUN_LOG_LEVEL, else info.
+    level_name = (log_level or os.environ.get("OMNIRUN_LOG_LEVEL") or "info").upper()
+    level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx logs one INFO line per request; at DEBUG it also dumps headers. Keep it
+    # at INFO even under our DEBUG so the signal is the omnirun.* trace, not TLS noise.
+    logging.getLogger("httpx").setLevel(max(level, logging.INFO))
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     cfg = _load_cfg()
     if host is not None:
         cfg.daemon.host = host

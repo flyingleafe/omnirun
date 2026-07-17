@@ -475,6 +475,34 @@ def test_runpod_submit_provision_timeout_terminates(spec, fake_ssh, fake_stage):
 
 
 @respx.mock
+def test_request_retries_on_429_then_succeeds():
+    """A rate-limited provider call (HTTP 429) is retried — honoring the body's
+    retry_after — instead of failing, so parallel provisioning survives vast's
+    ~3 req/s cap."""
+    route = respx.get(f"{REST_BASE}/pods/pod123").mock(
+        side_effect=[
+            httpx.Response(429, json={"retry_after": 0}),
+            httpx.Response(429, json={"retry_after": 0}),
+            httpx.Response(200, json={"desiredStatus": "RUNNING"}),
+        ]
+    )
+    inst = runpod_backend(api_429_retries=5)._get_instance("pod123")
+    assert route.call_count == 3  # two 429s absorbed, third succeeds
+    assert inst is not None
+
+
+@respx.mock
+def test_request_gives_up_after_429_retries_exhausted():
+    """429 retries are bounded — a provider stuck rate-limiting eventually raises
+    (the placement releases and retries later) rather than looping forever."""
+    respx.get(f"{REST_BASE}/pods/pod123").mock(
+        return_value=httpx.Response(429, json={"retry_after": 0})
+    )
+    with pytest.raises(BackendError, match="429"):
+        runpod_backend(api_429_retries=2)._get_instance("pod123")
+
+
+@respx.mock
 def test_submit_reprovisions_when_first_instance_never_boots(
     spec, fake_ssh, fake_stage
 ):

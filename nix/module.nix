@@ -81,6 +81,17 @@ in
         included.
       '';
     };
+
+    logLevel = lib.mkOption {
+      type = lib.types.enum [ "debug" "info" "warning" "error" ];
+      default = "info";
+      example = "debug";
+      description = ''
+        Daemon log verbosity (journald). `debug` traces every backend/API/ssh
+        action — each ssh command and its stderr, each provisioning poll's
+        instance status — so a stuck placement is fully diagnosable.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -113,6 +124,7 @@ in
       environment = {
         OMNIRUN_CONFIG = toString cfg.configFile;
         OMNIRUN_STATE_DIR = cfg.stateDir;
+        OMNIRUN_LOG_LEVEL = cfg.logLevel;
       };
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/omnirun serve";

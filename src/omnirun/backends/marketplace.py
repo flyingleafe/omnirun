@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -101,11 +102,39 @@ DEFAULT_FAILSAFE_GRACE_S = 24 * 3600
 # never boot ssh; a bad rental is the instance's fault, not the job's, so the
 # backend re-provisions rather than failing the whole placement.
 DEFAULT_PROVISION_ATTEMPTS = 3
+# How many times a rate-limited (HTTP 429) provider API call is retried, honoring
+# the server's Retry-After, before giving up. Parallel provisioning bursts calls;
+# a generous retry count keeps a placement from failing on a transient 429.
+DEFAULT_API_429_RETRIES = 6
+DEFAULT_RETRY_AFTER_S = 5.0
 WAIT_ESTIMATE_S = 150.0  # honest ballpark: instance provisioning + image pull
 WAIT_NOTE = "instance provisioning + image pull, typically 2-3 min"
 
 _sleep = time.sleep  # test seam
 _log = logging.getLogger("omnirun.backends.marketplace")
+
+
+def _retry_after_s(resp: "httpx.Response") -> float:
+    """Seconds to wait before retrying a 429, from the ``Retry-After`` header or a
+    ``retry_after`` field in the JSON body, else a sensible default. A small jitter
+    is added so parallel placement threads do not all retry on the same beat."""
+    import random
+
+    candidates: list[float] = []
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            candidates.append(float(header))
+        except ValueError:
+            pass
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and body.get("retry_after") is not None:
+            candidates.append(float(body["retry_after"]))
+    except (ValueError, TypeError):
+        pass
+    base = max(candidates) if candidates else DEFAULT_RETRY_AFTER_S
+    return base + random.uniform(0.0, 1.0)
 
 
 class HTTPBackendError(BackendError):
@@ -170,6 +199,14 @@ class MarketplaceBackend(Backend, ABC):
         # guard (the ``_get_instance`` check makes double-terminate safe).
         auto = bool(self.config.extra("auto_terminate", True))
         self.reap = ReapPolicy(hold_on_terminal=auto, release_lost=auto)
+        # Provider API throttle. Parallel provisioning fans many concurrent API
+        # calls at one provider; vast caps at ~3 req/s and answers a burst with
+        # HTTP 429. ``api_min_interval_s`` spaces this backend's calls (shared
+        # across the placement threads via one memoized instance) to stay under the
+        # ceiling; 429s that still slip through are retried with backoff below.
+        self._min_interval_s = float(self.config.extra("api_min_interval_s", 0.0))
+        self._rate_lock = threading.Lock()
+        self._last_call_at = 0.0
 
     # ---- provider primitives (subclass surface) -------------------------------
 
@@ -222,19 +259,52 @@ class MarketplaceBackend(Backend, ABC):
         hdrs = dict(headers or {})
         if auth:
             hdrs["Authorization"] = f"Bearer {self._require_key()}"
-        try:
-            resp = httpx.request(
-                method, url, json=json_body, headers=hdrs, timeout=HTTP_TIMEOUT_S
-            )
-        except httpx.HTTPError as e:
-            raise BackendUnreachable(f"{self.name}: {method} {url} failed: {e}") from e
-        if resp.status_code >= 400:
-            raise HTTPBackendError(
-                f"{self.name}: {method} {url} -> HTTP {resp.status_code}: "
-                f"{resp.text[:300]}",
-                status_code=resp.status_code,
-            )
-        return resp
+        retries = int(self.config.extra("api_429_retries", DEFAULT_API_429_RETRIES))
+        for attempt in range(retries + 1):
+            self._throttle()
+            try:
+                resp = httpx.request(
+                    method, url, json=json_body, headers=hdrs, timeout=HTTP_TIMEOUT_S
+                )
+            except httpx.HTTPError as e:
+                raise BackendUnreachable(
+                    f"{self.name}: {method} {url} failed: {e}"
+                ) from e
+            if resp.status_code == 429 and attempt < retries:
+                wait = _retry_after_s(resp)
+                _log.info(
+                    "%s: %s %s rate-limited (429); retry %d/%d in %.1fs",
+                    self.name,
+                    method,
+                    url,
+                    attempt + 1,
+                    retries,
+                    wait,
+                )
+                _sleep(wait)
+                continue
+            if resp.status_code >= 400:
+                raise HTTPBackendError(
+                    f"{self.name}: {method} {url} -> HTTP {resp.status_code}: "
+                    f"{resp.text[:300]}",
+                    status_code=resp.status_code,
+                )
+            return resp
+        raise BackendUnreachable(  # pragma: no cover - loop always returns/raises
+            f"{self.name}: {method} {url} exhausted 429 retries"
+        )
+
+    def _throttle(self) -> None:
+        """Space this backend's provider-API calls to ``api_min_interval_s`` so a
+        burst of parallel provisioning never trips the provider's rate limit. A
+        no-op when the interval is 0 (the default)."""
+        if self._min_interval_s <= 0:
+            return
+        with self._rate_lock:
+            wait = self._min_interval_s - (time.monotonic() - self._last_call_at)
+            if wait > 0:
+                _sleep(wait)
+            self._last_call_at = time.monotonic()
 
     # ---- ssh key handling --------------------------------------------------------
 
@@ -439,6 +509,14 @@ class MarketplaceBackend(Backend, ABC):
             inst = self._get_instance(instance_id)
             if inst is not None:
                 last = inst
+                _log.debug(
+                    "%s: instance %s status=%r ssh=%s:%s",
+                    self.name,
+                    instance_id,
+                    inst.status,
+                    inst.ssh_target,
+                    inst.ssh_port,
+                )
                 if inst.ssh_target and inst.status.lower() == "running":
                     return inst
             if time.monotonic() >= deadline:
@@ -454,16 +532,41 @@ class MarketplaceBackend(Backend, ABC):
             self.config.extra("ssh_wait_timeout_s", DEFAULT_SSH_WAIT_TIMEOUT_S)
         )
         deadline = time.monotonic() + timeout
+        attempts = 0
+        # The reason ssh is not up yet — connection refused (sshd not started),
+        # auth failure (key not on the instance/account), timeout, etc. Kept so a
+        # dead rental is reported with WHY, not just "did not accept connections".
+        last_reason = "no attempt completed"
         while True:
+            attempts += 1
             try:
-                if ex.run("true", timeout=15).ok:
+                res = ex.run("true", timeout=15)
+                if res.ok:
+                    _log.debug(
+                        "%s: ssh to %s ready after %d attempt(s)",
+                        self.name,
+                        ex.describe(),
+                        attempts,
+                    )
                     return
-            except Exception:
-                pass
+                last_reason = (
+                    f"exit {res.returncode}: {(res.stderr or '').strip()[:200]}"
+                )
+            except Exception as e:
+                last_reason = f"{type(e).__name__}: {e}"
+            # Every probe result is logged at DEBUG so a stuck placement shows the
+            # real handshake error each cycle, not silence.
+            _log.debug(
+                "%s: ssh to %s not ready (attempt %d): %s",
+                self.name,
+                ex.describe(),
+                attempts,
+                last_reason,
+            )
             if time.monotonic() >= deadline:
                 raise InstanceUnreachable(
-                    f"{self.name}: sshd on {ex.describe()} did not accept "
-                    f"connections within {timeout:.0f}s"
+                    f"{self.name}: sshd on {ex.describe()} did not accept connections "
+                    f"within {timeout:.0f}s ({attempts} attempts; last: {last_reason})"
                 )
             _sleep(SSH_WAIT_POLL_S)
 

@@ -13,6 +13,7 @@ hanging on an auth prompt.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import shlex
 import shutil
@@ -27,6 +28,8 @@ from omnirun.execlayer.base import (
     shell_quote,
     stream_lines,
 )
+
+_log = logging.getLogger("omnirun.execlayer.ssh")
 
 # stderr fragments (lowercased) that mean the transport itself failed —
 # distinguished from a remote command exiting 255.
@@ -174,17 +177,29 @@ class SSHExec(Exec):
             "-lc" if self.login_shell else "-c",
             shell_quote(command),
         ]
+        _log.debug("ssh %s: run %r (timeout=%s)", self.target, command[:200], timeout)
         try:
             proc = subprocess.run(
                 argv, input=stdin, capture_output=True, text=True, timeout=timeout
             )
         except subprocess.TimeoutExpired as e:
+            _log.debug(
+                "ssh %s: run %r TIMED OUT after %ss", self.target, command[:80], timeout
+            )
             return ExecResult(
                 returncode=124,
                 stdout=_text(e.output),
                 stderr=_text(e.stderr) or f"timed out after {timeout}s",
             )
         result = ExecResult(proc.returncode, proc.stdout, proc.stderr)
+        if result.returncode != 0:
+            _log.debug(
+                "ssh %s: run %r -> rc=%d stderr=%r",
+                self.target,
+                command[:80],
+                result.returncode,
+                (result.stderr or "").strip()[:300],
+            )
         if proc.returncode == 255 and self._transport_failed(proc.stderr):
             last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
             raise ExecError(
