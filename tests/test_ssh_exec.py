@@ -212,8 +212,11 @@ def test_ensure_master_noninteractive_auto_reconnects(ex, recorder):
 
     recorder.behavior = behavior
     ex.ensure_master(interactive=False)  # must NOT raise
-    argv, kwargs = recorder.calls[1]
-    assert argv[-1] == "true" and "-tt" not in argv  # no terminal
+    # The reconnect is the no-TTY `true` connect (found by content — a re-check
+    # under the shared lock may precede it).
+    argv, kwargs = next(
+        (a, k) for a, k in recorder.calls if a[-1] == "true" and "-tt" not in a
+    )
     assert any("ConnectTimeout=20" in a for a in argv)  # bounded connect
     assert kwargs.get("timeout")  # bounded wall-clock so it can't hang
 
@@ -226,9 +229,9 @@ def test_ensure_master_interactive_reconnects_with_tty(ex, recorder):
 
     recorder.behavior = behavior
     ex.ensure_master(interactive=True)
-    assert len(recorder.calls) == 2
-    argv, kwargs = recorder.calls[1]
-    assert "-tt" in argv
+    # The establish is the -tt connect (found by content — a re-check under the
+    # shared lock may precede it).
+    argv, kwargs = next((a, k) for a, k in recorder.calls if "-tt" in a)
     # inherits the user's terminal: no BatchMode, no output capture
     assert "BatchMode=yes" not in opt_pairs(argv)
     assert not kwargs.get("capture_output")

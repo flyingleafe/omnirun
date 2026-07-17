@@ -266,6 +266,11 @@ class SlurmBackend(Backend):
                 ssh_command=_ssh_command(self.config),
                 control_master=self.config.extra("control_master", True),
                 batch_mode=self.config.extra("batch_mode", True),
+                # Keep the one authenticated login-node session alive for a long time
+                # so every sbatch/squeue/status multiplexes over it — HPC logins are
+                # expensive (password/2FA) and some sites throttle repeated auth.
+                # Regular polling refreshes it, so it effectively never idle-closes.
+                control_persist=str(self.config.extra("ssh_control_persist", "8h")),
             )
         return self._exec
 

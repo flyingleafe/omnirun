@@ -18,6 +18,7 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+import threading
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -30,6 +31,25 @@ from omnirun.execlayer.base import (
 )
 
 _log = logging.getLogger("omnirun.execlayer.ssh")
+
+# One establishment lock per (host, control-socket) so that many callers hitting a
+# dead master at once — several apocrita backends + status polls + a churn of
+# placement retries — do NOT each fire a concurrent password auth (which QMUL and
+# similar sites throttle as an auth storm and start REFUSING). The first holder
+# (re)establishes the single shared ControlMaster; the rest find it alive and
+# reuse it. Module-level so it is shared across every SSHExec instance.
+_MASTER_LOCKS: dict[str, threading.Lock] = {}
+_MASTER_LOCKS_GUARD = threading.Lock()
+
+
+def _master_lock(key: str) -> threading.Lock:
+    with _MASTER_LOCKS_GUARD:
+        lock = _MASTER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _MASTER_LOCKS[key] = lock
+        return lock
+
 
 # stderr fragments (lowercased) that mean the transport itself failed —
 # distinguished from a remote command exiting 255.
@@ -74,6 +94,7 @@ class SSHExec(Exec):
         ssh_command: Sequence[str] = ("ssh",),
         control_master: bool = True,
         batch_mode: bool = True,
+        control_persist: str = "10m",
     ) -> None:
         self.target = target
         self.port = port
@@ -89,9 +110,21 @@ class SSHExec(Exec):
         self.ssh_command = list(ssh_command)
         self.control_master = control_master
         self.batch_mode = batch_mode
+        # How long the shared ControlMaster is kept alive after the last channel
+        # closes. A LONG value (set high for password/2FA hosts like apocrita) keeps
+        # ONE authenticated session up so subsequent commands multiplex over it
+        # instead of re-authenticating — the single-persistent-session model.
+        self.control_persist = control_persist
         # Wall-clock budget for a daemon's non-interactive auto-reconnect (a stuck
         # auth prompt can never exceed this; the backend degrades to unfit instead).
         self._auto_reconnect_timeout_s = 45.0
+
+    def _master_key(self) -> str:
+        """Identity of the shared ControlMaster socket (host+port+socket dir) — the
+        key every SSHExec to the same target serializes its (re)auth on."""
+        return (
+            f"{self.control_dir}|{'|'.join(self.ssh_command)}|{self.target}|{self.port}"
+        )
 
     # --- option assembly ------------------------------------------------
 
@@ -112,7 +145,7 @@ class SSHExec(Exec):
         return [
             "-oControlMaster=auto",
             f"-oControlPath={self.control_dir}/%C",
-            "-oControlPersist=10m",
+            f"-oControlPersist={self.control_persist}",
             "-oServerAliveInterval=30",
             "-oServerAliveCountMax=4",
         ]
@@ -146,53 +179,66 @@ class SSHExec(Exec):
         even that fails does it raise the reconnect hint.
         """
         self._ensure_control_dir()
-        check = subprocess.run(
-            [*self.ssh_command, *self._ssh_opts(), "-O", "check", self.target],
-            capture_output=True,
-            text=True,
-        )
-        if check.returncode == 0:
+        if self._master_alive():
             return
-        if interactive:
-            # Inherit the user's terminal so keyboard-interactive auth (Duo, TOTP,
-            # passwords) works. No BatchMode here.
-            proc = subprocess.run(
-                [*self.ssh_command, *self._ssh_opts(), "-tt", self.target, "true"]
-            )
-            if proc.returncode != 0:
-                raise ExecError(
-                    f"could not establish ssh connection to {self.target} "
-                    f"(ssh exited {proc.returncode})"
+        # Only ONE concurrent (re)auth per target: hold the shared lock so a burst of
+        # callers finding the master dead can't each fire a password auth (an auth
+        # storm QMUL-style hosts start REFUSING). Whoever wins re-establishes the one
+        # shared session; the rest re-check and find it alive.
+        with _master_lock(self._master_key()):
+            if self._master_alive():
+                return
+            if interactive:
+                # Inherit the user's terminal so keyboard-interactive auth (Duo,
+                # TOTP, passwords) works. No BatchMode here.
+                proc = subprocess.run(
+                    [*self.ssh_command, *self._ssh_opts(), "-tt", self.target, "true"]
                 )
-            return
-        # Daemon path: (re)establish the master WITHOUT a terminal — relies on a
-        # key/agent or the configured ssh wrapper to supply auth silently. A bounded
-        # timeout keeps a backend whose auth genuinely needs a human from hanging
-        # the scheduler tick (it degrades to an unfit offer this round instead).
-        try:
-            proc = subprocess.run(
-                [
-                    *self.ssh_command,
-                    *self._ssh_opts(),
-                    "-oConnectTimeout=20",
-                    self.target,
-                    "true",
-                ],
+                if proc.returncode != 0:
+                    raise ExecError(
+                        f"could not establish ssh connection to {self.target} "
+                        f"(ssh exited {proc.returncode})"
+                    )
+                return
+            # Daemon path: (re)establish the master WITHOUT a terminal — relies on a
+            # key/agent or the configured ssh wrapper to supply auth silently. A
+            # bounded timeout keeps a backend whose auth genuinely needs a human from
+            # hanging the tick (it degrades to an unfit offer this round instead).
+            try:
+                proc = subprocess.run(
+                    [
+                        *self.ssh_command,
+                        *self._ssh_opts(),
+                        "-oConnectTimeout=20",
+                        self.target,
+                        "true",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=self._auto_reconnect_timeout_s,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise ExecError(
+                    f"ssh session to {self.target} expired and auto-reconnect timed "
+                    f"out after {self._auto_reconnect_timeout_s:.0f}s — {RECONNECT_HINT}"
+                ) from e
+            if proc.returncode != 0:
+                last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
+                raise ExecError(
+                    f"ssh session to {self.target} expired; auto-reconnect failed "
+                    f"({last.strip()}) — {RECONNECT_HINT}"
+                )
+
+    def _master_alive(self) -> bool:
+        """True if the shared ControlMaster socket answers `-O check` (live)."""
+        return (
+            subprocess.run(
+                [*self.ssh_command, *self._ssh_opts(), "-O", "check", self.target],
                 capture_output=True,
                 text=True,
-                timeout=self._auto_reconnect_timeout_s,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise ExecError(
-                f"ssh session to {self.target} expired and auto-reconnect timed out "
-                f"after {self._auto_reconnect_timeout_s:.0f}s — {RECONNECT_HINT}"
-            ) from e
-        if proc.returncode != 0:
-            last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
-            raise ExecError(
-                f"ssh session to {self.target} expired; auto-reconnect failed "
-                f"({last.strip()}) — {RECONNECT_HINT}"
-            )
+            ).returncode
+            == 0
+        )
 
     # --- Exec protocol -----------------------------------------------------
 

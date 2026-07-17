@@ -653,7 +653,12 @@ class Daemon:
             # backends). Only a job this daemon never ingested falls back to a
             # direct one-shot tail through the core.
             live_path = d._ingest.path_for(job_id)
-            active = d._ingest.is_active(job_id)
+            live_has_content = live_path.is_file() and live_path.stat().st_size > 0
+            # The ingestor is only a usable source if it is BOTH running AND actually
+            # producing: a wedged ingestor (blocked on a broken backend tail after a
+            # re-placement) stays "active" forever with an empty file, so require
+            # content too — otherwise fall through to a direct worker tail below.
+            active = d._ingest.is_active(job_id) and live_has_content
             cached = (
                 Path(rec.logs_cached_to)
                 if rec.logs_cached_to and Path(rec.logs_cached_to).is_file()
@@ -677,9 +682,17 @@ class Daemon:
                             lambda: follow and d._ingest.is_active(job_id),
                             heartbeat_s=15.0,
                         )
+                    elif not rec.state.terminal and rec.placement is not None:
+                        # A RUNNING job the ingestor is NOT covering — e.g. it was
+                        # re-placed on a new backend/instance while the previous
+                        # attempt's ingestor is wedged (a broken backend tail that
+                        # never returns), leaving a stale/empty <id>.live.log. Serve
+                        # from a DIRECT worker tail so `logs -f` still shows the live
+                        # run instead of the stale empty file.
+                        src = d._core.logs(rec, follow=follow)
                     elif cached is not None:
                         src = tail_file(cached, lambda: False)
-                    elif live_path.is_file():
+                    elif live_has_content:
                         src = tail_file(live_path, lambda: False)
                     else:
                         src = d._core.logs(rec, follow=follow)
