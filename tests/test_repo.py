@@ -129,10 +129,15 @@ def test_pushed_head_passes(sample_repo: Path, origin: Path) -> None:
     assert ref.slug == "origin"  # slug follows the remote url basename
 
 
-def test_unpushed_head_raises(sample_repo: Path, origin: Path) -> None:
-    _commit(sample_repo, "new.txt")
-    with pytest.raises(RepoError, match="push"):
-        capture_repo_state(sample_repo)
+def test_unpushed_head_captures(sample_repo: Path, origin: Path) -> None:
+    # CODE-2c: a committed-but-unpushed HEAD is captured (delivery goes via the
+    # thin delta bundle at code-plan resolution) — the old refusal is gone.
+    sha = _commit(sample_repo, "new.txt")
+    ref = capture_repo_state(sample_repo)
+    assert ref.sha == sha
+    from omnirun.repo import sha_on_origin
+
+    assert not sha_on_origin(sample_repo, sha)
 
 
 def test_auto_push(sample_repo: Path, origin: Path) -> None:

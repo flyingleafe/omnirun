@@ -224,6 +224,12 @@ class CodePlan(BaseModel):
     clone_url: str = ""  # https (remote) or ssh git@host:owner/repo (private)
     origin: str = ""  # remote_url; for ``private`` it keys the deploy-key lookup
     deploy_key_material: str | None = None  # transient; injected at place time
+    # Thin bundle (CODE-2c): a base64 ``git bundle`` carrying the delta between
+    # the best origin-reachable base and a committed-but-UNPUSHED sha. Rides the
+    # spec like ``.env`` (works daemonless and against a remote daemon: the
+    # placer needs no local git objects); the worker clones/fetches origin per
+    # ``kind`` and then fetches this bundle on top. None = sha is on origin.
+    bundle_b64: str | None = None
 
 
 class DeployKey(BaseModel):
@@ -249,6 +255,10 @@ class JobPolicy(BaseModel):
     deadline: Deadline | None = None
     max_cost: float | None = None  # USD ceiling for a single job run
     priority: int = 0  # higher = scheduled sooner; reprioritizable after submission
+    # How a failed/cancelled dependency (``JobSpec.depends_on``) is treated:
+    # "fail" fails this job with cause dep-failed; "ignore" treats any terminal
+    # dependency as satisfied (run-anyway).
+    dep_failure: Literal["fail", "ignore"] = "fail"
 
 
 class JobSpec(BaseModel):
@@ -263,6 +273,13 @@ class JobSpec(BaseModel):
     policy: JobPolicy = Field(default_factory=JobPolicy)
     # Pin placement to this provider name (config key); None = any fitting provider.
     only_backend: str | None = None
+    # Group identity (FUT-1): jobs submitted as one matrix/sweep share a group
+    # name so ps/wait/cancel/retry/pull can address the whole set. None = no group.
+    group: str | None = None
+    # Minimal dependencies (FUT-2): job_ids that must be SUCCEEDED before the
+    # scheduler considers this job placeable. A failed/cancelled dependency
+    # fails this job (policy.dep_failure="fail") or is ignored ("ignore").
+    depends_on: list[str] = Field(default_factory=list)
     # How the worker materializes the repo (resolved client-side at submit). None
     # for legacy/hand-built specs → backends fall back to the local-objects path.
     code: CodePlan | None = None

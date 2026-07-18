@@ -12,9 +12,106 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnirun import chooser, client
+from omnirun import __version__, chooser, client
 from omnirun.chooser import RankedOffer
 from omnirun.models import JobPolicy, JobState, Offer, ProviderFacts
+from omnirun.state.store import EventRow
+
+# ---------------------------------------------------------------------------
+# Version handshake (CLI-6): the client stamps every request with its version;
+# the daemon answers its own version plus the minimum client it supports. A
+# mismatch surfaces as ONE line telling the user which side to upgrade.
+# ---------------------------------------------------------------------------
+
+VERSION_HEADER = "X-Omnirun-Version"
+MIN_VERSION_HEADER = "X-Omnirun-Min-Version"
+
+#: This build's protocol version — the package version (client and daemon ship
+#: from one wheel, so one number describes both sides).
+PROTOCOL_VERSION = __version__
+
+#: The oldest peer this build still speaks to. Bump when the wire genuinely
+#: breaks; the async-submit/events additions are backward compatible, so the
+#: floor stays at the first v2-surface release.
+MIN_SUPPORTED_PEER = "0.5"
+
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    """Leading numeric components of a version string ("0.5.18" → (0, 5, 18));
+    a malformed component ends the tuple (never raises)."""
+    out: list[int] = []
+    for part in v.strip().split("."):
+        if not part.isdigit():
+            break
+        out.append(int(part))
+    return tuple(out) or (0,)
+
+
+def check_peer_version(peer: str | None, peer_min: str | None) -> str | None:
+    """The CLIENT-side handshake check over the daemon's response headers.
+
+    Returns the one-line upgrade instruction, or ``None`` when compatible. A
+    daemon that sends no headers (pre-handshake build) is checked only against
+    our own floor implicitly — absent evidence is not a mismatch."""
+    if peer_min is not None and version_tuple(PROTOCOL_VERSION) < version_tuple(
+        peer_min
+    ):
+        return (
+            f"this omnirun client is v{PROTOCOL_VERSION} but the daemon requires "
+            f">= v{peer_min} — upgrade the client (pip install -U omnirun)"
+        )
+    if peer is not None and version_tuple(peer) < version_tuple(MIN_SUPPORTED_PEER):
+        return (
+            f"the daemon is v{peer}, older than this client supports "
+            f"(>= v{MIN_SUPPORTED_PEER}) — upgrade omnirun on the daemon host "
+            "and restart `omnirun serve`"
+        )
+    return None
+
+
+def check_client_version(client_version: str | None) -> str | None:
+    """The DAEMON-side handshake check over the request header. ``None`` when
+    the client is acceptable (or predates the handshake and sent nothing)."""
+    if client_version is not None and version_tuple(client_version) < version_tuple(
+        MIN_SUPPORTED_PEER
+    ):
+        return (
+            f"omnirun client v{client_version} is older than this daemon "
+            f"supports (>= v{MIN_SUPPORTED_PEER}) — upgrade the client "
+            "(pip install -U omnirun)"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Event rows (the /events SSE feed, FUT-9)
+# ---------------------------------------------------------------------------
+
+
+def event_row_to_json(ev: EventRow) -> dict[str, Any]:
+    return {
+        "id": ev.id,
+        "job_id": ev.job_id,
+        "seq": ev.seq,
+        "at": ev.at,
+        "actor": ev.actor,
+        "action": ev.action,
+        "cause": ev.cause,
+        "data": ev.data,
+    }
+
+
+def event_row_from_json(d: dict[str, Any]) -> EventRow:
+    return EventRow(
+        id=int(d["id"]),
+        job_id=d["job_id"],
+        seq=int(d["seq"]),
+        at=d["at"],
+        actor=d["actor"],
+        action=d["action"],
+        cause=d.get("cause"),
+        data=d.get("data"),
+    )
 
 
 def submit_outcome_to_json(o: client.SubmitOutcome) -> dict[str, Any]:

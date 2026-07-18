@@ -736,3 +736,221 @@ def test_shutdown_under_hung_provider_is_fast_and_adoptable(tmp_path: Path) -> N
         client2.close()
         h2.stop()
     assert cloud.create_calls == [resource_key(spec.job_id)]  # exactly one mint
+
+
+# ---------------------------------------------------------------------------
+# P6 surface: /events SSE, explain, async submit, version handshake, wait
+# ---------------------------------------------------------------------------
+
+
+def test_events_backlog_and_resume(harness: _Harness) -> None:
+    """GET /events?after=0 replays the whole event history as id-tagged SSE
+    frames; a Last-Event-ID resume continues exactly past the cursor."""
+    import httpx
+
+    client = RemoteClient(harness.url)
+    try:
+        outcome = client.submit(_spec("ev1"))
+        _await_state(client, outcome.job_id, {JobState.SUCCEEDED}, reaped=True)
+        rows = list(client.events(after=0, follow=False))
+        actions = [r.action for r in rows if r.job_id == outcome.job_id]
+        assert actions[:4] == ["submit", "reserve", "provision", "activate"]
+        assert {"finish", "capture", "reap"} <= set(actions)
+        assert [r.id for r in rows] == sorted(r.id for r in rows)
+
+        # Resume via Last-Event-ID: only events past the cursor come back.
+        cut = rows[3].id
+        with httpx.Client(base_url=harness.url) as http:
+            with http.stream(
+                "GET",
+                "/events",
+                params={"follow": "0", "after": "0"},
+                headers={"Last-Event-ID": str(cut)},
+            ) as resp:
+                body = "".join(resp.iter_text())
+        ids = [
+            int(ln.split(": ", 1)[1])
+            for ln in body.splitlines()
+            if ln.startswith("id: ")
+        ]
+        assert ids and min(ids) > cut
+        assert "event: eof" in body
+    finally:
+        client.close()
+
+
+def test_events_follow_streams_live(harness: _Harness) -> None:
+    """A followed /events subscription sees a job submitted AFTER the
+    subscribe, live."""
+    import queue as queue_mod
+    import threading as threading_mod
+
+    client = RemoteClient(harness.url)
+    watcher = RemoteClient(harness.url)
+    got: queue_mod.Queue[str] = queue_mod.Queue()
+
+    def _watch() -> None:
+        try:
+            for ev in watcher.events():  # from "now": only new events
+                got.put(f"{ev.job_id}:{ev.action}")
+        except Exception:
+            pass
+
+    thread = threading_mod.Thread(target=_watch, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.3)  # let the subscription attach
+        outcome = client.submit(_spec("ev2"))
+        seen: list[str] = []
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                seen.append(got.get(timeout=1.0))
+            except queue_mod.Empty:
+                continue
+            if f"{outcome.job_id}:activate" in seen:
+                break
+        assert f"{outcome.job_id}:submit" in seen
+        assert f"{outcome.job_id}:activate" in seen
+    finally:
+        client.close()
+        watcher.close()
+
+
+def test_async_submit_is_202_and_settles(harness: _Harness) -> None:
+    """The new client's submit opts into the async path: POST answers 202
+    immediately; the outcome comes from the /settle long-poll."""
+    import httpx
+
+    with httpx.Client(base_url=harness.url) as http:
+        resp = http.post(
+            "/jobs",
+            json={
+                "mode": "submit",
+                "spec": _spec("async1").model_dump(mode="json"),
+                "backend": None,
+                "async": True,
+            },
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["async"] is True and data["state"] == "queued"
+        job_id = data["job_id"]
+        deadline = time.monotonic() + 15.0
+        settled: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            settled = http.get(f"/jobs/{job_id}/settle").json()
+            if settled.get("settled"):
+                break
+        assert settled.get("settled") is True
+        outcome = settled["outcome"]
+        assert isinstance(outcome, dict) and outcome["placed"] is True
+
+
+def test_blocking_submit_path_kept_for_old_clients(harness: _Harness) -> None:
+    """A POST /jobs without the async field (an old client) still gets the
+    blocking outcome directly."""
+    import httpx
+
+    with httpx.Client(base_url=harness.url, timeout=30.0) as http:
+        resp = http.post(
+            "/jobs",
+            json={
+                "mode": "submit",
+                "spec": _spec("block1").model_dump(mode="json"),
+                "backend": None,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "async" not in data
+        assert data["placed"] is True and data["provider_name"] == "fake"
+
+
+def test_version_handshake_headers_and_too_old_client(harness: _Harness) -> None:
+    import httpx
+
+    from omnirun import wire
+
+    with httpx.Client(base_url=harness.url) as http:
+        resp = http.get("/healthz")
+        assert resp.headers[wire.VERSION_HEADER] == wire.PROTOCOL_VERSION
+        assert resp.headers[wire.MIN_VERSION_HEADER] == wire.MIN_SUPPORTED_PEER
+
+        # A client below the daemon's floor is refused with the upgrade line.
+        resp = http.get("/healthz", headers={wire.VERSION_HEADER: "0.0.1"})
+        assert resp.status_code == 426
+        assert "upgrade the client" in resp.json()["error"]
+
+
+def test_remote_client_raises_upgrade_error_when_daemon_requires_newer(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnirun import wire
+
+    monkeypatch.setattr(wire, "PROTOCOL_VERSION", "0.0.1")
+    client = RemoteClient(harness.url)
+    try:
+        with pytest.raises(BackendError, match="upgrade"):
+            client.list_jobs()
+    finally:
+        client.close()
+
+
+def test_explain_endpoint_roundtrip(tmp_path: Path) -> None:
+    """explain over HTTP: an unfit-everywhere job reads as held with the
+    reason; the daemon serves the pure pass verdict from its live snapshot."""
+    h = _sync_harness(tmp_path, lambda n, b: _UnfitBackend(n, b))
+    client = RemoteClient(h.url)
+    try:
+        ids = client.enqueue(_spec("exp1"))
+        deadline = time.monotonic() + 10.0
+        exp = client.explain(ids[0])
+        while time.monotonic() < deadline and not exp.verdict:
+            exp = client.explain(ids[0])
+        assert exp.job_id == ids[0]
+        assert exp.verdict  # a verdict, whatever the engine got to
+    finally:
+        client.close()
+        h.stop()
+
+
+def test_remote_wait_reaches_succeeded(harness: _Harness) -> None:
+    client = RemoteClient(harness.url)
+    try:
+        ids = client.enqueue(_spec("w1"))
+        result = client.wait(ids, timeout=20.0)  # default until: succeeded
+        assert result.timed_out is False
+        assert result.states[ids[0]] is JobState.SUCCEEDED
+    finally:
+        client.close()
+
+
+def test_remote_wait_times_out(tmp_path: Path) -> None:
+    h = _sync_harness(tmp_path, lambda n, b: _UnfitBackend(n, b))
+    client = RemoteClient(h.url)
+    try:
+        ids = client.enqueue(_spec("w2"))
+        result = client.wait(ids, timeout=1.5)
+        assert result.timed_out is True
+        assert not result.states[ids[0]].terminal
+    finally:
+        client.close()
+        h.stop()
+
+
+def test_submit_many_enqueues_a_group(harness: _Harness) -> None:
+    from omnirun.groups import expand_cells, parse_matrix
+
+    client = RemoteClient(harness.url)
+    try:
+        base = _spec("grp")
+        specs = expand_cells(base, parse_matrix("seed=0,1"), "grp-1")
+        ids = client.submit_many(specs)
+        assert len(ids) == 2
+        result = client.wait(ids, until=None, timeout=20.0)  # any terminal
+        assert not result.timed_out
+        recs = {r.spec.job_id: r for r in client.list_jobs()}
+        assert all(recs[j].spec.group == "grp-1" for j in ids)
+    finally:
+        client.close()

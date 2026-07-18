@@ -51,6 +51,8 @@ from omnirun.models import (
     Slot,
 )
 from omnirun.providers import BackendProvider
+from omnirun.scheduler import JobExplanation, Snapshot
+from omnirun.scheduler import explain as sched_explain
 from omnirun.state import Store
 from omnirun.state.store import EventRow, StaleTransition
 
@@ -106,6 +108,76 @@ class DiscoverRow:
     type: str
     enabled: bool
     facts: ProviderFacts | Exception | None  # None only when disabled
+
+
+@dataclass
+class WaitResult:
+    """Outcome of a ``wait`` verb: each watched job's final observed state,
+    plus whether the wall-clock budget expired first (exit 124)."""
+
+    states: dict[str, JobState] = field(default_factory=dict)
+    timed_out: bool = False
+
+
+def parse_wait_until(raw: str | None) -> JobState | None:
+    """Parse ``--until``: a target :class:`JobState`, or ``None`` for the
+    "done" pseudo-target (any terminal state counts as reached)."""
+    if raw is None:
+        return JobState.SUCCEEDED
+    value = raw.strip().lower()
+    if value in ("done", "terminal", "any"):
+        return None
+    try:
+        state = JobState(value)
+    except ValueError:
+        allowed = "running, succeeded, failed, cancelled, done"
+        raise ValueError(f"bad --until {raw!r} (allowed: {allowed})") from None
+    if state in (JobState.QUEUED, JobState.PLACING, JobState.HELD):
+        raise ValueError(f"--until {value} is not a waitable target")
+    return state
+
+
+def wait_reached(state: JobState, until: JobState | None) -> bool:
+    """Whether *state* satisfies the wait target (OBS-10)."""
+    if until is None:
+        return state.terminal
+    if state is until:
+        return True
+    # A job that already SUCCEEDED necessarily passed through running.
+    return until is JobState.RUNNING and state is JobState.SUCCEEDED
+
+
+def wait_settled(state: JobState, until: JobState | None) -> bool:
+    """Reached the target OR terminal-with-another-outcome — either way the
+    wait for this job is over (the exit code tells the two apart)."""
+    return wait_reached(state, until) or state.terminal
+
+
+# --------------------------------------------------------------------------- explain
+
+
+def build_snapshot(store: Store) -> Snapshot:
+    """The live store as the pure pass's :class:`Snapshot` (no cancel set —
+    cancel requests are engine-process state, not store state)."""
+    intents = {row.job_id: row.kind for row in store.open_intents()}
+    unreleased = frozenset(
+        row.job_id for row in store.unreleased_resources() if row.job_id is not None
+    )
+    return Snapshot(jobs=store.list_jobs(), intents=intents, unreleased=unreleased)
+
+
+def explain_job(
+    store: Store,
+    slots: list[Slot],
+    ledger: Callable[[datetime], BudgetLedger],
+    job_id: str,
+    *,
+    now: datetime | None = None,
+) -> JobExplanation:
+    """The ``explain`` verb: the pure pass's per-job verdict over the live
+    snapshot (SCHED-7) — the same function the engine schedules with."""
+    at = now or datetime.now(timezone.utc)
+    return sched_explain(build_snapshot(store), slots, ledger(at), at, job_id)
 
 
 def handle_of(rec: JobRecord) -> JobHandle | None:

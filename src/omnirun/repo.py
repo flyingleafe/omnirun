@@ -81,9 +81,13 @@ def current_project_slug(start: Path | None = None) -> str | None:
 
 def capture_repo_state(root: Path, *, auto_push: bool = False) -> RepoRef:
     """Snapshot the repo state a job will run against, enforcing the submit-time
-    invariants: a clean working tree and, when an origin remote exists, HEAD
-    pushed (unless auto_push does it for us). A dirty tree is always refused —
-    a job must run a real, reproducible revision, not an on-disk snapshot."""
+    invariant: a clean working tree (CODE-3). A dirty tree is always refused —
+    a job must run a real, reproducible revision, not an on-disk snapshot.
+
+    A committed-but-UNPUSHED HEAD is allowed: code-plan resolution delivers it
+    as a thin delta bundle over the best origin-reachable base (CODE-2c), so
+    fast iteration never routes around code capture. ``auto_push=True``
+    (``--push``) still pushes the branch first, keeping origin authoritative."""
     st = _git(root, "status", "--porcelain")
     if st.returncode != 0:
         raise RepoError(f"not a git repository: {root} ({st.stderr.strip()})")
@@ -116,21 +120,15 @@ def capture_repo_state(root: Path, *, auto_push: bool = False) -> RepoRef:
     origin = _git(root, "remote", "get-url", "origin")
     remote_url = origin.stdout.strip() if origin.returncode == 0 else ""
 
-    if remote_url and branch != "detached":
+    if remote_url and branch != "detached" and auto_push:
         contains = _git(root, "branch", "-r", "--contains", "HEAD")
         pushed = contains.returncode == 0 and bool(contains.stdout.strip())
         if not pushed:
-            if auto_push:
-                report(f"pushing {branch} to origin…")
-                push = _git(root, "push", "origin", branch)
-                if push.returncode != 0:
-                    raise RepoError(
-                        f"`git push origin {branch}` failed:\n{push.stderr.strip()}"
-                    )
-            else:
+            report(f"pushing {branch} to origin…")
+            push = _git(root, "push", "origin", branch)
+            if push.returncode != 0:
                 raise RepoError(
-                    f"HEAD ({sha[:12]}) is not on any remote branch of origin — "
-                    f"run `git push origin {branch}` first or pass --push"
+                    f"`git push origin {branch}` failed:\n{push.stderr.strip()}"
                 )
 
     return RepoRef(
@@ -358,6 +356,70 @@ def gh_create_deploy_key(owner_repo: str, public_key: str, title: str) -> str:
 def gh_delete_deploy_key(owner_repo: str, key_id: str) -> None:
     """Best-effort delete of a deploy key by id (for `omnirun deploy-key rm`)."""
     _gh("api", "-X", "DELETE", f"repos/{owner_repo}/keys/{key_id}")
+
+
+# A thin bundle rides the spec as base64 JSON through the store and the wire;
+# the guard keeps unpushed deltas honest (push your branch for bigger changes).
+THIN_BUNDLE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def sha_on_origin(root: Path, sha: str) -> bool:
+    """Whether *sha* is reachable from any remote-tracking branch — the same
+    local knowledge the old pushed-check used (no network round-trip)."""
+    r = _git(root, "branch", "-r", "--contains", sha)
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def create_thin_bundle(root: Path, sha: str, dest: Path) -> Path:
+    """A DELTA ``git bundle`` for a committed-but-unpushed *sha* (CODE-2c).
+
+    The bundle carries only the commits between the best origin-reachable
+    bases — every remote-tracking ref is excluded (`^refs/remotes/...`), so
+    the boundary is the merge-base with the remote tips — and pins *sha*
+    under a temporary branch ref (branch heads survive `git clone --bare`).
+    The worker first clones/fetches origin (providing the prerequisites),
+    then fetches this bundle on top. Size-guarded: a delta over
+    ``THIN_BUNDLE_MAX_BYTES`` is refused with a push-your-branch hint."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ref = f"refs/heads/omnirun/bundle-{sha[:12]}"
+    r = _git(root, "update-ref", ref, sha)
+    if r.returncode != 0:
+        raise RepoError(
+            f"cannot bundle {sha[:12]}: not a commit in {root} ({r.stderr.strip()})"
+        )
+    remotes = _git(root, "for-each-ref", "--format=%(refname)", "refs/remotes")
+    negatives = [
+        line.strip()
+        for line in remotes.stdout.splitlines()
+        if line.strip() and not line.strip().endswith("/HEAD")
+    ]
+    try:
+        b = _git(
+            root, "bundle", "create", str(dest), ref, *[f"^{n}" for n in negatives]
+        )
+        if b.returncode != 0:
+            raise RepoError(f"git bundle create failed:\n{b.stderr.strip()}")
+    finally:
+        _git(root, "update-ref", "-d", ref)
+    size = dest.stat().st_size
+    if size > THIN_BUNDLE_MAX_BYTES:
+        dest.unlink(missing_ok=True)
+        raise RepoError(
+            f"the unpushed delta for {sha[:12]} bundles to {size / 1e6:.1f} MB "
+            f"(cap {THIN_BUNDLE_MAX_BYTES / 1e6:.0f} MB) — push your branch "
+            "(git push, or submit with --push) instead"
+        )
+    return dest
+
+
+def thin_bundle_b64(root: Path, sha: str) -> str:
+    """The base64 payload of :func:`create_thin_bundle` (rides ``CodePlan``)."""
+    import base64
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="omnirun-bundle-") as d:
+        bundle = create_thin_bundle(root, sha, Path(d) / "thin.bundle")
+        return base64.b64encode(bundle.read_bytes()).decode("ascii")
 
 
 def create_bundle(root: Path, sha: str, dest: Path) -> Path:

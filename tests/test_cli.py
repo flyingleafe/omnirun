@@ -1458,3 +1458,107 @@ def test_cli_daemon_env_selects_remote(env, monkeypatch):
     # An explicit --local still wins over the env var.
     override = runner.invoke(app, ["--local", "ps"])
     assert override.exit_code == 0, override.output
+
+
+# ------------------------------------------------------------------ P6: wait / explain / groups
+
+
+def test_wait_until_running_exits_0(env):
+    job_id = submit_one("--backend", "stub")
+    result = runner.invoke(app, ["wait", job_id, "--until", "running"])
+    assert result.exit_code == 0, result.output
+    assert "running" in result.output
+
+
+def test_wait_exit_3_when_terminal_but_not_target(env):
+    job_id = submit_one("--backend", "stub")
+    assert runner.invoke(app, ["cancel", job_id, "--force"]).exit_code == 0
+    result = runner.invoke(app, ["wait", job_id, "--until", "succeeded"])
+    assert result.exit_code == 3, result.output
+
+
+def test_wait_timeout_exits_124_with_json(env):
+    import json as _json
+
+    job_id = submit_one("--backend", "stub")  # runs "forever" on the stub
+    result = runner.invoke(
+        app, ["wait", job_id, "--until", "succeeded", "--timeout", "1s", "--json"]
+    )
+    assert result.exit_code == 124, result.output
+    payload = _json.loads(result.output.strip().splitlines()[-1])
+    assert payload["timed_out"] is True and payload["reached"] is False
+    assert payload["jobs"][job_id] == "running"
+
+
+def test_wait_rejects_bad_until(env):
+    result = runner.invoke(app, ["wait", "whatever", "--until", "sideways"])
+    assert result.exit_code == 1
+    assert "bad --until" in result.output
+
+
+def test_submit_matrix_expands_to_group(env):
+    result = runner.invoke(
+        app,
+        ["submit", "--matrix", "seed=0,1", "--name", "mx", "--", "python", "t.py"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "2 job(s) as group" in result.output
+    store = _store()
+    recs = store.list_jobs()
+    assert len(recs) == 2
+    groups = {r.spec.group for r in recs}
+    assert len(groups) == 1 and next(iter(groups)) is not None
+    seeds = sorted(r.spec.env_vars.get("seed", "") for r in recs)
+    assert seeds == ["0", "1"]
+    # All cells share ONE resolved code plan.
+    plans = {r.spec.code.model_dump_json() for r in recs if r.spec.code}
+    assert len(plans) == 1
+    # ps --group lists exactly the group.
+    group = next(iter(groups))
+    assert group is not None
+    ps_result = runner.invoke(app, ["ps", "--group", group])
+    assert ps_result.exit_code == 0, ps_result.output
+    for r in recs:
+        assert r.spec.job_id in ps_result.output
+
+
+def test_submit_group_count(env):
+    result = runner.invoke(
+        app,
+        ["submit", "--group", "trio", "--count", "3", "--", "python", "t.py"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 job(s) as group trio" in result.output.replace("[bold]", "")
+    recs = _store().list_jobs()
+    assert len(recs) == 3 and all(r.spec.group == "trio" for r in recs)
+
+
+def test_submit_after_stamps_dependency(env):
+    dep_id = submit_one("--backend", "stub")
+    result = runner.invoke(app, ["submit", "--after", dep_id, "--", "python", "t2.py"])
+    assert result.exit_code == 0, result.output
+    assert "behind" in result.output
+    recs = [r for r in _store().list_jobs() if r.spec.job_id != dep_id]
+    assert len(recs) == 1
+    assert recs[0].spec.depends_on == [dep_id]
+    # The dependent holds (dep-wait) while the dependency runs.
+    assert recs[0].state in (JobState.QUEUED, JobState.HELD)
+
+
+def test_cancel_group(env):
+    result = runner.invoke(
+        app, ["submit", "--group", "cg", "--count", "2", "--", "python", "t.py"]
+    )
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(app, ["cancel", "--group", "cg", "--force"])
+    assert result.exit_code == 0, result.output
+    recs = _store().list_jobs()
+    assert all(r.state is JobState.CANCELLED for r in recs)
+
+
+def test_explain_command_renders_verdict(env):
+    job_id = submit_one("--backend", "stub")
+    result = runner.invoke(app, ["explain", job_id])
+    assert result.exit_code == 0, result.output
+    assert "verdict:" in result.output
+    assert job_id in result.output

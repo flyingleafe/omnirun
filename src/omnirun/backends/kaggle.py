@@ -615,12 +615,19 @@ class KaggleBackend(Backend):
         → ssh clone with the delivered read-only deploy key (embedded base64)."""
         plan = spec.code
         if plan is not None and plan.kind == "remote":
-            return CodeSource(kind="remote", clone_url=plan.clone_url)
+            return CodeSource(
+                kind="remote",
+                clone_url=plan.clone_url,
+                bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
+                fetch_bundle=plan.bundle_b64 is not None,
+            )
         if plan is not None and plan.kind == "private":
             return CodeSource(
                 kind="private",
                 clone_url=plan.clone_url,
                 deploy_key_path=f"{KAGGLE_ROOT}/jobs/{job_id}/deploy_key",
+                bundle_path=f"{KAGGLE_ROOT}/jobs/{job_id}/bundle.git",
+                fetch_bundle=plan.bundle_b64 is not None,
             )
         clone_url = _remote_clone_plan(spec.repo, _local_root(spec))
         if clone_url is not None:
@@ -654,6 +661,11 @@ class KaggleBackend(Backend):
                 bundle_path = stage / "bundle.git"
                 _create_bundle(local_root, spec.repo.sha, bundle_path)
                 bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode()
+            elif code.fetch_bundle and spec.code is not None and spec.code.bundle_b64:
+                # Thin delta bundle (CODE-2c): already base64 on the plan — the
+                # harness decodes it to $JOB_DIR/bundle.git; bootstrap clones
+                # origin for the base and fetches the delta on top.
+                bundle_b64 = spec.code.bundle_b64
             else:
                 bundle_b64 = ""
 

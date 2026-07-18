@@ -187,6 +187,10 @@ class CodeSource:
     bundle_path: str = "$JOB_DIR/bundle.git"
     clone_url: str = ""  # anonymous https (remote) or ssh git@host:owner/repo (private)
     deploy_key_path: str = "$JOB_DIR/deploy_key"  # for kind="private"
+    # Thin bundle (CODE-2c): with kind="remote"/"private", ALSO fetch the delta
+    # bundle at bundle_path after the origin clone/fetch — origin provides the
+    # base objects, the bundle carries the committed-but-unpushed sha.
+    fetch_bundle: bool = False
 
 
 @dataclass
@@ -387,6 +391,13 @@ def generate_bootstrap(
     )
     outputs = " ".join(shlex.quote(g) for g in spec.outputs)
 
+    # Thin bundle (CODE-2c): after the origin clone/fetch supplied the base
+    # objects, fetch the delta bundle so the unpushed sha lands in $GIT_DIR.
+    bundle_fetch = f"""\
+BUNDLE="{params.code.bundle_path}"
+[ -f "$BUNDLE" ] || fail "git bundle missing at $BUNDLE"
+git --git-dir="$GIT_DIR" fetch "$BUNDLE" '+refs/*:refs/*' >/dev/null 2>&1 || fail "bundle fetch failed"
+"""
     if params.code.kind == "bundle":
         code_block = f"""\
 BUNDLE="{params.code.bundle_path}"
@@ -406,6 +417,8 @@ else
   git --git-dir="$GIT_DIR" fetch "$CLONE_URL" '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || fail "fetch from $CLONE_URL failed"
 fi
 """
+        if params.code.fetch_bundle:
+            code_block += bundle_fetch
     elif params.code.kind == "private":
         code_block = f"""\
 DEPLOY_KEY="{params.code.deploy_key_path}"
@@ -419,6 +432,8 @@ else
   git --git-dir="$GIT_DIR" fetch "$CLONE_URL" '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || fail "private fetch from $CLONE_URL failed"
 fi
 """
+        if params.code.fetch_bundle:
+            code_block += bundle_fetch
     else:
         code_block = '[ -d "$GIT_DIR" ] || fail "object store missing at $GIT_DIR (submit-time push failed?)"\n'
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from pydantic import BaseModel
 
@@ -294,6 +295,71 @@ def _captured(rec: JobRecord) -> bool:
     return rec.logs_cached_to is not None or rec.outputs_cached_to is not None
 
 
+# --------------------------------------------------------------------------- deps
+
+
+def _dep_gate(rec: JobRecord, states: Mapping[str, JobState]) -> tuple[str, str] | None:
+    """The dependency gate (FUT-2) for one pending job.
+
+    ``None`` = every ``depends_on`` edge is satisfied. Otherwise ``("fail",
+    cause)`` — a dependency failed/was cancelled/is unknown and the job's
+    ``dep_failure`` policy is ``"fail"`` — or ``("wait", cause)`` — some
+    dependency has not reached a terminal state yet. With
+    ``dep_failure="ignore"`` any terminal (or unknown) dependency counts as
+    satisfied, so the job runs regardless of its predecessors' outcomes.
+    """
+    ignore = rec.spec.policy.dep_failure == "ignore"
+    waiting: list[str] = []
+    for dep in rec.spec.depends_on:
+        state = states.get(dep)
+        if state is JobState.SUCCEEDED:
+            continue
+        if state is not None and not state.terminal:
+            waiting.append(f"{dep} is {state.value}")
+            continue
+        if ignore:
+            continue
+        detail = state.value if state is not None else "unknown"
+        return ("fail", f"dep-failed: dependency {dep} is {detail}")
+    if waiting:
+        return ("wait", "dep-wait: " + "; ".join(waiting))
+    return None
+
+
+# --------------------------------------------------------------------------- explain
+
+
+class SlotVerdict(BaseModel):
+    """One considered slot in a job's explanation (SCHED-7 explainability)."""
+
+    provider: str
+    offer_key: str
+    free: bool
+    est_cost: float | None = None  # total for this job's estimated runtime
+    wait_s: float | None = None
+    chosen: bool = False
+    reasons: list[str] = []  # why the slot was NOT chosen (empty when chosen)
+
+
+class JobExplanation(BaseModel):
+    """The pure pass's verdict for one job, verbatim (SCHED-7).
+
+    ``verdict`` is the one-line answer ("why is my job where it is");
+    ``detail`` carries supporting lines; ``candidates`` lists every offered
+    slot with its per-slot verdict (the runners-up and their reasons).
+    """
+
+    job_id: str
+    state: str
+    verdict: str
+    detail: list[str] = []
+    candidates: list[SlotVerdict] = []
+    next_eligible: datetime | None = None  # not_before backoff, when set
+    budget_cap: float | None = None
+    budget_spent: float = 0.0
+    max_cost: float | None = None
+
+
 def _dead(rec: JobRecord) -> bool:
     """Positive worker-death evidence on a live placement (observer-marked)."""
     return (
@@ -329,15 +395,79 @@ def schedule(
     Emits, per job, at most one lifecycle follow-up (StartCancel preempting
     everything; then the terminal capture→reap ladder; then the dead-placement
     capture→release→requeue ladder), and for the pending set the same
-    Hold/Fail/ranking/matching rules as :func:`tick` — with two v2 additions:
-    ``not_before`` backoff filtering and collision-free offer assignment
+    Hold/Fail/ranking/matching rules as before — with the v2 additions:
+    ``not_before`` backoff filtering, ``depends_on`` gating (FUT-2: Hold with
+    cause dep-wait; a failed dependency fails the job with cause dep-failed
+    unless ``dep_failure="ignore"``), and collision-free offer assignment
     (SCHED-11: a slot's ``offer_key`` never appears in two Reserves of one
     pass; a Reserve consumes one unit of its provider's remaining capacity
     across ALL of that provider's slots).
     """
+    decisions, _ = _pass(snapshot, slots, ledger, now, policy, None)
+    return decisions
+
+
+def explain(
+    snapshot: Snapshot,
+    slots: list[Slot],
+    ledger: BudgetLedger,
+    now: datetime,
+    job_id: str,
+    *,
+    policy: SchedPolicy | None = None,
+) -> JobExplanation:
+    """The pass's per-job reasoning, verbatim (SCHED-7 explainability).
+
+    Runs the SAME pure pass as :func:`schedule` — same ranking, same
+    capacity/offer-key accounting, same budget gates, so higher-ranked jobs
+    consume slots exactly as they would in a real pass — and records the
+    verdict for *job_id*: why it is held/queued/failing, which slot it would
+    reserve, and every runner-up with its rejection reason. Raises
+    ``KeyError`` for a job absent from the snapshot.
+    """
+    if not any(rec.spec.job_id == job_id for rec in snapshot.jobs):
+        raise KeyError(f"no job {job_id!r} in the snapshot")
+    _, explanation = _pass(snapshot, slots, ledger, now, policy, job_id)
+    assert explanation is not None  # the job is in the snapshot
+    return explanation
+
+
+def _pass(
+    snapshot: Snapshot,
+    slots: list[Slot],
+    ledger: BudgetLedger,
+    now: datetime,
+    policy: SchedPolicy | None,
+    explain_for: str | None,
+) -> tuple[list[SchedDecision], JobExplanation | None]:
+    """The one pass body behind :func:`schedule` and :func:`explain` — one
+    policy, no drift (DESIGN-V2 §12.6)."""
     policy = policy or SchedPolicy()
     out: list[SchedDecision] = []
     pending: list[JobRecord] = []
+    exp: JobExplanation | None = None
+    states: dict[str, JobState] = {rec.spec.job_id: rec.state for rec in snapshot.jobs}
+
+    def _explain(
+        rec: JobRecord,
+        verdict: str,
+        *detail: str,
+        candidates: list[SlotVerdict] | None = None,
+    ) -> None:
+        nonlocal exp
+        if rec.spec.job_id != explain_for:
+            return
+        exp = JobExplanation(
+            job_id=rec.spec.job_id,
+            state=rec.state.value,
+            verdict=verdict,
+            detail=list(detail),
+            candidates=candidates or [],
+            next_eligible=rec.not_before if _backing_off(rec, now) else None,
+            budget_cap=ledger.cap,
+            budget_spent=ledger.in_window_total(now),
+            max_cost=rec.spec.policy.max_cost,
+        )
 
     for rec in snapshot.jobs:
         jid = rec.spec.job_id
@@ -347,46 +477,77 @@ def schedule(
         if jid in snapshot.cancels and not rec.state.terminal:
             if kind != "cancel":
                 out.append(StartCancel(jid))
+            _explain(rec, "cancel requested; the cancel ladder owns it")
             continue
         if kind is not None:
+            _explain(rec, f"in flight: a {kind} work item is open")
             continue  # one work item per job
         if rec.state.terminal:
             if rec.placement is None or rec.reaped:
+                _explain(rec, f"terminal ({rec.state.value}); nothing left to do")
                 continue
             if not _captured(rec):
                 out.append(StartCapture(jid))
+                _explain(rec, "terminal; capturing logs+outputs before release")
             else:
                 out.append(StartReap(jid))
+                _explain(rec, "terminal and captured; releasing the placement")
             continue
         if _dead(rec):
             # The dead-placement ladder: capture (possibly sacrificed) →
             # release-lost → requeue once the resource is confirmed gone.
             if not _captured(rec):
                 out.append(StartCapture(jid))
+                _explain(rec, "worker dead; capturing what remains")
             elif jid in snapshot.unreleased:
                 out.append(StartRelease(jid))
+                _explain(rec, "worker dead and captured; releasing the resource")
             else:
                 out.append(Requeue(jid, cause="worker-dead"))
+                _explain(rec, "worker dead, resource released; requeueing")
             continue
         if rec.state in _PENDING_STATES:
             pending.append(rec)
+        else:
+            _explain(
+                rec,
+                f"{rec.state.value}"
+                + (
+                    f" on {rec.placement.provider_name}"
+                    if rec.placement is not None
+                    else ""
+                ),
+            )
 
-    # Attempts-cap / hold / unhold over the pending set (same rules as tick).
+    # Attempts-cap / dep gate / hold / unhold over the pending set.
     admittable: list[JobRecord] = []
     for rec in pending:
         jid = rec.spec.job_id
         if rec.attempts >= policy.max_attempts and rec.last_error is not None:
-            out.append(
-                Fail(
-                    jid,
-                    cause=(
-                        f"placement failed {rec.attempts} times; "
-                        f"last error: {rec.last_error}"
-                    ),
-                )
+            cause = (
+                f"placement failed {rec.attempts} times; last error: {rec.last_error}"
             )
+            out.append(Fail(jid, cause=cause))
+            _explain(rec, "failing: attempts exhausted", cause)
+            continue
+        gate = _dep_gate(rec, states)
+        if gate is not None:
+            what, cause = gate
+            if what == "fail":
+                out.append(Fail(jid, cause=cause))
+                _explain(rec, "failing: a dependency failed", cause)
+            else:
+                if rec.state is JobState.QUEUED:
+                    out.append(Hold(jid, reason=cause))
+                _explain(rec, "held: waiting for dependencies", cause)
             continue
         if _backing_off(rec, now):
+            _explain(
+                rec,
+                "backing off: not eligible before "
+                f"{rec.not_before.isoformat() if rec.not_before else '?'}",
+                *([f"last error: {rec.last_error}"] if rec.last_error else []),
+            )
             continue  # backoff window: retried by a later pass
         eligible = _pinned_slots(rec, slots)
         if not eligible:
@@ -402,6 +563,11 @@ def schedule(
             continue
         if rec.state is not JobState.HELD:
             out.append(Hold(jid, reason="; ".join(min(unfit_reasons, key=len))))
+        _explain(
+            rec,
+            "held: no offered slot can satisfy the request",
+            "; ".join(min(unfit_reasons, key=len)),
+        )
         # An already-HELD, still-unsatisfiable job stays held: no decision.
 
     admittable.sort(key=lambda rec: _rank_key(rec, now))
@@ -460,6 +626,21 @@ def schedule(
             if free_late:
                 chosen = min(free_late, key=lambda pair: _wait_key(pair[1]))
 
+        if rec.spec.job_id == explain_for:
+            _explain_match(
+                _explain,
+                rec,
+                slots,
+                remaining,
+                used_keys,
+                candidates,
+                avoided,
+                chosen,
+                working,
+                now,
+                policy,
+            )
+
         if chosen is not None:
             idx, slot = chosen
             key = offer_key(slot, idx)
@@ -482,4 +663,136 @@ def schedule(
                 )
             )
 
-    return out
+    if explain_for is not None and exp is None:
+        # In the snapshot but produced no verdict above: an admittable job
+        # filtered out before ranking cannot happen (every branch explains),
+        # so this is a pending job we never matched — explain the wait.
+        for rec in snapshot.jobs:
+            if rec.spec.job_id == explain_for:
+                _explain(rec, "queued: waiting for the next pass")
+    return out, exp
+
+
+class _ExplainFn(Protocol):
+    def __call__(
+        self,
+        rec: JobRecord,
+        verdict: str,
+        *detail: str,
+        candidates: list[SlotVerdict] | None = None,
+    ) -> None: ...
+
+
+def _explain_match(
+    record: _ExplainFn,
+    rec: JobRecord,
+    slots: list[Slot],
+    remaining: list[int],
+    used_keys: set[str],
+    candidates: list[tuple[int, Slot]],
+    avoided: set[str],
+    chosen: tuple[int, Slot] | None,
+    ledger: BudgetLedger,
+    now: datetime,
+    policy: SchedPolicy,
+) -> None:
+    """Narrate the matching step for one job: the chosen slot plus every
+    runner-up with the SAME predicates the chooser used (no second policy)."""
+    verdicts: list[SlotVerdict] = []
+    candidate_idx = {idx for idx, _ in candidates}
+    chosen_idx = chosen[0] if chosen is not None else None
+    req = rec.spec.resources
+    pin = rec.spec.only_backend
+    for idx, slot in enumerate(slots):
+        reasons: list[str] = []
+        if pin is not None and slot.provider_name != pin:
+            reasons.append(f"job is pinned to {pin}")
+        unfit = slot.capabilities.satisfies(req)
+        if unfit:
+            reasons.extend(unfit)
+        if remaining[idx] <= 0:
+            reasons.append("provider at capacity (active jobs fill it)")
+        if offer_key(slot, idx) in used_keys:
+            reasons.append("offer taken by a higher-priority job this pass")
+        if not reasons and slot.provider_name in avoided and idx in candidate_idx:
+            reasons.append("provider recently failed this job (avoid window)")
+        if not reasons and idx in candidate_idx and idx != chosen_idx:
+            reasons.extend(_runner_up_reasons(slot, rec, ledger, now, policy, chosen))
+        if not reasons and idx not in candidate_idx and idx != chosen_idx:
+            reasons.append("provider in this job's avoid window")
+        est = slot.cost.total(req.time)
+        verdicts.append(
+            SlotVerdict(
+                provider=slot.provider_name,
+                offer_key=offer_key(slot, idx),
+                free=_is_free(slot),
+                est_cost=est,
+                wait_s=slot.availability.wait_s,
+                chosen=idx == chosen_idx,
+                reasons=reasons,
+            )
+        )
+    if chosen is not None:
+        idx, slot = chosen
+        est = slot.cost.total(req.time)
+        cost_note = (
+            "free"
+            if _is_free(slot)
+            else (f"est ${est:g}" if est is not None else "paid, cost unknown")
+        )
+        record(
+            rec,
+            f"placing on {slot.provider_name} "
+            f"(offer {offer_key(slot, idx)}, {cost_note})",
+            candidates=verdicts,
+        )
+    elif not slots:
+        record(rec, "queued: no slots offered right now", candidates=verdicts)
+    else:
+        record(rec, "queued: no fitting slot free this pass", candidates=verdicts)
+
+
+def _runner_up_reasons(
+    slot: Slot,
+    rec: JobRecord,
+    ledger: BudgetLedger,
+    now: datetime,
+    policy: SchedPolicy,
+    chosen: tuple[int, Slot] | None,
+) -> list[str]:
+    """Why a fitting, capacity-free candidate slot was not the chosen one —
+    the same predicates the chooser evaluated, narrated."""
+    reasons: list[str] = []
+    meets = _meets_deadline(slot, rec, now)
+    if _is_free(slot):
+        if not meets:
+            reasons.append("free but misses the finish-by deadline")
+        elif chosen is not None:
+            reasons.append("free and viable; a sooner/cheaper slot won")
+        return reasons
+    # Paid slot.
+    if not policy.allow_paid:
+        reasons.append("paid, and paid placement is disabled")
+        return reasons
+    if not meets:
+        reasons.append("paid and still misses the deadline")
+        return reasons
+    total = slot.cost.total(rec.spec.resources.time)
+    max_cost = rec.spec.policy.max_cost
+    if total is None:
+        if max_cost is not None or ledger.cap is not None:
+            reasons.append("cost unknowable (no runtime estimate) under a cap")
+        return reasons
+    if max_cost is not None and total > max_cost:
+        reasons.append(f"est ${total:g} exceeds this job's max_cost ${max_cost:g}")
+        return reasons
+    if not ledger.can_afford(total, now):
+        reasons.append(f"est ${total:g} does not fit the remaining budget")
+        return reasons
+    if chosen is not None and _is_free(chosen[1]):
+        reasons.append("paid; a free slot meets the deadline (free-first)")
+    elif chosen is not None:
+        reasons.append("paid and viable; a cheaper paid slot won")
+    else:
+        reasons.append("paid and viable but not selected")
+    return reasons

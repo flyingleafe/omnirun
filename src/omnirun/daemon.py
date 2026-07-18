@@ -103,6 +103,8 @@ _VERB_WAIT_S = 300.0
 # Bounded waits for follow-up settling (capture/reap before retry/pull/gc).
 _SETTLE_WAIT_S = 30.0
 _POLL_S = 0.05
+# Store-poll cadence of a followed /events SSE feed (lock-free paged reads).
+_EVENTS_POLL_S = 0.5
 
 
 def _state_root(state_dir: Path | None) -> Path:
@@ -224,11 +226,12 @@ class Daemon:
         self._slots: list[Slot] = []
         self._slot_gen = 0
 
+        self._ledger_fn = make_ledger(self._store, cfg)
         self._engine = Engine(
             self._store,
             providers,
             slots=self._supply_slots,
-            ledger=make_ledger(self._store, cfg),
+            ledger=self._ledger_fn,
             artifacts_dir=self._artifacts_dir,
             poll_interval=self.poll_interval,
         )
@@ -430,10 +433,8 @@ class Daemon:
         be.endpoints = self._endpoints
         return be
 
-    def _submit_and_settle(self, spec: JobSpec, backend: str | None) -> JobRecord:
-        """The daemon-mode submit: persist QUEUED, refresh slots, and wait for
-        the resident engine to settle the placement — launched, held, terminal,
-        or visibly left queued after a pass over fresh slots."""
+    def _accept_submit(self, spec: JobSpec, backend: str | None) -> str:
+        """Validate + persist a submit as QUEUED; returns the job id."""
         if backend is not None:
             if backend not in self.cfg.backends:
                 known = ", ".join(sorted(self.cfg.backends)) or "none configured"
@@ -442,7 +443,13 @@ class Daemon:
                 )
             spec = spec.model_copy(update={"only_backend": backend})
         submit_record(self._store, spec, datetime.now(timezone.utc))
-        job_id = spec.job_id
+        return spec.job_id
+
+    def _await_settle(self, job_id: str, timeout: float) -> JobRecord | None:
+        """Wait (bounded) for the resident engine to settle *job_id*'s
+        placement — launched, held, terminal, or visibly left queued after a
+        pass over fresh slots. ``None`` = not settled within *timeout* (the
+        async submit's long-poll answers "not yet"; the caller re-polls)."""
         passes_before: int | None
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -466,8 +473,16 @@ class Daemon:
                 and self._engine.pass_count > passes_before
             )
 
-        self._wait_for(_settled, _SUBMIT_WAIT_S)
-        rec = self._store.load_job(job_id)
+        done = self._wait_for(_settled, timeout)
+        return self._store.load_job(job_id) if done else None
+
+    def _submit_and_settle(self, spec: JobSpec, backend: str | None) -> JobRecord:
+        """The blocking (pre-async-handshake) submit: persist QUEUED and wait
+        for the resident engine to settle the placement."""
+        job_id = self._accept_submit(spec, backend)
+        rec = self._await_settle(job_id, _SUBMIT_WAIT_S)
+        if rec is None:
+            rec = self._store.load_job(job_id)
         if rec is None:  # pragma: no cover — we just wrote it
             raise BackendError(f"job {job_id} vanished after submit")
         return rec
@@ -637,6 +652,37 @@ class Daemon:
             return
         yield "event: eof\ndata: \n\n"
 
+    def _serve_events(self, cursor: int, follow: bool) -> Iterator[str]:
+        """The ``/events`` SSE body (FUT-9): ``job_events`` rows past *cursor*
+        as ``id:``-tagged frames — LOCK-FREE (plain paged store reads on this
+        handler thread; the engine is never touched), with keepalive comments
+        during quiet stretches and, for ``follow=False``, an ``eof`` frame
+        after the backlog."""
+        from omnirun import wire
+
+        # Immediate subscribe handshake: the cursor is already fixed, so a
+        # client that reads this frame KNOWS every later event will arrive —
+        # it can now take its initial state snapshot race-free (the wait verb
+        # depends on this ordering).
+        yield ": hello\n\n"
+        last_emit = time.monotonic()
+        while not self._stopping.is_set():
+            rows = self._store.events_after(cursor, limit=500)
+            if rows:
+                for ev in rows:
+                    cursor = ev.id
+                    payload = json.dumps(wire.event_row_to_json(ev))
+                    yield f"id: {ev.id}\ndata: {payload}\n\n"
+                last_emit = time.monotonic()
+                continue
+            if not follow:
+                yield "event: eof\ndata: \n\n"
+                return
+            if time.monotonic() - last_emit >= _KEEPALIVE_S:
+                yield ": keepalive\n\n"
+                last_emit = time.monotonic()
+            time.sleep(_EVENTS_POLL_S)
+
     def _logs_via_backend(self, rec: JobRecord) -> Iterator[str]:
         handle = handle_of(rec)
         if handle is None:
@@ -704,18 +750,27 @@ class Daemon:
                     status=503,
                 )
             body = _body()
-            spec = JobSpec.model_validate(body["spec"])
             backend = body.get("backend")
             # ENQUEUE only INSERTs fresh, unique job_id rows and wakes the
             # engine — it commits in milliseconds and never waits on placement.
             if body.get("mode") == "enqueue":
+                now = datetime.now(timezone.utc)
+                ids: list[str] = []
+                if body.get("specs"):
+                    # An already-expanded set (matrix/group): each spec keeps
+                    # its own job_id/group as the client expanded it.
+                    for raw in body["specs"]:
+                        job_spec = JobSpec.model_validate(raw)
+                        submit_record(d._store, job_spec, now)
+                        ids.append(job_spec.job_id)
+                    d.wake()
+                    return _json({"job_ids": ids})
+                spec = JobSpec.model_validate(body["spec"])
                 if backend is not None and backend not in d.cfg.backends:
                     known = ", ".join(sorted(d.cfg.backends)) or "none configured"
                     raise BackendError(
                         f"backend {backend!r} is not configured (known: {known})"
                     )
-                now = datetime.now(timezone.utc)
-                ids: list[str] = []
                 for _ in range(max(1, int(body.get("count", 1)))):
                     job_spec = spec.model_copy(
                         update={
@@ -727,11 +782,43 @@ class Daemon:
                     ids.append(job_spec.job_id)
                 d.wake()
                 return _json({"job_ids": ids})
-            # SUBMIT waits (bounded) for the resident engine to settle the
-            # placement, then reports the same outcome the daemonless path
-            # would; the engine keeps advancing the job either way.
+            spec = JobSpec.model_validate(body["spec"])
+            # ASYNC submit (a new client opted in via the wire field): commit
+            # QUEUED, kick a slot refresh, answer 202 immediately — the client
+            # collects the outcome through the idempotent /settle long-poll,
+            # so no HTTP request is pinned open for the whole placement.
+            if body.get("async"):
+                job_id = d._accept_submit(spec, backend)
+                d.wake()
+                return _json(
+                    {"job_id": job_id, "state": JobState.QUEUED.value, "async": True},
+                    status=202,
+                )
+            # Blocking SUBMIT (old clients): wait (bounded) for the resident
+            # engine to settle the placement, then report the same outcome the
+            # daemonless path would; the engine keeps advancing either way.
             rec = d._submit_and_settle(spec, backend)
             return _json(wire.submit_outcome_to_json(classify_submit(rec)))
+
+        @app.get("/jobs/<jid>/settle")
+        def _settle(jid: str) -> str:
+            from omnirun import wire
+
+            rec = d._store.resolve_job(jid)
+            raw = bottle.request.query.get("timeout") or ""
+            try:
+                timeout = min(max(float(raw), 0.0), 55.0) if raw else 25.0
+            except ValueError:
+                timeout = 25.0
+            settled = d._await_settle(rec.spec.job_id, timeout)
+            if settled is None:
+                return _json({"settled": False})
+            return _json(
+                {
+                    "settled": True,
+                    "outcome": wire.submit_outcome_to_json(classify_submit(settled)),
+                }
+            )
 
         # Pure reads are LOCK-FREE: they hit the independently-transactional
         # store directly, so a slow placement (a work item awaiting a hung
@@ -966,6 +1053,44 @@ class Daemon:
             removed = d._store.delete_deploy_key(origin)
             return _json({"removed": removed})
 
+        @app.get("/events")
+        def _events() -> Any:
+            # SSE feed of job_events rows (FUT-9). Cursor precedence:
+            # Last-Event-ID (a reconnecting reader) > ?after=<id> (0 replays
+            # the full history) > "now" (only new events).
+            bottle.response.content_type = "text/event-stream"
+            bottle.response.set_header("Cache-Control", "no-cache")
+            bottle.response.set_header("X-Accel-Buffering", "no")
+            follow = bottle.request.query.get("follow", "1") != "0"
+            raw_id = bottle.request.get_header("Last-Event-ID") or ""
+            raw_after = bottle.request.query.get("after") or ""
+            try:
+                if raw_id:
+                    cursor = max(0, int(raw_id))
+                elif raw_after:
+                    cursor = max(0, int(raw_after))
+                else:
+                    cursor = d._store.last_event_id()
+            except ValueError:
+                cursor = d._store.last_event_id()
+            return d._serve_events(cursor, follow)
+
+        @app.get("/jobs/<jid>/explain")
+        def _explain(jid: str) -> str:
+            from omnirun.engine.verbs import explain_job
+
+            rec = d._store.resolve_job(jid)  # lock-free resolve
+            # The pure pass's verdict over the live snapshot and the engine's
+            # CACHED slot supply (refreshed by the resident slot refresher) —
+            # a lock-free read, never a forced probe (OBS-9).
+            explanation = explain_job(
+                d._store,
+                d._supply_slots(),
+                d._ledger_fn,
+                rec.spec.job_id,
+            )
+            return _json({"explanation": explanation.model_dump(mode="json")})
+
         @app.get("/jobs/<jid>/logs")
         def _logs(jid: str) -> Any:
             follow = bottle.request.query.get("follow") == "1"
@@ -1016,6 +1141,10 @@ class Daemon:
         # the SAME exception class, so the CLI renders it exactly as the daemonless
         # path would. Installed as a plugin wrapping every route.
         app.install(_ErrorTranslator(bottle))
+        # Version handshake (CLI-6), installed LAST so it wraps outermost: every
+        # response — success or translated error — carries the daemon's version
+        # pair, and a too-old client is refused with the one-line upgrade text.
+        app.install(_VersionHandshake(bottle))
         return app
 
 
@@ -1028,6 +1157,35 @@ _ERROR_STATUS = {
     "StoreError": 400,
     "ValueError": 400,
 }
+
+
+class _VersionHandshake:
+    """A bottle plugin implementing the client↔daemon version handshake
+    (CLI-6): stamps every response with the daemon's version + minimum
+    supported client, and answers a too-old client with a 426 typed error
+    carrying the exact upgrade instruction."""
+
+    api = 2
+
+    def __init__(self, bottle_mod: Any) -> None:
+        self._bottle = bottle_mod
+
+    def apply(self, callback: Callable[..., Any], _route: Any) -> Callable[..., Any]:
+        bottle = self._bottle
+
+        def wrapper(*a: Any, **kw: Any) -> Any:
+            from omnirun import wire
+
+            bottle.response.set_header(wire.VERSION_HEADER, wire.PROTOCOL_VERSION)
+            bottle.response.set_header(wire.MIN_VERSION_HEADER, wire.MIN_SUPPORTED_PEER)
+            err = wire.check_client_version(
+                bottle.request.get_header(wire.VERSION_HEADER)
+            )
+            if err is not None:
+                return _error_json(bottle, 426, err, "BackendError")
+            return callback(*a, **kw)
+
+        return wrapper
 
 
 class _ErrorTranslator:

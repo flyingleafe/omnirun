@@ -132,9 +132,19 @@ def stage_job(
     job_dir = job_dir_of(root, spec.job_id)
     plan = spec.code
     if plan is not None and plan.kind == "remote":
-        params.code = CodeSource(kind="remote", clone_url=plan.clone_url)
+        params.code = CodeSource(
+            kind="remote",
+            clone_url=plan.clone_url,
+            fetch_bundle=plan.bundle_b64 is not None,
+        )
+        stage_bundle(exec_, job_dir, plan.bundle_b64)
     elif plan is not None and plan.kind == "private":
-        params.code = CodeSource(kind="private", clone_url=plan.clone_url)
+        params.code = CodeSource(
+            kind="private",
+            clone_url=plan.clone_url,
+            fetch_bundle=plan.bundle_b64 is not None,
+        )
+        stage_bundle(exec_, job_dir, plan.bundle_b64)
         if plan.deploy_key_material:
             exec_.write_file(
                 f"{job_dir}/deploy_key", plan.deploy_key_material, mode="600"
@@ -147,6 +157,26 @@ def stage_job(
     script = generate_bootstrap(spec, params, attempt=attempt)
     exec_.write_file(f"{job_dir}/bootstrap.sh", script, mode="755")
     return job_dir
+
+
+def stage_bundle(exec_: Exec, job_dir: str, bundle_b64: str | None) -> None:
+    """Deliver a thin delta bundle (CODE-2c) to ``$JOB_DIR/bundle.git``.
+
+    The bundle rides the spec as base64 (the placer has no local git objects);
+    it is written as text and decoded worker-side, since the exec transport's
+    ``write_file`` is text-only. ``None`` = the sha is on origin, no bundle."""
+    if bundle_b64 is None:
+        return
+    exec_.write_file(f"{job_dir}/bundle.b64", bundle_b64)
+    q = shell_quote(job_dir)
+    r = exec_.run(
+        f"base64 -d < {q}/bundle.b64 > {q}/bundle.git && rm -f {q}/bundle.b64"
+    )
+    if not r.ok:
+        raise BackendError(
+            f"staging the code bundle on {exec_.describe()} failed: "
+            f"{r.stderr.strip()[:200]}"
+        )
 
 
 def stage_env_file(exec_: Exec, job_dir: str, content: str | None) -> None:

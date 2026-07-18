@@ -29,8 +29,24 @@ jobs:
       - name: basedpyright
         run: nix develop --command basedpyright
 
+      - name: Build trace-check (formal model checker)
+        run: nix build .#trace-check --out-link trace-check
+
       - name: Tests
-        run: nix develop --command uv run pytest -q
+        run: >
+          nix develop --command env
+          OMNIRUN_TRACE_CHECK=$PWD/trace-check/bin/trace-check
+          uv run pytest -q
+
+      # The conformance-marked suites (bounded-exhaustive enumeration, the
+      # provider contract, the trace-gated engine tests) MUST run against the
+      # compiled checker — a missing binary skips them locally but is a
+      # failure here, so conformance coverage can never silently vanish.
+      - name: Conformance suites (trace-check gated)
+        run: >
+          nix develop --command env
+          OMNIRUN_TRACE_CHECK=$PWD/trace-check/bin/trace-check
+          uv run pytest -q -m conformance
 
       - name: Minimize uv cache
         run: nix develop --command uv cache prune --ci

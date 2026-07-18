@@ -165,32 +165,41 @@ def export_global_trace(
     budget_cents: int,
     caps: dict[str, int],
     with_asserts: bool = False,
+    alias_out: dict[int, str] | None = None,
 ) -> str:
     """The global validation view: all lifecycle events, one trace.
 
     ``init`` carries the global budget and the SUM of all provider caps (the
     cap is effectively non-binding here — I2 is the per-provider view's job).
-    """
+    *alias_out*, when given, is filled with the nid → job_id mapping (every
+    alias, including ``retry`` re-aliases) — the replay validator reads it to
+    name the violating job in its report."""
     events = _all_events(store)
     coster = _Coster(events)
     lines = [f"init {budget_cents} {sum(caps.values())}"]
     nids: dict[str, int] = {}
     fresh = 0
+
+    def _alias(job_id: str) -> None:
+        nonlocal fresh
+        nids[job_id] = fresh
+        if alias_out is not None:
+            alias_out[fresh] = job_id
+        fresh += 1
+
     for ev in events:
         if ev.action == RETRY_ACTION:
             # Re-alias: the retried job re-enters as a fresh model job priced
             # from its new arc.
             coster.next_arc(ev.job_id)
             if ev.job_id in nids:
-                nids[ev.job_id] = fresh
-                fresh += 1
+                _alias(ev.job_id)
                 lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
             continue
         if ev.action not in ALPHABET:
             continue
         if ev.job_id not in nids:
-            nids[ev.job_id] = fresh
-            fresh += 1
+            _alias(ev.job_id)
         if ev.action == "submit":
             lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
             continue
@@ -207,11 +216,13 @@ def export_provider_trace(
     budget_cents: int,
     cap: int,
     with_asserts: bool = False,
+    alias_out: dict[int, str] | None = None,
 ) -> str:
     """The per-provider validation view (see module docstring).
 
     On a job's first contact a ``submit`` (priced from its current arc's first
     reserve) is replayed into the trace so the single-provider model knows it.
+    *alias_out* as in :func:`export_global_trace`.
     """
     events = _all_events(store)
     coster = _Coster(events)
@@ -237,6 +248,8 @@ def export_provider_trace(
         if binding.get(ev.job_id) == provider:
             if ev.job_id not in nids:
                 nids[ev.job_id] = fresh
+                if alias_out is not None:
+                    alias_out[fresh] = ev.job_id
                 fresh += 1
                 lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
             lines.append(_line(ev.action, nids[ev.job_id], ev))

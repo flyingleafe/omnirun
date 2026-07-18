@@ -73,6 +73,8 @@ from omnirun.providers.asyncadapter import (
 )
 from omnirun.state.store import Store, open_store
 
+pytestmark = pytest.mark.conformance
+
 HAVE_ENGINE_FAKES = importlib.util.find_spec("tests.enginefakes") is not None
 
 FRESH_HEARTBEAT = "9999-12-31T23:59:59+00:00"

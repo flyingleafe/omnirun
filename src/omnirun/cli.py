@@ -482,8 +482,36 @@ def submit(
         "-w",
         help="Block until the job is terminal (daemonless: the CLI drives it).",
     ),
+    matrix: str | None = typer.Option(
+        None,
+        "--matrix",
+        help='Expand a parameter grid, e.g. "lr=0.1,0.3×seed=0,1" — one job per '
+        "cell (params ride the environment), all sharing one code plan.",
+    ),
+    group: str | None = typer.Option(
+        None,
+        "--group",
+        help="Group name for the submitted set (auto-generated with --matrix).",
+    ),
+    count: int = typer.Option(
+        1, "--count", help="With --group: submit N identical jobs as one group."
+    ),
+    after: list[str] | None = typer.Option(
+        None,
+        "--after",
+        help="Run only after this job (id/prefix) or group SUCCEEDED (repeatable).",
+    ),
+    dep_failure: str = typer.Option(
+        "fail",
+        "--dep-failure",
+        help="What a failed --after dependency does: 'fail' this job, or "
+        "'ignore' (run once the dependency is merely finished).",
+    ),
 ) -> None:
     cfg = _load_cfg()
+    if dep_failure not in ("fail", "ignore"):
+        _die("--dep-failure must be 'fail' or 'ignore'")
+    grouped = matrix is not None or group is not None or count > 1
 
     def _spec() -> JobSpec:
         return _build_job_spec(
@@ -505,6 +533,9 @@ def submit(
             priority=priority,
             max_cost=max_cost,
         )
+
+    if dry_run and (grouped or after):
+        _die("--dry-run cannot be combined with --matrix/--group/--after")
 
     # --dry-run just renders the payload; when a single backend is named we skip
     # probing entirely so you can preview scripts offline (before creds/access
@@ -537,6 +568,60 @@ def submit(
                 _die("no fitting offers")
             picked = chooser.auto_pick(ranked, cfg.policy) or ranked[0]
             _render_payload(backends[picked.offer.backend], spec, picked.offer)
+            return
+
+        deps = _resolve_deps(client, after or [])
+
+        # A matrix/group set — or a single job gated behind dependencies —
+        # goes through submit_many: the code plan resolves ONCE client-side
+        # (FUT-1), every cell shares it, and the engine/daemon places what
+        # fits; `omnirun wait --group` blocks on the whole set.
+        if grouped or deps:
+            spec = _spec()
+            if deps:
+                spec = spec.model_copy(
+                    update={
+                        "depends_on": deps,
+                        "policy": spec.policy.model_copy(
+                            update={"dep_failure": dep_failure}
+                        ),
+                    }
+                )
+            if backend is not None:
+                if backend not in cfg.backends:
+                    _die(f"unknown backend {backend!r} (see `omnirun backends`)")
+                spec = spec.model_copy(update={"only_backend": backend})
+            with reporting(lambda msg: console.print(f"[dim]· {msg}[/dim]")):
+                spec = client.plan_code(spec)
+                if grouped:
+                    from omnirun.groups import (
+                        expand_cells,
+                        make_group_name,
+                        parse_matrix,
+                    )
+
+                    cells = (
+                        parse_matrix(matrix)
+                        if matrix is not None
+                        else [{} for _ in range(max(1, count))]
+                    )
+                    group_name = group or make_group_name(spec.name)
+                    specs = expand_cells(spec, cells, group_name)
+                else:
+                    group_name = None
+                    specs = [spec]
+                job_ids = client.submit_many(specs)
+            if group_name is not None:
+                console.print(
+                    f"[green]submitted[/green] {len(job_ids)} job(s) as group "
+                    f"[bold]{group_name}[/bold]"
+                )
+                console.print(f"follow with: omnirun wait --group {group_name}")
+            else:
+                console.print(
+                    f"[green]queued[/green] {job_ids[0]} behind {', '.join(deps)}"
+                )
+                console.print(f"follow with: omnirun wait {job_ids[0]}")
             return
 
         # Real placement runs through the client: daemonless it drives the pure
@@ -583,6 +668,136 @@ def _report_submit(outcome: SubmitOutcome) -> None:
         "command (ps/status/tick) retries placement, or run `omnirun serve` to "
         "place it in the background"
     )
+
+
+def _resolve_deps(client: Client, refs: list[str]) -> list[str]:
+    """Resolve ``--after`` references — a group name (all its jobs) or a job
+    id/prefix — into a deduplicated job_id list."""
+    out: list[str] = []
+    for ref in refs:
+        in_group = [r for r in client.list_jobs() if r.spec.group == ref]
+        if in_group:
+            out.extend(r.spec.job_id for r in in_group)
+            continue
+        out.append(client.resolve_job(ref).spec.job_id)
+    seen: set[str] = set()
+    return [j for j in out if not (j in seen or seen.add(j))]
+
+
+def _group_jobs(client: Client, group: str) -> list[JobRecord]:
+    recs = [r for r in client.list_jobs() if r.spec.group == group]
+    if not recs:
+        _die(f"no jobs in group {group!r}")
+    return recs
+
+
+# --------------------------------------------------------------------------- wait
+
+
+@app.command(
+    help="Block until a job (or a whole --group) reaches a state. Exit codes: "
+    "0 target reached, 3 finished otherwise, 124 timeout."
+)
+@friendly_errors
+def wait(
+    job: str | None = typer.Argument(
+        None, help="Job id or unique prefix (omit with --group)."
+    ),
+    group: str | None = typer.Option(
+        None, "--group", help="Wait for every job in this group."
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Target state: succeeded (default), running, failed, cancelled, "
+        "or 'done' (any terminal state).",
+    ),
+    timeout: str | None = typer.Option(
+        None, "--timeout", help="Give up after this long ('30m', '2h'); exit 124."
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Machine-readable result on stdout."
+    ),
+) -> None:
+    from omnirun.engine.verbs import parse_wait_until, wait_reached
+
+    if (job is None) == (group is None):
+        _die("pass exactly one of a JOB argument or --group")
+    try:
+        target = parse_wait_until(until)
+    except ValueError as e:
+        _die(str(e))
+    timeout_s = _parse_time(timeout).total_seconds() if timeout is not None else None
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        if group is not None:
+            job_ids = [r.spec.job_id for r in _group_jobs(client, group)]
+        else:
+            assert job is not None
+            job_ids = [client.resolve_job(job).spec.job_id]
+        result = client.wait(job_ids, until=target, timeout=timeout_s)
+    finally:
+        client.close()
+    reached = all(wait_reached(s, target) for s in result.states.values())
+    if json_out:
+        import json as _json
+
+        typer.echo(
+            _json.dumps(
+                {
+                    "jobs": {j: s.value for j, s in result.states.items()},
+                    "timed_out": result.timed_out,
+                    "reached": reached and not result.timed_out,
+                }
+            )
+        )
+    else:
+        for jid, state in result.states.items():
+            style = _STATE_STYLE.get(state)
+            text = f"[{style}]{state.value}[/{style}]" if style else state.value
+            console.print(f"{jid}: {text}")
+    if result.timed_out:
+        raise typer.Exit(124)
+    raise typer.Exit(0 if reached else 3)
+
+
+# --------------------------------------------------------------------------- explain
+
+
+@app.command(help="Explain the scheduler's verdict for a job (why is it where it is).")
+@friendly_errors
+def explain(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+    cfg = _load_cfg()
+    client = make_client(cfg, config_path=_state["config_path"])
+    try:
+        exp = client.explain(job)
+    finally:
+        client.close()
+    console.print(f"[bold]job:[/bold] {exp.job_id}")
+    console.print(f"[bold]state:[/bold] {exp.state}")
+    console.print(f"[bold]verdict:[/bold] {exp.verdict}")
+    for line in exp.detail:
+        console.print(f"  [dim]{line}[/dim]")
+    if exp.next_eligible is not None:
+        console.print(f"[bold]next eligible:[/bold] {exp.next_eligible.isoformat()}")
+    cap = "unbounded" if exp.budget_cap is None else f"${exp.budget_cap:g}"
+    console.print(
+        f"[bold]budget:[/bold] ${exp.budget_spent:g} spent/committed of {cap}"
+        + (f"; per-job max_cost ${exp.max_cost:g}" if exp.max_cost is not None else "")
+    )
+    if exp.candidates:
+        table = Table("slot", "offer", "cost", "wait", "verdict")
+        for c in exp.candidates:
+            cost = (
+                "free"
+                if c.free
+                else (f"${c.est_cost:g}" if c.est_cost is not None else "paid (?)")
+            )
+            wait_txt = f"{c.wait_s:.0f}s" if c.wait_s else "now"
+            verdict = "[green]chosen[/green]" if c.chosen else "; ".join(c.reasons)
+            table.add_row(c.provider, c.offer_key, cost, wait_txt, verdict)
+        console.print(table)
 
 
 # --------------------------------------------------------------------------- offers
@@ -921,6 +1136,9 @@ def ps(
         "-A",
         help="List jobs from every project, not just the current repo.",
     ),
+    group: str | None = typer.Option(
+        None, "--group", help="List only this group's jobs (across projects)."
+    ),
 ) -> None:
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
@@ -931,9 +1149,14 @@ def ps(
     # just reads (sub-second) instead of forcing a slow backend-probing tick.
     for event in client.catch_up():
         console.print(f"[dim]· {event}[/dim]")
-    scope = None if all_projects else _current_project()
+    scope = None if all_projects or group is not None else _current_project()
     records = client.list_jobs(project=scope)
+    if group is not None:
+        records = [r for r in records if r.spec.group == group]
     if not records:
+        if group is not None:
+            console.print(f"no jobs in group {group!r}")
+            return
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
     now = datetime.now(timezone.utc)
@@ -1042,7 +1265,12 @@ def logs(
 @app.command(help="Cancel a running job (graceful by default; --force = hard kill).")
 @friendly_errors
 def cancel(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str | None = typer.Argument(
+        None, help="Job id or unique prefix (omit with --group)."
+    ),
+    group: str | None = typer.Option(
+        None, "--group", help="Cancel every non-terminal job in this group."
+    ),
     force: bool = typer.Option(
         False, "--force", "-f", help="Skip the graceful window; hard-kill immediately."
     ),
@@ -1052,32 +1280,44 @@ def cancel(
         help="Signal the cancel and return; the next tick (or daemon) releases it.",
     ),
 ) -> None:
+    if (job is None) == (group is None):
+        _die("pass exactly one of a JOB argument or --group")
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
-    rec = client.resolve_job(job)
-    if rec.state.terminal:
-        console.print(f"[dim]{rec.spec.job_id} is already {rec.state.value}[/dim]")
-        return
-    # Control.cancel reaps any placement (graceful→force→gc) and marks the job
-    # CANCELLED — the same path the daemon uses. A still-QUEUED (unplaced) job is
-    # cancelled too: it simply has no placement to reap, so it is removed from the
-    # pending set without touching a backend.
+    if group is not None:
+        targets = [r for r in _group_jobs(client, group) if not r.state.terminal]
+        if not targets:
+            console.print(f"[dim]group {group} has no jobs left to cancel[/dim]")
+            return
+    else:
+        assert job is not None
+        rec = client.resolve_job(job)
+        if rec.state.terminal:
+            console.print(f"[dim]{rec.spec.job_id} is already {rec.state.value}[/dim]")
+            return
+        targets = [rec]
+    # The engine's cancel ladder reaps any placement (graceful→force→gc) and
+    # marks the job CANCELLED — the same path the daemon uses. A still-QUEUED
+    # (unplaced) job is cancelled too: it simply has no placement to reap, so it
+    # is removed from the pending set without touching a backend.
     if not force and not no_wait:
         # The graceful path polls the backend until the job stops (up to the
         # per-backend grace window), so warn before the wait — otherwise cancel
         # can block for tens of seconds with no output.
+        names = ", ".join(r.spec.job_id for r in targets)
         console.print(
-            f"[dim]asking {rec.spec.job_id} to stop; "
-            f"waiting for graceful shutdown…[/dim]"
+            f"[dim]asking {names} to stop; waiting for graceful shutdown…[/dim]"
         )
-    client.cancel(rec, force=force, wait=not no_wait)
+    for rec in targets:
+        client.cancel(rec, force=force, wait=not no_wait)
     if no_wait:
         console.print(
             "cancel signalled; resources are released on the next tick "
             "(or by the daemon)"
         )
     else:
-        console.print(f"cancelled {rec.spec.job_id}")
+        for rec in targets:
+            console.print(f"cancelled {rec.spec.job_id}")
 
 
 @app.command(
@@ -1260,10 +1500,15 @@ def edit(
 @friendly_errors
 def retry(
     job: str | None = typer.Argument(
-        None, help="Job id/prefix. Omit and use --failed to retry all failed jobs."
+        None, help="Job id/prefix. Omit and use --failed/--group for a set."
     ),
     failed: bool = typer.Option(
         False, "--failed", "--all-failed", help="Retry ALL failed jobs."
+    ),
+    group: str | None = typer.Option(
+        None,
+        "--group",
+        help="Retry this group's terminal jobs (with --failed: only its failed).",
     ),
     all_projects: bool = typer.Option(
         False, "--all-projects", "-A", help="With --failed, across every project."
@@ -1275,8 +1520,8 @@ def retry(
         False, "--any", help="Also unpin the retry (any backend)."
     ),
 ) -> None:
-    if (job is None) == (not failed):
-        _die("pass exactly one of a JOB argument or --failed")
+    if (job is None) == (not failed and group is None):
+        _die("pass exactly one of a JOB argument, --failed, or --group")
     if to is not None and any_backend:
         _die("pass at most one of --to <backend> or --any")
     repin = to is not None or any_backend
@@ -1285,6 +1530,13 @@ def retry(
     try:
         if job is not None:
             targets = [client.resolve_job(job)]
+        elif group is not None:
+            wanted = (
+                (lambda r: r.state is JobState.FAILED)
+                if failed
+                else (lambda r: r.state.terminal)
+            )
+            targets = [r for r in _group_jobs(client, group) if wanted(r)]
         else:
             scope = None if all_projects else _current_project()
             targets = [
@@ -1404,14 +1656,40 @@ def budget(
 @app.command(help="Pull a job's collected outputs to a local directory.")
 @friendly_errors
 def pull(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str | None = typer.Argument(
+        None, help="Job id or unique prefix (omit with --group)."
+    ),
     dest: Path | None = typer.Argument(
         None, help="Destination dir (default: ./omnirun-outputs/<job_id>)."
     ),
+    group: str | None = typer.Option(
+        None,
+        "--group",
+        help="Pull every job in this group (per-job failure isolation), "
+        "each into <dest>/<job_id>.",
+    ),
 ) -> None:
+    if (job is None) == (group is None):
+        _die("pass exactly one of a JOB argument or --group")
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     try:
+        if group is not None:
+            base = dest or Path("omnirun-outputs") / group
+            pulled = failed = 0
+            for rec in _group_jobs(client, group):
+                try:
+                    paths, where = client.pull(rec, base / rec.spec.job_id)
+                    console.print(
+                        f"pulled {len(paths)} path(s) of {rec.spec.job_id} to {where}"
+                    )
+                    pulled += 1
+                except Exception as e:  # per-job failure isolation (FUT-1)
+                    console.print(f"[yellow]skipped[/yellow] {rec.spec.job_id}: {e}")
+                    failed += 1
+            console.print(f"group pull done: {pulled} pulled, {failed} skipped")
+            return
+        assert job is not None
         rec = client.resolve_job(job)
         dest = dest or Path("omnirun-outputs") / rec.spec.job_id
         paths, dest = client.pull(rec, dest)
@@ -1678,6 +1956,51 @@ def config_path() -> None:
     p = _state["config_path"] or default_config_path()
     note = "exists" if Path(p).exists() else "missing — create it to configure backends"
     typer.echo(f"{p} ({note})")
+
+
+@app.command(
+    "validate-replay",
+    help="Replay-validate the event log against the formal model; file a "
+    "GitHub issue per violation (daemon-host only — needs store access).",
+)
+@friendly_errors
+def validate_replay(
+    once: bool = typer.Option(
+        False, "--once", help="One validation round, then exit (1 on violation)."
+    ),
+    interval: float = typer.Option(
+        60.0, "--interval", help="Seconds between rounds in service mode."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print would-be issues instead of filing them."
+    ),
+) -> None:
+    from omnirun.state import open_store
+    from omnirun.validator import ReplayValidator, ValidatorError
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    cfg = _load_cfg()
+    store = open_store(cfg.state.resolved_url())
+    try:
+        try:
+            validator = ReplayValidator(store, dry_run=dry_run)
+        except ValidatorError as e:
+            _die(str(e))
+        if once:
+            violations = validator.run_once()
+            for violation in violations:
+                console.print(f"[red]VIOLATION[/red] {violation.title}")
+                console.print(f"  {violation.reason}")
+            if violations:
+                raise typer.Exit(1)
+            console.print("[green]OK[/green] both trace views replay clean")
+            return
+        console.print(f"validating every {interval:g}s (Ctrl-C to stop)")
+        validator.run_forever(interval_s=interval)
+    finally:
+        store.close()
 
 
 # --------------------------------------------------------------------------- state

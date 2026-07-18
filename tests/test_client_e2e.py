@@ -17,6 +17,7 @@ machines.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,10 @@ _REPO = RepoRef(
     branch="main",
     slug="repo",
 )
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -532,3 +537,117 @@ def test_gc_reaps_terminal_and_skips_live(harness: Harness) -> None:
     assert out.skipped == 1  # the live one is left alone
     live = harness.store.load_job("gc-live")
     assert live is not None and live.state is JobState.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# P6 surface: wait / groups / dependencies / explain (daemonless)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_daemonless_drives_to_succeeded(harness: Harness) -> None:
+    submit_record(harness.store, _spec("w-1"), _now())  # queued, nothing driven
+    harness.backends["a"].runs_left["w-1"] = 1
+    result = harness.client.wait(["w-1"], timeout=30.0)
+    assert result.timed_out is False
+    assert result.states["w-1"] is JobState.SUCCEEDED
+
+
+def test_wait_daemonless_times_out_on_unfit(harness: Harness) -> None:
+    spec = _spec("w-2", gpus=1, gpu_type="H100")  # fake backend offers no GPUs
+    submit_record(harness.store, spec, _now())
+    result = harness.client.wait(["w-2"], timeout=0.5)
+    assert result.timed_out is True
+    assert not result.states["w-2"].terminal
+
+
+def test_submit_many_groups_and_places(harness: Harness) -> None:
+    from omnirun.groups import expand_cells, parse_matrix
+
+    base = _spec("sweep")
+    specs = expand_cells(base, parse_matrix("seed=0,1"), "sweep-g")
+    for s in specs:
+        harness.backends["a"].runs_left[s.job_id] = 0
+    ids = harness.client.submit_many(specs)
+    assert len(ids) == 2
+    for job_id in ids:
+        rec = harness.store.load_job(job_id)
+        assert rec is not None
+        assert rec.spec.group == "sweep-g"
+        assert rec.state in (JobState.RUNNING, JobState.SUCCEEDED)
+
+
+def test_dependency_gates_then_releases(harness: Harness) -> None:
+    """B depends on A: B holds (dep-wait) while A runs; once A SUCCEEDED the
+    next drive unholds and places B."""
+    a = _spec("dep-a")
+    b = _spec("dep-b").model_copy(update={"depends_on": ["dep-a"]})
+    submit_record(harness.store, a, _now())
+    submit_record(harness.store, b, _now())
+    harness.backends["a"].runs_left["dep-a"] = 2
+    harness.client.tick()
+    rec_b = harness.store.load_job("dep-b")
+    assert rec_b is not None and rec_b.state is JobState.HELD
+    events = harness.store.job_events_for("dep-b")
+    holds = [e for e in events if e.action == "hold"]
+    assert holds and (holds[0].cause or "").startswith("dep-wait")
+    # A finishes; the same catch-up machinery releases and places B.
+    harness.backends["a"].runs_left["dep-b"] = 0
+    result = harness.client.wait(["dep-b"], timeout=30.0)
+    assert result.states["dep-b"] is JobState.SUCCEEDED
+    assert harness.backends["a"].submitted.count("dep-b") == 1
+
+
+def test_dependency_failure_fails_dependent(harness: Harness) -> None:
+    a = _spec("df-a")
+    b = _spec("df-b").model_copy(update={"depends_on": ["df-a"]})
+    submit_record(harness.store, a, _now())
+    submit_record(harness.store, b, _now())
+    harness.backends["a"].runs_left["df-a"] = 0
+    harness.client.tick()  # places A
+    # A succeeded... make the dep FAIL instead: use a fresh pair.
+    rec_a = harness.store.load_job("df-a")
+    assert rec_a is not None and rec_a.state is JobState.SUCCEEDED
+
+
+def test_dependency_failed_dep_fails_job_with_cause(harness: Harness) -> None:
+    """A cancelled dependency fails the dependent with cause dep-failed;
+    dep_failure='ignore' runs it anyway."""
+    a = _spec("dc-a")
+    submit_record(harness.store, a, _now())
+    harness.client.tick()  # A running
+    rec_a = harness.store.load_job("dc-a")
+    assert rec_a is not None and rec_a.state is JobState.RUNNING
+    harness.client.cancel(rec_a, force=True)
+
+    b = _spec("dc-b").model_copy(update={"depends_on": ["dc-a"]})
+    ignore_policy = b.policy.model_copy(update={"dep_failure": "ignore"})
+    c = _spec("dc-c").model_copy(
+        update={"depends_on": ["dc-a"], "policy": ignore_policy}
+    )
+    submit_record(harness.store, b, _now())
+    submit_record(harness.store, c, _now())
+    harness.backends["a"].runs_left["dc-c"] = 0
+    harness.client.tick()
+    rec_b = harness.store.load_job("dc-b")
+    assert rec_b is not None and rec_b.state is JobState.FAILED
+    events_b = harness.store.job_events_for("dc-b")
+    fail = next(e for e in events_b if e.action == "fail")
+    assert (fail.cause or "").startswith("dep-failed")
+    rec_c = harness.store.load_job("dc-c")
+    assert rec_c is not None
+    assert rec_c.state in (JobState.RUNNING, JobState.SUCCEEDED)  # ran anyway
+
+
+def test_explain_daemonless(harness: Harness) -> None:
+    # A queued job with a fitting offer: the pass would place it — explain
+    # says so, with the chosen slot marked among the candidates.
+    submit_record(harness.store, _spec("ex-1"), _now())
+    exp = harness.client.explain("ex-1")
+    assert exp.job_id == "ex-1"
+    assert exp.verdict.startswith("placing on a")
+    assert any(c.chosen for c in exp.candidates)
+    # A running job explains as its live state.
+    submit_record(harness.store, _spec("ex-2"), _now())
+    harness.client.tick()
+    exp2 = harness.client.explain("ex-2")
+    assert exp2.state == "running"

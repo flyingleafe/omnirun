@@ -49,6 +49,7 @@ testpaths = ["tests"]
 # the required creds/config are absent — missing coverage must be loud.
 addopts = "-m 'not live'"
 markers = [
+    "conformance: formal-model conformance suites (run in CI against the nix-built trace-check binary)",
     "integration: needs docker or network (deselect with '-m \"not integration\"')",
     "live: hits a real backend; off by default, fails (not skips) without creds",
     "slurm: live test against a Slurm cluster (set OMNIRUN_TEST_SLURM_BACKEND)",

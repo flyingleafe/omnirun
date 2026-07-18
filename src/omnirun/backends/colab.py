@@ -528,12 +528,19 @@ class ColabBackend(Backend):
         submit and render_payload so `--dry-run` previews the real delivery."""
         plan = spec.code
         if plan is not None and plan.kind == "remote":
-            return CodeSource(kind="remote", clone_url=plan.clone_url)
+            return CodeSource(
+                kind="remote",
+                clone_url=plan.clone_url,
+                bundle_path=f"{job_dir}/bundle.git",
+                fetch_bundle=plan.bundle_b64 is not None,
+            )
         if plan is not None and plan.kind == "private":
             return CodeSource(
                 kind="private",
                 clone_url=plan.clone_url,
                 deploy_key_path=f"{job_dir}/deploy_key",
+                bundle_path=f"{job_dir}/bundle.git",
+                fetch_bundle=plan.bundle_b64 is not None,
             )
         clone_url = _remote_clone_plan(spec)
         if clone_url is not None:
@@ -669,10 +676,23 @@ class ColabBackend(Backend):
                     f"{job_dir}/bootstrap.sh",
                     timeout=UPLOAD_TIMEOUT_S,
                 )
-                if code.kind == "bundle":  # private repo → upload the bundle
-                    bundle = _create_bundle(
-                        _local_root(spec), spec.repo.sha, local / "bundle.git"
-                    )
+                if code.kind == "bundle" or code.fetch_bundle:
+                    # Full bundle (private/unpushed legacy path) from the local
+                    # objects, or the thin delta bundle already riding the plan
+                    # (CODE-2c — the placer needs no local git objects).
+                    if (
+                        code.fetch_bundle
+                        and spec.code is not None
+                        and spec.code.bundle_b64
+                    ):
+                        import base64 as _b64
+
+                        bundle = local / "bundle.git"
+                        bundle.write_bytes(_b64.b64decode(spec.code.bundle_b64))
+                    else:
+                        bundle = _create_bundle(
+                            _local_root(spec), spec.repo.sha, local / "bundle.git"
+                        )
                     limit = int(
                         self.config.extra("max_upload_bytes", COLAB_MAX_UPLOAD_BYTES)
                     )

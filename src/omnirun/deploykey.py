@@ -60,23 +60,45 @@ def resolve_code_plan(
     ssh clone; otherwise fall back to the placer's local objects (``local``), or
     raise with actionable guidance when there is nothing to fall back to.
 
+    A committed-but-UNPUSHED sha with a cloneable origin gets the origin plan
+    PLUS a thin delta bundle (CODE-2c): the worker clones origin for the base
+    and fetches the bundle on top, so unpushed work runs in daemonless AND
+    daemon mode without the local-push restriction.
+
     ``allow_local_fallback`` is False when the placer is a REMOTE daemon (it has
     no access to this client's filesystem): the ``local`` fallback is then
     refused HERE, at submit, with the actionable message — rather than the daemon
     failing placement later with a cryptic ``[Errno 2]`` on the client's path."""
     origin = ref.remote_url
     root = Path(ref.local_root) if ref.local_root else None
+    unpushed = (
+        bool(origin) and root is not None and not repo.sha_on_origin(root, ref.sha)
+    )
+
+    def _bundle(plan: CodePlan) -> CodePlan:
+        if unpushed and root is not None:
+            report("bundling the unpushed delta…")
+            return plan.model_copy(
+                update={"bundle_b64": repo.thin_bundle_b64(root, ref.sha)}
+            )
+        return plan
 
     # Known-private: we already hold a key for this origin — clone via ssh.
     if origin and get_key(origin) is not None:
         ssh_url = repo.ssh_clone_url(origin)
         if ssh_url:
-            return CodePlan(kind="private", clone_url=ssh_url, origin=origin)
+            return _bundle(CodePlan(kind="private", clone_url=ssh_url, origin=origin))
 
-    # Public + reachable: anonymous clone, no key.
-    public = _public_clone_url(ref, root)
-    if public is not None:
-        return CodePlan(kind="remote", clone_url=public, origin=origin)
+    # Public + reachable: anonymous clone, no key. An unpushed sha only needs
+    # the origin to be public (the reachability proof is what the bundle waives).
+    if unpushed:
+        url = repo.worker_clone_url(origin)
+        if url is not None and repo.remote_is_public(origin):
+            return _bundle(CodePlan(kind="remote", clone_url=url, origin=origin))
+    else:
+        public = _public_clone_url(ref, root)
+        if public is not None:
+            return CodePlan(kind="remote", clone_url=public, origin=origin)
 
     # Private origin: provision a read-only deploy key if `gh` lets us.
     if origin:
@@ -91,7 +113,7 @@ def resolve_code_plan(
                     origin=origin, private_key=priv, public_key=pub, key_id=key_id
                 )
             )
-            return CodePlan(kind="private", clone_url=ssh_url, origin=origin)
+            return _bundle(CodePlan(kind="private", clone_url=ssh_url, origin=origin))
 
     # Fallback: the placer delivers from its OWN local objects. Only a co-located
     # placer (daemonless, or a loopback daemon) can — a remote daemon has no

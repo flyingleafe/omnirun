@@ -29,7 +29,8 @@ from __future__ import annotations
 import asyncio
 import queue as queue_mod
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,7 +71,11 @@ from omnirun.engine.verbs import (
     resolve_meta_cap as resolve_meta_cap,
     retry_job,
     submit_record as submit_record,
+    wait_settled,
+    WaitResult as WaitResult,
+    explain_job,
 )
+from omnirun.scheduler import JobExplanation
 from omnirun.models import (
     Deadline,
     DeployKey,
@@ -85,7 +90,7 @@ from omnirun.models import (
 from omnirun.providers import BackendProvider
 from omnirun.providers.asyncadapter import AsyncBackendProvider
 from omnirun.state import Store, open_store
-from omnirun.state.store import default_store_dir
+from omnirun.state.store import EventRow, default_store_dir
 
 import logging
 
@@ -145,6 +150,16 @@ class Client(Protocol):
     def enqueue(
         self, spec: JobSpec, *, backend: str | None = None, count: int = 1
     ) -> list[str]: ...
+    def submit_many(self, specs: list[JobSpec]) -> list[str]: ...
+    def plan_code(self, spec: JobSpec) -> JobSpec: ...
+    def wait(
+        self,
+        job_ids: list[str],
+        *,
+        until: JobState | None = None,
+        timeout: float | None = None,
+    ) -> WaitResult: ...
+    def explain(self, ref: str) -> JobExplanation: ...
     def tick(self) -> list[str]: ...
     def catch_up(self) -> list[str]: ...
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]: ...
@@ -278,23 +293,32 @@ class _Session:
         *,
         until: Callable[[], bool] | None = None,
         poll_s: float = _WAIT_POLL_S,
-    ) -> None:
+        deadline: float | None = None,
+    ) -> bool:
         """Run the engine to quiescence (and, with *until*, keep driving —
-        sleeping on the wake event between rounds — until it holds)."""
-        asyncio.run(self._drive_async(until=until, poll_s=poll_s))
+        sleeping on the wake event between rounds — until it holds). *deadline*
+        (a ``time.monotonic`` instant) bounds the wait: checked between rounds,
+        so an in-flight work item finishes its stage first. Returns False only
+        when the deadline expired with *until* still unmet."""
+        return asyncio.run(
+            self._drive_async(until=until, poll_s=poll_s, deadline=deadline)
+        )
 
     async def _drive_async(
         self,
         *,
         until: Callable[[], bool] | None,
         poll_s: float,
-    ) -> None:
+        deadline: float | None,
+    ) -> bool:
         try:
             while True:
                 self.refresh_slots()
                 await self.engine.run_until_quiescent(task_timeout=_ITEM_TIMEOUT_S)
                 if until is None or until():
-                    return
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
                 await self.engine.wait_wake(poll_s)
         finally:
             await self.engine.shutdown()
@@ -345,6 +369,10 @@ class LocalClient:
     ) -> _Session:
         return _Session(self, backend=backend, tuning=tuning)
 
+    def _settle_drive(self) -> None:
+        """One catch-up drive as a settle hook (retry/pull)."""
+        self._session().drive()
+
     def backend_for(self, name: str) -> Backend:
         bcfg = self.cfg.backends.get(name)
         if bcfg is None:
@@ -371,6 +399,12 @@ class LocalClient:
 
     def _plan_code(self, spec: JobSpec) -> JobSpec:
         return resolve_spec_code(spec, self.deploy_key_get, self.deploy_key_register)
+
+    def plan_code(self, spec: JobSpec) -> JobSpec:
+        """Resolve the code plan + ``.env`` blob ONCE (idempotent) — the CLI
+        calls this before a matrix/group expansion so every cell shares the
+        one resolved plan (FUT-1)."""
+        return self._plan_code(spec)
 
     # -- store reads --
     def list_jobs(self, *, project: str | None = None) -> list[JobRecord]:
@@ -434,6 +468,77 @@ class LocalClient:
             submit_record(store, job_spec, now)
             job_ids.append(job_spec.job_id)
         return job_ids
+
+    def submit_many(self, specs: list[JobSpec]) -> list[str]:
+        """Persist an already-expanded set (a matrix/group, FUT-1) QUEUED —
+        the specs carry their shared, pre-resolved code plan (``_plan_code``
+        is idempotent, so an unresolved base still resolves exactly once per
+        distinct plan) — then run ONE engine drive so whatever fits places
+        now; the rest waits for the next catch-up or a daemon."""
+        store = self._store()
+        now = datetime.now(timezone.utc)
+        job_ids: list[str] = []
+        for spec in specs:
+            spec = self._plan_code(spec)
+            submit_record(store, spec, now)
+            job_ids.append(spec.job_id)
+        session = self._session()
+        session.drive()
+        return job_ids
+
+    def wait(
+        self,
+        job_ids: list[str],
+        *,
+        until: JobState | None = None,
+        timeout: float | None = None,
+    ) -> WaitResult:
+        """Blocking, engine-driven wait (OBS-10, daemonless): this process
+        drives the same engine a daemon would run — placement, observation,
+        capture — until every watched job settles (reaches the target or any
+        terminal state), or the wall budget expires (checked between rounds)."""
+        store = self._store()
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
+        def _states() -> dict[str, JobState]:
+            out: dict[str, JobState] = {}
+            for jid in job_ids:
+                rec = store.load_job(jid)
+                # A job that vanished mid-wait (gc'd elsewhere) is settled.
+                out[jid] = rec.state if rec is not None else JobState.CANCELLED
+            return out
+
+        def _done() -> bool:
+            return all(wait_settled(s, until) for s in _states().values())
+
+        # The catch-up preset: no live streams (nothing reads the bytes here),
+        # the observer batch-polls every placed job each cycle — the fastest
+        # settling cadence for a process whose only question is "done yet?".
+        session = self._session()
+        completed = session.drive(until=_done, deadline=deadline)
+        return WaitResult(states=_states(), timed_out=not completed)
+
+    def explain(self, ref: str) -> JobExplanation:
+        """The pure pass's verdict for one job over the LIVE snapshot: gather
+        the currently-offered slots (the same gather a drive would use), then
+        run the scheduler's own :func:`~omnirun.scheduler.explain` (SCHED-7)."""
+        store = self._store()
+        rec = store.resolve_job(ref)
+        slots: list[Slot] = []
+        try:
+            backends, _broken = make_backends(
+                self.cfg,
+                None,
+                self._config_path,
+                self._backend_factory,
+                store,
+                self._endpoints,
+            )
+            inners = {name: BackendProvider(be, store) for name, be in backends.items()}
+            slots = SlotGather(store, inners).refresh()
+        except ConfigError:
+            pass  # no backends configured: explain over an empty offer set
+        return explain_job(store, slots, make_ledger(store, self.cfg), rec.spec.job_id)
 
     def tick(self) -> list[str]:
         """One catch-up round: what a daemon would have done since last time."""
@@ -522,7 +627,7 @@ class LocalClient:
             rec,
             only_backend=only_backend,
             repin=repin,
-            settle=lambda: self._session().drive(),
+            settle=self._settle_drive,
         )
 
     def budget_set(self, window: str, cap: float) -> None:
@@ -714,7 +819,7 @@ class LocalClient:
             self.backend_for,
             rec,
             dest,
-            settle=lambda: self._session().drive(),
+            settle=self._settle_drive,
         )
 
 
@@ -734,8 +839,16 @@ class RemoteClient:
     def __init__(self, base_url: str, *, timeout: float = 60.0) -> None:
         import httpx
 
+        from omnirun import wire
+
         self._base = base_url.rstrip("/")
-        self._http = httpx.Client(base_url=self._base, timeout=timeout)
+        # Version handshake (CLI-6): every request carries the client version;
+        # every response is checked against the daemon's advertised pair.
+        self._http = httpx.Client(
+            base_url=self._base,
+            timeout=timeout,
+            headers={wire.VERSION_HEADER: wire.PROTOCOL_VERSION},
+        )
         # For a followed log the gap between lines is unbounded (a job can run a
         # long step silently), so the SSE read must NOT time out — disable just
         # the read timeout; connect/write/pool stay bounded so an unreachable
@@ -747,6 +860,16 @@ class RemoteClient:
         self._http.close()
 
     # -- transport --
+    def _check_version(self, headers: Any) -> None:
+        """Raise the one-line upgrade instruction on a version mismatch."""
+        from omnirun import wire
+
+        err = wire.check_peer_version(
+            headers.get(wire.VERSION_HEADER), headers.get(wire.MIN_VERSION_HEADER)
+        )
+        if err is not None:
+            raise BackendError(err)
+
     def _request(self, method: str, path: str, **kw: Any) -> Any:
         import httpx
 
@@ -757,6 +880,7 @@ class RemoteClient:
                 f"cannot reach the omnirun daemon at {self._base} "
                 f"({e}); is it running? (`omnirun serve` on the daemon host)"
             ) from e
+        self._check_version(resp.headers)
         if resp.status_code >= 400:
             self._raise_typed(resp)
         return resp
@@ -817,6 +941,11 @@ class RemoteClient:
             allow_local_fallback=self._is_loopback(),
         )
 
+    def plan_code(self, spec: JobSpec) -> JobSpec:
+        """Resolve the code plan + ``.env`` blob ONCE (idempotent; see
+        :meth:`LocalClient.plan_code`)."""
+        return self._plan_code(spec)
+
     def _is_loopback(self) -> bool:
         from urllib.parse import urlparse
 
@@ -827,6 +956,12 @@ class RemoteClient:
     def submit(
         self, spec: JobSpec, *, backend: str | None = None, wait: bool = False
     ) -> SubmitOutcome:
+        """Submit via the 202-style ASYNC path: the POST commits the job and
+        returns immediately (no HTTP request pinned open for the whole
+        placement); the outcome is then collected through the idempotent,
+        retryable ``/settle`` long-poll. An older daemon ignores the ``async``
+        field and answers with the blocking outcome directly — both shapes are
+        handled, so mixed versions keep working."""
         from omnirun import wire
 
         spec = self._plan_code(spec)
@@ -834,11 +969,41 @@ class RemoteClient:
             "mode": "submit",
             "spec": spec.model_dump(mode="json"),
             "backend": backend,
+            "async": True,
         }
-        outcome = wire.submit_outcome_from_json(self._post("/jobs", json=body))
+        data = self._post("/jobs", json=body)
+        if data.get("async"):
+            outcome = self._settle_submit(data["job_id"])
+        else:
+            outcome = wire.submit_outcome_from_json(data)
         if wait:
             outcome = self._await_terminal(outcome)
         return outcome
+
+    def _settle_submit(self, job_id: str) -> SubmitOutcome:
+        """Collect an async submit's outcome: loop the bounded server-side
+        settle wait (each request well under the HTTP timeout) until the
+        placement settles — launched, held, terminal, or visibly left queued."""
+        import time as _time
+
+        from omnirun import wire
+
+        deadline = _time.monotonic() + 3600.0
+        while True:
+            data = self._get(f"/jobs/{job_id}/settle")
+            if data.get("settled"):
+                return wire.submit_outcome_from_json(data["outcome"])
+            if _time.monotonic() >= deadline:
+                # Report what we know; the daemon keeps advancing the job.
+                rec = self.status(job_id)
+                return SubmitOutcome(
+                    job_id=job_id,
+                    state=rec.state,
+                    provider_name=(
+                        rec.placement.provider_name if rec.placement else None
+                    ),
+                    placed=rec.placement is not None and bool(rec.placement.handle),
+                )
 
     def _await_terminal(self, outcome: SubmitOutcome) -> SubmitOutcome:
         """``submit --wait`` against a daemon: poll until the job is terminal
@@ -868,6 +1033,137 @@ class RemoteClient:
             "count": count,
         }
         return list(self._post("/jobs", json=body)["job_ids"])
+
+    def submit_many(self, specs: list[JobSpec]) -> list[str]:
+        """Enqueue an already-expanded set (matrix/group) in ONE request; the
+        daemon's resident engine places the cells continuously."""
+        payload = [self._plan_code(spec).model_dump(mode="json") for spec in specs]
+        body = {"mode": "enqueue", "specs": payload}
+        return list(self._post("/jobs", json=body)["job_ids"])
+
+    # -- events / wait ----------------------------------------------------
+
+    def events(
+        self, after: int | None = None, *, follow: bool = True
+    ) -> Iterator[EventRow]:
+        """The daemon's ``/events`` SSE feed as decoded event rows (FUT-9).
+
+        ``after`` resumes from that global event id (``0`` replays the full
+        history); ``None`` starts at "now" (only new events). ``follow=False``
+        returns the backlog and ends at the daemon's eof frame."""
+        for item in self._event_frames(after, follow=follow):
+            if item is not None:
+                yield item
+
+    def _event_frames(
+        self, after: int | None, *, follow: bool
+    ) -> Generator[EventRow | None, None, None]:
+        """The raw SSE loop: decoded event rows, with ``None`` for each
+        keepalive comment (the wait verb uses those to check its deadline)."""
+        import json as _json
+
+        from omnirun import wire
+
+        params: dict[str, str] = {"follow": "1" if follow else "0"}
+        if after is not None:
+            params["after"] = str(after)
+        with self._http.stream(
+            "GET", "/events", params=params, timeout=self._stream_timeout
+        ) as resp:
+            if resp.status_code >= 400:
+                resp.read()
+                self._raise_typed(resp)
+            error_next = False
+            for raw in resp.iter_lines():
+                if raw.startswith(":"):
+                    yield None  # keepalive
+                    continue
+                if raw.startswith("event: eof"):
+                    return
+                if raw.startswith("event: error"):
+                    error_next = True
+                    continue
+                if raw.startswith("data:"):
+                    payload = raw[len("data:") :].lstrip(" ")
+                    if error_next:
+                        try:
+                            err = _json.loads(payload)
+                        except ValueError:
+                            err = {"error": payload, "type": "BackendError"}
+                        self._raise_error(
+                            err.get("error", payload), err.get("type", "BackendError")
+                        )
+                    yield wire.event_row_from_json(_json.loads(payload))
+
+    def wait(
+        self,
+        job_ids: list[str],
+        *,
+        until: JobState | None = None,
+        timeout: float | None = None,
+    ) -> WaitResult:
+        """Blocking wait against a daemon (OBS-10): event-driven over the
+        ``/events`` SSE feed — a watched job's event triggers one status
+        re-read; keepalive frames bound how stale the deadline check can get.
+        The daemon's engine is what advances the jobs meanwhile."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout if timeout is not None else None
+        states: dict[str, JobState] = {}
+
+        def _refresh(jid: str) -> None:
+            try:
+                rec = self.status(jid)
+                states[jid] = rec.state
+            except KeyError:
+                states[jid] = JobState.CANCELLED  # vanished mid-wait: settled
+
+        def _done() -> bool:
+            return all(wait_settled(states[jid], until) for jid in job_ids)
+
+        import httpx
+
+        for jid in job_ids:
+            _refresh(jid)
+        while not _done():
+            if deadline is not None and _time.monotonic() >= deadline:
+                return WaitResult(states=states, timed_out=True)
+            try:
+                frames = self._event_frames(None, follow=True)
+                try:
+                    # Subscribe-then-snapshot, race-free: the daemon's first
+                    # frame (the hello comment) confirms the feed's cursor is
+                    # fixed, so events between our snapshot below and the
+                    # subscribe can no longer be missed.
+                    next(frames, None)
+                    for jid in job_ids:
+                        _refresh(jid)
+                    if _done():
+                        break
+                    for item in frames:
+                        if deadline is not None and _time.monotonic() >= deadline:
+                            return WaitResult(states=states, timed_out=True)
+                        if item is None:
+                            # Keepalive: cheap belt-and-braces refresh so a
+                            # missed edge can never wedge the wait.
+                            for jid in job_ids:
+                                _refresh(jid)
+                        elif item.job_id in states:
+                            _refresh(item.job_id)
+                        if _done():
+                            break
+                finally:
+                    frames.close()
+            except (ConnectionError, httpx.HTTPError):
+                # Daemon restarting: back off, re-poll, re-subscribe.
+                _time.sleep(2.0)
+            for jid in job_ids:
+                _refresh(jid)
+        return WaitResult(states=states, timed_out=False)
+
+    def explain(self, ref: str) -> JobExplanation:
+        data = self._get(f"/jobs/{ref}/explain")
+        return JobExplanation.model_validate(data["explanation"])
 
     def tick(self) -> list[str]:
         return list(self._post("/tick")["events"])

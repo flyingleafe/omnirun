@@ -6,6 +6,7 @@ scripts spawned as subprocesses) is made HOME-independent via env vars.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -76,8 +77,11 @@ def sample_repo(tmp_path: Path) -> Path:
 # (CONFORMANCE.md §2) — and ANY checker violation fails the test.
 # ---------------------------------------------------------------------------
 
-TRACE_CHECK_BIN = (
-    Path(__file__).resolve().parents[1]
+# The compiled formal checker: $OMNIRUN_TRACE_CHECK (CI points it at the
+# `nix build .#trace-check` output) wins over the in-repo lake build.
+TRACE_CHECK_BIN = Path(
+    os.environ.get("OMNIRUN_TRACE_CHECK")
+    or Path(__file__).resolve().parents[1]
     / "formal"
     / ".lake"
     / "build"
