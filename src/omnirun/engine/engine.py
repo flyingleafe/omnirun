@@ -113,6 +113,10 @@ class Engine:
         self._poll_interval = poll_interval
         self._capture_tries = capture_tries
         self._wake = asyncio.Event()
+        #: Monotone count of completed scheduling passes. Plain int, safe to
+        #: READ from other threads (the daemon's submit wait uses it to detect
+        #: "a pass ran over the refreshed slots and left the job queued").
+        self.pass_count = 0
         # job_id → force? A requested cancel; the pass turns it into a cancel
         # work item (whose intent row persists the request across processes).
         self._cancels: dict[str, bool] = {}
@@ -254,6 +258,7 @@ class Engine:
         )
         for decision in decisions:
             acted += self._enact(decision, now)
+        self.pass_count += 1
         return acted
 
     def _enact_rollback_recovery(self, job_id: str, rec: JobRecord) -> bool:
@@ -521,20 +526,33 @@ class Engine:
                 return
         raise RuntimeError(f"engine did not quiesce within {max_passes} passes")
 
-    async def run_forever(self) -> None:
+    async def run_forever(self, stop: asyncio.Event | None = None) -> None:
         """The daemon loop: pass, then sleep until a wakeup or the poll timer.
 
-        SIGTERM → cancel the work-item tasks (each persists its intent stage),
-        skip any final pass, exit within seconds (ROBUST-3).
+        With no *stop* event the engine owns SIGTERM itself (a loop on the
+        main thread); a caller running the loop on a helper thread — the HTTP
+        daemon — passes its own *stop* and translates process signals into it
+        (``loop.call_soon_threadsafe(stop.set)``). Stopping cancels the
+        work-item tasks (each persists its intent stage), skips any final
+        pass, and returns within seconds (ROBUST-3).
         """
         loop = asyncio.get_running_loop()
-        stop = asyncio.Event()
-        loop.add_signal_handler(signal.SIGTERM, stop.set)
+        own_signal = stop is None
+        if stop is None:
+            stop = asyncio.Event()
+            loop.add_signal_handler(signal.SIGTERM, stop.set)
         try:
             while not stop.is_set():
                 self._wake.clear()
-                await self.observe_once()
-                await self.run_pass()
+                try:
+                    await self.observe_once()
+                    await self.run_pass()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A defective round must never kill the resident loop; the
+                    # next timer tick retries (v1's "tick raised; continuing").
+                    _log.warning("engine round raised; continuing", exc_info=True)
                 waiters = [
                     asyncio.ensure_future(self._wake.wait()),
                     asyncio.ensure_future(stop.wait()),
@@ -550,7 +568,8 @@ class Engine:
                         w.cancel()
                     await asyncio.gather(*waiters, return_exceptions=True)
         finally:
-            loop.remove_signal_handler(signal.SIGTERM)
+            if own_signal:
+                loop.remove_signal_handler(signal.SIGTERM)
             await self.shutdown()
 
     async def shutdown(self) -> None:

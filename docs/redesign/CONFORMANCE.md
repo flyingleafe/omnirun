@@ -28,6 +28,17 @@ exactly the checker's tokens:
 `<nid>` is a per-trace dense numeric alias of `job_id` (the exporter
 assigns it). `cost` is the committed placement estimate in integer cents.
 
+**Cost scale-down (model job cost = first-arc estimate).** The model prices
+a job once, at `submit`; the implementation only learns a price at reserve
+time, per attempt. The exporter therefore stamps `submit <nid> <cost>` with
+the `est_cost` of the job's **first `reserve` event** of the arc the alias
+covers (0 when that arc never reserved — free slots, or a job that never
+placed), and `Store.abstract_state` computes each job's cost by the same
+rule, so replayed spend and α agree and I1 is checked non-vacuously. Later
+re-shops/re-reserves within one arc may carry different estimates; the model
+keeps the first-arc price. A `retry` re-alias starts a fresh arc and is
+priced from that arc's own first reserve.
+
 **Scale-downs (deliberate, documented):** log growth (`log-append`) is NOT
 event-logged — I12 is enforced by the accumulating-log test suite, not the
 trace. `unreachable-poll` is emitted only when an unreachable outcome was

@@ -16,6 +16,10 @@ The CLI is thin: it parses flags, does *local* git-repo work, and then calls a
   (repo capture, code-plan resolution) then sends fully-formed requests, so it
   needs no store access and no backend credentials of its own.
 
+The verb *logic* itself lives in :mod:`omnirun.engine.verbs`, shared verbatim
+with the daemon's resident engine; this module only supplies the daemonless
+"advance the machine" halves (per-verb engine sessions).
+
 :func:`make_client` picks between them by whether ``[daemon].address`` is
 configured — never by probing for a local pid.
 """
@@ -23,44 +27,65 @@ configured — never by probing for a local pid.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import queue as queue_mod
-import shutil
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
-from omnirun.budget import BudgetLedger, DualWindowLedger
-from omnirun.config import Config, ConfigError, default_config_path
+from omnirun.config import Config, ConfigError
 from omnirun.deploykey import resolve_code_plan
 from omnirun.endpoints.manager import EndpointManager
-from omnirun.engine import workitems as wi
 from omnirun.engine.engine import Engine
-from omnirun.engine.supervisor import cas_step
+from omnirun.engine.verbs import (
+    BackendFactory as BackendFactory,
+    BudgetRow as BudgetRow,
+    CheckRow as CheckRow,
+    DiscoverRow as DiscoverRow,
+    GcOutcome as GcOutcome,
+    SlotGather,
+    SubmitOutcome as SubmitOutcome,
+    budget_rows,
+    budget_set,
+    capture_log_path,
+    check_rows,
+    classify_submit,
+    discover_rows,
+    drain_events,
+    durable_log_paths,
+    edit_job,
+    gc_sweep,
+    handle_of as handle_of,
+    make_backends,
+    make_ledger,
+    narrate,
+    persist_cancel_intent,
+    probe_offers,
+    pull_to_dir,
+    reprioritize_policy,
+    resolve_meta_cap as resolve_meta_cap,
+    retry_job,
+    submit_record as submit_record,
+)
 from omnirun.models import (
     Deadline,
     DeployKey,
-    JobHandle,
     JobPolicy,
     JobRecord,
     JobSpec,
     JobState,
-    JobStatus,
     Offer,
-    ProviderFacts,
     ResourceSpec,
     Slot,
 )
 from omnirun.providers import BackendProvider
 from omnirun.providers.asyncadapter import AsyncBackendProvider
 from omnirun.state import Store, open_store
-from omnirun.state.store import EventRow, StaleTransition, default_store_dir
+from omnirun.state.store import default_store_dir
 
 import logging
 
@@ -70,67 +95,12 @@ _log = logging.getLogger("omnirun.client")
 GetKey = Callable[[str], "DeployKey | None"]
 RegisterKey = Callable[["DeployKey"], None]
 
-# Parallel-I/O tuning for the client's slot gather / facts refresh (the same
-# budgets v1's tick used): a straggler is skipped, never allowed to hang a
-# read command.
-_POLL_TIMEOUT_S = 30.0
-_MAX_POLL_WORKERS = 8
 # Work items during a drive may legitimately run for minutes (a marketplace
 # instance provisioning); the daemonless drive waits them out, exactly as the
 # v1 inline place did. Per-stage budgets live in the backends (COST-4).
 _ITEM_TIMEOUT_S = 3600.0
 # Cadence of the --wait / logs -f drive loop between wakeups.
 _WAIT_POLL_S = 2.0
-
-
-def resolve_meta_cap(store: Store, window: str, default: float | None) -> float | None:
-    """The live spend cap for *window*, resolved fresh from the ``meta`` table.
-
-    ``omnirun budget`` (and the daemon) write the current cap into ``meta`` under
-    ``budget.<window>`` — an empty string means "no cap" (unbounded). A parseable
-    float there wins; an unparseable value is logged and IGNORED (falling back to
-    *default*, the config-derived construction default). This single resolver is
-    shared by the engine's pass ledger and the ``omnirun budget`` display so the
-    two can never drift on how a stored cap is interpreted.
-    """
-    raw = store.get_meta(f"budget.{window}")
-    if raw is not None:
-        raw = raw.strip()
-        if raw == "":
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            _log.warning(
-                "unparseable budget cap %r for window %s; using config default",
-                raw,
-                window,
-            )
-    return default
-
-
-def submit_record(store: Store, spec: JobSpec, now: datetime) -> JobRecord:
-    """Persist *spec* as a fresh QUEUED job via the ``submit`` transition.
-
-    Raises ``ValueError`` on a duplicate ``job_id`` — re-submitting a live id
-    would reset a placed record and risk a double launch, so it is refused
-    (the transition's CAS at seq 0 detects the existing row).
-    """
-    rec = JobRecord(spec=spec, submitted_at=now, state=JobState.QUEUED)
-    try:
-        store.transition(
-            spec.job_id,
-            rec,
-            expected_seq=0,
-            actor="client",
-            action="submit",
-            data={"cost_cents": 0},
-        )
-    except StaleTransition:
-        raise ValueError(
-            f"duplicate job_id {spec.job_id!r}: already submitted"
-        ) from None
-    return rec
 
 
 def resolve_spec_code(
@@ -163,57 +133,6 @@ def resolve_spec_code(
         if envf is not None:
             updates["env_dotenv"] = envf.read_text()
     return spec.model_copy(update=updates) if updates else spec
-
-
-def handle_of(rec: JobRecord) -> JobHandle | None:
-    """The backend handle for the live-I/O verbs (``logs``/``pull``/``ssh``),
-    derived from the job's ``placement`` — the single source of truth. ``None``
-    when the job was never placed anywhere."""
-    p = rec.placement
-    if p is None or not p.handle:
-        return None
-    return JobHandle(backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle)
-
-
-@dataclass
-class SubmitOutcome:
-    job_id: str
-    state: JobState
-    provider_name: str | None
-    placed: bool  # a real placement handle exists (the job launched)
-    held_reason: str | None = None  # set when state is HELD
-
-
-@dataclass
-class GcOutcome:
-    events: list[str] = field(default_factory=list)  # drive events drained first
-    cleaned: int = 0
-    failed: int = 0
-    skipped: int = 0
-    warnings: list[str] = field(default_factory=list)
-
-
-@dataclass
-class BudgetRow:
-    window: str
-    spent: float
-    cap: float | None
-
-
-@dataclass
-class CheckRow:
-    name: str
-    type: str
-    enabled: bool
-    outcome: str | Exception | None  # None only when disabled
-
-
-@dataclass
-class DiscoverRow:
-    name: str
-    type: str
-    enabled: bool
-    facts: ProviderFacts | Exception | None  # None only when disabled
 
 
 class Client(Protocol):
@@ -269,181 +188,6 @@ class Client(Protocol):
 # --------------------------------------------------------------------------- local
 
 
-BackendFactory = Callable[[str, Any], Backend]
-
-
-def _make_backends(
-    cfg: Config,
-    only: str | None,
-    config_path: Path | None,
-    factory: BackendFactory = make_backend,
-    store: Store | None = None,
-    endpoints: EndpointManager | None = None,
-) -> tuple[dict[str, Backend], list[Offer]]:
-    """Construct enabled backends; a backend whose constructor fails becomes a
-    synthetic unfit offer instead of killing the whole command.
-
-    *store* is the CONFIGURED state store, injected into every backend
-    (``Backend.store``) so their best-effort caches (wait history, facts,
-    entitlement blocks) hit the one real store instead of resolving a default
-    (the H48 dual-store bug). *endpoints* is the process's shared
-    :class:`EndpointManager`, injected on the same path so backends pointed at
-    one physical target share its ssh session, API throttle, and discovery
-    cache instead of duplicating remote traffic."""
-    sections = {n: c for n, c in cfg.backends.items() if c.enabled}
-    if only is not None:
-        if only not in cfg.backends:
-            known = ", ".join(sorted(cfg.backends)) or "none configured"
-            raise BackendError(f"backend {only!r} is not configured (known: {known})")
-        sections = {only: cfg.backends[only]}
-    if not sections:
-        raise ConfigError(
-            "no backends configured/enabled — add [backends.*] sections to "
-            f"{config_path or default_config_path()}"
-        )
-    backends: dict[str, Backend] = {}
-    broken: list[Offer] = []
-    for name, bcfg in sections.items():
-        try:
-            be = factory(name, bcfg)
-            if store is not None:  # never reset a cached instance's store
-                be.store = store
-            if endpoints is not None:
-                be.endpoints = endpoints
-            backends[name] = be
-        except Exception as e:
-            broken.append(
-                Offer(
-                    backend=name,
-                    label=f"{name}: unavailable",
-                    fits=False,
-                    unfit_reasons=[f"backend init failed: {e}"],
-                )
-            )
-    return backends, broken
-
-
-def _apply_admission(
-    offers: list[Offer], res: ResourceSpec, store: Store
-) -> list[Offer]:
-    """Mark fitting offers unfit when FRESH cached facts prove the job can't run
-    there. Stale facts (past TTL) are ignored so an old cache never wrongly blocks."""
-    now = datetime.now(timezone.utc)
-    for o in offers:
-        if not o.fits:
-            continue
-        facts = store.load_facts(o.backend)
-        if facts is None or not facts.is_fresh(now):
-            continue
-        reasons = facts.capabilities.satisfies(res)
-        if reasons:
-            o.fits = False
-            o.unfit_reasons.extend(reasons)
-    return offers
-
-
-def _parallel_by_name(
-    items: list[tuple[str, Any]], fn: Callable[[tuple[str, Any]], Any]
-) -> dict[str, Any]:
-    """Run ``fn(item)`` for each ``(name, cfg)`` in a thread pool → ``name ->
-    result-or-Exception``. Callers iterate their own ordering to print."""
-    if not items:
-        return {}
-    out: dict[str, Any] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool:
-        future_to_name = {pool.submit(fn, item): item[0] for item in items}
-        for future in concurrent.futures.as_completed(future_to_name):
-            name = future_to_name[future]
-            exc = future.exception()
-            out[name] = exc if exc is not None else future.result()
-    return out
-
-
-def _parallel_io(
-    items: list[Any],
-    fn: Callable[[Any], Any],
-    describe: Callable[[Any], str],
-    *,
-    timeout_s: float = _POLL_TIMEOUT_S,
-    max_workers: int = _MAX_POLL_WORKERS,
-) -> list[tuple[Any, Any]]:
-    """Fan ``fn(item)`` out across threads with a wall budget; a straggler is
-    DROPPED (skipped this round, one warning) so slow provider I/O can never
-    hang a read command. Returns ``(item, result-or-Exception)`` pairs."""
-    if not items:
-        return []
-    workers = min(max_workers, len(items))
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-    future_to_item = {executor.submit(fn, item): item for item in items}
-    done, not_done = concurrent.futures.wait(future_to_item, timeout=timeout_s)
-    results: list[tuple[Any, Any]] = []
-    for future in done:
-        item = future_to_item[future]
-        exc = future.exception()
-        if isinstance(exc, Exception):
-            results.append((item, exc))
-        elif exc is not None:
-            raise exc  # BaseException — never swallowed as a provider fault
-        else:
-            results.append((item, future.result()))
-    for future in not_done:
-        _log.warning(
-            "%s did not finish within %.0fs; skipping this round",
-            describe(future_to_item[future]),
-            timeout_s,
-        )
-    executor.shutdown(wait=False)
-    return results
-
-
-# Human narration of the engine's lifecycle events (drained by tick/ps/gc so
-# what the machine did during a drive is visible — an invisible cleanup is how
-# the split-brain bug hid).
-def _narrate(events: list[EventRow]) -> list[str]:
-    lines: list[str] = []
-    for ev in events:
-        data = ev.data or {}
-        provider = data.get("provider") or "?"
-        if ev.action == "reserve":
-            lines.append(f"placing {ev.job_id} on {provider}")
-        elif ev.action == "activate":
-            if data.get("dead"):
-                lines.append(f"placement of {ev.job_id} on {provider} came up dead")
-            else:
-                lines.append(f"launched {ev.job_id} on {provider}")
-        elif ev.action == "finish":
-            ok = bool(data.get("ok"))
-            lines.append(f"{ev.job_id} finished: {'succeeded' if ok else 'failed'}")
-        elif ev.action == "capture":
-            if data.get("sacrificed"):
-                lines.append(f"capture of {ev.job_id} sacrificed (worker gone)")
-            else:
-                lines.append(f"captured logs+outputs of {ev.job_id}")
-        elif ev.action == "reap":
-            lines.append(
-                f"released {provider} placement of {ev.job_id}; reclaimed 1 slot"
-            )
-        elif ev.action == "release-lost":
-            lines.append(
-                f"released lost placement of {ev.job_id} on {provider}; "
-                "reclaimed 1 slot"
-            )
-        elif ev.action == "rollback":
-            cause = ev.cause or "released"
-            lines.append(f"placement of {ev.job_id} rolled back: {cause}")
-        elif ev.action == "requeue":
-            lines.append(f"requeued {ev.job_id}: {ev.cause or 'placement lost'}")
-        elif ev.action == "fail":
-            lines.append(f"failed {ev.job_id}: {ev.cause or 'attempts exhausted'}")
-        elif ev.action == "cancel":
-            lines.append(f"cancelled {ev.job_id}")
-        elif ev.action == "cancel-failed":
-            lines.append(f"cancel of {ev.job_id} FAILED: {ev.cause or 'unknown'}")
-        elif ev.action == "worker-dead":
-            lines.append(f"worker of {ev.job_id} is gone: {ev.cause or ''}".strip())
-    return lines
-
-
 @dataclass(frozen=True)
 class _Tuning:
     """Per-verb engine observation preset (daemonless).
@@ -480,7 +224,7 @@ class _Session:
     ) -> None:
         self._client = client
         self.store = client._store()
-        backends, _broken = _make_backends(
+        backends, _broken = make_backends(
             client.cfg,
             backend,
             client._config_path,
@@ -495,29 +239,13 @@ class _Session:
             name: AsyncBackendProvider(inner, self.store)
             for name, inner in self.inners.items()
         }
+        self._gather = SlotGather(self.store, self.inners)
         self._slots: list[Slot] = []
-        cfg = client.cfg
-        store = self.store
-
-        def _ledger(now: datetime) -> BudgetLedger:
-            day = store.load_ledger(
-                "day", resolve_meta_cap(store, "day", cfg.budget.daily), now
-            )
-            week_cap = resolve_meta_cap(store, "week", cfg.budget.weekly)
-            if week_cap is None:
-                return day
-            return DualWindowLedger(
-                window="day",
-                cap=day.cap,
-                entries=day.entries,
-                secondary=store.load_ledger("week", week_cap, now),
-            )
-
         self.engine = Engine(
             self.store,
             dict(self.providers),
             slots=self._supply_slots,
-            ledger=_ledger,
+            ledger=make_ledger(self.store, client.cfg),
             artifacts_dir=client._artifacts_dir,
             observe_streams=tuning.streams,
             silence_threshold_s=tuning.silence_threshold_s,
@@ -540,100 +268,8 @@ class _Session:
         return list(self._slots)
 
     def refresh_slots(self) -> None:
-        """Gather the currently-offered slots for the pending reqs.
-
-        Gated on pending work (nothing QUEUED/HELD → no probing, so reads
-        stay fast); stale capacity facts are refreshed first (the provider
-        self-GCs and reports true free capacity). Slot capacity is restored
-        to the provider's GROSS room — the v2 pass subtracts the store's
-        active jobs itself, so the adapter's already-net capacity would be
-        double-counted."""
-        jobs = self.store.list_jobs()
-        pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
-        if not pending:
-            self._slots = []
-            return
-        self._refresh_facts()
-
-        reqs_by_provider: dict[str, list[ResourceSpec]] = {
-            name: [] for name in self.inners
-        }
-        seen: dict[str, set[str]] = {name: set() for name in self.inners}
-
-        def _add(name: str, req: ResourceSpec) -> None:
-            if name not in reqs_by_provider:
-                return
-            key = req.model_dump_json()
-            if key not in seen[name]:
-                seen[name].add(key)
-                reqs_by_provider[name].append(req)
-
-        for r in pending:
-            pin = r.spec.only_backend
-            if pin is None:
-                for name in self.inners:
-                    _add(name, r.spec.resources)
-            else:
-                _add(pin, r.spec.resources)
-
-        targeted = [
-            (name, inner)
-            for name, inner in self.inners.items()
-            if reqs_by_provider[name]
-        ]
-
-        def _offer_all(item: tuple[str, BackendProvider]) -> list[Slot]:
-            name, inner = item
-            out: list[Slot] = []
-            for req in reqs_by_provider[name]:
-                out.extend(inner.offer(req))
-            return out
-
-        outcomes = _parallel_io(
-            targeted, _offer_all, lambda item: f"offer of {item[0]}"
-        )
-        by_name: dict[str, list[Slot]] = {}
-        for (name, _inner), outcome in outcomes:
-            if isinstance(outcome, Exception):
-                _log.warning(
-                    "offer raised for provider %r; skipping this round: %s",
-                    name,
-                    outcome,
-                )
-                continue
-            by_name[name] = outcome
-        slots: list[Slot] = []
-        for name, _inner in targeted:  # config order: deterministic ranking
-            active = self.store.count_active_jobs(name)
-            for slot in by_name.get(name, []):
-                # Restore gross capacity: the adapter netted out the active
-                # jobs; the pass nets them out again from the snapshot.
-                slots.append(
-                    slot.model_copy(update={"capacity": slot.capacity + active})
-                )
-        self._slots = slots
-
-    def _refresh_facts(self) -> None:
-        """Refresh stale/absent capacity facts before offering (self-GC)."""
-        now = datetime.now(timezone.utc)
-        stale = [
-            (name, inner)
-            for name, inner in self.inners.items()
-            if (facts := self.store.load_facts(name)) is None
-            or not facts.capacity_fresh(now)
-        ]
-        outcomes = _parallel_io(
-            stale,
-            lambda item: item[1].discover(),
-            lambda item: f"discover of {item[0]}",
-        )
-        for (name, _inner), outcome in outcomes:
-            if isinstance(outcome, Exception):
-                _log.warning(
-                    "discover raised for %r; keeping stale facts: %s", name, outcome
-                )
-                continue
-            self.store.save_facts(outcome)
+        """Gather the currently-offered slots for the pending reqs."""
+        self._slots = self._gather.refresh()
 
     # -- drives -----------------------------------------------------------
 
@@ -645,8 +281,7 @@ class _Session:
     ) -> None:
         """Run the engine to quiescence (and, with *until*, keep driving —
         sleeping on the wake event between rounds — until it holds)."""
-        with self._client._place_io_cm():
-            asyncio.run(self._drive_async(until=until, poll_s=poll_s))
+        asyncio.run(self._drive_async(until=until, poll_s=poll_s))
 
     async def _drive_async(
         self,
@@ -666,16 +301,8 @@ class _Session:
 
     def events(self) -> list[str]:
         """Narrate the lifecycle events this session's drives produced."""
-        collected: list[EventRow] = []
-        cursor = self._cursor
-        while True:
-            page = self.store.events_after(cursor, limit=1000)
-            if not page:
-                break
-            collected.extend(page)
-            cursor = page[-1].id
-        self._cursor = cursor
-        return _narrate(collected)
+        collected, self._cursor = drain_events(self.store, self._cursor)
+        return narrate(collected)
 
 
 class LocalClient:
@@ -688,7 +315,6 @@ class LocalClient:
         config_path: Path | None = None,
         backend_factory: BackendFactory = make_backend,
         outputs_dir: Path | None = None,
-        place_io: AbstractContextManager[object] | None = None,
     ) -> None:
         self.cfg = cfg
         self._config_path = config_path
@@ -702,10 +328,6 @@ class LocalClient:
         # backend this client builds shares its ssh sessions, provider-API
         # throttles, and discovery cache. Injected wherever backends are made.
         self._endpoints = EndpointManager()
-        # stage-b: the daemon passes a lock-yield context so its store lock is
-        # dropped for the duration of a drive (a concurrent cancel is not
-        # starved behind a slow placement). Daemonless: None → no-op.
-        self._place_io = place_io
 
     # -- infra --
     def _store(self) -> Store:
@@ -717,9 +339,6 @@ class LocalClient:
         if self._store_obj is not None:
             self._store_obj.close()
             self._store_obj = None
-
-    def _place_io_cm(self) -> AbstractContextManager[object]:
-        return self._place_io if self._place_io is not None else nullcontext()
 
     def _session(
         self, *, backend: str | None = None, tuning: _Tuning = _CATCH_UP
@@ -793,19 +412,7 @@ class LocalClient:
         rec = session.store.load_job(job_id)
         if rec is None:  # pragma: no cover — we just wrote it
             raise BackendError(f"job {job_id} vanished after submit")
-        placed = rec.placement is not None and bool(rec.placement.handle)
-        held_reason = None
-        if not placed and rec.state is JobState.HELD:
-            held_reason = (
-                rec.last_status.detail if rec.last_status else "no slot can satisfy it"
-            )
-        return SubmitOutcome(
-            job_id=job_id,
-            state=rec.state,
-            provider_name=rec.placement.provider_name if rec.placement else None,
-            placed=placed,
-            held_reason=held_reason,
-        )
+        return classify_submit(rec)
 
     def enqueue(
         self, spec: JobSpec, *, backend: str | None = None, count: int = 1
@@ -858,23 +465,14 @@ class LocalClient:
         fresh = store.load_job(rec.spec.job_id)
         if fresh is None or fresh.state.terminal:
             return
-        job_id = fresh.spec.job_id
-        provider = fresh.placement.provider_name if fresh.placement else None
-        if not wait and store.get_intent(job_id) is None:
-            # Leave the durable intent for the next catch-up to adopt. (With
-            # an intent already open — e.g. a crashed placement's — fall
-            # through to the inline path: overwriting it would lose that
-            # item's write-ahead stage.)
-            store.put_intent(
-                job_id,
-                wi.WorkKind.CANCEL.value,
-                "signal",
-                provider,
-                wi.CancelData(provider=provider, force=force).model_dump(mode="json"),
-            )
+        if not wait and persist_cancel_intent(store, fresh, force=force):
+            # The durable intent is left for the next catch-up to adopt. (With
+            # an intent already open — e.g. a crashed placement's — we fall
+            # through to the inline path instead: overwriting it would lose
+            # that item's write-ahead stage.)
             return
         session = self._session()
-        session.engine.request_cancel(job_id, force=force)
+        session.engine.request_cancel(fresh.spec.job_id, force=force)
         session.drive()
 
     def reprioritize(
@@ -885,42 +483,13 @@ class LocalClient:
         deadline: Deadline | None,
         allow_paid: bool | None,
     ) -> JobPolicy:
-        """Mutate a live job's scheduling policy; return the new policy.
-
-        A finished or unknown job cannot be reprioritized (``ValueError``).
-        ``allow_paid`` maps to the ``max_cost`` ceiling: ``True`` clears it,
-        ``False`` pins it to ``0.0``, ``None`` leaves it untouched."""
-        store = self._store()
-        rec = store.load_job(job_id)
-        if rec is None:
-            raise ValueError(f"unknown job {job_id!r}")
-        if rec.state.terminal:
-            raise ValueError(
-                f"job {job_id!r} is {rec.state.value}; cannot reprioritize a "
-                "finished job"
-            )
-        current = rec.spec.policy
-        new_max_cost = current.max_cost
-        if allow_paid is True:
-            new_max_cost = None
-        elif allow_paid is False:
-            new_max_cost = 0.0
-        new_policy = JobPolicy(
-            deadline=deadline if deadline is not None else current.deadline,
-            max_cost=new_max_cost,
-            priority=priority if priority is not None else current.priority,
+        return reprioritize_policy(
+            self._store(),
+            job_id,
+            priority=priority,
+            deadline=deadline,
+            allow_paid=allow_paid,
         )
-
-        def _mut(r: JobRecord) -> JobRecord | None:
-            if r.state.terminal:
-                return None
-            r.spec = r.spec.model_copy(update={"policy": new_policy})
-            return r
-
-        done = cas_step(store, job_id, _mut, actor="client", action="reprioritize")
-        if done is None:
-            raise ValueError(f"job {job_id!r} changed state; not reprioritized")
-        return new_policy
 
     def repin(self, rec: JobRecord, *, backend: str | None) -> JobRecord:
         """Re-pin (or unpin, ``backend=None``) a not-yet-started job — a thin
@@ -928,165 +497,39 @@ class LocalClient:
         return self.edit(rec, updates={"only_backend": backend})
 
     def edit(self, rec: JobRecord, *, updates: dict[str, Any]) -> JobRecord:
-        """Edit a NOT-YET-STARTED job's mutable spec parameters and requeue it.
+        """Edit a NOT-YET-STARTED job's mutable spec parameters and requeue it
+        (:func:`omnirun.engine.verbs.edit_job`); a pending placement is torn
+        down through a per-verb engine drive (the cancel ladder)."""
 
-        Refuses a terminal job, or one that has actually STARTED running. A
-        job that is merely *placed but still waiting* at its backend has that
-        placement torn down through the engine's cancel ladder (capture → reap
-        follow-ups included) and is returned to QUEUED with the new
-        parameters, so the next catch-up re-places it."""
-        store = self._store()
-        job_id = rec.spec.job_id
-        fresh = store.load_job(job_id)
-        if fresh is None:
-            raise ValueError(f"unknown job {job_id!r}")
-        if fresh.state.terminal:
-            raise ValueError(
-                f"job {job_id!r} is {fresh.state.value}; cannot edit a finished job"
-            )
-        started = (
-            fresh.last_status is not None
-            and fresh.last_status.status is JobStatus.RUNNING
-        )
-        if started:
-            where = fresh.placement.provider_name if fresh.placement else "?"
-            raise ValueError(
-                f"job {job_id!r} has already STARTED running on {where}; cancel it "
-                "instead — edit only changes jobs that have not started yet"
-            )
-        if "only_backend" in updates:
-            b = updates["only_backend"]
-            if b is not None and b not in self.cfg.backends:
-                known = ", ".join(sorted(self.cfg.backends)) or "(none configured)"
-                raise ValueError(f"unknown backend {b!r} (known: {known})")
-
-        if fresh.placement is not None or fresh.state in (
-            JobState.PLACING,
-            JobState.RUNNING,
-        ):
-            # Tear the pending placement down through the engine (the only
-            # trace-legal route from placed back to queued), then requeue with
-            # the edited spec via the retry transition.
+        def _cancel_placed(job_id: str) -> None:
             session = self._session()
             session.engine.request_cancel(job_id, force=True)
             session.drive()
-            fresh = store.load_job(job_id)
-            if fresh is None or fresh.state is not JobState.CANCELLED:
-                state = fresh.state.value if fresh is not None else "gone"
-                raise BackendError(
-                    f"could not release the pending placement of {job_id} "
-                    f"(job is {state}); retry the edit when its backend is "
-                    "reachable"
-                )
-            return self._requeue_transition(
-                store, job_id, spec_updates=updates, cause="edit"
-            )
 
-        def _mut(r: JobRecord) -> JobRecord | None:
-            if r.state.terminal or r.placement is not None:
-                return None
-            r.spec = r.spec.model_copy(update=updates)
-            return r
-
-        done = cas_step(store, job_id, _mut, actor="client", action="edit")
-        if done is None:
-            raise ValueError(f"job {job_id!r} changed state mid-edit; not edited")
-        return done
+        return edit_job(
+            self._store(), self.cfg, rec, updates, cancel_placed=_cancel_placed
+        )
 
     def retry(
         self, rec: JobRecord, *, only_backend: str | None = None, repin: bool = False
     ) -> JobRecord:
-        """Re-queue a TERMINAL job for a fresh run (attempts, placement,
-        capture pointers, avoid set all reset; the spec untouched unless
-        ``repin`` atomically re-pins/unpins).
-
-        A catch-up drive first settles any outstanding capture/reap of the old
-        placement, so the fresh arc starts clean; a placement whose resource
-        could not be released (backend unreachable) refuses the retry rather
-        than risking a double-run."""
-        store = self._store()
-        job_id = rec.spec.job_id
-        fresh = store.load_job(job_id)
-        if fresh is None:
-            raise ValueError(f"unknown job {job_id!r}")
-        if not fresh.state.terminal:
-            raise ValueError(
-                f"job {job_id!r} is {fresh.state.value}, not terminal — nothing to "
-                "retry (it is already queued/running)"
-            )
-        if repin and only_backend is not None and only_backend not in self.cfg.backends:
-            known = ", ".join(sorted(self.cfg.backends)) or "(none configured)"
-            raise ValueError(f"unknown backend {only_backend!r} (known: {known})")
-        if fresh.placement is not None and not fresh.reaped:
-            # Settle the old placement first (capture → reap through the
-            # engine) so the retry cannot race a still-held resource.
-            session = self._session()
-            session.drive()
-            fresh = store.load_job(job_id) or fresh
-        for row in store.unreleased_resources():
-            if row.job_id == job_id:
-                raise BackendError(
-                    f"cannot retry {job_id}: its previous placement on "
-                    f"{row.provider} is not released yet; retry once that "
-                    "backend is reachable"
-                )
-        updates = {"only_backend": only_backend} if repin else None
-        return self._requeue_transition(store, job_id, spec_updates=updates, cause=None)
-
-    def _requeue_transition(
-        self,
-        store: Store,
-        job_id: str,
-        *,
-        spec_updates: dict[str, Any] | None,
-        cause: str | None,
-    ) -> JobRecord:
-        """The ``retry`` transition: terminal → QUEUED with a full scheduler +
-        capture reset. Modeled as a FRESH job (the trace exporter re-aliases
-        the id on this event), so it is legal from any terminal state."""
-
-        def _mut(r: JobRecord) -> JobRecord | None:
-            if not r.state.terminal:
-                return None
-            if spec_updates:
-                r.spec = r.spec.model_copy(update=spec_updates)
-            r.state = JobState.QUEUED
-            r.placement = None
-            r.last_status = None
-            r.last_error = None
-            r.attempts = 0
-            r.avoid_backends = {}
-            r.not_before = None
-            r.reaped = False
-            r.logs_cached_to = None
-            r.outputs_cached_to = None
-            r.outputs_pulled_to = None
-            r.log_offset = 0
-            r.log_offset_attempt = -1
-            return r
-
-        done = cas_step(
-            store, job_id, _mut, actor="client", action="retry", cause=cause
+        """Re-queue a TERMINAL job for a fresh run
+        (:func:`omnirun.engine.verbs.retry_job`); a catch-up drive first
+        settles any outstanding capture/reap of the old placement."""
+        return retry_job(
+            self._store(),
+            self.cfg,
+            rec,
+            only_backend=only_backend,
+            repin=repin,
+            settle=lambda: self._session().drive(),
         )
-        if done is None:
-            raise ValueError(f"job {job_id!r} changed state; not retried")
-        return done
 
     def budget_set(self, window: str, cap: float) -> None:
-        self._store().set_meta(f"budget.{window}", repr(cap))
+        budget_set(self._store(), window, cap)
 
     def budget_status(self) -> list[BudgetRow]:
-        store = self._store()
-        now = datetime.now(timezone.utc)
-        rows: list[BudgetRow] = []
-        for window, cfg_default in (
-            ("day", self.cfg.budget.daily),
-            ("week", self.cfg.budget.weekly),
-        ):
-            cap = resolve_meta_cap(store, window, cfg_default)
-            spent = store.load_ledger(window, cap, now).in_window_total(now)
-            rows.append(BudgetRow(window=window, spent=spent, cap=cap))
-        return rows
+        return budget_rows(self._store(), self.cfg)
 
     def gc(self, *, all_: bool, project: str | None) -> GcOutcome:
         store = self._store()
@@ -1099,140 +542,38 @@ class LocalClient:
         # released by the engine's follow-up work items.
         session.drive()
         out = GcOutcome(events=session.events())
-        for rec in store.list_jobs(project=project):
-            handle = handle_of(rec)
-            if handle is None:
-                continue
-            if not rec.state.terminal:
-                out.skipped += 1
-                continue
-            try:
-                # Idempotent per-job cleanup: removes only the job dir /
-                # instance, never the shared worktree/venv. Re-running it on
-                # an already-reaped placement is a cheap no-op.
-                self.backend_for(handle.backend).gc(handle)
-            except Exception as e:
-                out.failed += 1
-                out.warnings.append(f"gc of {rec.spec.job_id} failed: {e}")
-                continue
-            out.cleaned += 1
-        return out
+        return gc_sweep(store, self.backend_for, project, out)
 
     # -- probing / backends --
     def probe(
         self, res: ResourceSpec, only: str | None
     ) -> tuple[dict[str, Backend], list[chooser.RankedOffer], list[Offer]]:
-        backends, broken = _make_backends(
+        return probe_offers(
             self.cfg,
-            only,
             self._config_path,
             self._backend_factory,
             self._store(),
             self._endpoints,
+            res,
+            only,
         )
-        offers = (
-            chooser.gather_offers(
-                backends, res, timeout_s=self.cfg.policy.probe_timeout_s
-            )
-            + broken
-        )
-        offers = _apply_admission(offers, res, self._store())
-        ranked = chooser.rank(offers, res, self.cfg.policy)
-        unfit = [o for o in offers if not o.fits]
-        return backends, ranked, unfit
 
     def backends_check(self, name: str | None) -> list[CheckRow]:
-        sections = self._sections(name)
-
-        def _check_one(item: tuple[str, Any]) -> str:
-            nm, bcfg = item
-            be = self._backend_factory(nm, bcfg)
-            be.endpoints = self._endpoints  # share sessions/throttles
-            return be.check()
-
-        enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
-        results = _parallel_by_name(enabled, _check_one)
-        return [
-            CheckRow(
-                name=nm,
-                type=bcfg.type,
-                enabled=bcfg.enabled,
-                outcome=results.get(nm) if bcfg.enabled else None,
-            )
-            for nm, bcfg in sections.items()
-        ]
+        return check_rows(
+            self.cfg, name, self._config_path, self._backend_factory, self._endpoints
+        )
 
     def backends_discover(self, name: str | None) -> list[DiscoverRow]:
-        sections = self._sections(name)
-        store = self._store()
-
-        def _discover_one(item: tuple[str, Any]) -> ProviderFacts:
-            nm, bcfg = item
-            be = self._backend_factory(nm, bcfg)
-            # Shared discovery cache + single flight: backends on one physical
-            # endpoint coalesce identical queries even in this parallel fan-out.
-            be.endpoints = self._endpoints
-            return be.discover()
-
-        enabled = [(nm, bcfg) for nm, bcfg in sections.items() if bcfg.enabled]
-        results = _parallel_by_name(enabled, _discover_one)
-        rows: list[DiscoverRow] = []
-        for nm, bcfg in sections.items():
-            if not bcfg.enabled:
-                rows.append(
-                    DiscoverRow(name=nm, type=bcfg.type, enabled=False, facts=None)
-                )
-                continue
-            outcome = results[nm]
-            if isinstance(outcome, ProviderFacts):
-                store.save_facts(outcome)
-            rows.append(
-                DiscoverRow(name=nm, type=bcfg.type, enabled=True, facts=outcome)
-            )
-        return rows
-
-    def _sections(self, name: str | None) -> dict[str, Any]:
-        sections = self.cfg.backends
-        if name is not None:
-            if name not in sections:
-                known = ", ".join(sorted(sections)) or "none configured"
-                raise BackendError(
-                    f"backend {name!r} is not configured (known: {known})"
-                )
-            return {name: sections[name]}
-        if not sections:
-            raise ConfigError(
-                "no backends configured — add [backends.*] sections to "
-                f"{self._config_path or default_config_path()}"
-            )
-        return dict(sections)
+        return discover_rows(
+            self.cfg,
+            name,
+            self._config_path,
+            self._backend_factory,
+            self._endpoints,
+            self._store(),
+        )
 
     # -- logs / outputs ---------------------------------------------------
-
-    def _capture_log_path(self, rec: JobRecord) -> Path | None:
-        """The capture sink's from-zero log snapshot, when one exists (the
-        ``logs_cached_to`` pointer names a file directly, or the capture
-        item's sink directory holding ``log.txt``)."""
-        if not rec.logs_cached_to:
-            return None
-        p = Path(rec.logs_cached_to)
-        if p.is_file():
-            return p
-        if (p / "log.txt").is_file():
-            return p / "log.txt"
-        return None
-
-    def _durable_log_paths(self, rec: JobRecord) -> list[Path]:
-        """Candidate durable log files, most authoritative first: the capture
-        sink's from-zero snapshot, then the stream's attempt-segmented log."""
-        out: list[Path] = []
-        cap = self._capture_log_path(rec)
-        if cap is not None:
-            out.append(cap)
-        stream_log = self._artifacts_dir / f"{rec.spec.job_id}.log"
-        if stream_log.is_file():
-            out.append(stream_log)
-        return out
 
     def logs(self, rec: JobRecord, *, follow: bool) -> Iterator[str]:
         if follow:
@@ -1252,16 +593,16 @@ class LocalClient:
             fresh.state.terminal
             and fresh.placement is not None
             and not fresh.reaped
-            and self._capture_log_path(fresh) is None
+            and capture_log_path(fresh) is None
         ):
             self._session().drive()
             fresh = self._store().load_job(rec.spec.job_id) or fresh
-        capture = self._capture_log_path(fresh)
+        capture = capture_log_path(fresh)
         if capture is not None:
             with capture.open(encoding="utf-8") as f:
                 yield from f
             return
-        durable = self._durable_log_paths(fresh)
+        durable = durable_log_paths(fresh, self._artifacts_dir)
         handle = handle_of(fresh)
         if fresh.state.terminal and durable:
             with durable[0].open(encoding="utf-8") as f:
@@ -1325,7 +666,7 @@ class LocalClient:
                 await engine.run_until_quiescent(task_timeout=_ITEM_TIMEOUT_S)
                 rec = store.load_job(job_id) or rec
             if rec.state.terminal:
-                for path in self._durable_log_paths(rec)[:1]:
+                for path in durable_log_paths(rec, self._artifacts_dir)[:1]:
                     with path.open(encoding="utf-8") as f:
                         for line in f:
                             out.put(line)
@@ -1368,47 +709,13 @@ class LocalClient:
             await engine.shutdown()
 
     def pull(self, rec: JobRecord, dest: Path) -> tuple[list[Path], Path]:
-        store = self._store()
-        fresh = store.load_job(rec.spec.job_id) or rec
-        handle = handle_of(fresh)
-        if handle is None and not fresh.outputs_cached_to:
-            raise BackendError(
-                f"job {fresh.spec.job_id} was never submitted; no outputs"
-            )
-        if fresh.state.terminal and not fresh.outputs_cached_to and handle is not None:
-            # The capture work item has not run yet (e.g. the job finished
-            # under another client): one catch-up drive captures durably first.
-            session = self._session()
-            session.drive()
-            fresh = store.load_job(rec.spec.job_id) or fresh
-        if fresh.outputs_cached_to:
-            cache = Path(fresh.outputs_cached_to)
-            src = cache / "outputs" if (cache / "outputs").is_dir() else cache
-            if not src.is_dir():
-                raise BackendError(
-                    f"cached outputs for {fresh.spec.job_id} are missing at {cache} "
-                    "(session already reaped, nothing to re-fetch)"
-                )
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src, dest, dirs_exist_ok=True)
-            paths = sorted(p for p in dest.rglob("*") if p.is_file())
-        else:
-            assert handle is not None
-            paths = self.backend_for(handle.backend).pull_outputs(handle, dest)
-
-        def _mut(r: JobRecord) -> JobRecord | None:
-            r.outputs_pulled_to = str(dest)
-            return r
-
-        cas_step(
-            store,
-            fresh.spec.job_id,
-            _mut,
-            actor="client",
-            action="pull",
-            data={"dest": str(dest)},
+        return pull_to_dir(
+            self._store(),
+            self.backend_for,
+            rec,
+            dest,
+            settle=lambda: self._session().drive(),
         )
-        return paths, dest
 
 
 # --------------------------------------------------------------------------- remote
@@ -1680,10 +987,12 @@ class RemoteClient:
                 self._raise_typed(resp)
             error_next = False
             for raw in resp.iter_lines():
-                # SSE frames: `data: <line>` payloads, a terminal `event: eof`,
-                # and `event: error` (backend failed mid-stream — the next
-                # `data:` frame carries the typed error JSON, since the 200 is
-                # already sent and the status can no longer be changed).
+                # SSE frames: `data: <line>` payloads, `id: <offset>` resume
+                # cursors (ignored here — a reconnecting reader may send the
+                # last one back as Last-Event-ID), a terminal `event: eof`, and
+                # `event: error` (backend failed mid-stream — the next `data:`
+                # frame carries the typed error JSON, since the 200 is already
+                # sent and the status can no longer be changed).
                 if raw.startswith(":"):
                     continue  # keepalive comment — resets idle timers, no output
                 if raw.startswith("event: eof"):

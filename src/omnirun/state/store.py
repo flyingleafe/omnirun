@@ -960,10 +960,15 @@ class Store:
         open intents, unreleased resources, and model spend.
 
         *provider* filters to jobs/intents/resources bound to that backend (the
-        per-provider validation view); ``None`` is the global view. Cost comes
-        from each job's ``submit`` event (``data.cost_cents``); model spend is
-        the sum over jobs whose reserve was never returned (rollback/requeue):
-        PLACING/RUNNING jobs plus terminal jobs that actually placed.
+        per-provider validation view); ``None`` is the global view. A job's
+        model cost is its **first-arc estimate**: the ``est_cost`` of the FIRST
+        ``reserve`` event of its current arc (arcs are delimited by ``retry``,
+        which re-aliases the job as a fresh model inhabitant), 0 when it never
+        reserved — exactly the cost the trace exporter stamps on the job's
+        ``submit`` line, so the checker's replayed spend and α agree. Model
+        spend is the sum over jobs whose reserve was never returned
+        (rollback/requeue): PLACING/RUNNING jobs plus terminal jobs that
+        actually placed.
         """
         stmt = select(jobs.c.job_id, jobs.c.state, cast(jobs.c.data, Text))
         if provider is not None:
@@ -971,14 +976,19 @@ class Store:
         with self._engine.connect() as conn:
             job_rows = conn.execute(stmt).fetchall()
             cost_rows = conn.execute(
-                select(job_events.c.job_id, job_events.c.data).where(
-                    job_events.c.action == "submit"
-                )
+                select(job_events.c.job_id, job_events.c.action, job_events.c.data)
+                .where(job_events.c.action.in_(("reserve", "retry")))
+                .order_by(job_events.c.id)
             ).fetchall()
         costs: dict[str, int] = {}
-        for job_id, data in cost_rows:
-            if job_id not in costs:
-                costs[job_id] = int((data or {}).get("cost_cents", 0))
+        priced: set[str] = set()
+        for job_id, action, data in cost_rows:
+            if action == "retry":
+                costs[job_id] = 0  # fresh arc: unpriced until its first reserve
+                priced.discard(job_id)
+            elif job_id not in priced:
+                costs[job_id] = reserve_cost_cents(data)
+                priced.add(job_id)
         out_jobs: dict[str, dict[str, Any]] = {}
         spent = 0
         active = 0
@@ -1279,6 +1289,18 @@ _MODEL_STATE: dict[str, str] = {
     _JobState.FAILED.value: "failed",
     _JobState.CANCELLED.value: "cancelled",
 }
+
+
+def reserve_cost_cents(data: Any) -> int:
+    """A ``reserve`` event's committed estimate (``data.est_cost``, currency
+    units) as the model's integer cents; malformed/absent data is 0.
+
+    The single conversion shared by ``abstract_state`` and the trace exporter
+    (CONFORMANCE.md §1: model job cost = first-arc estimate)."""
+    try:
+        return int(round(float((data or {}).get("est_cost", 0.0)) * 100))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _record_data_placed(raw: Any) -> bool:

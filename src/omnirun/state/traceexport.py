@@ -27,6 +27,15 @@ Line grammar (one action per line, matching the checker's ``Action``):
 order starting at 0. Actions outside the checker alphabet (diagnostic events —
 adoption breadcrumbs, ``unreachable-poll`` handling notes) are skipped.
 
+**Cost convention (non-vacuous I1):** the model prices a job once, at
+``submit`` — so the emitted ``submit <nid> <cost>`` carries the job's
+**first-arc estimate**: the ``est_cost`` (in cents) of the FIRST ``reserve``
+event of the arc the alias covers, 0 when that arc never reserved. Later
+re-shops/re-reserves within the arc may re-estimate; the model keeps the
+first-arc price (a documented scale-down — CONFORMANCE.md §1).
+``Store.abstract_state`` computes each job's cost by the same rule, so the
+checker's replayed spend and the α checkpoint agree.
+
 ``fail`` (attempts exhausted, QUEUED → FAILED) happens while the job is
 UNBOUND — after any rollback — so, exactly like a ``cancel`` of an unbound
 job, it appears in the global view but in no provider view (the binding rule
@@ -47,7 +56,7 @@ the store — asserting it here would compare different worlds).
 
 from __future__ import annotations
 
-from omnirun.state.store import EventRow, Store
+from omnirun.state.store import EventRow, Store, reserve_cost_cents
 
 # The validated alphabet — exactly the checker tokens (CONFORMANCE.md §1).
 ALPHABET = frozenset(
@@ -71,9 +80,10 @@ ALPHABET = frozenset(
 # edge — the model's job lifecycle is one-way past a terminal state. A retried
 # job is therefore modeled as a FRESH inhabitant: on a ``retry`` event both
 # exporters RE-ALIAS the job_id to a new dense nid and replay a ``submit``
-# for it (global view immediately; provider view on its next first contact).
-# The old nid keeps its terminal model state, exactly matching the α
-# checkpoint, which asserts only the CURRENT alias of each job_id.
+# for it (global view immediately; provider view on its next first contact),
+# priced from the NEW arc's first reserve. The old nid keeps its terminal
+# model state, exactly matching the α checkpoint, which asserts only the
+# CURRENT alias of each job_id.
 RETRY_ACTION = "retry"
 
 # Arc-ending actions after which a job is re-reservable (returns to the pool).
@@ -94,13 +104,38 @@ def _all_events(store: Store) -> list[EventRow]:
         cursor = page[-1].id
 
 
-def _cost_cents(ev: EventRow | None) -> int:
-    return int((ev.data or {}).get("cost_cents", 0)) if ev is not None else 0
+def _arc_costs(events: list[EventRow]) -> dict[str, list[int]]:
+    """Per job, one entry per ``retry``-delimited arc: the committed estimate
+    (cents) of that arc's FIRST ``reserve`` event, 0 when it never reserved."""
+    raw: dict[str, list[int | None]] = {}
+    for ev in events:
+        if ev.action == RETRY_ACTION:
+            raw.setdefault(ev.job_id, [None]).append(None)
+        elif ev.action == "reserve":
+            arcs = raw.setdefault(ev.job_id, [None])
+            if arcs[-1] is None:
+                arcs[-1] = reserve_cost_cents(ev.data)
+    return {job: [c if c is not None else 0 for c in arcs] for job, arcs in raw.items()}
+
+
+class _Coster:
+    """The per-alias submit cost: tracks each job's current arc index across
+    the walk and serves that arc's first-reserve estimate."""
+
+    def __init__(self, events: list[EventRow]) -> None:
+        self._arcs = _arc_costs(events)
+        self._idx: dict[str, int] = {}
+
+    def next_arc(self, job_id: str) -> None:
+        self._idx[job_id] = self._idx.get(job_id, 0) + 1
+
+    def cost(self, job_id: str) -> int:
+        arcs = self._arcs.get(job_id, [])
+        idx = self._idx.get(job_id, 0)
+        return arcs[idx] if idx < len(arcs) else 0
 
 
 def _line(action: str, nid: int, ev: EventRow) -> str:
-    if action == "submit":
-        return f"submit {nid} {_cost_cents(ev)}"
     if action == "finish":
         ok = int(bool((ev.data or {}).get("ok", 0)))
         return f"finish {nid} {ok}"
@@ -136,26 +171,29 @@ def export_global_trace(
     ``init`` carries the global budget and the SUM of all provider caps (the
     cap is effectively non-binding here — I2 is the per-provider view's job).
     """
+    events = _all_events(store)
+    coster = _Coster(events)
     lines = [f"init {budget_cents} {sum(caps.values())}"]
     nids: dict[str, int] = {}
     fresh = 0
-    submits: dict[str, EventRow] = {}
-    for ev in _all_events(store):
+    for ev in events:
         if ev.action == RETRY_ACTION:
-            # Re-alias: the retried job re-enters as a fresh model job.
+            # Re-alias: the retried job re-enters as a fresh model job priced
+            # from its new arc.
+            coster.next_arc(ev.job_id)
             if ev.job_id in nids:
                 nids[ev.job_id] = fresh
                 fresh += 1
-                sub = submits.get(ev.job_id)
-                lines.append(f"submit {nids[ev.job_id]} {_cost_cents(sub)}")
+                lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
             continue
         if ev.action not in ALPHABET:
             continue
-        if ev.action == "submit":
-            submits.setdefault(ev.job_id, ev)
         if ev.job_id not in nids:
             nids[ev.job_id] = fresh
             fresh += 1
+        if ev.action == "submit":
+            lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
+            continue
         lines.append(_line(ev.action, nids[ev.job_id], ev))
     if with_asserts:
         lines.extend(_assert_lines(store.abstract_state(None), nids))
@@ -172,26 +210,27 @@ def export_provider_trace(
 ) -> str:
     """The per-provider validation view (see module docstring).
 
-    On a job's first contact its original ``submit`` (with its committed cost)
-    is replayed into the trace so the single-provider model knows the job.
+    On a job's first contact a ``submit`` (priced from its current arc's first
+    reserve) is replayed into the trace so the single-provider model knows it.
     """
+    events = _all_events(store)
+    coster = _Coster(events)
     lines = [f"init {budget_cents} {cap}"]
     nids: dict[str, int] = {}
     fresh = 0
     binding: dict[str, str | None] = {}
-    submits: dict[str, EventRow] = {}
-    for ev in _all_events(store):
+    for ev in events:
         if ev.action == RETRY_ACTION:
             # Re-alias (see RETRY_ACTION): drop the binding and the alias so
             # the job's next contact with this provider replays a fresh
             # ``submit`` under a new nid.
+            coster.next_arc(ev.job_id)
             binding.pop(ev.job_id, None)
             nids.pop(ev.job_id, None)
             continue
         if ev.action not in ALPHABET:
             continue
         if ev.action == "submit":
-            submits.setdefault(ev.job_id, ev)
             continue  # replayed on first contact, never emitted directly
         if ev.action == "reserve":
             binding[ev.job_id] = ((ev.data or {}).get("provider")) or None
@@ -199,8 +238,7 @@ def export_provider_trace(
             if ev.job_id not in nids:
                 nids[ev.job_id] = fresh
                 fresh += 1
-                sub = submits.get(ev.job_id)
-                lines.append(f"submit {nids[ev.job_id]} {_cost_cents(sub)}")
+                lines.append(f"submit {nids[ev.job_id]} {coster.cost(ev.job_id)}")
             lines.append(_line(ev.action, nids[ev.job_id], ev))
         if ev.action in _UNBIND:
             binding[ev.job_id] = None  # back to the pool: re-reservable anywhere

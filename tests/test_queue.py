@@ -1,11 +1,11 @@
-"""Unified-model daemon tests: the job store IS the queue.
+"""Unified-model queue tests: the job store IS the queue.
 
-The daemon drives the SAME v2 engine the daemonless CLI runs — through its
-in-process ``LocalClient`` core (one catch-up drive per ``tick()``). These
-tests seed jobs directly through ``submit_record`` over the daemon's shared
-store, drive rounds via ``daemon._core.tick()``, and assert on
-``JobRecord``s — there is no separate queue table or projection. (HTTP
-end-to-end coverage lives in test_daemon_http.py.)
+The daemon and the daemonless CLI drive the SAME v2 engine over the same
+store; these tests exercise the queue semantics through the ``LocalClient``
+catch-up drive (one engine round per ``tick()``) — seeding jobs directly via
+``submit_record`` and asserting on ``JobRecord``s. There is no separate queue
+table or projection. (Resident-engine HTTP coverage lives in
+``test_daemon_http.py``.)
 """
 
 from __future__ import annotations
@@ -17,9 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omnirun.backends.base import Backend, ProvisioningSink
-from omnirun.config import BackendConfig, Config, DaemonConfig
-from omnirun.client import submit_record
-from omnirun.daemon import Daemon
+from omnirun.config import BackendConfig, Config, StateConfig
+from omnirun.client import LocalClient, submit_record
 from omnirun.models import (
     CancelMode,
     JobHandle,
@@ -63,8 +62,8 @@ def make_spec(name: str = "train", *, only_backend: str | None = None) -> JobSpe
 class FakeBackend(Backend):
     """In-process backend: fitting probe, recorded submit, counter-driven status.
 
-    Not registered — passed to the daemon via ``backend_factory``. One instance
-    per backend name (the daemon caches it), so per-job status state persists.
+    Not registered — injected via ``backend_factory``. One instance per backend
+    name (the harness memoizes it), so per-job status state persists.
     """
 
     def __init__(
@@ -82,8 +81,6 @@ class FakeBackend(Backend):
         self.runs_before_done = runs_before_done
         self.fail_submit = fail_submit
         self.submitted = submitted if submitted is not None else []
-        # Shared across the per-call FakeBackend instances the LocalClient core
-        # rebuilds, so a cancel recorded on any instance is observable in the test.
         self.cancelled = cancelled if cancelled is not None else []
         self.cost_per_hour = cost_per_hour
         self._polls: dict[str, int] = {}
@@ -130,7 +127,7 @@ class FakeBackend(Backend):
         return []
 
 
-def make_daemon(
+def make_client(
     tmp_path: Path,
     backends: dict[str, int],
     *,
@@ -139,52 +136,56 @@ def make_daemon(
     submitted: list[str] | None = None,
     cancelled: list[str] | None = None,
     cost_per_hour: float | None = None,
-    poll_interval_s: float = 0.01,
-) -> Daemon:
+) -> LocalClient:
     cfg = Config(
-        daemon=DaemonConfig(host="127.0.0.1", port=0, poll_interval_s=poll_interval_s),
+        state=StateConfig(url=f"sqlite:///{tmp_path / 'omnirun.db'}"),
         backends={
             name: BackendConfig(type="fake", max_parallel=cap)
             for name, cap in backends.items()
         },
     )
+    instances: dict[str, FakeBackend] = {}
 
     def factory(name: str, bcfg: BackendConfig) -> FakeBackend:
-        return FakeBackend(
-            name,
-            bcfg,
-            runs_before_done=runs_before_done,
-            fail_submit=fail_submit,
-            submitted=submitted,
-            cancelled=cancelled,
-            cost_per_hour=cost_per_hour,
-        )
+        be = instances.get(name)
+        if be is None:
+            be = FakeBackend(
+                name,
+                bcfg,
+                runs_before_done=runs_before_done,
+                fail_submit=fail_submit,
+                submitted=submitted,
+                cancelled=cancelled,
+                cost_per_hour=cost_per_hour,
+            )
+            instances[name] = be
+        return be
 
-    return Daemon(cfg, state_dir=tmp_path, backend_factory=factory)
+    return LocalClient(cfg, backend_factory=factory, outputs_dir=tmp_path / "outputs")
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _seed(daemon: Daemon, spec: JobSpec) -> str:
-    """Submit *spec* into the daemon's shared store (as the CLI's enqueue does)."""
-    submit_record(daemon._core._store(), spec, _now())
+def _seed(client: LocalClient, spec: JobSpec) -> str:
+    """Submit *spec* into the shared store (as the CLI's enqueue does)."""
+    submit_record(client._store(), spec, _now())
     return spec.job_id
 
 
-def _tick(daemon: Daemon) -> None:
-    """Drive one scheduling round through the daemon's core (as its loop does)."""
-    daemon._core.tick()
+def _tick(client: LocalClient) -> None:
+    """Drive one scheduling round (as the daemon's resident engine does)."""
+    client.tick()
 
 
-def _states(daemon: Daemon) -> list[JobState]:
-    return [r.state for r in daemon._core._store().list_jobs()]
+def _states(client: LocalClient) -> list[JobState]:
+    return [r.state for r in client._store().list_jobs()]
 
 
-def _no_placing(daemon: Daemon) -> None:
-    """A synchronous tick must not leave a job PLACING (place is inline)."""
-    jobs = daemon._core._store().list_jobs()
+def _no_placing(client: LocalClient) -> None:
+    """A synchronous tick must not leave a job PLACING (place is driven)."""
+    jobs = client._store().list_jobs()
     assert not any(r.state is JobState.PLACING for r in jobs), (
         "a synchronous tick must not leave a job PLACING"
     )
@@ -197,33 +198,33 @@ def test_respects_cap_and_backfills(tmp_path: Path) -> None:
     submitted: list[str] = []
     # A few RUNNING polls per job: one engine tick may observe several times,
     # so a longer runway keeps the cap genuinely contended across ticks.
-    daemon = make_daemon(tmp_path, {"a": 2}, submitted=submitted, runs_before_done=3)
+    client = make_client(tmp_path, {"a": 2}, submitted=submitted, runs_before_done=3)
     for _ in range(5):
-        _seed(daemon, make_spec())
+        _seed(client, make_spec())
 
     peak = 0
     for _ in range(40):
-        _tick(daemon)
-        _no_placing(daemon)
-        running = sum(s is JobState.RUNNING for s in _states(daemon))
+        _tick(client)
+        _no_placing(client)
+        running = sum(s is JobState.RUNNING for s in _states(client))
         peak = max(peak, running)
-        if all(s.terminal for s in _states(daemon)):
+        if all(s.terminal for s in _states(client)):
             break
 
-    assert all(s is JobState.SUCCEEDED for s in _states(daemon))
+    assert all(s is JobState.SUCCEEDED for s in _states(client))
     assert peak == 2  # never exceeded the per-backend cap, and did reach it
     assert len(submitted) == 5  # every job ran exactly once
 
 
 def test_spreads_across_two_backends(tmp_path: Path) -> None:
-    daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    _seed(daemon, make_spec("j1"))
-    _seed(daemon, make_spec("j2"))
+    client = make_client(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
+    _seed(client, make_spec("j1"))
+    _seed(client, make_spec("j2"))
 
-    _tick(daemon)
-    _no_placing(daemon)
+    _tick(client)
+    _no_placing(client)
 
-    recs = daemon._core._store().list_jobs()
+    recs = client._store().list_jobs()
     assert all(r.state is JobState.RUNNING for r in recs)
     assert {r.placement.provider_name for r in recs if r.placement} == {"a", "b"}
 
@@ -232,29 +233,29 @@ def test_only_backend_restriction(tmp_path: Path) -> None:
     # A `--backend b`-pinned job must place on b even when a (which the scheduler
     # would otherwise pick, iterating providers in order) is free too. The pin
     # rides spec.only_backend and is honored by the plain tick.
-    daemon = make_daemon(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
-    _seed(daemon, make_spec("j", only_backend="b"))
+    client = make_client(tmp_path, {"a": 1, "b": 1}, runs_before_done=3)
+    _seed(client, make_spec("j", only_backend="b"))
 
-    _tick(daemon)
-    _no_placing(daemon)
+    _tick(client)
+    _no_placing(client)
 
-    [rec] = daemon._core._store().list_jobs()
+    [rec] = client._store().list_jobs()
     assert rec.state is JobState.RUNNING
     assert rec.placement is not None and rec.placement.provider_name == "b"
     assert rec.spec.only_backend == "b"
 
 
 def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:
-    daemon = make_daemon(tmp_path, {"a": 1}, fail_submit=True)
-    _seed(daemon, make_spec())
+    client = make_client(tmp_path, {"a": 1}, fail_submit=True)
+    _seed(client, make_spec())
 
     for _ in range(10):
-        _tick(daemon)
-        _no_placing(daemon)
-        if all(s.terminal for s in _states(daemon)):
+        _tick(client)
+        _no_placing(client)
+        if all(s.terminal for s in _states(client)):
             break
 
-    [rec] = daemon._core._store().list_jobs()
+    [rec] = client._store().list_jobs()
     assert rec.state is JobState.FAILED
     assert rec.attempts == 3
     # The place-failure reason is surfaced on the FAILED job's status detail.
@@ -262,14 +263,14 @@ def test_submit_failure_retries_then_fails(tmp_path: Path) -> None:
     assert "boom" in rec.last_status.detail
 
 
-def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> None:
+def test_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> None:
     """A crash after reserve leaves an empty-handle PLACING stub. On restart the
-    daemon's first tick (Control's reconcile) reverts it to QUEUED and re-places
+    first engine round (crash-gap recovery) reverts it to QUEUED and re-places
     it — asserted on JobRecords, no queue projection involved."""
     db_url = f"sqlite:///{tmp_path / 'omnirun.db'}"
 
     # Seed a mid-place stub directly: PLACING with an empty-handle placement, as
-    # Store.reserve writes before place() runs.
+    # the reserve transition writes before the place item runs.
     from omnirun.state import open_store
 
     store = open_store(db_url)
@@ -286,10 +287,10 @@ def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> Non
     )
     store.close()
 
-    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=3)
-    _tick(daemon)  # crash-gap recovery rolls the stub back, then re-places
+    client = make_client(tmp_path, {"a": 1}, runs_before_done=3)
+    _tick(client)  # crash-gap recovery rolls the stub back, then re-places
 
-    [rec] = daemon._core._store().list_jobs()
+    [rec] = client._store().list_jobs()
     # After one tick it is placed and running on 'a' (rolled back → re-placed).
     assert rec.state is JobState.RUNNING
     assert rec.placement is not None
@@ -302,18 +303,18 @@ def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> Non
 # ------------------------------------------------------------------ cancel
 
 
-def test_queue_cancel_through_the_core(tmp_path: Path) -> None:
-    """Cancel goes through the daemon's core (Control.cancel over the shared
-    store). A RUNNING job is force-reaped and marked CANCELLED."""
+def test_queue_cancel_through_the_client(tmp_path: Path) -> None:
+    """Cancel goes through the shared verb logic over the shared store. A
+    RUNNING job is force-reaped and marked CANCELLED."""
     cancelled: list[str] = []
-    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=100, cancelled=cancelled)
-    job_id = _seed(daemon, make_spec("cxl"))
-    _tick(daemon)  # place it (RUNNING)
-    rec = daemon._core._store().load_job(job_id)
+    client = make_client(tmp_path, {"a": 1}, runs_before_done=100, cancelled=cancelled)
+    job_id = _seed(client, make_spec("cxl"))
+    _tick(client)  # place it (RUNNING)
+    rec = client._store().load_job(job_id)
     assert rec is not None and rec.state is JobState.RUNNING
 
-    daemon._core.cancel(rec, force=True)
+    client.cancel(rec, force=True)
 
-    after = daemon._core._store().load_job(job_id)
+    after = client._store().load_job(job_id)
     assert after is not None and after.state is JobState.CANCELLED
     assert job_id in cancelled  # the placement was reaped

@@ -409,26 +409,51 @@ def _seed_two_provider_scenario(store: Store) -> None:
     """Job A runs to reaped success on uni; job B rolls back off uni, then runs
     on vast and is cancelled+captured there; job C rolls back off uni and is
     then failed by the scheduler (attempts exhausted) while unbound.
-    Interleaved to exercise ordering."""
+    Interleaved to exercise ordering.
+
+    Costs follow the exporter's convention (CONFORMANCE.md §1): a job's model
+    cost is the ``est_cost`` of its FIRST reserve (in cents) — B's vast
+    re-reserve carries a DIFFERENT estimate that must NOT re-price it."""
     ap = store.append_event
-    ap("A", actor="client", action="submit", data={"cost_cents": 250})
-    ap("A", actor="scheduler", action="reserve", data={"provider": "uni"})
+    ap("A", actor="client", action="submit", data={"cost_cents": 0})
+    ap(
+        "A",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "uni", "est_cost": 2.5},
+    )
     ap("A", actor="supervisor", action="provision")
     ap("A", actor="supervisor", action="activate")
     ap("A", actor="observer", action="finish", data={"ok": 1})
-    ap("B", actor="client", action="submit", data={"cost_cents": 100})
-    ap("B", actor="scheduler", action="reserve", data={"provider": "uni"})
+    ap("B", actor="client", action="submit", data={"cost_cents": 0})
+    ap(
+        "B",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "uni", "est_cost": 1.0},
+    )
     ap("B", actor="supervisor", action="rollback")
     ap("A", actor="supervisor", action="capture")
     ap("A", actor="supervisor", action="reap")
-    ap("B", actor="scheduler", action="reserve", data={"provider": "vast"})
+    # Same arc, new estimate: the model keeps the first-arc price (100).
+    ap(
+        "B",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "vast", "est_cost": 3.0},
+    )
     ap("B", actor="supervisor", action="provision")
     ap("B", actor="supervisor", action="activate")
     ap("B", actor="client", action="cancel")
     ap("B", actor="supervisor", action="capture")
     ap("B", actor="observer", action="poll-note", cause="diagnostic")  # skipped
-    ap("C", actor="client", action="submit", data={"cost_cents": 50})
-    ap("C", actor="scheduler", action="reserve", data={"provider": "uni"})
+    ap("C", actor="client", action="submit", data={"cost_cents": 0})
+    ap(
+        "C",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "uni", "est_cost": 0.5},
+    )
     ap("C", actor="supervisor", action="rollback")
     ap("C", actor="scheduler", action="fail", cause="attempts exhausted")
 
@@ -496,7 +521,9 @@ def test_export_provider_traces_golden(store: Store) -> None:
 
 def _seed_transition_scenario(store: Store) -> None:
     """One job driven through CAS transitions to RUNNING on uni, with its
-    provider resource minted — job rows AND events exist, so α is populated."""
+    provider resource minted — job rows AND events exist, so α is populated.
+    The 300-cent model cost comes from the reserve's ``est_cost`` (the
+    first-arc estimate), not from the submit event."""
     rec = make_record("j1")
     store.transition(
         "j1",
@@ -504,7 +531,7 @@ def _seed_transition_scenario(store: Store) -> None:
         expected_seq=0,
         actor="client",
         action="submit",
-        data={"cost_cents": 300},
+        data={"cost_cents": 0},
     )
     rec.state = JobState.PLACING
     _placed(rec)
@@ -514,7 +541,7 @@ def _seed_transition_scenario(store: Store) -> None:
         expected_seq=1,
         actor="scheduler",
         action="reserve",
-        data={"provider": "uni"},
+        data={"provider": "uni", "est_cost": 3.0},
     )
     store.mint_resource("uni", "omnirun-j1", "j1")
     store.transition("j1", rec, expected_seq=2, actor="supervisor", action="provision")
@@ -544,6 +571,57 @@ def test_export_with_asserts_from_alpha(store: Store) -> None:
     assert alpha["jobs"] == {"j1": {"state": "placed", "cost_cents": 300}}
     assert alpha["resources"] == [("uni", "omnirun-j1", "j1")]
     assert store.abstract_state("vast")["jobs"] == {}
+
+
+def test_retry_realias_prices_from_the_new_arc(store: Store) -> None:
+    """A retried job re-enters as a fresh model inhabitant priced from its NEW
+    arc's first reserve — the old alias keeps the old arc's price."""
+    ap = store.append_event
+    ap("R", actor="client", action="submit", data={"cost_cents": 0})
+    ap(
+        "R",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "uni", "est_cost": 2.0},
+    )
+    ap("R", actor="supervisor", action="provision")
+    ap("R", actor="supervisor", action="activate")
+    ap("R", actor="observer", action="finish", data={"ok": 0})
+    ap("R", actor="supervisor", action="capture")
+    ap("R", actor="supervisor", action="reap")
+    ap("R", actor="client", action="retry")
+    ap(
+        "R",
+        actor="scheduler",
+        action="reserve",
+        data={"provider": "uni", "est_cost": 7.0},
+    )
+    trace = export_global_trace(store, budget_cents=10_000, caps={"uni": 2})
+    assert trace == (
+        "init 10000 2\n"
+        "submit 0 200\n"
+        "reserve 0\n"
+        "provision 0\n"
+        "activate 0\n"
+        "finish 0 0\n"
+        "capture 0\n"
+        "reap 0\n"
+        "submit 1 700\n"
+        "reserve 1\n"
+    )
+    uni = export_provider_trace(store, "uni", budget_cents=10_000, cap=2)
+    assert uni == (
+        "init 10000 2\n"
+        "submit 0 200\n"
+        "reserve 0\n"
+        "provision 0\n"
+        "activate 0\n"
+        "finish 0 0\n"
+        "capture 0\n"
+        "reap 0\n"
+        "submit 1 700\n"
+        "reserve 1\n"
+    )
 
 
 _TRACE_CHECK = (

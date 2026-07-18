@@ -637,6 +637,12 @@ def offers(
 def serve(
     host: str | None = typer.Option(None, "--host", help="Bind host override."),
     port: int | None = typer.Option(None, "--port", help="Bind port override."),
+    drain: bool = typer.Option(
+        False,
+        "--drain",
+        help="Start in drain mode: refuse new jobs (POST /jobs → 503) while "
+        "continuing to advance existing ones (migration intake freeze).",
+    ),
     log_level: str | None = typer.Option(
         None,
         "--log-level",
@@ -665,7 +671,9 @@ def serve(
     if port is not None:
         cfg.daemon.port = port
     console.print(f"listening on {cfg.daemon.host}:{cfg.daemon.port}")
-    Daemon(cfg).serve()
+    if drain:
+        console.print("[yellow]drain mode: refusing new jobs[/yellow]")
+    Daemon(cfg, drain=drain).serve()
 
 
 @app.command(help="Drive one scheduling round now (place pending, reconcile running).")
