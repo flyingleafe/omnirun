@@ -99,9 +99,19 @@ replayed model state against α at every checkpoint via assert lines.
 Migration 7→8 emits, for every existing job, a **synthetic reconstruction
 prefix** (actor=`migration`): the shortest action sequence reaching its
 current state (e.g. RUNNING on uni → `submit, reserve, provision,
-activate`; SUCCEEDED+reaped → …`finish 1, capture, reap`). Production
-replay validation therefore starts from `init` and stays a valid model
-path across the upgrade — no snapshot special-casing in the checker.
+activate`). A **placed-terminal** job's sequence is ALWAYS closed — it
+ends `…, capture, reap` regardless of the v1 record's cached/reaped
+flags (the capture may be empty, per §1): its `provision` opens a
+model-ext entry, the v1 placement is already settled, and the v2
+scheduler can never StartReap a terminal record that carries no live
+placement — an unclosed sequence would leak that ext entry forever and
+fail `assert-ext-count`. Production replay validation therefore starts
+from `init` and stays a valid model path across the upgrade — no
+snapshot special-casing in the checker. Migration 8→9 repairs stores
+migrated by the pre-always-close builder: any terminal job whose event
+fold leaves ext open on its current arc and that holds no unreleased
+`resources` row gets the missing `capture`/`reap` appended
+(actor=`migration`).
 In-progress placements are additionally re-adopted by deterministic key
 after the daemon restarts (SCHED-8); adoption emits no new lifecycle
 events (state is unchanged), only a cause-annotated diagnostic event.

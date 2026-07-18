@@ -5,6 +5,7 @@ handling, and --dry-run. The ``gh`` CLI is a PATH shim recording its argv."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 from datetime import datetime, timedelta, timezone
@@ -240,6 +241,36 @@ def test_dry_run_prints_instead_of_filing(
     out = capsys.readouterr().out
     assert "would file" in out and "job-bad" in out
     assert fake_gh.calls() == []  # gh never touched
+
+
+def test_report_failure_warns_and_retries_next_round(
+    store: Store,
+    fake_gh: FakeGh,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken ``gh`` (network down, missing label, no auth) must NOT crash
+    the round: the failure is logged at WARNING and the cursor stays put, so
+    the next round re-validates and retries the filing — no crash-restart
+    loop, no silently-swallowed violation."""
+    _seed_corrupt_history(store)
+    bad = tmp_path / "bad-gh"
+    bad.write_text("#!/bin/sh\necho 'could not add label: not found' >&2\nexit 1\n")
+    bad.chmod(bad.stat().st_mode | stat.S_IEXEC)
+    v = ReplayValidator(store, trace_check=default_trace_check(), gh=str(bad))
+    with caplog.at_level(logging.WARNING, logger="omnirun.validator"):
+        violations = v.run_once()  # must not raise
+    assert len(violations) == 1
+    assert any("retry next round" in r.message for r in caplog.records)
+    # Cursor NOT advanced: the failed report is retried instead of skipped.
+    assert int(store.get_meta(CURSOR_KEY) or 0) == 0
+    assert fake_gh.issues() == []
+    # gh recovers (the PATH-shimmed fake): the retry round files the issue
+    # and only then advances the cursor.
+    v2 = ReplayValidator(store, trace_check=default_trace_check())
+    assert len(v2.run_once()) == 1
+    assert len(fake_gh.issues()) == 1
+    assert int(store.get_meta(CURSOR_KEY) or 0) == store.last_event_id()
 
 
 def test_violation_body_carries_trace_window(store: Store, fake_gh: FakeGh) -> None:

@@ -160,19 +160,35 @@ class ReplayValidator:
         """One validation round. Skipped (returns ``[]``) when no event has
         arrived since the persisted cursor; otherwise both views are
         re-exported from init and replayed; every violation found is reported
-        (filed/commented, or printed in dry-run) and returned."""
+        (filed/commented, or printed in dry-run) and returned.
+
+        A reporting failure (gh unreachable, missing label, network) must
+        never take the round loop down — it is logged at WARNING and the
+        cursor is left in place, so the NEXT round re-validates and retries
+        the filing instead of crash-looping the service."""
         cursor = int(self._store.get_meta(CURSOR_KEY) or 0)
         page = self._store.events_after(cursor, limit=1)
         if not page:
             return []
         violations = self.validate_all()
+        reported_ok = True
         for violation in violations:
-            self._report(violation)
+            try:
+                self._report(violation)
+            except Exception:
+                reported_ok = False
+                _log.warning(
+                    "reporting %s failed; will retry next round",
+                    violation.title,
+                    exc_info=True,
+                )
         # Advance the cursor even on violation: the trace is re-validated only
         # when NEW events arrive; the dedup marker (not the cursor) is what
-        # prevents duplicate issues for a persisting violation.
-        last = self._last_event_id()
-        self._store.set_meta(CURSOR_KEY, str(last))
+        # prevents duplicate issues for a persisting violation. A FAILED
+        # report keeps the cursor so the next round retries it.
+        if reported_ok:
+            last = self._last_event_id()
+            self._store.set_meta(CURSOR_KEY, str(last))
         return violations
 
     def run_forever(self, interval_s: float = 60.0) -> None:

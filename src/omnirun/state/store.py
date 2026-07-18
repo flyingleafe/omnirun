@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,7 +101,16 @@ _SUPPORTED_DIALECTS = ("sqlite", "postgresql")
 # ``init`` and stays a valid model path across the upgrade (CONFORMANCE.md §5;
 # the doc labels this step "6→7" — it was written before the deploy_keys bump
 # claimed v7, so it lands here as 7→8).
-STATE_SCHEMA_VERSION = 8
+# v9: no DDL — repairs the original v8 reconstruction's open model-ext leak.
+# That builder emitted ``provision``+``activate`` for every placed-terminal job
+# but closed (``capture``+``reap``) only those whose v1 record carried
+# cached/reaped flags, so a terminal job whose placement was already released
+# flag-less keeps an open model-ext forever (its record holds no placement, so
+# the scheduler can never StartReap it) and production replay validation fails
+# ``assert-ext-count``. The migration appends the missing ``capture``/``reap``
+# (actor="migration") to every such job; the builder itself now always closes
+# placed-terminal jobs (CONFORMANCE.md §5), so fresh 7→8 runs need no repair.
+STATE_SCHEMA_VERSION = 9
 
 # Scheduler states that occupy a provider slot (the #12 capacity guard counts
 # these): a job reserved onto a provider (PLACING) or actively running (RUNNING).
@@ -1355,6 +1364,8 @@ def _run_migrations(conn: Connection, from_version: int) -> None:
     # this runner is entered) — no data step.
     if from_version < 8:
         _migrate_to_8(conn)
+    if from_version < 9:
+        _migrate_to_9(conn)
 
 
 def _migrate_to_6(conn: Connection) -> None:
@@ -1442,11 +1453,17 @@ def _reconstruction_actions(
 
     Follows the model's guards exactly (formal/OmnirunFormal/Exec.lean): finish
     requires ``placed``; cancel is legal from queued or placed (never placing);
-    ``reap`` requires ``captured``, so a reaped job ALWAYS gets a ``capture``
-    first (an empty capture, per CONFORMANCE.md §1) even when no cache path was
-    recorded. Reconstructed jobs carry ``cost_cents=0`` — the v1 store has no
-    committed-estimate column, and a zero cost keeps the replayed budget fold
-    consistent with α.
+    ``reap`` requires ``captured``, so a reap is ALWAYS preceded by a
+    ``capture`` (an empty capture, per CONFORMANCE.md §1) even when no cache
+    path was recorded. A **placed-terminal** job's sequence is always CLOSED —
+    ``…, capture, reap`` regardless of the v1 record's cached/reaped flags
+    (CONFORMANCE.md §5): its ``provision`` opens a model-ext entry, its v1
+    placement is already settled, and the v2 scheduler can never StartReap a
+    terminal record whose flags say otherwise (or that holds no placement), so
+    an unclosed sequence would leak that ext entry forever and fail production
+    replay validation at ``assert-ext-count``. Reconstructed jobs carry
+    ``cost_cents=0`` — the v1 store has no committed-estimate column, and a
+    zero cost keeps the replayed budget fold consistent with α.
     """
     provider = rec.placement.provider_name if rec.placement is not None else None
     reserve_data = {"provider": provider} if provider is not None else None
@@ -1475,13 +1492,116 @@ def _reconstruction_actions(
         else:
             actions = [*placed_chain, ("cancel", None)]
     # capture is legal on placed/terminal only; reap additionally requires it.
-    capturable = state is _JobState.RUNNING or state.terminal
     cached = rec.outputs_cached_to is not None or rec.logs_cached_to is not None
-    if capturable and (cached or rec.reaped):
+    if state.terminal:
+        if any(action == "provision" for action, _ in actions):
+            # The always-close rule: every placed-terminal job ends
+            # capture, reap — never leave its provisioned ext entry open.
+            actions.append(("capture", None))
+            actions.append(("reap", None))
+        else:
+            # Never-placed terminal (cancelled from the queue): no ext entry
+            # exists; mirror the v1 flags only.
+            if cached or rec.reaped:
+                actions.append(("capture", None))
+            if rec.reaped:
+                actions.append(("reap", None))
+    elif state is _JobState.RUNNING and (cached or rec.reaped):
         actions.append(("capture", None))
-    if rec.reaped and state.terminal:
-        actions.append(("reap", None))
     return actions
+
+
+def _fold_ext_state(actions: Iterable[str]) -> tuple[bool, bool]:
+    """``(ext_open, captured)`` after folding *actions* in event order.
+
+    A tiny pure mirror of ``apply``'s ext/captured effects ONLY
+    (formal/OmnirunFormal/Exec.lean): ``provision`` adds the job's ext entry,
+    ``reap``/``release-lost`` erase it, ``capture`` sets captured, ``requeue``
+    clears it. A ``retry`` re-aliases the job as a fresh model inhabitant
+    (traceexport's ``RETRY_ACTION``), so the fold restarts — only the CURRENT
+    arc is reported, because appended events can only ever affect the current
+    alias. Actions outside the model alphabet are no-ops, exactly as the trace
+    exporter skips them.
+    """
+    ext_open = False
+    captured = False
+    for action in actions:
+        if action == "retry":
+            ext_open = False
+            captured = False
+        elif action == "provision":
+            ext_open = True
+        elif action in ("reap", "release-lost"):
+            ext_open = False
+        elif action == "capture":
+            captured = True
+        elif action == "requeue":
+            captured = False
+    return ext_open, captured
+
+
+def _migrate_to_9(conn: Connection) -> None:
+    """8→9: repair the original v8 reconstruction's open model-ext leak.
+
+    No schema DDL. The original ``_reconstruction_actions`` closed a
+    placed-terminal job's sequence (``capture``+``reap``) only when its v1
+    record carried cached/reaped flags; a terminal job whose v1 placement was
+    already released flag-less (e.g. cancelled-after-placed, or a FAILED
+    record whose placement was cleared on release) kept an open model-ext
+    forever — the v2 scheduler sees ``terminal`` + no placement/reaped and has
+    nothing left to do — so production replay validation fails
+    ``assert-ext-count``.
+
+    For every job whose event-fold (``_fold_ext_state``) leaves ext open on
+    its current arc, whose scheduler state is terminal, and which holds NO
+    unreleased ``resources`` row (a live row means real money the engine must
+    release itself), append the missing ``capture`` (unless the current arc
+    already captured — reap's model guard requires captured) and ``reap``
+    events (actor="migration") and bump ``jobs.seq`` past them. Idempotent: a
+    repaired job's fold has ext closed, so a re-run appends nothing.
+    """
+    unreleased = {
+        row[0]
+        for row in conn.execute(
+            select(resources.c.job_id).where(resources.c.released_at.is_(None))
+        ).fetchall()
+        if row[0] is not None
+    }
+    job_rows = conn.execute(select(jobs.c.job_id, jobs.c.state, jobs.c.seq)).fetchall()
+    now = _now_iso()
+    for job_id, state, job_seq in job_rows:
+        try:
+            terminal = _JobState(state).terminal
+        except ValueError:
+            continue  # unknown/corrupt state token: leave the row alone
+        if not terminal or job_id in unreleased:
+            continue
+        event_rows = conn.execute(
+            select(job_events.c.action, job_events.c.seq)
+            .where(job_events.c.job_id == job_id)
+            .order_by(job_events.c.seq)
+        ).fetchall()
+        ext_open, captured = _fold_ext_state(action for action, _ in event_rows)
+        if not ext_open:
+            continue
+        # Diagnostic events may sit above jobs.seq (standalone append_event);
+        # continue past BOTH so the per-(job_id, seq) unique index holds.
+        seq = max([int(job_seq)] + [int(s) for _, s in event_rows])
+        repair = (["capture"] if not captured else []) + ["reap"]
+        for action in repair:
+            seq += 1
+            conn.execute(
+                insert(job_events).values(
+                    job_id=job_id,
+                    seq=seq,
+                    at=now,
+                    actor="migration",
+                    action=action,
+                    cause="v8-reconstruction-repair",
+                    data=None,
+                )
+            )
+        conn.execute(update(jobs).where(jobs.c.job_id == job_id).values(seq=seq))
 
 
 def _slug_from_record_data(data: Any) -> str | None:

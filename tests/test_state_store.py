@@ -41,8 +41,8 @@ def test_open_store_creates_schema(tmp_path: Path) -> None:
         "intents",
         "resources",
     } <= names
-    assert store.schema_version() == 8  # STATE_SCHEMA_VERSION
-    assert STATE_SCHEMA_VERSION == 8
+    assert store.schema_version() == 9  # STATE_SCHEMA_VERSION
+    assert STATE_SCHEMA_VERSION == 9
     # Fresh DBs carry the ``project`` column + its index natively.
     cols = {c["name"] for c in inspect(store._engine).get_columns("jobs")}
     assert "project" in cols

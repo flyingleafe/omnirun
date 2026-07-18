@@ -20,9 +20,9 @@ from omnirun.models import (
     Placement,
     RepoRef,
 )
-from omnirun.state import open_store
+from omnirun.state import STATE_SCHEMA_VERSION, open_store
 from omnirun.state.schema import jobs
-from omnirun.state.store import StaleTransition, Store, StoreError
+from omnirun.state.store import StaleTransition, Store, StoreError, _fold_ext_state
 from omnirun.state.traceexport import export_global_trace, export_provider_trace
 
 # ---------------------------------------------------------------------------
@@ -307,6 +307,10 @@ def _v7_records() -> list[JobRecord]:
     cancelled_p = _placed(make_record("j-cancelled-p", JobState.CANCELLED))
     reaped_uncached = _placed(make_record("j-reaped-uncached", JobState.FAILED))
     reaped_uncached.reaped = True  # reap REQUIRES capture: an empty one is emitted
+    # v1 released this job's placement flag-less (placement=None, reaped=False,
+    # nothing cached) — the production ext-leak class the always-close rule
+    # exists for: its sequence must still end capture, reap.
+    failed_noplace = make_record("j-failed-noplace", JobState.FAILED)
     return [
         queued,
         held,
@@ -317,37 +321,28 @@ def _v7_records() -> list[JobRecord]:
         cancelled_q,
         cancelled_p,
         reaped_uncached,
+        failed_noplace,
     ]
 
 
 # JobState → the expected reconstruction action sequence (the CONFORMANCE §5
-# table, plus the model's capture-before-reap gate).
+# table, plus the model's capture-before-reap gate). Every placed-terminal
+# job's sequence is CLOSED (…capture, reap) regardless of v1 flags — the
+# always-close rule; otherwise its provision's model-ext entry would leak
+# forever (the scheduler can never reap a terminal record without a live
+# placement).
+_PLACED_CLOSED = ["submit", "reserve", "provision", "activate"]
 _EXPECTED = {
     "j-queued": ["submit"],
     "j-held": ["submit"],
     "j-placing": ["submit", "reserve"],
     "j-running": ["submit", "reserve", "provision", "activate"],
-    "j-succeeded": [
-        "submit",
-        "reserve",
-        "provision",
-        "activate",
-        "finish",
-        "capture",
-        "reap",
-    ],
-    "j-failed": ["submit", "reserve", "provision", "activate", "finish"],
+    "j-succeeded": [*_PLACED_CLOSED, "finish", "capture", "reap"],
+    "j-failed": [*_PLACED_CLOSED, "finish", "capture", "reap"],
     "j-cancelled-q": ["submit", "cancel"],
-    "j-cancelled-p": ["submit", "reserve", "provision", "activate", "cancel"],
-    "j-reaped-uncached": [
-        "submit",
-        "reserve",
-        "provision",
-        "activate",
-        "finish",
-        "capture",
-        "reap",
-    ],
+    "j-cancelled-p": [*_PLACED_CLOSED, "cancel", "capture", "reap"],
+    "j-reaped-uncached": [*_PLACED_CLOSED, "finish", "capture", "reap"],
+    "j-failed-noplace": [*_PLACED_CLOSED, "finish", "capture", "reap"],
 }
 
 
@@ -356,7 +351,7 @@ def test_migration_v7_to_v8_reconstruction(tmp_path: Path) -> None:
     _write_v7_db(db, _v7_records())
     store = open_store(f"sqlite:///{db}")
     try:
-        assert store.schema_version() == 8
+        assert store.schema_version() == STATE_SCHEMA_VERSION
         for job_id, expected in _EXPECTED.items():
             events = store.job_events_for(job_id)
             assert [e.action for e in events] == expected, job_id
@@ -372,9 +367,20 @@ def test_migration_v7_to_v8_reconstruction(tmp_path: Path) -> None:
             for e in store.events_after(0)
             if e.action == "finish"
         }
-        assert ok_flags == {"j-succeeded": 1, "j-failed": 0, "j-reaped-uncached": 0}
+        assert ok_flags == {
+            "j-succeeded": 1,
+            "j-failed": 0,
+            "j-reaped-uncached": 0,
+            "j-failed-noplace": 0,
+        }
         reserves = [e for e in store.events_after(0) if e.action == "reserve"]
-        assert all((e.data or {}).get("provider") == "uni" for e in reserves)
+        # A placement-carrying record's reserve names its provider; the
+        # placement-less one has nothing to name (data stays None).
+        for e in reserves:
+            if e.job_id == "j-failed-noplace":
+                assert e.data is None
+            else:
+                assert (e.data or {}).get("provider") == "uni"
         # The corrupt row got no events and keeps seq 0.
         assert store.job_events_for("corrupt") == []
         with store._engine.connect() as conn:
@@ -396,6 +402,156 @@ def test_migration_v7_to_v8_idempotent(tmp_path: Path) -> None:
     try:
         events = store.job_events_for("j-succeeded")
         assert [e.action for e in events] == _EXPECTED["j-succeeded"]
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Migration 8→9: repair of the pre-always-close v8 reconstruction's ext leak
+# ---------------------------------------------------------------------------
+
+
+def test_fold_ext_state_mirrors_model_effects() -> None:
+    """The pure fold mirrors Exec.lean apply's ext/captured effects only."""
+    fold = _fold_ext_state
+    assert fold([]) == (False, False)
+    assert fold(["submit", "reserve", "provision", "activate"]) == (True, False)
+    assert fold(["submit", "reserve", "provision", "activate", "finish"]) == (
+        True,
+        False,
+    )
+    closed = ["submit", "reserve", "provision", "activate", "finish", "capture"]
+    assert fold(closed) == (True, True)
+    assert fold([*closed, "reap"]) == (False, True)
+    assert fold(["provision", "capture", "release-lost"]) == (False, True)
+    # requeue clears captured (the model resets the flags on the fresh arc).
+    assert fold(["provision", "capture", "release-lost", "requeue"]) == (False, False)
+    # retry re-aliases the job: only the CURRENT arc is reported — an ext entry
+    # an old arc left open cannot be closed by appended events at all.
+    assert fold(["provision", "retry"]) == (False, False)
+    assert fold(["provision", "retry", "submit", "reserve", "provision"]) == (
+        True,
+        False,
+    )
+    # Non-alphabet diagnostic actions are no-ops, as in the trace exporter.
+    assert fold(["provision", "adopt-breadcrumb", "pull"]) == (True, False)
+
+
+def _seed_v8_leak_store(db: Path) -> None:
+    """A store at schema v8 as the ORIGINAL (pre-always-close) reconstruction
+    left it: leaky terminal jobs, a genuinely-live RUNNING job, a terminal job
+    with an unreleased resource, and a properly closed one. Built by opening a
+    current store, writing rows/events raw, then stamping the version back to 8
+    so re-opening runs exactly the 8→9 step."""
+    store = open_store(f"sqlite:///{db}")
+    try:
+        chains: dict[str, tuple[JobRecord, list[str]]] = {
+            # The production leak class: FAILED, v1 placement released
+            # flag-less — open ext, no capture.
+            "leak-plain": (
+                make_record("leak-plain", JobState.FAILED),
+                ["submit", "reserve", "provision", "activate", "finish"],
+            ),
+            # Leaky but already captured (v1 had a cache path): reap only.
+            "leak-captured": (
+                make_record("leak-captured", JobState.FAILED),
+                ["submit", "reserve", "provision", "activate", "finish", "capture"],
+            ),
+            # Cancelled after placing, released flag-less.
+            "leak-cancelled": (
+                _placed(make_record("leak-cancelled", JobState.CANCELLED)),
+                ["submit", "reserve", "provision", "activate", "cancel"],
+            ),
+            # Genuinely live: RUNNING with its unreleased resource — repair
+            # must not touch it (the engine will finish/capture/reap it).
+            "live-running": (
+                _placed(make_record("live-running", JobState.RUNNING)),
+                ["submit", "reserve", "provision", "activate"],
+            ),
+            # Terminal but with an UNRELEASED resource row: real money — the
+            # engine must release it; the migration must not lie it away.
+            "term-unreleased": (
+                _placed(make_record("term-unreleased", JobState.FAILED)),
+                ["submit", "reserve", "provision", "activate", "finish"],
+            ),
+            # Properly closed: untouched.
+            "closed": (
+                _placed(make_record("closed", JobState.SUCCEEDED)),
+                [
+                    "submit",
+                    "reserve",
+                    "provision",
+                    "activate",
+                    "finish",
+                    "capture",
+                    "reap",
+                ],
+            ),
+        }
+        for job_id, (rec, actions) in chains.items():
+            store.save_job(rec)
+            seq = 0
+            for action in actions:
+                seq = store.transition(
+                    job_id, rec, expected_seq=seq, actor="migration", action=action
+                )
+        store.mint_resource("uni", "omnirun-live-running", "live-running")
+        store.mint_resource("uni", "omnirun-term-unreleased", "term-unreleased")
+        store.set_meta("schema_version", "8")
+    finally:
+        store.close()
+
+
+def test_migration_v8_to_v9_repairs_ext_leaks(tmp_path: Path) -> None:
+    db = tmp_path / "v8.db"
+    _seed_v8_leak_store(db)
+    store = open_store(f"sqlite:///{db}")
+    try:
+        assert store.schema_version() == STATE_SCHEMA_VERSION
+        repaired = {
+            "leak-plain": ["capture", "reap"],
+            "leak-captured": ["reap"],
+            "leak-cancelled": ["capture", "reap"],
+        }
+        for job_id, tail in repaired.items():
+            events = store.job_events_for(job_id)
+            appended = [e for e in events if e.cause == "v8-reconstruction-repair"]
+            assert [e.action for e in appended] == tail, job_id
+            assert all(e.actor == "migration" for e in appended)
+            # jobs.seq bumped past the appended events (fold cursor stays sane).
+            assert store.job_seq(job_id) == events[-1].seq
+            # The repaired fold has ext closed (and captured for reap's guard).
+            assert _fold_ext_state(e.action for e in events) == (False, True)
+        for job_id in ("live-running", "term-unreleased", "closed"):
+            events = store.job_events_for(job_id)
+            assert all(e.cause != "v8-reconstruction-repair" for e in events), job_id
+        # The live/engine-owned resources are untouched.
+        assert {r.external_key for r in store.unreleased_resources()} == {
+            "omnirun-live-running",
+            "omnirun-term-unreleased",
+        }
+    finally:
+        store.close()
+
+
+def test_migration_v8_to_v9_idempotent(tmp_path: Path) -> None:
+    db = tmp_path / "v8.db"
+    _seed_v8_leak_store(db)
+    open_store(f"sqlite:///{db}").close()
+    first = open_store(f"sqlite:///{db}")
+    try:
+        before = [e.id for e in first.job_events_for("leak-plain")]
+    finally:
+        first.close()
+    # Force the step to re-run: a repaired fold appends nothing more.
+    again = open_store(f"sqlite:///{db}")
+    try:
+        again.set_meta("schema_version", "8")
+    finally:
+        again.close()
+    store = open_store(f"sqlite:///{db}")
+    try:
+        assert [e.id for e in store.job_events_for("leak-plain")] == before
     finally:
         store.close()
 
@@ -702,7 +858,7 @@ def test_open_store_default_ok_without_state_config(
     monkeypatch.setenv("OMNIRUN_STATE_DIR", str(tmp_path / "state"))
     store = open_store()
     try:
-        assert store.schema_version() == 8
+        assert store.schema_version() == STATE_SCHEMA_VERSION
     finally:
         store.close()
 
