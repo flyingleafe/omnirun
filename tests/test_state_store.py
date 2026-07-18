@@ -255,19 +255,20 @@ def test_load_facts_corrupt_row_is_none(tmp_path: Path) -> None:
         store.close()
 
 
-def test_run_tick_over_corrupt_row_completes(tmp_path: Path) -> None:
-    """A run_tick over a store holding a corrupt row completes (lists skip it)."""
-    from datetime import datetime, timezone
+def test_engine_pass_over_corrupt_row_completes(tmp_path: Path) -> None:
+    """An engine pass over a store holding a corrupt row completes (lists
+    skip it) — the scheduler never crashes on one bad record."""
+    import asyncio
 
-    from omnirun.control import Control
+    from omnirun.engine.engine import Engine
 
     store = open_store(f"sqlite:///{tmp_path / 't.db'}")
     try:
         store.save_job(make_record("good-1"))
         _insert_corrupt_job_row(store, "bad-1")
-        control = Control(store, {})
-        # No provider needed: the corrupt row must not crash the reconcile/list.
-        control.run_tick(datetime(2026, 7, 11, tzinfo=timezone.utc))
+        # No provider needed: the corrupt row must not crash the pass/list.
+        engine = Engine(store, {}, slots=lambda: [], artifacts_dir=tmp_path / "a")
+        asyncio.run(engine.run_pass())
         assert [r.spec.job_id for r in store.list_jobs()] == ["good-1"]
     finally:
         store.close()

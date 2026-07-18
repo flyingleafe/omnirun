@@ -73,6 +73,7 @@ class PlaceData(ItemData):
 
 class CancelData(ItemData):
     provider: str | None = None
+    force: bool = False  # skip the grace window (``cancel --force``)
 
 
 class CaptureData(ItemData):

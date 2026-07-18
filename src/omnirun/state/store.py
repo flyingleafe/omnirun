@@ -746,6 +746,14 @@ class Store:
             ).fetchone()
         return 0 if row is None else int(row[0])
 
+    def last_event_id(self) -> int:
+        """The highest global ``job_events.id`` (0 on an empty log) — the
+        cursor a client takes before a drive so it can narrate exactly the
+        events that drive produced."""
+        with self._engine.connect() as conn:
+            top = conn.execute(select(func.max(job_events.c.id))).scalar_one_or_none()
+        return 0 if top is None else int(top)
+
     def events_after(self, global_id: int, limit: int = 1000) -> list[EventRow]:
         """Events with ``id > global_id`` in global order — the replay-validator
         and SSE-feed cursor read. Page with the last row's ``id``."""

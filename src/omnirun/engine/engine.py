@@ -27,10 +27,11 @@ import asyncio
 import logging
 import signal
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from omnirun.budget import BudgetLedger
+from omnirun.engine import billing
 from omnirun.engine import workitems as wi
 from omnirun.engine.jobstream import JobStreams
 from omnirun.engine.observer import Observer, finish_job
@@ -66,6 +67,7 @@ _log = logging.getLogger("omnirun.engine")
 
 _SHUTDOWN_BUDGET_S = 4.0  # task-group cancellation budget (< 5 s exit, ROBUST-3)
 _SETTLE_YIELDS = 25  # event-loop turns granted to stream tasks at quiescence
+_REQUEUE_BACKOFF_S = 30.0  # retry pacing after a dead placement's requeue
 
 
 def _utcnow() -> datetime:
@@ -99,6 +101,7 @@ class Engine:
         ladder_cooldown_s: float = 30.0,
         stream_backoff_s: float = 1.0,
         follow_queue: int = 64,
+        observe_streams: bool = True,
     ) -> None:
         typed: dict[str, AsyncProvider] = dict(providers)
         self._store = store
@@ -110,7 +113,9 @@ class Engine:
         self._poll_interval = poll_interval
         self._capture_tries = capture_tries
         self._wake = asyncio.Event()
-        self._cancels: set[str] = set()
+        # job_id → force? A requested cancel; the pass turns it into a cancel
+        # work item (whose intent row persists the request across processes).
+        self._cancels: dict[str, bool] = {}
         self._adopted_boot = False
         artifacts = artifacts_dir or Path("artifacts")
         self._sup = Supervisor(
@@ -141,6 +146,7 @@ class Engine:
             silence_threshold_s=silence_threshold_s,
             silence_thresholds=silence_thresholds,
             ladder_cooldown_s=ladder_cooldown_s,
+            use_streams=observe_streams,
         )
 
     @property
@@ -174,9 +180,19 @@ class Engine:
         self.wake()
         return rec
 
-    def request_cancel(self, job_id: str) -> None:
-        self._cancels.add(job_id)
+    def request_cancel(self, job_id: str, *, force: bool = False) -> None:
+        self._cancels[job_id] = force or self._cancels.get(job_id, False)
         self.wake()
+
+    async def wait_wake(self, timeout: float) -> bool:
+        """Wait until something wakes the loop (work-item completion, stream
+        exit, an external write) or *timeout* elapses; True = woken. The
+        daemonless ``--wait``/``logs -f`` drives sleep here between rounds."""
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout)
+            return True
+        except TimeoutError:
+            return False
 
     def live_work_items(self) -> list[asyncio.Task[None]]:
         """The currently-live work-item tasks (drive/join them in tests and
@@ -231,7 +247,7 @@ class Engine:
             jobs=jobs,
             intents=intents,
             unreleased=unreleased,
-            cancels=frozenset(self._cancels),
+            cancels=frozenset(self._cancels.keys()),
         )
         decisions = schedule(
             snapshot, list(self._slots()), self._ledger(now), now, policy=self._policy
@@ -242,6 +258,7 @@ class Engine:
 
     def _enact_rollback_recovery(self, job_id: str, rec: JobRecord) -> bool:
         provider = rec.placement.provider_name if rec.placement is not None else None
+        paid = rec.placement.cost_actual if rec.placement is not None else None
 
         def _mut(r: JobRecord) -> JobRecord | None:
             if r.state is not JobState.PLACING:
@@ -250,19 +267,19 @@ class Engine:
             r.placement = None
             return r
 
-        return (
-            cas_step(
-                self._store,
-                job_id,
-                _mut,
-                actor="scheduler",
-                action="rollback",
-                cause="place intent lost (crash gap)",
-                data={"provider": provider},
-                retries=1,
-            )
-            is not None
+        done = cas_step(
+            self._store,
+            job_id,
+            _mut,
+            actor="scheduler",
+            action="rollback",
+            cause="place intent lost (crash gap)",
+            data={"provider": provider},
+            retries=1,
         )
+        if done is not None and paid is not None:
+            billing.settle(self._store, job_id, 0.0, self._now())
+        return done is not None
 
     def _enact(self, decision: SchedDecision, now: datetime) -> int:
         match decision:
@@ -298,7 +315,13 @@ class Engine:
                 return None
             rec.state = JobState.PLACING
             rec.placement = Placement(
-                provider_name=d.provider, job_id=d.job_id, state=JobStatus.QUEUED
+                provider_name=d.provider,
+                job_id=d.job_id,
+                state=JobStatus.QUEUED,
+                # A PAID reserve carries its committed estimate on the
+                # placement — the settle/void half reads it back (v1's
+                # ``cost_actual`` convention, kept).
+                cost_actual=d.est_cost if d.est_cost > 0 else None,
             )
             return rec
 
@@ -323,6 +346,8 @@ class Engine:
         )
         if done is None:
             return 0
+        if d.est_cost > 0:
+            billing.commit(self._store, d.job_id, d.provider, d.est_cost, self._now())
         self._sup.spawn_place(d.job_id, data, wi.PlaceStage.ASSIGN)
         return 1
 
@@ -390,9 +415,11 @@ class Engine:
                 return 0  # guard: resource still unreleased; not yet
 
         provider = None
+        paid = None
         current = self._store.load_job(d.job_id)
         if current is not None and current.placement is not None:
             provider = current.placement.provider_name
+            paid = current.placement.cost_actual
 
         def _mut(rec: JobRecord) -> JobRecord | None:
             if rec.state is not JobState.RUNNING:
@@ -403,6 +430,10 @@ class Engine:
             rec.logs_cached_to = None
             rec.outputs_cached_to = None
             rec.reaped = False
+            # Pace the retry: a worker that just died may keep dying (a broken
+            # image, a flapping host) — without a timer a catch-up drive would
+            # loop place→dead→requeue hot until its pass budget.
+            rec.not_before = self._now() + timedelta(seconds=_REQUEUE_BACKOFF_S)
             return rec
 
         done = cas_step(
@@ -415,6 +446,10 @@ class Engine:
             data={"provider": provider},
             retries=1,
         )
+        if done is not None and paid is not None:
+            # A lost attempt is never charged: void the committed estimate so
+            # the re-placement's fresh commit cannot double-count (v1 rule).
+            billing.settle(self._store, d.job_id, 0.0, self._now())
         return 0 if done is None else 1
 
     def _enact_capture(self, d: StartCapture) -> int:

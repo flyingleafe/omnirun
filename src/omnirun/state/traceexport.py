@@ -67,6 +67,15 @@ ALPHABET = frozenset(
     }
 )
 
+# The client's ``retry`` verb (terminal → QUEUED, full reset) has no model
+# edge — the model's job lifecycle is one-way past a terminal state. A retried
+# job is therefore modeled as a FRESH inhabitant: on a ``retry`` event both
+# exporters RE-ALIAS the job_id to a new dense nid and replay a ``submit``
+# for it (global view immediately; provider view on its next first contact).
+# The old nid keeps its terminal model state, exactly matching the α
+# checkpoint, which asserts only the CURRENT alias of each job_id.
+RETRY_ACTION = "retry"
+
 # Arc-ending actions after which a job is re-reservable (returns to the pool).
 _UNBIND = frozenset({"rollback", "requeue"})
 
@@ -129,11 +138,25 @@ def export_global_trace(
     """
     lines = [f"init {budget_cents} {sum(caps.values())}"]
     nids: dict[str, int] = {}
+    fresh = 0
+    submits: dict[str, EventRow] = {}
     for ev in _all_events(store):
+        if ev.action == RETRY_ACTION:
+            # Re-alias: the retried job re-enters as a fresh model job.
+            if ev.job_id in nids:
+                nids[ev.job_id] = fresh
+                fresh += 1
+                sub = submits.get(ev.job_id)
+                lines.append(f"submit {nids[ev.job_id]} {_cost_cents(sub)}")
+            continue
         if ev.action not in ALPHABET:
             continue
-        nid = nids.setdefault(ev.job_id, len(nids))
-        lines.append(_line(ev.action, nid, ev))
+        if ev.action == "submit":
+            submits.setdefault(ev.job_id, ev)
+        if ev.job_id not in nids:
+            nids[ev.job_id] = fresh
+            fresh += 1
+        lines.append(_line(ev.action, nids[ev.job_id], ev))
     if with_asserts:
         lines.extend(_assert_lines(store.abstract_state(None), nids))
     return "\n".join(lines) + "\n"
@@ -154,19 +177,28 @@ def export_provider_trace(
     """
     lines = [f"init {budget_cents} {cap}"]
     nids: dict[str, int] = {}
+    fresh = 0
     binding: dict[str, str | None] = {}
     submits: dict[str, EventRow] = {}
     for ev in _all_events(store):
+        if ev.action == RETRY_ACTION:
+            # Re-alias (see RETRY_ACTION): drop the binding and the alias so
+            # the job's next contact with this provider replays a fresh
+            # ``submit`` under a new nid.
+            binding.pop(ev.job_id, None)
+            nids.pop(ev.job_id, None)
+            continue
         if ev.action not in ALPHABET:
             continue
         if ev.action == "submit":
-            submits[ev.job_id] = ev
+            submits.setdefault(ev.job_id, ev)
             continue  # replayed on first contact, never emitted directly
         if ev.action == "reserve":
             binding[ev.job_id] = ((ev.data or {}).get("provider")) or None
         if binding.get(ev.job_id) == provider:
             if ev.job_id not in nids:
-                nids[ev.job_id] = len(nids)
+                nids[ev.job_id] = fresh
+                fresh += 1
                 sub = submits.get(ev.job_id)
                 lines.append(f"submit {nids[ev.job_id]} {_cost_cents(sub)}")
             lines.append(_line(ev.action, nids[ev.job_id], ev))

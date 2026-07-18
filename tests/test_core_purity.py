@@ -12,20 +12,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from omnirun import budget, control, daemon, scheduler
+from omnirun import budget, client, daemon, scheduler
 from omnirun.engine import engine as engine_engine
 from omnirun.engine import jobstream as engine_jobstream
 from omnirun.engine import observer as engine_observer
 from omnirun.engine import outcomes as engine_outcomes
 from omnirun.engine import providertypes as engine_providertypes
 from omnirun.engine import supervisor as engine_supervisor
+from omnirun.engine import billing as engine_billing
 from omnirun.engine import workitems as engine_workitems
 from omnirun.providers import adapter, asyncadapter
 from omnirun.providers import base as providers_base
 
 # The core modules that must stay free of backend-specific vocabulary.
 _CORE_MODULES = (
-    control,
+    client,
     scheduler,
     budget,
     providers_base,
@@ -35,6 +36,7 @@ _CORE_MODULES = (
     engine_outcomes,
     engine_providertypes,
     engine_workitems,
+    engine_billing,
     engine_supervisor,
     engine_observer,
     engine_jobstream,

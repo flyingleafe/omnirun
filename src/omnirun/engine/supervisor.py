@@ -36,11 +36,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping, MutableSet
+from collections.abc import Callable, Mapping, MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from omnirun.engine import billing
 from omnirun.engine import workitems as wi
 from omnirun.engine.outcomes import (
     CapacityContention,
@@ -54,6 +55,7 @@ from omnirun.models import (
     JobRecord,
     JobState,
     JobStatus,
+    Link,
     Slot,
     StatusReport,
 )
@@ -72,11 +74,26 @@ _ACTOR = "supervisor"
 
 # Failure-policy knobs (module constants, not per-backend tunables).
 _BACKOFF_S = 30.0  # placement retry backoff after an infra failure
+_CAPACITY_BACKOFF_S = 30.0  # quiet retry pacing after capacity contention
 _AVOID_TTL_S = 300.0  # provider avoidance window after an infra failure
 _ENTITLEMENT_AVOID_S = 3600.0  # avoidance window after an entitlement rejection
 _RETRY_S = 30.0  # re-spawn timer for frozen (unreachable) / retrying items
 _RESHOP_LIMIT = 3  # bounded re-shop on capacity contention
 _CANCEL_POLL_S = 0.05  # poll cadence inside the cancel grace window
+
+# JobHandle keys whose name carries this token are surfaced as display Links
+# on the placement (same generic rule as the v1 adapter — no backend-specific
+# display vocabulary in the engine).
+_LINK_KEY_HINTS = ("url",)
+
+
+def _links_of(handle: Mapping[str, Any]) -> list[Link]:
+    return [
+        Link(label=key, url=value)
+        for key, value in handle.items()
+        if isinstance(value, str)
+        and any(hint in key.lower() for hint in _LINK_KEY_HINTS)
+    ]
 
 
 def cas_step(
@@ -144,7 +161,7 @@ class Supervisor:
         artifacts_dir: Path,
         slots: Callable[[], list[Slot]],
         now: Callable[[], datetime],
-        cancels: MutableSet[str],
+        cancels: MutableMapping[str, bool],
         place_limit: int = 4,
         cancel_grace_s: float = 30.0,
     ) -> None:
@@ -297,7 +314,8 @@ class Supervisor:
             stage = wi.PlaceStage(row.stage)
             self.spawn_place(row.job_id, data, stage)
         elif kind is wi.WorkKind.CANCEL:
-            self._cancels.add(row.job_id)
+            assert isinstance(data, wi.CancelData)
+            self._cancels[row.job_id] = data.force
             self.spawn_cancel(row.job_id)
         elif kind is wi.WorkKind.CAPTURE:
             assert isinstance(data, wi.CaptureData)
@@ -348,8 +366,15 @@ class Supervisor:
                 )
             raise
         except CapacityContention as e:
-            # Re-shop exhausted: plain rollback — no attempt, no avoidance.
-            self._rollback(job_id, data.provider, cause=str(e) or "capacity contention")
+            # Re-shop exhausted: plain rollback — no attempt, no avoidance —
+            # but WITH a retry-pacing timer, so a drive to quiescence defers
+            # (waits) instead of re-reserving the full provider in a hot loop.
+            self._rollback(
+                job_id,
+                data.provider,
+                cause=str(e) or "capacity contention",
+                backoff_s=_CAPACITY_BACKOFF_S,
+            )
         except EntitlementRejected as e:
             self._unwind_place(
                 job_id,
@@ -406,11 +431,19 @@ class Supervisor:
                 raise InfraFailure("job vanished before launch")
             await provider.launch(rec, key)
 
+        # Persist the launched handle onto the placement in the SAME activate
+        # transition: every later process (logs/pull/ssh/gc, the daemon's
+        # ingestors) derives its live-I/O handle from the placement row.
+        handle = provider.placement_handle(job_id)
+
         def _activate(rec: JobRecord) -> JobRecord | None:
             if rec.state is not JobState.PLACING:
                 return None
             rec.state = JobState.RUNNING
             if rec.placement is not None:
+                if handle:
+                    rec.placement.handle = dict(handle)
+                    rec.placement.links = _links_of(handle)
                 rec.placement.state = JobStatus.STARTING
                 rec.placement.placed_at = self._now()
             return rec
@@ -538,17 +571,29 @@ class Supervisor:
                 return key
         return None
 
-    def _rollback(self, job_id: str, provider: str, *, cause: str) -> None:
-        """PLACING → QUEUED with NOTHING minted: the model's ``rollback``."""
+    def _rollback(
+        self, job_id: str, provider: str, *, cause: str, backoff_s: float | None = None
+    ) -> None:
+        """PLACING → QUEUED with NOTHING minted: the model's ``rollback``.
+
+        *backoff_s* stamps a ``not_before`` retry-pacing timer (the capacity
+        defer) — never an attempt, an error, or an avoidance."""
+        paid: list[float] = []
+        now = self._now()
 
         def _mut(rec: JobRecord) -> JobRecord | None:
             if rec.state is not JobState.PLACING:
                 return None
+            paid.clear()
+            if rec.placement is not None and rec.placement.cost_actual is not None:
+                paid.append(rec.placement.cost_actual)
             rec.state = JobState.QUEUED
             rec.placement = None
+            if backoff_s is not None:
+                rec.not_before = now + timedelta(seconds=backoff_s)
             return rec
 
-        cas_step(
+        done = cas_step(
             self._store,
             job_id,
             _mut,
@@ -558,6 +603,9 @@ class Supervisor:
             data={"provider": provider},
             close_intent=True,
         )
+        if done is not None and paid:
+            # Void the paid commit: the reservation is returned unspent.
+            billing.settle(self._store, job_id, 0.0, self._now())
         self._wake()
 
     def _unwind_place(
@@ -579,9 +627,14 @@ class Supervisor:
         ``placing``. A preemption records no failure bookkeeping — the cancel
         item takes the job from wherever this leaves it.
         """
-        provisioned = any(
-            e.action == "provision" for e in self._store.job_events_for(job_id)
+        # "Provisioned" is scoped to the CURRENT placement arc (events after
+        # the last reserve) — a prior arc's provision was already unwound by
+        # its own release, so it must not activate THIS arc's stub as dead.
+        events = self._store.job_events_for(job_id)
+        last_reserve = max(
+            (i for i, e in enumerate(events) if e.action == "reserve"), default=-1
         )
+        provisioned = any(e.action == "provision" for e in events[last_reserve + 1 :])
         now = self._now()
 
         def _bookkeep(rec: JobRecord) -> None:
@@ -593,17 +646,21 @@ class Supervisor:
                 rec.avoid_backends[provider] = now + timedelta(seconds=avoid_s)
 
         if not provisioned:
+            paid: list[float] = []
 
             def _mut(rec: JobRecord) -> JobRecord | None:
                 if rec.state is not JobState.PLACING:
                     return None
+                paid.clear()
+                if rec.placement is not None and rec.placement.cost_actual is not None:
+                    paid.append(rec.placement.cost_actual)
                 rec.state = JobState.QUEUED
                 rec.placement = None
                 if not preempt:
                     _bookkeep(rec)
                 return rec
 
-            cas_step(
+            done = cas_step(
                 self._store,
                 job_id,
                 _mut,
@@ -613,6 +670,8 @@ class Supervisor:
                 data={"provider": provider},
                 close_intent=True,
             )
+            if done is not None and paid:
+                billing.settle(self._store, job_id, 0.0, now)
         else:
 
             def _mut(rec: JobRecord) -> JobRecord | None:
@@ -661,8 +720,9 @@ class Supervisor:
         rec = self._store.load_job(job_id)
         if rec is None or rec.state.terminal:
             self._store.close_intent(job_id)
-            self._cancels.discard(job_id)
+            self._cancels.pop(job_id, None)
             return
+        force = bool(self._cancels.get(job_id, False))
         provider_name = (
             rec.placement.provider_name if rec.placement is not None else None
         )
@@ -671,13 +731,21 @@ class Supervisor:
             wi.WorkKind.CANCEL.value,
             "signal",
             provider_name,
-            wi.CancelData(provider=provider_name).model_dump(mode="json"),
+            wi.CancelData(provider=provider_name, force=force).model_dump(mode="json"),
         )
         try:
             if rec.state is JobState.PLACING:
                 # No live place task took this to a resolvable state (crash
-                # gap): roll it back, then cancel from QUEUED.
-                self._rollback(job_id, provider_name or "", cause="cancelled")
+                # gap / frozen item): unwind it — rollback when nothing was
+                # minted, activate-as-dead when a resource exists (the model
+                # has no release edge from placing) — then cancel from the
+                # state that leaves us in.
+                self._unwind_place(
+                    job_id,
+                    cause="cancelled",
+                    provider=provider_name or "",
+                    preempt=True,
+                )
             elif rec.state is JobState.RUNNING:
                 provider = (
                     self._providers.get(provider_name)
@@ -686,7 +754,7 @@ class Supervisor:
                 )
                 if provider is not None:
                     try:
-                        await self._signal_stop(rec, provider)
+                        await self._signal_stop(rec, provider, force=force)
                     except Unreachable:
                         self._freeze(job_id)
                         return
@@ -708,11 +776,19 @@ class Supervisor:
                 data={"provider": provider_name},
                 close_intent=True,
             )
-            self._cancels.discard(job_id)
+            self._cancels.pop(job_id, None)
             self._wake()
 
-    async def _signal_stop(self, rec: JobRecord, provider: AsyncProvider) -> None:
-        """Graceful signal → grace window → force (the cancel ladder)."""
+    async def _signal_stop(
+        self, rec: JobRecord, provider: AsyncProvider, *, force: bool = False
+    ) -> None:
+        """Graceful signal → grace window → force (the cancel ladder).
+
+        ``force=True`` (``cancel --force``) skips the grace window entirely:
+        one immediate hard kill."""
+        if force:
+            await provider.cancel_placement(rec, force=True)
+            return
         await provider.cancel_placement(rec, force=False)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._cancel_grace_s
@@ -723,12 +799,17 @@ class Supervisor:
         await provider.cancel_placement(rec, force=True)
 
     def _apply_cancel(self, job_id: str, provider_name: str | None) -> None:
+        paid: list[float] = []
+
         def _mut(rec: JobRecord) -> JobRecord | None:
             if rec.state.terminal:
                 return None
+            paid.clear()
             rec.state = JobState.CANCELLED
             rec.last_status = StatusReport(status=JobStatus.CANCELLED)
             if rec.placement is not None:
+                if rec.placement.cost_actual is not None:
+                    paid.append(rec.placement.cost_actual)
                 rec.placement.state = JobStatus.CANCELLED
                 rec.placement.ended_at = self._now()
             return rec
@@ -744,7 +825,11 @@ class Supervisor:
         )
         if done is None:
             self._store.close_intent(job_id)
-        self._cancels.discard(job_id)
+        elif paid:
+            # Realize the paid placement's committed estimate (the cancelled
+            # run is charged, exactly as a finished one is).
+            billing.settle(self._store, job_id, paid[0], self._now())
+        self._cancels.pop(job_id, None)
         self._wake()
 
     # ------------------------------------------------------------------

@@ -480,7 +480,7 @@ def submit(
         False,
         "--wait",
         "-w",
-        help="With a running daemon, block until the job is RUNNING or terminal.",
+        help="Block until the job is terminal (daemonless: the CLI drives it).",
     ),
 ) -> None:
     cfg = _load_cfg()
@@ -548,7 +548,7 @@ def submit(
         def _place() -> None:
             report("resolving repo state…")
             spec = _spec()
-            _report_submit(client.submit(spec, backend=backend))
+            _report_submit(client.submit(spec, backend=backend, wait=wait))
 
         # On a terminal, narrate on one live status line (spinner). When output is
         # piped / redirected (CI, `nohup`) a Live spinner renders nothing, so print
@@ -574,11 +574,14 @@ def _report_submit(outcome: SubmitOutcome) -> None:
         return
     if outcome.state is JobState.HELD:
         _die(f"job {outcome.job_id} cannot be placed: {outcome.held_reason}")
-    # QUEUED but unplaced: admissible yet no fitting offer right now. The record
-    # persists; a running `omnirun serve` will place it on the next tick.
+    # QUEUED but unplaced: admissible yet no fitting offer right now. The
+    # record persists; state WHO advances it (JOB-5): daemonless, the next
+    # omnirun command's catch-up retries placement, or a daemon does so
+    # continuously.
     console.print(
-        f"queued {outcome.job_id}: no slot free right now — it will place on a later "
-        "tick; run `omnirun serve` to place it in the background"
+        f"queued {outcome.job_id}: no slot free right now — any later omnirun "
+        "command (ps/status/tick) retries placement, or run `omnirun serve` to "
+        "place it in the background"
     )
 
 
@@ -789,6 +792,11 @@ def queue(
         if wait:
             _queue_wait(client)
             return
+        # Daemonless, the catch-up drive advances the machine before the read
+        # (ROBUST-8); with a daemon configured it is a no-op (the daemon's
+        # scheduler is the continuous catch-up).
+        for event in client.catch_up():
+            console.print(f"[dim]· {event}[/dim]")
         records = client.list_jobs(project=scope)
         console.print(_queue_table(records, show_project=scope is None))
         if scope is not None:

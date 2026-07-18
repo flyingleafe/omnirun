@@ -1,21 +1,24 @@
 """Unified-model daemon tests: the job store IS the queue.
 
-The daemon drives the SAME pure ``tick`` the daemonless CLI runs — through its
-in-process ``LocalClient`` core. These tests seed jobs directly through
-``Control.submit`` over the daemon's shared store, drive one round via
-``daemon._core.tick()``, and assert on ``JobRecord``s — there is no separate queue
-table or projection. (HTTP end-to-end coverage lives in test_daemon_http.py.)
+The daemon drives the SAME v2 engine the daemonless CLI runs — through its
+in-process ``LocalClient`` core (one catch-up drive per ``tick()``). These
+tests seed jobs directly through ``submit_record`` over the daemon's shared
+store, drive rounds via ``daemon._core.tick()``, and assert on
+``JobRecord``s — there is no separate queue table or projection. (HTTP
+end-to-end coverage lives in test_daemon_http.py.)
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
+
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
 from omnirun.backends.base import Backend, ProvisioningSink
 from omnirun.config import BackendConfig, Config, DaemonConfig
-from omnirun.control import Control
+from omnirun.client import submit_record
 from omnirun.daemon import Daemon
 from omnirun.models import (
     CancelMode,
@@ -33,6 +36,18 @@ from omnirun.models import (
 
 
 # --------------------------------------------------------------------- fixtures
+
+
+@pytest.fixture(autouse=True)
+def _fast_engine_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero the engine's placement backoff/avoid/retry windows: these tests
+    tick in a tight loop and must see retries immediately (the production
+    defaults pace retries in wall-clock seconds)."""
+    from omnirun.engine import supervisor
+
+    monkeypatch.setattr(supervisor, "_BACKOFF_S", 0.0)
+    monkeypatch.setattr(supervisor, "_AVOID_TTL_S", 0.0)
+    monkeypatch.setattr(supervisor, "_RETRY_S", 0.0)
 
 
 def make_spec(name: str = "train", *, only_backend: str | None = None) -> JobSpec:
@@ -153,8 +168,9 @@ def _now() -> datetime:
 
 
 def _seed(daemon: Daemon, spec: JobSpec) -> str:
-    """Submit *spec* into the daemon's shared store via Control (as the CLI does)."""
-    return Control(daemon._core._store(), {}).submit(spec, now=_now())
+    """Submit *spec* into the daemon's shared store (as the CLI's enqueue does)."""
+    submit_record(daemon._core._store(), spec, _now())
+    return spec.job_id
 
 
 def _tick(daemon: Daemon) -> None:
@@ -179,7 +195,9 @@ def _no_placing(daemon: Daemon) -> None:
 
 def test_respects_cap_and_backfills(tmp_path: Path) -> None:
     submitted: list[str] = []
-    daemon = make_daemon(tmp_path, {"a": 2}, submitted=submitted)
+    # A few RUNNING polls per job: one engine tick may observe several times,
+    # so a longer runway keeps the cap genuinely contended across ticks.
+    daemon = make_daemon(tmp_path, {"a": 2}, submitted=submitted, runs_before_done=3)
     for _ in range(5):
         _seed(daemon, make_spec())
 
@@ -268,16 +286,17 @@ def test_daemon_restart_reverts_placing_stub_and_replaces(tmp_path: Path) -> Non
     )
     store.close()
 
-    daemon = make_daemon(tmp_path, {"a": 1})
-    _tick(daemon)  # reconcile reverts the stub, then this same tick re-places
+    daemon = make_daemon(tmp_path, {"a": 1}, runs_before_done=3)
+    _tick(daemon)  # crash-gap recovery rolls the stub back, then re-places
 
     [rec] = daemon._core._store().list_jobs()
-    # After one tick it is placed and running on 'a' (reverted → re-placed).
+    # After one tick it is placed and running on 'a' (rolled back → re-placed).
     assert rec.state is JobState.RUNNING
     assert rec.placement is not None
     assert rec.placement.provider_name == "a"
     assert rec.placement.handle  # a real placement, not the empty stub
-    assert rec.attempts == 1  # the revert bumped attempts once
+    # v2: a crash-gap rollback is not a placement FAILURE — no attempt counted.
+    assert rec.attempts == 0
 
 
 # ------------------------------------------------------------------ cancel

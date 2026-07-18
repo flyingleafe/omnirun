@@ -153,7 +153,14 @@ class BackendProvider:
                     cost=cost,
                     availability=availability,
                     capacity=capacity,
-                    provider_ref={"offer": offer.model_dump(mode="json")},
+                    provider_ref={
+                        "offer": offer.model_dump(mode="json"),
+                        # A stable per-probe identity (SCHED-11): the v2 pass
+                        # assigns THIS key to a Reserve, and the async
+                        # adapter's rent stage re-derives the same key from a
+                        # fresh offer() call to find the concrete offer again.
+                        "offer_key": f"{self.name}:{len(slots)}",
+                    },
                 )
             )
         return slots

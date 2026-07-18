@@ -16,7 +16,6 @@ from omnirun.models import (
     Capabilities,
     Cost,
     Deadline,
-    Decision,
     JobPolicy,
     JobRecord,
     JobSpec,
@@ -191,30 +190,6 @@ class TestSerializationRoundtrip:
         assert len(restored.links) == 1
         assert restored.links[0].label == "dashboard"
         assert restored.placed_at == now
-
-    def test_decision_roundtrip_with_slot(self) -> None:
-        slot = Slot(
-            provider_name="vast",
-            capabilities=Capabilities(),
-            cost=Cost(),
-        )
-        d = Decision(
-            kind="place", job_id="job-xyz", slot=slot, reason="free slot available"
-        )
-        dumped = d.model_dump(mode="json")
-        restored = Decision.model_validate(dumped)
-        assert restored.kind == "place"
-        assert restored.job_id == "job-xyz"
-        assert restored.slot is not None
-        assert restored.slot.provider_name == "vast"
-        assert restored.reason == "free slot available"
-
-    def test_decision_noop_roundtrip(self) -> None:
-        d = Decision(kind="noop", job_id="job-xyz")
-        dumped = d.model_dump(mode="json")
-        restored = Decision.model_validate(dumped)
-        assert restored.kind == "noop"
-        assert restored.slot is None
 
     def test_status_roundtrip(self) -> None:
         s = Status(state=JobStatus.RUNNING, exit_code=None, detail="all good")

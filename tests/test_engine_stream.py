@@ -221,7 +221,9 @@ def test_dead_worker_requeues_with_two_attempt_segments(
         clock.advance(6)
         marked = await engine.observe_once()  # rung 2/3: gone + no result
         assert marked == 1
-        await engine.run_until_quiescent()  # dead ladder, replace, finish
+        await engine.run_until_quiescent()  # dead ladder → requeue (paced)
+        clock.advance(31)  # cross the requeue retry-pacing window
+        await engine.run_until_quiescent()  # re-place, finish
         await _wait_terminal(gated_store, "j1")
         await engine.run_until_quiescent()
 

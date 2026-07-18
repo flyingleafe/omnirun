@@ -40,6 +40,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from omnirun.engine import billing
 from omnirun.engine.jobstream import JobStreams
 from omnirun.engine.outcomes import Unreachable
 from omnirun.engine.providertypes import AsyncProvider, resource_key
@@ -61,29 +62,34 @@ def finish_job(store: Store, job_id: str, ok: bool, now: datetime) -> bool:
         if current is not None and current.placement is not None
         else None
     )
+    paid: list[float] = []
 
     def _mut(rec: JobRecord) -> JobRecord | None:
         if rec.state is not JobState.RUNNING:
             return None
+        paid.clear()
         rec.state = JobState.SUCCEEDED if ok else JobState.FAILED
         status = JobStatus.SUCCEEDED if ok else JobStatus.FAILED
         rec.last_status = StatusReport(status=status, finished_at=now)
         if rec.placement is not None:
+            if rec.placement.cost_actual is not None:
+                paid.append(rec.placement.cost_actual)
             rec.placement.state = status
             rec.placement.ended_at = now
         return rec
 
-    return (
-        cas_step(
-            store,
-            job_id,
-            _mut,
-            actor=_ACTOR,
-            action="finish",
-            data={"ok": 1 if ok else 0, "provider": provider_name},
-        )
-        is not None
+    done = cas_step(
+        store,
+        job_id,
+        _mut,
+        actor=_ACTOR,
+        action="finish",
+        data={"ok": 1 if ok else 0, "provider": provider_name},
     )
+    if done is not None and paid:
+        # Realize the paid placement's committed estimate into the spend.
+        billing.settle(store, job_id, paid[0], now)
+    return done is not None
 
 
 def _mark_dead(store: Store, job_id: str, detail: str) -> bool:
@@ -131,6 +137,7 @@ class Observer:
         silence_threshold_s: float = 120.0,
         silence_thresholds: Mapping[str, float] | None = None,
         ladder_cooldown_s: float = 30.0,
+        use_streams: bool = True,
     ) -> None:
         self._store = store
         self._providers = dict(providers)
@@ -141,6 +148,11 @@ class Observer:
         self._thresholds = dict(silence_thresholds or {})
         self._cooldown = timedelta(seconds=ladder_cooldown_s)
         self._ladder: dict[str, _Ladder] = {}
+        # ``use_streams=False`` is the daemonless catch-up preset: a process
+        # that lives for one command starts no stream tasks — every placed job
+        # goes straight to the batched fallback poll each cycle (exactly the
+        # v1 reconcile cadence); durable logs come from the capture item.
+        self._use_streams = use_streams
 
     def _threshold(self, provider_name: str) -> float:
         return self._thresholds.get(provider_name, self._default_threshold)
@@ -170,6 +182,14 @@ class Observer:
             if placement is None or placement.provider_name not in self._providers:
                 continue
             seen.add(job_id)
+            if not self._use_streams:
+                # Stream-less (catch-up) mode: batch-poll every cycle, honoring
+                # only the per-job cooldown (zero in the catch-up preset).
+                ladder = self._ladder.setdefault(job_id, _Ladder())
+                if ladder.next_at is not None and now < ladder.next_at:
+                    continue
+                pending.setdefault(placement.provider_name, []).append(rec)
+                continue
             if not self._streams.active(job_id):
                 if self._start_stream(job_id, rec, placement.provider_name):
                     changed += 1
@@ -255,8 +275,27 @@ class Observer:
                     changed += 1
                 self._forget(job_id)
             else:
+                self._note_substate(rec, obs.runtime_state)
                 self._bump(job_id, now)
         return changed
+
+    def _note_substate(self, rec: JobRecord, runtime_state: str | None) -> None:
+        """Persist the observed display substatus (``running``/backend-queued)
+        onto ``last_status`` — display data only, no lifecycle event, so a
+        placed job reads honestly in ``ps`` instead of sticking at its
+        optimistic ``starting``."""
+        status = {
+            "alive": JobStatus.RUNNING,
+            "queued": JobStatus.QUEUED,
+        }.get(runtime_state or "")
+        if status is None:
+            return
+        if rec.last_status is not None and rec.last_status.status is status:
+            return
+        try:
+            self._store.update_job_status(rec.spec.job_id, StatusReport(status=status))
+        except KeyError:
+            pass
 
     def _bump(self, job_id: str, now: datetime) -> None:
         ladder = self._ladder.setdefault(job_id, _Ladder())

@@ -1,61 +1,69 @@
-"""Hypothesis stateful test — correctness invariants (spec §11, post-budget removal).
+"""Hypothesis stateful test — correctness invariants over the v2 Engine.
 
 This module is *the* correctness contract of the scheduler. A
 :class:`~hypothesis.stateful.RuleBasedStateMachine` generates random
-interleavings of the scheduler's operations —
+interleavings of the engine's operations —
 
-    submit / run_tick / provider_responds / provider_fails(mode) / cancel /
-    advance_time
+    submit / drive / provider_responds / provider_faults(kind) /
+    toggle_capacity / worker_dead / cancel / advance_time / restart_driver /
+    second_driver_drive
 
-— over the REAL impure :class:`~omnirun.control.Control` driver (which calls the
-pure :func:`~omnirun.scheduler.tick`), a REAL SQLite
+— over the REAL :class:`~omnirun.engine.engine.Engine` (pure ``schedule``
+pass + supervisor work items + observer), a REAL SQLite
 :class:`~omnirun.state.store.Store`, and the deterministic
-:class:`~tests.fakes.FlakyProvider` doubles. After EVERY rule, all seven
-``@invariant()`` methods run and assert the properties that *are* the
-correctness guarantee (spec §11):
+:class:`tests.enginefakes.FakeAsyncProvider` doubles. After EVERY rule the
+``@invariant()`` methods assert the properties that *are* the correctness
+guarantee (spec §11 / DESIGN-V2 §10):
 
-1. admission_soundness  — every placement's provider can satisfy the req.       (#8)
-2. concurrency_safety   — non-terminal placements per provider ≤ its cap.       (#12)
-3. liveness_no_silent_loss — a non-cancelled job is always in a live/terminal set.
-4. cancellation_completeness — a cancelled job has zero live placements + stays cancelled. (#7)
-5. crash_isolation      — a failing provider never crashes the tick nor blocks healthy ones.
-6. tick_convergence     — a second identical tick creates no new placements.
-7. no_stranded_satisfiable_job — a satisfiable job is never left QUEUED after a
-   settled tick (the `?`-limbo fix: daemonless reads advance the same machine).
+1. admission_soundness   — every placement's provider can satisfy the req. (#8/I2-adjacent)
+2. concurrency_safety    — active placements per provider ≤ its cap.        (I2)
+3. liveness_no_silent_loss — a non-cancelled job is always in a live/terminal set. (I3)
+4. cancellation_completeness — a cancelled job's placement is torn down and it
+   stays cancelled forever.                                                  (I4)
+5. running_jobs_carry_handles — a live (non-dead) placement always has the
+   handle later verbs need (crash isolation: a co-scheduled fault never
+   corrupts a healthy placement).
+6. pass_convergence      — after settling, one more pass takes no action.    (I9)
+7. no_stranded_satisfiable_job — with every provider healthy, a satisfiable,
+   non-backing-off job is never left QUEUED after a settled drive (ROBUST-8's
+   `?`-limbo fix: daemonless reads advance the same machine).
 
-The FlakyProvider's ``lose_after_place`` / ``succeed_then_lost`` modes drive LOST
-polls through the reconciler, so this suite also exercises the honest-LOST path
-(reap-then-requeue) — a lost job re-queues (inv 3) without freezing or leaking.
+Plus the **trace gate at teardown** (invariant 8, the Layer-4 conformance
+driver): the store's full ``job_events`` log — everything the interleaving
+did — is exported in both validation views and replayed through the compiled
+formal checker (``formal/.lake/build/bin/trace-check``); ANY violation fails
+the machine. That makes every random interleaving a machine-checked path of
+the verified transition system.
 
-The three that are the *definitive* verifiers of the reviewed correctness fixes
-and the #12 guard are called out in their docstrings (inv 3 = C2 run-late /
-no-starve + reconcile requeue; inv 2 = the atomic ``Store.reserve`` guard).
-
-**At-least-once caveat (spec §7).** The Provider seam is at-least-once across a
-place/crash boundary — a place-failure can leak a backend-side instance that a
-later tick relaunches. Leaked *backend* instances are NOT tracked in the Store
-and are EXPECTED; the fakes do not model them. Every assertion here is therefore
-STORE-LEVEL only (job states, ``count_active_jobs`` ≤ cap). We never assert
-"exactly one live backend instance per job" — that is knowingly false across a
-place failure and would false-fail the suite.
+Faults are injected at the typed-outcome seam (JOB-4): infra failures at any
+place stage, unreachable freezes (I10), capacity contention (re-shop /
+quiet rollback), capture/release failures, and positive worker-death
+evidence driving the dead-placement ladder. ``restart_driver`` rebuilds the
+engine over a reopened store (work-item adoption, ROBUST-2);
+``second_driver_drive`` races a second engine over the same store at
+command granularity (dual-driver, ROBUST-9).
 """
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
+from collections.abc import Coroutine
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, TypeVar
 
 from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
 
-from omnirun.control import Control
+from omnirun.engine.engine import Engine
+from omnirun.engine.outcomes import InfraFailure, Unreachable
+from omnirun.engine.providertypes import BatchObservation
 from omnirun.models import (
     Availability,
     Capabilities,
     Cost,
-    Decision,
     JobPolicy,
     JobRecord,
     JobSpec,
@@ -65,18 +73,20 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.providers.base import Provider
 from omnirun.scheduler import SchedPolicy
 from omnirun.state.store import Store, open_store
-from tests.fakes import FlakyProvider
+from tests.conftest import run_trace_gate
+from tests.enginefakes import FakeAsyncProvider
 
 UTC = timezone.utc
 # A fixed base time; ``advance_time`` only ever moves forward from here.
 BASE_NOW = datetime(2026, 7, 11, 6, 0, 0, tzinfo=UTC)
 
-# The attempts-cap the default-policy Control (built below) applies: a job whose
-# place() genuinely raises this many times is failed rather than retried forever.
+# The attempts-cap the default-policy pass applies: a job whose placement
+# genuinely fails this many times is failed rather than retried forever.
 _ATTEMPTS_CAP = SchedPolicy().max_attempts
+
+_T = TypeVar("_T")
 
 _REPO = RepoRef(
     remote_url="https://github.com/example/repo.git",
@@ -86,130 +96,123 @@ _REPO = RepoRef(
 )
 
 # GPU types the providers advertise. Drawing "H100" (offered by NEITHER
-# provider) forces a HELD job (exercises inv 2/3); None / "T4" / "A100" are
-# placeable. Both providers list exactly {"T4", "A100"} below.
+# provider) forces a HELD job; None / "T4" / "A100" are placeable.
 _OFFERED_GPUS = ["T4", "A100"]
 _DRAWN_GPU_TYPES = [None, "T4", "A100", "H100"]
 
-# Free-provider capacity is set FAR above the step budget so the free slot is
-# never the concurrency bottleneck. inv 2 still asserts
-# ``count_active("free") <= FREE_CAP`` (a real, would-fire-on-overbook check).
-# The PAID provider carries a SMALL cap so inv 2's concurrency guard is genuinely
-# exercised: escalating jobs pile onto it and the atomic ``reserve`` must hold
-# the line at PAID_CAP.
-FREE_CAP = 64
-PAID_CAP = 3
+FREE_CAP = 64  # never the concurrency bottleneck
+PAID_CAP = 3  # small → pile-ups genuinely exercise the capacity guard
+_FREE_WAIT_S = 1800.0  # the free queue wait (paid stays ready-now)
 
-# The free slot carries a real queue wait so jobs wait a bit before being
-# placed. Without this the free slot would win every time and paid escalation
-# would be dead code the suite never exercises.
-_FREE_WAIT_S = 1800.0  # 30 min
-
-
-def _capabilities() -> Capabilities:
-    """Honest, identical capabilities for both providers (offer T4/A100, ≤2 GPUs)."""
-    return Capabilities(gpu_types=list(_OFFERED_GPUS), max_gpus_per_job=2)
-
-
-def _free_slot() -> Slot:
-    """A FREE slot with a 30-min queue wait; large capacity (never the bottleneck)."""
-    return Slot(
-        provider_name="free",
-        capabilities=_capabilities(),
-        cost=Cost(),  # per_hour None → free (costs 0)
-        availability=Availability(kind="queued", wait_s=_FREE_WAIT_S),
-        capacity=FREE_CAP,
-    )
-
-
-def _paid_slot() -> Slot:
-    """A PAID ready-now slot at $2/hr; small capacity (inv 2's real guard subject)."""
-    return Slot(
-        provider_name="paid",
-        capabilities=_capabilities(),
-        cost=Cost(per_hour=2.0),
-        availability=Availability(kind="ready_now", wait_s=0.0),
-        capacity=PAID_CAP,
-    )
-
-
-# Runtimes drawn for jobs. Always set (never None) so a paid slot's cost is
-# KNOWABLE. 0.5h..2h at $2/hr ⇒ $1..$4 per paid job.
 _RUNTIME_CHOICES = [
     timedelta(minutes=30),
     timedelta(hours=1),
     timedelta(hours=2),
 ]
 
-# Real misbehaviour modes the FlakyProvider realizes; each is switched onto a
-# live provider by ``provider_fails`` and exercised by the NEXT tick.
-_FAIL_MODES = [
-    "raise_on_place",
-    "timeout",
-    "drop",
-    "lose_after_place",
-    "succeed_then_lost",
-    "garble",
-    "flapping_place",
+# One-shot typed faults injected at a place/lifecycle stage of one provider.
+_FAULTS: list[tuple[str, type[Exception]]] = [
+    ("rent", InfraFailure),
+    ("boot", InfraFailure),
+    ("launch", InfraFailure),
+    ("rent", Unreachable),
+    ("capture", InfraFailure),
+    ("release", InfraFailure),
 ]
 
-# The benign mode: a FlakyProvider whose mode is NOT a misbehaviour behaves
-# exactly like a well-behaved FakeProvider (no raise, default poll script).
-_OK_MODE = "ok"
+_PROVIDERS = ["free", "paid"]
 
 
-@settings(max_examples=50, stateful_step_count=20, deadline=None)
-class SchedulerInvariants(RuleBasedStateMachine):
-    """Random-interleaving state machine over the real Control loop + fakes."""
+def _capabilities() -> Capabilities:
+    return Capabilities(gpu_types=list(_OFFERED_GPUS), max_gpus_per_job=2)
+
+
+def _free_slot() -> Slot:
+    return Slot(
+        provider_name="free",
+        capabilities=_capabilities(),
+        cost=Cost(),  # per_hour None → free
+        availability=Availability(kind="queued", wait_s=_FREE_WAIT_S),
+        capacity=FREE_CAP,
+        provider_ref={"offer_key": "free-k1"},
+    )
+
+
+def _paid_slot() -> Slot:
+    return Slot(
+        provider_name="paid",
+        capabilities=_capabilities(),
+        cost=Cost(per_hour=2.0),
+        availability=Availability(kind="ready_now", wait_s=0.0),
+        capacity=PAID_CAP,
+        provider_ref={"offer_key": "paid-k1"},
+    )
+
+
+_SLOTS = {"free": _free_slot(), "paid": _paid_slot()}
+
+
+@settings(max_examples=40, stateful_step_count=15, deadline=None)
+class EngineInvariants(RuleBasedStateMachine):
+    """Random-interleaving state machine over the real Engine + fakes."""
 
     def __init__(self) -> None:
         super().__init__()
-        # A fresh temp SQLite DB per machine instance (hypothesis reuses the
-        # class across examples, so the Store must be created here). The temp
-        # dir is left for the OS to reap — no shared state escapes an instance.
         self._tmpdir = Path(tempfile.mkdtemp(prefix="omnirun-inv-"))
-        # Keep the db url on self so ``restart_driver`` can reopen the SAME DB.
         self._db_url = f"sqlite:///{self._tmpdir / 'state.db'}"
         self.store: Store = open_store(self._db_url)
+        # ONE long-lived loop: engine tasks (frozen items, retries) survive
+        # between rules exactly as they do inside one daemon process.
+        self.loop = asyncio.new_event_loop()
 
-        # Two providers with KNOWN, honest slots. Both start in the benign "ok"
-        # mode. ``provider_fails`` swaps a provider for a same-name/same-slots one
-        # in a real failing mode; ``provider_responds`` scripts a specific job's
-        # poll toward SUCCEEDED.
-        # Typed as ``Provider`` (the Control ctor's param type — the dict is
-        # shared BY REFERENCE, so it must be invariance-compatible); the values
-        # are FlakyProviders, narrowed with ``isinstance`` at the one call site
-        # that touches fake internals (``provider_responds``).
-        self.providers: dict[str, Provider] = {
-            "free": FlakyProvider("free", [_free_slot()], mode=_OK_MODE),
-            "paid": FlakyProvider("paid", [_paid_slot()], mode=_OK_MODE),
+        self.fakes: dict[str, FakeAsyncProvider] = {
+            "free": FakeAsyncProvider("free"),
+            "paid": FakeAsyncProvider("paid"),
         }
-        # Track each provider's current mode ourselves (no reach into fakes) so
-        # inv 5 can ask which providers are healthy right now.
-        self.provider_modes: dict[str, str] = {"free": _OK_MODE, "paid": _OK_MODE}
-
-        # Total slot capacity per provider — inv 2 asserts count_active ≤ this.
-        self.provider_cap: dict[str, int] = {"free": FREE_CAP, "paid": PAID_CAP}
-
-        # Control holds the providers dict BY REFERENCE, so swapping an entry in
-        # ``self.providers`` is seen by the driver on the next tick.
-        self.control = Control(self.store, self.providers)
-
-        # A SECOND Control instance, modelling a CLI tick racing the daemon over
-        # the SAME store + providers. Built lazily on first ``second_driver_tick``
-        # and REBUILT whenever ``provider_fails`` swaps a provider (so it never
-        # holds a stale provider reference — the dict is shared by reference, but
-        # a rebuilt Control re-reads it fresh, matching the primary).
-        self.control2: Control | None = None
-
+        self.provider_cap = {"free": FREE_CAP, "paid": PAID_CAP}
         self.now: datetime = BASE_NOW
-        self._seq = 0  # monotonically unique job-id suffix
+        self.engine: Engine = self._make_engine(self.store)
+        self.engine2: Engine | None = None
 
-        # Bookkeeping the invariants read.
+        self._seq = 0
         self.job_ids: list[str] = []
-        self.cancelled_ids: set[str] = set()
-        # Decisions from the most recent run_tick (inv 6 reads these).
-        self.decisions: list[Decision] = []
+        self.cancel_requested: set[str] = set()
+        self.cancel_observed: set[str] = set()  # ids SEEN in CANCELLED
+
+    # ------------------------------------------------------------------
+    # Wiring
+    # ------------------------------------------------------------------
+
+    def _make_engine(self, store: Store) -> Engine:
+        return Engine(
+            store,
+            dict(self.fakes),
+            slots=lambda: [_SLOTS[name].model_copy(deep=True) for name in _PROVIDERS],
+            artifacts_dir=self._tmpdir / "artifacts",
+            now=lambda: self.now,
+            cancel_grace_s=0.05,
+            observe_streams=False,
+            silence_threshold_s=0.0,
+            ladder_cooldown_s=0.0,
+        )
+
+    def _run(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        return self.loop.run_until_complete(coro)
+
+    def _settle(self, engine: Engine | None = None) -> None:
+        eng = engine or self.engine
+        self._run(eng.run_until_quiescent(task_timeout=20.0))
+
+    def _faults_pending(self) -> bool:
+        return (
+            any(queue for fake in self.fakes.values() for queue in fake.fail.values())
+            or any(fake.reject_keys for fake in self.fakes.values())
+            or any(
+                isinstance(v, BatchObservation) and v.runtime_state == "gone"
+                for fake in self.fakes.values()
+                for v in fake.batch.values()
+            )
+        )
 
     # ------------------------------------------------------------------
     # Rules
@@ -220,18 +223,10 @@ class SchedulerInvariants(RuleBasedStateMachine):
         gpus=st.integers(min_value=0, max_value=2),
         runtime=st.sampled_from(_RUNTIME_CHOICES),
     )
-    def submit(
-        self,
-        gpu_type: str | None,
-        gpus: int,
-        runtime: timedelta,
-    ) -> None:
-        """Submit a fresh QUEUED job whose requirement the providers CAN sometimes
-        satisfy (and sometimes not — ``gpu_type="H100"`` is offered by neither →
-        HELD)."""
+    def submit(self, gpu_type: str | None, gpus: int, runtime: timedelta) -> None:
+        """Submit a fresh QUEUED job (sometimes unsatisfiable → HELD)."""
         self._seq += 1
         job_id = f"inv-{self._seq:04d}"
-
         spec = JobSpec(
             job_id=job_id,
             name=f"job{self._seq}",
@@ -240,122 +235,137 @@ class SchedulerInvariants(RuleBasedStateMachine):
             resources=ResourceSpec(gpus=gpus, gpu_type=gpu_type, time=runtime),
             policy=JobPolicy(),
         )
-        self.control.submit(spec, now=self.now)
+        self.engine.submit(spec)
         self.job_ids.append(job_id)
 
     @rule()
-    def run_tick(self) -> None:
-        """One real scheduling round. MUST NOT raise (inv 5 depends on this)."""
-        self.decisions = list(self.control.run_tick(self.now))
+    def drive(self) -> None:
+        """One daemonless catch-up drive. MUST NOT raise (crash isolation)."""
+        self._settle()
 
     @precondition(lambda self: bool(self._running_job_ids()))
     @rule(data=st.data())
     def provider_responds(self, data: st.DataObject) -> None:
-        """Nudge a RUNNING job's poll script toward SUCCEEDED (the next reconcile
-        pops it terminal), realizing progress so jobs finish and free capacity."""
+        """A RUNNING job's worker reports a durable success on the next
+        observation, so jobs finish and free capacity."""
         running = sorted(self._running_job_ids())
         job_id = data.draw(st.sampled_from(running))
-        provider = self._provider_of(job_id)
-        if isinstance(provider, FlakyProvider):
-            # Direct script assignment is the established fake-manipulation idiom
-            # in this suite (see test_control_e2e.py's ``provider._slots = ...``).
-            provider._poll_script[job_id] = [JobStatus.SUCCEEDED]
+        fake = self._fake_of(job_id)
+        if fake is not None:
+            fake.observe[job_id] = True
+            fake.batch[job_id] = BatchObservation(job_id=job_id, result=0)
 
-    @rule(mode=st.sampled_from(_FAIL_MODES), which=st.sampled_from(["free", "paid"]))
-    def provider_fails(self, mode: str, which: str) -> None:
-        """Switch one provider into a real failing *mode* by swapping in a fresh
-        same-name/same-slots FlakyProvider. The NEXT run_tick that touches it
-        exercises crash isolation / no-silent-loss (inv 3/5)."""
-        slot = _free_slot() if which == "free" else _paid_slot()
-        self.providers[which] = FlakyProvider(which, [slot], mode=mode)
-        self.provider_modes[which] = mode
-        # Drop the lazily-built second driver so its NEXT use rebuilds over the
-        # freshly-swapped providers dict (mirrors the primary re-reading the
-        # shared dict by reference).
-        self.control2 = None
+    @rule(
+        fault=st.sampled_from(_FAULTS),
+        which=st.sampled_from(_PROVIDERS),
+    )
+    def provider_faults(self, fault: tuple[str, type[Exception]], which: str) -> None:
+        """Queue ONE typed fault at a stage of one provider — the next work
+        item touching that stage hits it (infra failure → rollback/backoff;
+        unreachable → freeze, I10)."""
+        stage, exc_type = fault
+        self.fakes[which].fail.setdefault(stage, []).append(
+            exc_type(f"{stage} fault on {which}")
+        )
+
+    @rule(which=st.sampled_from(_PROVIDERS), on=st.booleans())
+    def toggle_capacity(self, which: str, on: bool) -> None:
+        """Flip a provider's offer into (out of) capacity contention: rents of
+        its key defer quietly (no attempt, no avoidance)."""
+        key = f"{which}-k1"
+        if on:
+            self.fakes[which].reject_keys.add(key)
+        else:
+            self.fakes[which].reject_keys.discard(key)
+
+    @precondition(lambda self: bool(self._running_job_ids()))
+    @rule(data=st.data())
+    def worker_dead(self, data: st.DataObject) -> None:
+        """Positive death evidence for one RUNNING job: the observer marks it
+        dead and the scheduler runs the capture → release-lost → requeue
+        ladder. The evidence is one-shot (cleared after a bounded number of
+        rounds) so the requeued arc can run."""
+        running = sorted(self._running_job_ids())
+        job_id = data.draw(st.sampled_from(running))
+        fake = self._fake_of(job_id)
+        if fake is None or fake.observe.get(job_id) is not None:
+            return
+        fake.batch[job_id] = BatchObservation(job_id=job_id, runtime_state="gone")
+
+        async def _rounds() -> None:
+            for _ in range(4):
+                await self.engine.observe_once()
+                await self.engine.run_pass()
+                tasks = self.engine.live_work_items()
+                if tasks:
+                    await asyncio.wait(tasks, timeout=20.0)
+
+        self._run(_rounds())
+        fake.batch.pop(job_id, None)
 
     @precondition(lambda self: bool(self._cancellable_job_ids()))
-    @rule(data=st.data())
-    def cancel(self, data: st.DataObject) -> None:
-        """Cancel a tracked non-terminal job; it must reach CANCELLED and stay so."""
+    @rule(data=st.data(), force=st.booleans())
+    def cancel(self, data: st.DataObject, force: bool) -> None:
+        """Cancel a tracked non-terminal job and drive; once CANCELLED it must
+        stay so forever."""
         candidates = sorted(self._cancellable_job_ids())
         job_id = data.draw(st.sampled_from(candidates))
-        self.control.cancel(job_id, self.now)
-        self.cancelled_ids.add(job_id)
+        self.engine.request_cancel(job_id, force=force)
+        self.cancel_requested.add(job_id)
+        self._settle()
 
     @rule(seconds=st.integers(min_value=1, max_value=1200))
     def advance_time(self, seconds: int) -> None:
-        """Move ``now`` forward (bounded so a run never rolls past the UTC day)."""
+        """Move ``now`` forward (crosses backoff/retry/quarantine windows)."""
         self.now = self.now + timedelta(seconds=seconds)
 
     @rule()
     def restart_driver(self) -> None:
-        """Model a daemon crash/redeploy mid-run: close the store, REOPEN it over
-        the SAME db url, and rebuild ``Control`` over the reopened store and the
-        SAME providers dict.
-
-        Every invariant must hold across the restart with NO new allowances —
-        that is the point: the durable store is the only state that survives a
-        process death, so a job's fate is decided entirely by what is persisted.
-        Reopening also re-runs the migration runner, which must be a no-op — this
-        rule implicitly regression-tests migration idempotency under Hypothesis.
-        """
+        """Model a daemon crash/redeploy mid-run: shut the engine down, reopen
+        the SAME database, rebuild the engine. Open work items are ADOPTED
+        (boot mode — counts toward crash-loop quarantine, ROBUST-2); every
+        invariant must hold across the restart with NO new allowances."""
+        self._run(self.engine.shutdown())
         self.store.close()
         self.store = open_store(self._db_url)
-        self.control = Control(self.store, self.providers)
-        # The second driver referenced the now-closed store; drop it so its next
-        # use rebuilds over the reopened one.
-        self.control2 = None
+        self.engine = self._make_engine(self.store)
+        self.engine2 = None
 
     @rule()
-    def second_driver_tick(self) -> None:
-        """Model a CLI tick racing the daemon at command granularity: a SECOND
-        ``Control`` over the SAME store + providers runs one ``run_tick``.
-
-        Interleaved single-thread execution is the model here (true
-        thread-parallelism is the soak test's job). The second driver is built
-        lazily and rebuilt after ``provider_fails``/``restart_driver`` so it never
-        holds a stale provider or a closed store."""
-        if self.control2 is None:
-            self.control2 = Control(self.store, self.providers)
-        self.control2.run_tick(self.now)
+    def second_driver_drive(self) -> None:
+        """A SECOND engine over the SAME store drives to quiescence — the
+        CLI-races-daemon interleaving at command granularity. CAS transitions
+        and the intents PK keep the two drivers consistent."""
+        if self.engine2 is None:
+            self.engine2 = self._make_engine(self.store)
+        self._settle(self.engine2)
 
     # ------------------------------------------------------------------
-    # Invariants (spec §11). Each reads fresh Store state and asserts a REAL,
-    # non-vacuous property after EVERY rule.
+    # Invariants
     # ------------------------------------------------------------------
 
     @invariant()
     def admission_soundness(self) -> None:
-        """§11.1 (#8) — every real placement sits on a provider that can satisfy
-        the job's requirement: at least one of that provider's slots' capabilities
-        ``satisfies`` the req. No job is ever placed where it could not fit."""
+        """§11.1 — every real placement sits on a provider whose slot
+        capabilities can satisfy the job's requirement."""
         for rec in self.store.list_jobs():
             placement = rec.placement
             if placement is None or not placement.handle:
-                continue  # stub / absent placement — not a real launch
-            provider = self.providers.get(placement.provider_name)
-            assert provider is not None, (
+                continue
+            slot = _SLOTS.get(placement.provider_name)
+            assert slot is not None, (
                 f"placement on unknown provider {placement.provider_name}"
             )
-            req = rec.spec.resources
-            fits = any(
-                not slot.capabilities.satisfies(req) for slot in provider.offer(req)
-            )
-            assert fits, (
+            reasons = slot.capabilities.satisfies(rec.spec.resources)
+            assert not reasons, (
                 f"job {rec.spec.job_id} placed on {placement.provider_name} "
-                f"which cannot satisfy {req!r}"
+                f"which cannot satisfy {rec.spec.resources!r}: {reasons}"
             )
 
     @invariant()
     def concurrency_safety(self) -> None:
-        """§11.2 (#12) — DEFINITIVE concurrency CHECK.
-
-        For each provider, the number of PLACING/RUNNING jobs reserved on it never
-        exceeds its total slot capacity. This is the end-to-end proof of the atomic
-        ``Store.reserve`` guard: no provider is over its cap, no slot is
-        double-booked. The PAID provider's small cap (3) makes escalation pile-ups
-        a genuine over-book risk the guard must refuse."""
+        """§11.2 (I2) — PLACING/RUNNING jobs per provider never exceed its
+        slot capacity (the pass's active-accounting + CAS reserve guard)."""
         for name, cap in self.provider_cap.items():
             active = self.store.count_active_jobs(name)
             assert active <= cap, (
@@ -364,22 +374,9 @@ class SchedulerInvariants(RuleBasedStateMachine):
 
     @invariant()
     def liveness_no_silent_loss(self) -> None:
-        """§11.3 — DEFINITIVE C2 CHECK.
-
-        Every tracked, non-cancelled job is ALWAYS in a known live-or-terminal
-        state {QUEUED, HELD, PLACING, RUNNING, SUCCEEDED} — never silently lost,
-        never vanished, never stuck outside the set. An infra failure (the
-        FlakyProvider raise/lose modes) must have returned the job to QUEUED
-        (verified by membership), proving the C2 run-late / no-starve fix and the
-        reconcile requeue path: a dropped/lost job re-queues rather than
-        disappearing or wedging.
-
-        FAILED is admitted as a legitimate terminal outcome ONLY for a job that
-        genuinely hit the attempts-cap — its placement RAISED (``last_error`` set)
-        ``max_attempts`` times. That is the core's deliberate give-up (a
-        raise_on_place / timeout provider can never succeed), not silent loss; a
-        FAILED job WITHOUT a recorded ``last_error`` (or under the cap) WOULD be a
-        bug and is rejected."""
+        """§11.3 (I3) — every tracked, non-cancelled job is in a known
+        live-or-terminal state; FAILED is admitted ONLY as the deliberate
+        attempts-cap give-up (attempts ≥ cap with a recorded last_error)."""
         live = {
             JobState.QUEUED,
             JobState.HELD,
@@ -388,39 +385,28 @@ class SchedulerInvariants(RuleBasedStateMachine):
             JobState.SUCCEEDED,
         }
         for job_id in self.job_ids:
-            if job_id in self.cancelled_ids:
+            if job_id in self.cancel_requested:
                 continue
             rec = self.store.load_job(job_id)
             assert rec is not None, f"job {job_id} vanished from the store"
             if rec.state is JobState.FAILED:
-                # A capped-out placement (place() raised ``max_attempts`` times):
-                # a deliberate give-up, never silent loss.
                 assert rec.last_error is not None and rec.attempts >= _ATTEMPTS_CAP, (
                     f"job {job_id} FAILED without a capped-out placement "
                     f"(attempts={rec.attempts}, last_error={rec.last_error!r})"
                 )
                 continue
-            # Otherwise every non-cancelled job stays in the live set: an infra
-            # failure funnels to requeue (LOST) or release-on-place-raise (→ QUEUED).
             assert rec.state in live, (
                 f"job {job_id} in unexpected state {rec.state} (silent loss?)"
             )
 
     @invariant()
     def cancellation_completeness(self) -> None:
-        """§11.4 (#7) — a cancelled job has ZERO live placements and STAYS cancelled.
-
-        For every job in CANCELLED: its Store placement is either None or terminal
-        (``placement.state.terminal`` with ``ended_at`` set) — no live placement
-        survives. And once a job is cancelled it is never resurrected to
-        RUNNING/PLACING by a later tick (tracked via ``cancelled_ids``): the tick
-        only considers QUEUED/HELD and reconcile only folds PLACING/RUNNING, so
-        CANCELLED is a sink. (Backend-instance reaping is best-effort and not
-        modelled by the fakes — see the module caveat; this asserts the STORE
-        placement only.)"""
+        """§11.4 (I4) — a CANCELLED job has no live placement and, once seen
+        CANCELLED, is never resurrected."""
         for rec in self.store.list_jobs():
             if rec.state is not JobState.CANCELLED:
                 continue
+            self.cancel_observed.add(rec.spec.job_id)
             placement = rec.placement
             if placement is not None:
                 assert placement.state.terminal, (
@@ -430,7 +416,7 @@ class SchedulerInvariants(RuleBasedStateMachine):
                 assert placement.ended_at is not None, (
                     f"cancelled job {rec.spec.job_id} placement has no ended_at"
                 )
-        for job_id in self.cancelled_ids:
+        for job_id in self.cancel_observed:
             rec = self.store.load_job(job_id)
             assert rec is not None, f"cancelled job {job_id} vanished"
             assert rec.state is JobState.CANCELLED, (
@@ -438,98 +424,68 @@ class SchedulerInvariants(RuleBasedStateMachine):
             )
 
     @invariant()
-    def crash_isolation(self) -> None:
-        """§11.5 — a failing provider never crashes the tick, and never leaves a
-        HEALTHY provider's admissions corrupted.
-
-        That ``run_tick`` did not raise is proven structurally: had the last
-        ``run_tick`` rule raised, the state machine would already have errored out
-        before reaching any invariant (a provider in raise/timeout/garble mode must
-        NOT crash the tick — the driver degrades it). The active half asserted
-        here: every RUNNING job on a CURRENTLY-HEALTHY provider carries a real
-        handle, so a co-scheduled provider's failure did not corrupt the healthy
-        provider's placements."""
+    def running_jobs_carry_handles(self) -> None:
+        """§11.5 — a healthy RUNNING placement always carries the handle the
+        live-I/O verbs need (activate persisted it); only a dead-activated
+        placement (positive LOST evidence) may lack one."""
         for rec in self.store.list_jobs():
             if rec.state is not JobState.RUNNING:
                 continue
-            placement = rec.placement
-            if placement is None:
-                continue
-            if self.provider_modes.get(placement.provider_name) != _OK_MODE:
-                continue  # only assert about currently-healthy providers
-            assert placement.handle, (
-                f"RUNNING job {rec.spec.job_id} on healthy provider "
-                f"{placement.provider_name} has no handle"
+            assert rec.placement is not None, (
+                f"RUNNING job {rec.spec.job_id} has no placement"
             )
+            dead = (
+                rec.last_status is not None and rec.last_status.status is JobStatus.LOST
+            )
+            if not dead:
+                assert rec.placement.handle, (
+                    f"RUNNING job {rec.spec.job_id} on "
+                    f"{rec.placement.provider_name} has no handle"
+                )
 
     @invariant()
-    def tick_convergence(self) -> None:
-        """§11.6 — ticking twice on unchanged state creates no NEW placements.
-
-        Run a first tick at ``now`` to SETTLE any pending work (this invariant may
-        fire after a bare ``submit`` with no preceding ``run_tick`` rule, so it
-        cannot assume the state was already drained — settling first is what makes
-        the property well-defined). Then run a SECOND tick at the SAME ``now`` and
-        assert it never RE-places a job the first tick just placed to RUNNING: once
-        the enact loop moves a placed job to RUNNING it leaves the pending set, so
-        a converged state yields no further place for it. A job whose ``attempts``
-        rose between the two ticks was legitimately reverted (LOST / place-raise)
-        and MAY retry — that is liveness, not divergence — so it is excluded; only
-        a still-live RUNNING job re-emitted with UNCHANGED attempts is the
-        double-launch bug this guards against."""
-        first = self.control.run_tick(self.now)
-        # Jobs the first tick actually placed to RUNNING, with their attempt count.
-        running_after_first: dict[str, int] = {}
-        for d in first:
-            if d.kind != "place":
-                continue
-            rec = self.store.load_job(d.job_id)
-            if rec is not None and rec.state is JobState.RUNNING:
-                running_after_first[d.job_id] = rec.attempts
-
-        second = self.control.run_tick(self.now)
-        for d in second:
-            if d.kind != "place" or d.job_id not in running_after_first:
-                continue
-            rec = self.store.load_job(d.job_id)
-            assert rec is not None
-            # Re-placed WITHOUT an intervening revert (attempts unchanged) ⇒ a
-            # still-live job was placed twice ⇒ non-convergence / double-launch.
-            assert rec.attempts != running_after_first[d.job_id], (
-                f"a second identical tick re-placed still-live job {d.job_id} "
-                f"(attempts unchanged at {rec.attempts}) — non-convergence"
-            )
+    def pass_convergence(self) -> None:
+        """§11.6 (I9) — settle, then one more pass over the unchanged store
+        takes NO action (no double-launch, no churn)."""
+        self._settle()
+        acted = self._run(self.engine.run_pass())
+        assert acted == 0, (
+            f"a pass over a settled store still acted ({acted} actions) — "
+            "non-convergence"
+        )
 
     @invariant()
     def no_stranded_satisfiable_job(self) -> None:
-        """The `?`-limbo fix (one machine, two drivers): after settling a tick, a
-        job whose requirement a provider can satisfy is NEVER left QUEUED — the
-        tick places it, so a daemonless read advances it exactly as the daemon
-        would; nothing sits stranded with no backend.
-
-        Guarded on all-providers-healthy: a failing provider legitimately leaves a
-        job it just released QUEUED for the next tick, so the property only holds
-        when no provider is misbehaving. Free capacity (64) is never the
-        bottleneck over the step budget, so a satisfiable job always has room."""
-        if any(mode != _OK_MODE for mode in self.provider_modes.values()):
+        """ROBUST-8's `?`-limbo fix — with every provider healthy, a settled
+        drive never leaves a satisfiable, non-backing-off, item-free job
+        QUEUED: the same engine a daemon runs has advanced it."""
+        if self._faults_pending():
             return
-        self.control.run_tick(self.now)  # settle
+        self._settle()
+        open_intents = {row.job_id for row in self.store.open_intents()}
         for rec in self.store.list_jobs():
             if rec.state is not JobState.QUEUED:
                 continue
+            job_id = rec.spec.job_id
+            if job_id in open_intents or job_id in self.cancel_requested:
+                continue
+            not_before = rec.not_before
+            if not_before is not None:
+                if not_before.tzinfo is None:
+                    not_before = not_before.replace(tzinfo=UTC)
+                if not_before > self.now:
+                    continue  # legitimately backing off
             req = rec.spec.resources
             satisfiable = any(
-                not slot.capabilities.satisfies(req)
-                for provider in self.providers.values()
-                for slot in provider.offer(req)
+                not slot.capabilities.satisfies(req) for slot in _SLOTS.values()
             )
             assert not satisfiable, (
-                f"job {rec.spec.job_id} left QUEUED despite a fitting free slot "
-                "(stranded — the tick should have placed it)"
+                f"job {job_id} left QUEUED despite a fitting healthy slot "
+                "(stranded — the drive should have placed it)"
             )
 
     # ------------------------------------------------------------------
-    # helpers reading current Store / provider state
+    # Helpers
     # ------------------------------------------------------------------
 
     def _running_job_ids(self) -> list[str]:
@@ -540,19 +496,23 @@ class SchedulerInvariants(RuleBasedStateMachine):
     def _cancellable_job_ids(self) -> list[str]:
         return [r.spec.job_id for r in self.store.list_jobs() if not r.state.terminal]
 
-    def _provider_of(self, job_id: str) -> Provider | None:
+    def _fake_of(self, job_id: str) -> FakeAsyncProvider | None:
         rec: JobRecord | None = self.store.load_job(job_id)
         if rec is None or rec.placement is None:
             return None
-        return self.providers.get(rec.placement.provider_name)
+        return self.fakes.get(rec.placement.provider_name)
 
     def teardown(self) -> None:
-        """Close the per-instance Store (the temp dir is left for the OS)."""
-        self.store.close()
+        """Shut the engine(s) down, then replay the WHOLE interleaving's event
+        log through the compiled formal checker (the Layer-4 trace gate)."""
+        try:
+            self._run(self.engine.shutdown())
+            if self.engine2 is not None:
+                self._run(self.engine2.shutdown())
+            run_trace_gate(self.store, self._tmpdir)
+        finally:
+            self.store.close()
+            self.loop.close()
 
 
-# Wrap as a pytest TestCase. ``@settings`` on the machine class above sets the
-# example budget (50 examples × 20 steps: a wide interleaving space of the six
-# rules with all six invariants checked after each step; ``deadline=None``
-# avoids per-step SQLite-timing flakiness).
-TestSchedulerInvariants = SchedulerInvariants.TestCase
+TestEngineInvariants = EngineInvariants.TestCase

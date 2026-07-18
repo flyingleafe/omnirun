@@ -262,7 +262,10 @@ def test_capacity_exhausted_rolls_back_quietly(
     assert rec is not None
     assert rec.state is JobState.QUEUED
     assert rec.attempts == 0 and rec.last_error is None
-    assert rec.avoid_backends == {} and rec.not_before is None
+    assert rec.avoid_backends == {}
+    # Not a failure — but the retry IS paced, so a catch-up drive defers
+    # instead of hammering the full provider in a hot loop.
+    assert rec.not_before is not None
 
 
 def test_unreachable_freezes_everything(gated_store: Store, tmp_path: Path) -> None:

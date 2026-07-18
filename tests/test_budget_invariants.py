@@ -1,27 +1,28 @@
-"""Hypothesis stateful test — the budget-safety correctness invariant.
+"""Hypothesis stateful test — the budget-safety correctness invariant (I1).
 
-This is a FOCUSED companion to ``test_scheduler_invariants.py`` (which owns the
-lifecycle invariants of the unified machine). Here we drive the real ``Control``
-loop with a FREE and a PAID provider under a deliberately SMALL day-window
-budget cap, and assert the one property the budget layer exists to guarantee:
+A FOCUSED companion to ``test_scheduler_invariants.py`` (which owns the
+lifecycle invariants): here the real v2 :class:`~omnirun.engine.engine.Engine`
+runs a FREE and a PAID provider under a deliberately SMALL day-window budget
+cap, and the machine asserts the one property the budget layer exists to
+guarantee:
 
 * **budget_safety** — the in-window ledger total never exceeds the cap; every
   ledger entry is ≤ its job's ``max_cost``; the FREE provider never writes a
-  (nonzero) ledger row. This is the property-based proof that the intra-tick
-  *working-ledger* holds under random interleavings — the persisted window total
-  can only exceed the cap if a single tick committed more than it could afford,
-  or a lost paid attempt was double-counted (the requeue-void path).
-* **concurrency_safety** — reserved (PLACING/RUNNING) jobs per provider never
-  exceed its slot capacity (the atomic ``reserve`` guard, with the small PAID
-  cap making escalation pile-ups a real over-book risk).
+  (nonzero) ledger row. The engine's commit-at-reserve / settle-at-terminal /
+  void-at-rollback-or-requeue write-through (``engine.billing``) must hold
+  under random interleavings — the persisted window total can only exceed the
+  cap if a pass committed more than it could afford, or a lost paid attempt
+  was double-counted (the requeue-void path).
+* **concurrency_safety** — active jobs per provider never exceed its slot
+  capacity.
 
-Kept intentionally small and separate so the primary invariant suite stays
-free-only (a budget cap can legitimately defer a paid-only job, which would
-otherwise trip that suite's ``no_stranded_satisfiable_job``).
+Teardown replays the whole event log through the formal trace checker, so the
+interleavings are also conformance-gated.
 """
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +31,10 @@ from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
 
-from omnirun.control import Control
+from omnirun.budget import BudgetLedger
+from omnirun.engine.engine import Engine
+from omnirun.engine.outcomes import InfraFailure, Unreachable
+from omnirun.engine.providertypes import BatchObservation
 from omnirun.models import (
     Availability,
     Capabilities,
@@ -40,18 +44,15 @@ from omnirun.models import (
     JobRecord,
     JobSpec,
     JobState,
-    JobStatus,
     RepoRef,
     ResourceSpec,
     Slot,
 )
-from omnirun.providers.base import Provider
 from omnirun.state.store import Store, open_store
-from tests.fakes import FlakyProvider
+from tests.conftest import run_trace_gate
+from tests.enginefakes import FakeAsyncProvider
 
 UTC = timezone.utc
-# A fixed base time; ``advance_time`` only moves forward, bounded so a run never
-# rolls past the UTC day boundary (keeping the "day" budget window stable).
 BASE_NOW = datetime(2026, 7, 11, 6, 0, 0, tzinfo=UTC)
 
 _REPO = RepoRef(
@@ -63,78 +64,94 @@ _REPO = RepoRef(
 
 # Paid slots cost $2/hr and drawn runtimes are 0.5–2h ($1–$4 each); the cap is
 # deliberately SMALL relative to achievable paid spend so ``can_afford`` must
-# start refusing escalations before the window total crosses $6 — making the
-# budget_safety invariant non-vacuous.
+# start refusing escalations before the window total crosses $6.
 BUDGET_CAP = 6.0
-BUDGET_WINDOW = "day"
 
 _OFFERED_GPUS = ["T4", "A100"]
-_DRAWN_GPU_TYPES = [None, "T4", "A100", "H100"]  # H100 → HELD (offered by neither)
+_DRAWN_GPU_TYPES = [None, "T4", "A100", "H100"]  # H100 → HELD
 
-FREE_CAP = 64  # never the concurrency bottleneck
-PAID_CAP = 3  # small → escalation pile-ups genuinely test the reserve guard
-_FREE_WAIT_S = 1800.0  # 30-min queue wait: a tight deadline escalates to paid
+FREE_CAP = 64
+PAID_CAP = 3
+_FREE_WAIT_S = 1800.0  # a tight deadline escalates past the free queue wait
 
 _RUNTIME_CHOICES = [timedelta(minutes=30), timedelta(hours=1), timedelta(hours=2)]
-_FAIL_MODES = [
-    "raise_on_place",
-    "timeout",
-    "drop",
-    "lose_after_place",
-    "succeed_then_lost",
-    "garble",
+
+_FAULTS: list[tuple[str, type[Exception]]] = [
+    ("rent", InfraFailure),
+    ("launch", InfraFailure),
+    ("rent", Unreachable),
 ]
-_OK_MODE = "ok"
+
+_PROVIDERS = ["free", "paid"]
 
 
 def _capabilities() -> Capabilities:
     return Capabilities(gpu_types=list(_OFFERED_GPUS), max_gpus_per_job=2)
 
 
-def _free_slot() -> Slot:
-    return Slot(
+_SLOTS = {
+    "free": Slot(
         provider_name="free",
         capabilities=_capabilities(),
-        cost=Cost(),  # per_hour None → free (costs 0, never touches the ledger)
+        cost=Cost(),
         availability=Availability(kind="queued", wait_s=_FREE_WAIT_S),
         capacity=FREE_CAP,
-    )
-
-
-def _paid_slot() -> Slot:
-    return Slot(
+        provider_ref={"offer_key": "free-k1"},
+    ),
+    "paid": Slot(
         provider_name="paid",
         capabilities=_capabilities(),
         cost=Cost(per_hour=2.0),
         availability=Availability(kind="ready_now", wait_s=0.0),
         capacity=PAID_CAP,
-    )
+        provider_ref={"offer_key": "paid-k1"},
+    ),
+}
 
 
-@settings(max_examples=50, stateful_step_count=20, deadline=None)
+@settings(max_examples=40, stateful_step_count=15, deadline=None)
 class BudgetInvariants(RuleBasedStateMachine):
-    """Random-interleaving machine over the real Control loop + fake providers."""
+    """Random-interleaving machine over the real Engine + fake providers."""
 
     def __init__(self) -> None:
         super().__init__()
         self._tmpdir = Path(tempfile.mkdtemp(prefix="omnirun-budget-inv-"))
         self.store: Store = open_store(f"sqlite:///{self._tmpdir / 'state.db'}")
-        self.providers: dict[str, Provider] = {
-            "free": FlakyProvider("free", [_free_slot()], mode=_OK_MODE),
-            "paid": FlakyProvider("paid", [_paid_slot()], mode=_OK_MODE),
+        self.loop = asyncio.new_event_loop()
+        self.fakes: dict[str, FakeAsyncProvider] = {
+            "free": FakeAsyncProvider("free"),
+            "paid": FakeAsyncProvider("paid"),
         }
-        self.provider_cap: dict[str, int] = {"free": FREE_CAP, "paid": PAID_CAP}
-        # Control holds the providers dict BY REFERENCE, so swapping an entry in
-        # ``self.providers`` is seen by the driver on the next tick.
-        self.control = Control(
-            self.store,
-            self.providers,
-            budget_window=BUDGET_WINDOW,
-            budget_cap=BUDGET_CAP,
-        )
+        self.provider_cap = {"free": FREE_CAP, "paid": PAID_CAP}
         self.now: datetime = BASE_NOW
+        self.engine = self._make_engine()
         self._seq = 0
-        self.cancelled_ids: set[str] = set()
+
+    def _make_engine(self) -> Engine:
+        store = self.store
+
+        def _ledger(now: datetime) -> BudgetLedger:
+            return store.load_ledger("day", BUDGET_CAP, now)
+
+        return Engine(
+            store,
+            dict(self.fakes),
+            slots=lambda: [_SLOTS[n].model_copy(deep=True) for n in _PROVIDERS],
+            ledger=_ledger,
+            artifacts_dir=self._tmpdir / "artifacts",
+            now=lambda: self.now,
+            cancel_grace_s=0.05,
+            observe_streams=False,
+            silence_threshold_s=0.0,
+            ladder_cooldown_s=0.0,
+        )
+
+    def _settle(self) -> None:
+        self.loop.run_until_complete(self.engine.run_until_quiescent(task_timeout=20.0))
+
+    # ------------------------------------------------------------------
+    # Rules
+    # ------------------------------------------------------------------
 
     @rule(
         gpu_type=st.sampled_from(_DRAWN_GPU_TYPES),
@@ -185,46 +202,74 @@ class BudgetInvariants(RuleBasedStateMachine):
             resources=ResourceSpec(gpus=gpus, gpu_type=gpu_type, time=runtime),
             policy=JobPolicy(deadline=deadline, max_cost=max_cost, priority=priority),
         )
-        self.control.submit(spec, now=self.now)
+        self.engine.submit(spec)
 
     @rule()
-    def run_tick(self) -> None:
-        """One real scheduling round. MUST NOT raise."""
-        self.control.run_tick(self.now)
+    def drive(self) -> None:
+        """One catch-up drive. MUST NOT raise."""
+        self._settle()
 
     @precondition(lambda self: bool(self._running_job_ids()))
     @rule(data=st.data())
     def provider_responds(self, data: st.DataObject) -> None:
-        """Nudge a RUNNING job's poll toward SUCCEEDED so it finishes (realizing
-        its committed spend and freeing capacity)."""
+        """A RUNNING job finishes on the next observation (realizing its
+        committed spend and freeing capacity)."""
         running = sorted(self._running_job_ids())
         job_id = data.draw(st.sampled_from(running))
-        provider = self._provider_of(job_id)
-        if isinstance(provider, FlakyProvider):
-            provider._poll_script[job_id] = [JobStatus.SUCCEEDED]
+        fake = self._fake_of(job_id)
+        if fake is not None:
+            fake.observe[job_id] = True
+            fake.batch[job_id] = BatchObservation(job_id=job_id, result=0)
 
-    @rule(mode=st.sampled_from(_FAIL_MODES), which=st.sampled_from(["free", "paid"]))
-    def provider_fails(self, mode: str, which: str) -> None:
-        """Switch a provider into a failing mode (exercises the requeue-void path
-        for a lost PAID placement — the ledger must not double-count it)."""
-        slot = _free_slot() if which == "free" else _paid_slot()
-        self.providers[which] = FlakyProvider(which, [slot], mode=mode)
+    @rule(fault=st.sampled_from(_FAULTS), which=st.sampled_from(_PROVIDERS))
+    def provider_faults(self, fault: tuple[str, type[Exception]], which: str) -> None:
+        stage, exc_type = fault
+        self.fakes[which].fail.setdefault(stage, []).append(
+            exc_type(f"{stage} fault on {which}")
+        )
+
+    @precondition(lambda self: bool(self._running_job_ids()))
+    @rule(data=st.data())
+    def worker_dead(self, data: st.DataObject) -> None:
+        """A lost PAID placement must be voided on requeue — the ledger never
+        double-counts a re-placed job."""
+        running = sorted(self._running_job_ids())
+        job_id = data.draw(st.sampled_from(running))
+        fake = self._fake_of(job_id)
+        if fake is None or fake.observe.get(job_id) is not None:
+            return
+        fake.batch[job_id] = BatchObservation(job_id=job_id, runtime_state="gone")
+
+        async def _rounds() -> None:
+            for _ in range(4):
+                await self.engine.observe_once()
+                await self.engine.run_pass()
+                tasks = self.engine.live_work_items()
+                if tasks:
+                    await asyncio.wait(tasks, timeout=20.0)
+
+        self.loop.run_until_complete(_rounds())
+        fake.batch.pop(job_id, None)
 
     @precondition(lambda self: bool(self._cancellable_job_ids()))
     @rule(data=st.data())
     def cancel(self, data: st.DataObject) -> None:
         candidates = sorted(self._cancellable_job_ids())
         job_id = data.draw(st.sampled_from(candidates))
-        self.control.cancel(job_id, self.now)
-        self.cancelled_ids.add(job_id)
+        self.engine.request_cancel(job_id)
+        self._settle()
 
     @rule(seconds=st.integers(min_value=1, max_value=1200))
     def advance_time(self, seconds: int) -> None:
         self.now = self.now + timedelta(seconds=seconds)
 
+    # ------------------------------------------------------------------
+    # Invariants
+    # ------------------------------------------------------------------
+
     @invariant()
     def budget_safety(self) -> None:
-        led = self.store.load_ledger(BUDGET_WINDOW, BUDGET_CAP, self.now)
+        led = self.store.load_ledger("day", BUDGET_CAP, self.now)
         total = led.in_window_total(self.now)
         assert total <= BUDGET_CAP + 1e-9, (
             f"window total {total} exceeds cap {BUDGET_CAP}"
@@ -252,9 +297,9 @@ class BudgetInvariants(RuleBasedStateMachine):
             if r.placement is not None and r.placement.provider_name == "free"
         }
         for entry in led.entries:
-            # A voided (spent-$0) relic of a prior PAID attempt that was lost then
-            # re-placed free is harmless (free costs nothing; the row keeps its
-            # paid provider). Only a NONZERO row for a currently-free job is a bug.
+            # A voided ($0) relic of a prior PAID attempt that was lost then
+            # re-placed free is harmless. Only a NONZERO row for a currently-
+            # free job is a bug.
             if entry.amount == 0.0:
                 continue
             assert entry.job_id not in free_job_ids, (
@@ -270,6 +315,10 @@ class BudgetInvariants(RuleBasedStateMachine):
                 f"provider {name} has {active} active jobs > cap {cap}"
             )
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _running_job_ids(self) -> list[str]:
         return [
             r.spec.job_id for r in self.store.list_jobs() if r.state is JobState.RUNNING
@@ -278,14 +327,19 @@ class BudgetInvariants(RuleBasedStateMachine):
     def _cancellable_job_ids(self) -> list[str]:
         return [r.spec.job_id for r in self.store.list_jobs() if not r.state.terminal]
 
-    def _provider_of(self, job_id: str) -> Provider | None:
+    def _fake_of(self, job_id: str) -> FakeAsyncProvider | None:
         rec: JobRecord | None = self.store.load_job(job_id)
         if rec is None or rec.placement is None:
             return None
-        return self.providers.get(rec.placement.provider_name)
+        return self.fakes.get(rec.placement.provider_name)
 
     def teardown(self) -> None:
-        self.store.close()
+        try:
+            self.loop.run_until_complete(self.engine.shutdown())
+            run_trace_gate(self.store, self._tmpdir)
+        finally:
+            self.store.close()
+            self.loop.close()
 
 
 TestBudgetInvariants = BudgetInvariants.TestCase

@@ -138,3 +138,35 @@ class BudgetLedger(BaseModel):
             spent_entry if i == committed_idx else e for i, e in enumerate(self.entries)
         ]
         return self.model_copy(update={"entries": new_entries})
+
+
+class DualWindowLedger(BudgetLedger):
+    """A primary-window ledger that ALSO enforces a secondary window.
+
+    The pure scheduling pass takes ONE ledger; when both a day and a week cap
+    are configured the one wallet must satisfy BOTH ceilings. This subclass
+    keeps the primary window's behavior (totals, window attribution) and ANDs
+    ``can_afford`` with the secondary ledger's answer; ``commit`` reserves in
+    both, so intra-pass commitments count against both ceilings. Still pure —
+    every operation returns a new instance.
+    """
+
+    secondary: BudgetLedger | None = None
+
+    def can_afford(self, amount: float, now: datetime) -> bool:
+        if not super().can_afford(amount, now):
+            return False
+        return self.secondary is None or self.secondary.can_afford(amount, now)
+
+    def commit(
+        self,
+        job_id: str,
+        provider: str,
+        amount: float,
+        now: datetime,
+    ) -> "DualWindowLedger":
+        new = super().commit(job_id, provider, amount, now)
+        assert isinstance(new, DualWindowLedger)  # model_copy preserves the class
+        if self.secondary is not None:
+            new.secondary = self.secondary.commit(job_id, provider, amount, now)
+        return new

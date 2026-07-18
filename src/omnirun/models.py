@@ -362,7 +362,7 @@ class JobState(str, enum.Enum):
 
     QUEUED = "queued"
     HELD = "held"  # admitted but no suitable slot found; retried each tick
-    PLACING = "placing"  # tick emitted a ``place`` Decision; provider.place in flight
+    PLACING = "placing"  # the pass Reserved it; the place work item in flight
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -544,15 +544,6 @@ class Status(BaseModel):
     state: JobStatus
     exit_code: int | None = None
     detail: str = ""
-
-
-class Decision(BaseModel):
-    """Output of one ``tick`` call for a single job."""
-
-    kind: Literal["place", "hold", "requeue", "noop", "fail"]
-    job_id: str
-    slot: Slot | None = None
-    reason: str = ""
 
 
 class CancelMode(str, enum.Enum):

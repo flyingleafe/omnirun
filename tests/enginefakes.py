@@ -195,6 +195,12 @@ class FakeAsyncProvider:
     async def wait_ready(self, external_key: str) -> None:
         await self._stage("boot", external_key)
 
+    def placement_handle(self, job_id: str) -> dict[str, object] | None:
+        key = resource_key(job_id)
+        if key in self.cloud.resources:
+            return {"id": job_id}
+        return None
+
     async def launch(self, job: JobRecord, external_key: str) -> None:
         await self._stage("launch", job.spec.job_id)
         # A launch starts a NEW canonical stream (next scripted attempt).

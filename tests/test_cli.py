@@ -6,7 +6,7 @@ import types
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -102,6 +102,10 @@ class StubBackend(Backend):
         yield '@omnirun:{"ev":"phase","phase":"run","t":1}'
         yield "hello from stub"
         yield f"following={follow}"
+        # The bootstrap always ends the canonical stream with the exit
+        # sentinel; the engine's follow path relies on it (a bare EOF is a
+        # connection loss and reconnects).
+        yield '@omnirun:{"ev":"exit","code":0,"t":2}'
 
     def cancel(self, handle: JobHandle, mode: CancelMode = CancelMode.GRACEFUL) -> None:
         type(self).cancelled.append(handle.job_id)
@@ -294,7 +298,7 @@ def test_submit_failed_placement_leaves_retryable_queued_job(env):
     )
     assert result.exit_code == 0, result.output  # job persists; user informed
     assert "queued" in result.output
-    assert "later tick" in result.output
+    assert "later omnirun command" in result.output  # JOB-5: who advances it
 
     ids = _store().list_job_ids()
     assert len(ids) == 1  # QUEUED record survives for a retry
@@ -629,8 +633,10 @@ def test_cli_cancel_force_passes_force_mode(env, monkeypatch):
     job_id = submit_one()
     result = runner.invoke(app, ["cancel", "--force", job_id])
     assert result.exit_code == 0, result.output
-    # --force skips the graceful window entirely: only a FORCE cancel is issued.
-    assert modes == [CancelMode.FORCE]
+    # --force skips the graceful window entirely: no GRACEFUL signal is ever
+    # issued (the reap work item may force-kill again while confirming the
+    # release — that is idempotent teardown, still never graceful).
+    assert modes and all(m is CancelMode.FORCE for m in modes)
     # No graceful wait, so no "waiting…" heads-up line.
     assert "graceful shutdown" not in result.output
 
@@ -910,11 +916,14 @@ def test_gc_all_tolerates_cancel_failure(env, monkeypatch):
     monkeypatch.setattr(StubBackend, "cancel", boom)
     result = runner.invoke(app, ["gc", "--all"])
     assert result.exit_code == 0, result.output
-    assert "1 cleaned" in result.output  # gc proceeded despite the failed cancel
+    # v2: a cancel the platform cannot honor is a LOUD failure — the job stays
+    # placed (never silently marked cancelled over a live worker) and gc skips
+    # it as non-terminal; the diagnostic is narrated.
+    assert "cancel of " + job_id + " FAILED" in result.output
+    assert "1 skipped" in result.output
     rec = _store().load_job(job_id)
     assert rec is not None
-    # cancel is best-effort; the job is still marked CANCELLED despite the failure
-    assert rec.state is JobState.CANCELLED
+    assert rec.state is JobState.RUNNING
 
 
 def test_backends_check_green(env):
@@ -1182,33 +1191,32 @@ def test_budget_show_reads_ledger_spend(env):
     assert "20" in result.output  # cap
 
 
-def test_daemonless_submit_control_built_with_config_budget_caps(env, monkeypatch):
+def test_daemonless_submit_engine_ledger_uses_config_budget_caps(env, monkeypatch):
     """A ``[budget]`` config with daily+weekly is threaded into the daemonless
-    ``submit`` path's ``Control`` as the day cap AND the weekly cap."""
-    from omnirun.control import Control as _Control
-    from omnirun.providers import Provider as _Provider
+    engine's pass ledger: the day cap as the primary window and the weekly cap
+    as the enforced secondary window (one wallet, two ceilings)."""
+    from collections.abc import Callable
+    from datetime import datetime, timezone
+
+    from omnirun.budget import BudgetLedger, DualWindowLedger
+    from omnirun.client import _Session
 
     env.config_file.write_text(BASE_CONFIG + "\n[budget]\ndaily = 7.0\nweekly = 40.0\n")
-    built: list[_Control] = []
+    captured: list[Callable[[datetime], BudgetLedger]] = []
+    orig = _Session.__init__
 
-    class RecordingControl(_Control):
-        def __init__(
-            self,
-            store: Store,
-            providers: dict[str, _Provider],
-            **kwargs: object,
-        ) -> None:
-            super().__init__(store, providers, **kwargs)  # pyright: ignore[reportArgumentType]
-            built.append(self)
+    def _recording(self: _Session, *args: Any, **kwargs: Any) -> None:
+        orig(self, *args, **kwargs)
+        captured.append(self.engine._ledger)
 
-    monkeypatch.setattr("omnirun.client.Control", RecordingControl)
+    monkeypatch.setattr(_Session, "__init__", _recording)
     result = runner.invoke(app, ["submit", "--", "python", "train.py"])
     assert result.exit_code == 0, result.output
-    assert built, "submit did not build a Control"
-    control = built[0]
-    assert control._budget_cap == 7.0
-    assert control._week_cap == 40.0
-    assert control._budget_window == "day"
+    assert captured, "submit did not build an engine session"
+    ledger = captured[0](datetime.now(timezone.utc))
+    assert isinstance(ledger, DualWindowLedger)
+    assert ledger.cap == 7.0
+    assert ledger.secondary is not None and ledger.secondary.cap == 40.0
 
 
 # ------------------------------------------------------------------ regression: CLI ergonomics
@@ -1378,10 +1386,10 @@ def test_queue_wait_requires_a_running_daemon(env):
 
 
 def test_cli_cancel_no_wait_signals_then_next_read_reaps(env):
-    """`cancel --no-wait` sends ONE cancel signal, marks the job CANCELLED with
-    reaped=False (placement kept), and prints the deferred-release line. A later
-    read (`ps`, which drives a tick daemonlessly) force-reaps it via the terminal
-    catch-up."""
+    """`cancel --no-wait` leaves a durable cancel intent (no teardown here) and
+    prints the deferred-release line. The next read (`ps`, whose daemonless
+    catch-up adopts the intent) completes the cancel: CANCELLED, captured,
+    reaped."""
     job_id = submit_one()  # RUNNING on the stub
 
     result = runner.invoke(app, ["cancel", "--no-wait", job_id])
@@ -1391,18 +1399,21 @@ def test_cli_cancel_no_wait_signals_then_next_read_reaps(env):
 
     signalled = _store().load_job(job_id)
     assert signalled is not None
-    assert signalled.state is JobState.CANCELLED
-    assert signalled.reaped is False  # not yet reaped — next tick finishes it
-    assert signalled.placement is not None
-    assert StubBackend.cancelled == [job_id]  # exactly one cancel signal so far
+    # v2 no-wait: nothing torn down yet — the intent IS the durable request.
+    assert signalled.state is JobState.RUNNING
+    assert StubBackend.cancelled == []  # no signal sent yet
+    intent = _store().get_intent(job_id)
+    assert intent is not None and intent.kind == "cancel"
 
-    # A daemonless `ps` drives a tick whose terminal catch-up force-reaps it.
+    # A daemonless `ps` catch-up adopts the intent and completes the cancel.
     result = runner.invoke(app, ["ps"])
     assert result.exit_code == 0, result.output
-    assert "released cancelled placement" in result.output
+    assert "cancelled " + job_id in result.output
     after = _store().load_job(job_id)
     assert after is not None
+    assert after.state is JobState.CANCELLED
     assert after.reaped is True
+    assert job_id in StubBackend.cancelled
 
 
 # ---------------------------------------- daemon-address selection (flags/env/toml)

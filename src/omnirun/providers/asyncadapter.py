@@ -44,6 +44,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
+from typing import Any
 
 from omnirun.backends.base import Backend, BackendUnreachable, OfferGoneError
 from omnirun.backends.base import CapacityError as SeamCapacityError
@@ -171,6 +172,11 @@ class AsyncBackendProvider:
             raise self._outcome(e) from e
         self._handles[job_id] = launched
 
+    def placement_handle(self, job_id: str) -> dict[str, Any] | None:
+        """The launched/adopted handle's data (persisted at ``activate``)."""
+        handle = self._handles.get(job_id)
+        return dict(handle.data) if handle is not None else None
+
     # -- lifecycle ------------------------------------------------------
 
     async def cancel_placement(self, job: JobRecord, *, force: bool = False) -> None:
@@ -188,6 +194,8 @@ class AsyncBackendProvider:
         if handle is None:
             raise InfraFailure(f"no placement recorded for {job.spec.job_id}")
         placement = self._placement(job.spec.job_id, handle)
+        outputs_dir = sink / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
         try:
             # From-zero durable log read, streamed line-by-line to the file
             # (bounded memory, OBS-3/H1), then the pull-only outputs capture
@@ -195,9 +203,7 @@ class AsyncBackendProvider:
             await asyncio.to_thread(
                 self._inner.capture_logs, placement, sink / "log.txt"
             )
-            await asyncio.to_thread(
-                self._backend.capture_outputs, handle, sink / "outputs"
-            )
+            await asyncio.to_thread(self._backend.capture_outputs, handle, outputs_dir)
         except BaseException as e:
             raise self._outcome(e) from e
 
@@ -328,7 +334,15 @@ class AsyncBackendProvider:
                 return
             _put(loop, queue, stop, None)
 
-        pump = loop.run_in_executor(None, _pump)
+        # A dedicated DAEMON thread, not the default executor: a pump blocked
+        # inside a follow-tail that yields nothing (a quiet worker) can only be
+        # abandoned, and an abandoned executor thread would keep the process
+        # alive at exit (the interpreter joins non-daemon threads). The daemon
+        # thread dies with the process; ``stop`` retires it at the next line.
+        pump = threading.Thread(
+            target=_pump, name=f"omnirun-stream-{job.spec.job_id}", daemon=True
+        )
+        pump.start()
         try:
             while True:
                 item = await queue.get()
@@ -341,7 +355,6 @@ class AsyncBackendProvider:
             stop.set()
             while not queue.empty():  # unblock a pump stuck on a full queue
                 queue.get_nowait()
-            await asyncio.wait([pump])
 
     # -- helpers --------------------------------------------------------
 

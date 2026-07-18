@@ -1,9 +1,17 @@
-"""Tests for the pure scheduler tick (``omnirun.scheduler``).
+"""Tests for the pure scheduling pass (``omnirun.scheduler.schedule``).
 
 Every test builds ``Slot`` / ``JobRecord`` / ``BudgetLedger`` by hand with a
 fixed ``datetime`` — no DB, no network, no wall-clock. Each test pins exactly
-one rule of the tick's semantics (spec §7 steps 2–6).
-"""
+one rule of the pass's matching semantics (admission/hold, ranking, deadline
+vs. paid escalation, run-late, pins, budget, attempts-cap).
+
+The tests predate the v2 pass (they drove v1's ``tick``); a thin local
+``tick`` adapter maps ``schedule``'s typed decisions back onto the old
+``(kind, job_id, slot, reason)`` shape so each pinned rule keeps its original
+statement. Two v2 semantics differences are asserted where they bite:
+distinct-offer assignment (SCHED-11 — one Reserve per offer key per pass) and
+active-job capacity accounting (the pass nets PLACING/RUNNING jobs out of the
+snapshot itself)."""
 
 from __future__ import annotations
 
@@ -12,12 +20,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from omnirun.budget import BudgetLedger, LedgerEntry
+from dataclasses import dataclass as _dataclass
+
 from omnirun.models import (
     Availability,
     Capabilities,
     Cost,
     Deadline,
-    Decision,
     JobPolicy,
     JobRecord,
     JobSpec,
@@ -26,7 +35,60 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.scheduler import SchedPolicy, tick
+from omnirun.budget import BudgetLedger as _Ledger
+from omnirun.scheduler import (
+    Fail,
+    Hold,
+    Reserve,
+    SchedPolicy,
+    Snapshot,
+    schedule,
+)
+
+
+@_dataclass
+class Decision:
+    """The v1 decision shape the assertions below were written against."""
+
+    kind: str
+    job_id: str
+    slot: Slot | None = None
+    reason: str = ""
+
+
+def tick(
+    jobs: list[JobRecord],
+    slots: list[Slot],
+    ledger: _Ledger,
+    now: datetime,
+    *,
+    policy: SchedPolicy | None = None,
+) -> list[Decision]:
+    """Drive the v2 pass over a bare-jobs snapshot; fold to v1 shapes.
+
+    v1's tick could assign one slot up to ``capacity`` times per round; the
+    v2 pass assigns each distinct OFFER at most once (SCHED-11). To keep the
+    original multi-place statements, a capacity-N slot is presented as N
+    distinct offers of the same shape (which is what a real provider's offer
+    list looks like) — provider-level capacity accounting still holds because
+    every copy carries the provider's full capacity and each Reserve
+    decrements all of a provider's slots."""
+    expanded: list[Slot] = []
+    for slot in slots:
+        expanded.extend(
+            slot.model_copy(deep=True) for _ in range(max(1, slot.capacity))
+        )
+    out: list[Decision] = []
+    for d in schedule(Snapshot(jobs=list(jobs)), expanded, ledger, now, policy=policy):
+        if isinstance(d, Reserve):
+            out.append(Decision("place", d.job_id, slot=d.slot))
+        elif isinstance(d, Hold):
+            out.append(Decision("hold", d.job_id, reason=d.reason))
+        elif isinstance(d, Fail):
+            out.append(Decision("fail", d.job_id, reason=d.cause))
+        # Unhold / Start* / Requeue: v2 bookkeeping the v1 shape never had.
+    return out
+
 
 UTC = timezone.utc
 NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)

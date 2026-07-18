@@ -35,7 +35,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from omnirun.models import JobRecord
 
@@ -95,6 +95,17 @@ class AsyncProvider(Protocol):
 
     async def launch(self, job: JobRecord, external_key: str) -> None:
         """Deliver the payload and start the bootstrap."""
+        ...
+
+    def placement_handle(self, job_id: str) -> dict[str, Any] | None:
+        """The in-memory backend handle of a placement this provider produced
+        or adopted in this process, or ``None`` when it holds none.
+
+        Read (never awaited — plain in-memory data) by the supervisor at
+        ``activate`` so the handle is persisted onto the placement row: every
+        later process (``logs``/``pull``/``ssh``/``gc``, the daemon's
+        ingestors) re-derives its live-I/O handle from the placement instead
+        of re-probing the provider."""
         ...
 
     async def cancel_placement(self, job: JobRecord, *, force: bool = False) -> None:
