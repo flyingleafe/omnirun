@@ -32,6 +32,16 @@ in
         default = [ ];
         description = "Extra arguments for `omnirun validate-replay` (e.g. --dry-run).";
       };
+      ghRepo = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "owner/repo";
+        description = ''
+          GitHub repository (owner/repo) violations are filed against, exported
+          as GH_REPO — required because the validator runs outside any git
+          checkout and `gh` cannot infer a repo from its cwd.
+        '';
+      };
     };
 
     package = lib.mkOption {
@@ -174,6 +184,8 @@ in
         OMNIRUN_STATE_DIR = cfg.stateDir;
         OMNIRUN_LOG_LEVEL = cfg.logLevel;
         OMNIRUN_TRACE_CHECK = "${cfg.validator.traceCheck}/bin/trace-check";
+      } // lib.optionalAttrs (cfg.validator.ghRepo != null) {
+        GH_REPO = cfg.validator.ghRepo;
       };
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " ([
