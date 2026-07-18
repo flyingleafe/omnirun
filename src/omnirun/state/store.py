@@ -68,6 +68,8 @@ from omnirun.state.schema import (
 )
 
 _log = logging.getLogger("omnirun.state.store")
+# One INFO line per appended job event — the daemon's journald narration.
+_events_log = logging.getLogger("omnirun.events")
 
 # The store speaks these two SQLAlchemy dialects. Both provide an
 # ``insert(...).on_conflict_do_update(index_elements=…, set_=…)`` and, for
@@ -607,6 +609,19 @@ class Store:
                 cause=cause,
                 data=data,
             )
+        )
+        # The event log is the refinement interface AND the daemon journal's
+        # narration: one INFO line per lifecycle/diagnostic event keeps the
+        # resident daemon observable from journald alone (the v1 Control's
+        # INFO release events lived at the same altitude). Inert unless the
+        # process configured logging (the CLI doesn't; `serve` does).
+        _events_log.info(
+            "%s %s by %s%s%s",
+            action,
+            job_id,
+            actor,
+            f" cause={cause}" if cause else "",
+            f" {data}" if data else "",
         )
 
     def append_event(

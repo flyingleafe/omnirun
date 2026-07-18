@@ -16,6 +16,23 @@
       # nixpkgs). Wrapped onto omnirun's PATH so the daemon has Colab support.
       mkColabCli = pkgs: pkgs.callPackage ./nix/colab-cli.nix { };
 
+      # The proved formal-model trace checker (formal/, DEPLOY-V2.md §1):
+      # validates job_events traces against the Lean kernel model. Used by the
+      # omnirun-validator service and the conformance test suites.
+      mkTraceCheck = pkgs: pkgs.stdenv.mkDerivation {
+        pname = "omnirun-trace-check";
+        version = "0.1.0";
+        src = ./formal;
+        nativeBuildInputs = [ pkgs.lean4 ];
+        buildPhase = ''
+          export HOME=$TMPDIR
+          lake build trace-check
+        '';
+        installPhase = ''
+          install -Dm755 .lake/build/bin/trace-check $out/bin/trace-check
+        '';
+      };
+
       # kaggle 2.2.x (nixpkgs ships an ancient 1.7.4.5 lacking OAuth support),
       # built for omnirun's python since omnirun imports it.
       mkKaggle = pkgs: pkgs.callPackage ./nix/kaggle.nix {
@@ -106,22 +123,7 @@
         packages.default = mkOmnirun pkgs;
         packages.omnirun = mkOmnirun pkgs;
         packages.google-colab-cli = mkColabCli pkgs;
-        # The proved trace checker (formal/ Lean model, DEPLOY-V2.md §1):
-        # validates job_events traces against the formal kernel model. Used
-        # by the omnirun-validator service and the conformance test suites.
-        packages.trace-check = pkgs.stdenv.mkDerivation {
-          pname = "omnirun-trace-check";
-          version = "0.1.0";
-          src = ./formal;
-          nativeBuildInputs = [ pkgs.lean4 ];
-          buildPhase = ''
-            export HOME=$TMPDIR
-            lake build trace-check
-          '';
-          installPhase = ''
-            install -Dm755 .lake/build/bin/trace-check $out/bin/trace-check
-          '';
-        };
+        packages.trace-check = mkTraceCheck pkgs;
 
         formatter =
           let
@@ -160,7 +162,10 @@
     // {
       # System-agnostic outputs: an overlay that adds `omnirun` to a pkgs set,
       # and the NixOS module that runs the daemon (`services.omnirun`).
-      overlays.default = final: _prev: { omnirun = mkOmnirun final; };
+      overlays.default = final: _prev: {
+        omnirun = mkOmnirun final;
+        omnirun-trace-check = mkTraceCheck final;
+      };
       nixosModules.default = import ./nix/module.nix;
     };
 }

@@ -54,8 +54,16 @@ case "$MODE" in
   chaos)
     CLIENTS="${1:-4}"; DUR="${2:-180}"; MAXJOBS="${3:-40}"; SETTLE="${4:-1200}"
     BACKENDS="${CHAOS_BACKENDS:-uni-cpu,uni-gpushort,kaggle,colab}"
-    docker run --rm "${mounts[@]}" "$IMAGE" \
-      python /work/chaos_driver.py --clients "$CLIENTS" --duration "$DUR" \
+    MODE="${CHAOS_MODE:-chaos}"
+    # v2 driver needs the compiled formal checker for the post-run trace gate;
+    # mount the host's lake build read-only (build it first: `lake build` in formal/).
+    TRACE_CHECK="${OMNIRUN_TRACE_CHECK:-$REPO/formal/.lake/build/bin/trace-check}"
+    docker run --rm "${mounts[@]}" \
+      -v "$TRACE_CHECK:/usr/local/bin/trace-check:ro" \
+      "$IMAGE" \
+      python /work/chaos_driver.py --mode "$MODE" --config /work/config.toml \
+        --trace-check /usr/local/bin/trace-check \
+        --clients "$CLIENTS" --duration "$DUR" \
         --max-jobs "$MAXJOBS" --settle "$SETTLE" --backends "$BACKENDS"
     ;;
   shell)

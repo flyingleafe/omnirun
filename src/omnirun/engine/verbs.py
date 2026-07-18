@@ -553,10 +553,16 @@ class SlotGather:
             by_name[name] = outcome
         slots: list[Slot] = []
         for name, _inner in targeted:  # config order: deterministic ranking
-            active = self._store.count_active_jobs(name)
             for slot in by_name.get(name, []):
                 # Restore gross capacity: the adapter netted out the active
-                # jobs; the pass nets them out again from the snapshot.
+                # jobs; the pass nets them out again from the snapshot. The
+                # add-back MUST be the very count the adapter subtracted
+                # (stamped as ``active_at_offer`` at offer time) — re-reading
+                # ``count_active_jobs`` here races with reserves landing
+                # between the offer and this line, inflating gross past
+                # ``max_parallel`` (live chaos finding: three concurrent
+                # PLACING on a max_parallel=2 provider).
+                active = int(slot.provider_ref.get("active_at_offer", 0))
                 slots.append(
                     slot.model_copy(update={"capacity": slot.capacity + active})
                 )

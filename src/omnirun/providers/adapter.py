@@ -155,6 +155,12 @@ class BackendProvider:
                     capacity=capacity,
                     provider_ref={
                         "offer": offer.model_dump(mode="json"),
+                        # The exact active count this capacity was netted by —
+                        # SlotGather adds back THIS number to restore gross
+                        # room (re-reading count_active_jobs there races with
+                        # concurrent reserves and can inflate gross past
+                        # max_parallel).
+                        "active_at_offer": active,
                         # A stable per-probe identity (SCHED-11): the v2 pass
                         # assigns THIS key to a Reserve, and the async
                         # adapter's rent stage re-derives the same key from a

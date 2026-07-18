@@ -88,22 +88,47 @@ def remote_git_dir(exec_: Exec, project_root: str) -> str:
 def push_repo(exec_: Exec, local_repo_root: Path, sha: str, git_dir: str) -> None:
     """Push the exact sha from the client repo into the worker-side object store
     over our own transport — the worker never needs git credentials. The refspec
-    targets a non-branch ref, so pushing into an existing checkout is safe."""
+    targets a non-branch ref, so pushing into an existing checkout is safe.
+
+    Idempotent under concurrency: two placements of the same revision race on
+    creating ``refs/omnirun/<sha12>`` — git rejects the loser with "reference
+    already exists" even though the ref already points at the exact sha we
+    want. That loser must WIN too (the object is durably there), so on that
+    rejection we confirm the remote ref resolves to *sha* and return; only a
+    genuine mismatch (or any other failure) raises."""
     env = {**os.environ, **exec_.git_env()}
+    url = exec_.git_url(git_dir)
     # An explicit ref per push keeps the sha alive against gc; worktrees detach from it.
-    refspec = f"{sha}:refs/omnirun/{sha[:12]}"
+    ref = f"refs/omnirun/{sha[:12]}"
+    refspec = f"{sha}:{ref}"
     proc = subprocess.run(
-        ["git", "push", "--quiet", exec_.git_url(git_dir), refspec],
+        ["git", "push", "--quiet", url, refspec],
         cwd=local_repo_root,
         env=env,
         capture_output=True,
         text=True,
         timeout=600,
     )
-    if proc.returncode != 0:
-        raise BackendError(
-            f"pushing repo to {exec_.describe()} failed:\n{proc.stderr.strip()}"
+    if proc.returncode == 0:
+        return
+    if "reference already exists" in proc.stderr:
+        probe = subprocess.run(
+            ["git", "ls-remote", url, ref],
+            cwd=local_repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
+        if (
+            probe.returncode == 0
+            and probe.stdout.split()
+            and (probe.stdout.split()[0] == sha)
+        ):
+            return  # a concurrent placement already delivered this exact sha
+    raise BackendError(
+        f"pushing repo to {exec_.describe()} failed:\n{proc.stderr.strip()}"
+    )
 
 
 def stage_job(

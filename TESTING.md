@@ -80,6 +80,55 @@ marketplaces. Work through it top to bottom; the free stuff comes first.
   the marketplace code is transcribed from docs/research, not observed — hence
   §3.
 
+### 2026-07-18 — v2 chaos gate (DEPLOY-V2 §3): live acceptance on real backends
+
+Ran the upgraded `chaos/` harness v2 (host-run: a LOCAL `omnirun serve` on an
+ephemeral port over a scratch SQLite store + scratch config; the driver refuses
+non-loopback daemons) through the full DEPLOY-V2 §3 gate. **Every leg PASSED
+every gate check**: both trace views (global + per-provider, plus a
+binding-`max_parallel` replay per provider) replay clean through the compiled
+formal checker `trace-check`; `omnirun validate-replay --once --dry-run` clean;
+zero non-terminal records, zero open intents, zero `unreleased_resources()`
+rows; durable logs + pulled artifacts for every activated terminal job.
+
+- **local (aggressive)** — 6 clients × 2 min, 28 jobs, 2 mid-run daemon
+  SIGTERM restarts (28→28 jobs known, adoption held), one drain toggle
+  (submit refused with 503 while draining, accepted after), one group-of-3 +
+  `wait --group`. A second cap-stress round (max_parallel=2, 22 jobs) passed
+  the binding-cap replay.
+- **kaggle+colab (moderate, live)** — 11 jobs across three rounds (kernels /
+  colab VMs really ran: worker hostnames + full phase logs pulled back);
+  session-cap contention deferred and backfilled (kaggle max_parallel=2 with 6
+  competing jobs); kaggle cancel's platform limit (no stop API) surfaced loud
+  and was handled as correct behavior.
+- **uni-gpushort smoke (paced per the QMUL rate-limit rule)** — exactly 3
+  sequential jobs (V100 ×1: a 90 s success, one cancel-while-QUEUED that
+  preempted the in-flight place work item and minted nothing, a 20 s success);
+  daemon restarted while job a was RUNNING — adopted by name, no duplicate
+  provision, finished normally after the restart. **Exactly one omnirun
+  ControlMaster** across all audits; zero password-auth failures; final
+  `squeue` ground-truth clean of chaos jobs.
+- **vast (live, capped)** — **first live marketplace run.** 2 jobs on the
+  cheapest fitting instance ($0.053/h, est ~$0.009/job — a $2 hard cap
+  enforced by an offer-price pre-check), each provisioned in ~90 s, ran to
+  SUCCEEDED, captured + reaped (auto-terminate destroyed the instance);
+  final vast-API audit: **zero instances remaining**. Total spend: pennies.
+
+The gate surfaced (and this branch fixes) three real defects, each with a
+regression test: (1) the resident daemon logged **nothing** at INFO for a full
+job lifecycle — every appended `job_events` row now emits one INFO line on
+`omnirun.events` (the journald narration); (2) concurrent placements of one
+revision raced on the `refs/omnirun/<sha12>` push — the loser now verifies the
+ref via `ls-remote` and succeeds idempotently; (3) **capacity over-reservation**:
+`SlotGather` restored gross slot capacity with a *re-read* of
+`count_active_jobs` that raced reserves landing after the adapter's own count,
+inflating gross past `max_parallel` (observed live: 3 concurrent PLACING on
+kaggle with max_parallel=2, caught by replaying the kaggle trace with the
+binding cap); the adapter now stamps `active_at_offer` into each slot and the
+gather adds back exactly that number. Plus one site fix: slurm discovery now
+translates raw sinfo gres names through the backend's own `gpu_map` inverse, so
+a normalized ask ("V100") admits on a partition whose QOS demands GRES.
+
 ### 2026-07-17 — HTTP-daemon chaos validation (Docker, all four real backends)
 
 Ran the `chaos/` Docker harness (see `chaos/README.md`): one `omnirun serve` HTTP

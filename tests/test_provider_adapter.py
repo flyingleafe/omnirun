@@ -30,6 +30,7 @@ from omnirun.models import (
     ProviderFacts,
     RepoRef,
     ResourceSpec,
+    Slot,
     StatusReport,
 )
 from omnirun.providers import BackendProvider, CancelMode
@@ -650,3 +651,50 @@ def test_place_persists_partial_handle_before_returning(store: Store) -> None:
         "instance_id": "i-123",
         "job_dir": "/root/.omnirun/jobs/x",
     }
+
+
+# ---------------------------------------------------------------------------
+# Capacity-race regression (live chaos finding): the adapter stamps the exact
+# active count its net capacity was computed with, and SlotGather restores
+# gross room from THAT stamp — never from a re-read of count_active_jobs,
+# which races with reserves landing between the offer and the gather and
+# inflated gross past max_parallel (three concurrent PLACING on a
+# max_parallel=2 provider were observed live).
+# ---------------------------------------------------------------------------
+
+
+def test_offer_stamps_active_at_offer(store: Store) -> None:
+    provider, _backend = _provider(store, max_parallel=2)
+    store.save_job(_running_on("busy-1", "stub"))
+
+    slots = provider.offer(ResourceSpec())
+
+    assert slots[0].capacity == 1  # net of the one active job
+    assert slots[0].provider_ref["active_at_offer"] == 1
+
+
+def test_slotgather_gross_capacity_immune_to_reserve_race(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    class RaceyProvider(BackendProvider):
+        """Two jobs go active AFTER the net capacity was computed but BEFORE
+        the gather's add-back — the historical over-count window."""
+
+        def offer(self, req: ResourceSpec) -> list[Slot]:
+            slots = super().offer(req)
+            self._store.save_job(_running_on("racer-1", "stub"))
+            self._store.save_job(_running_on("racer-2", "stub"))
+            return slots
+
+    backend = StubBackend(
+        name="stub", config=BackendConfig(type="local", max_parallel=2)
+    )
+    provider = RaceyProvider(backend, store)
+    store.save_job(_record("pending-1"))  # QUEUED work so refresh() probes
+
+    slots = SlotGather(store, {"stub": provider}).refresh()
+
+    assert slots
+    # Gross room must equal max_parallel (net 2 + active-at-offer 0), NOT
+    # net 2 + racy re-read 2 = 4.
+    assert all(s.capacity == 2 for s in slots)

@@ -393,3 +393,31 @@ def test_submit_no_time_no_facts_logs_generic_warning(
     with caplog.at_level(logging.WARNING, logger="omnirun.backends.slurm"):
         be._enforce_walltime(spec)
     assert any("--time not set" in r.message for r in caplog.records)
+
+
+def test_parse_sinfo_gres_translates_site_names_through_gpu_map() -> None:
+    """Site gres names (Apocrita-style) must resolve to the NORMALIZED keys the
+    config's gpu_map declares for them — otherwise discovery publishes raw site
+    strings and admission rejects a normalized ask for a GPU that is mapped
+    (live chaos finding: a V100 job HELD on a partition full of V100s)."""
+    gpu_map = {
+        "H100": "gres:nvidia_h100_pcie:{n}",
+        "A100-80": "gres:nvidia_a100_80gb_pcie:{n}",
+        "A100-40": "gres:nvidia_a100-pcie-40gb:{n}",
+        "V100": "gres:tesla_v100-pcie-32gb:{n}",
+    }
+    sinfo = (
+        "gpu:nvidia_h100_pcie:4(S:0-1)\n"
+        "gpu:nvidia_a100_80gb_pcie:4,gpu:nvidia_a100-pcie-40gb:2\n"
+        "gpu:tesla_v100-pcie-16gb:2,gpu:tesla_v100-pcie-32gb:4\n"
+    )
+    got = _parse_sinfo_gres(sinfo, gpu_map)
+    assert got == [
+        "H100",
+        "A100-80",
+        "A100-40",
+        "tesla_v100-pcie-16gb",  # unmapped site name passes through verbatim
+        "V100",
+    ]
+    # And without a map the old behavior is unchanged.
+    assert _parse_sinfo_gres("gpu:a100:4(S:0-1)\ngpu:v100:2") == ["A100", "V100"]

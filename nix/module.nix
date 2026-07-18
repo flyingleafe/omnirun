@@ -10,6 +10,30 @@ in
   options.services.omnirun = {
     enable = lib.mkEnableOption "the omnirun scheduler daemon";
 
+    validator = {
+      enable = lib.mkEnableOption ''
+        the replay validator (DEPLOY-V2 §1): tails job_events, re-validates
+        both trace views through the proved trace-check binary each round,
+        and files a deduplicated GitHub issue per formal-model violation
+      '';
+      traceCheck = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.omnirun-trace-check;
+        defaultText = lib.literalExpression "pkgs.omnirun-trace-check";
+        description = "The trace-check package (this flake's overlay provides it).";
+      };
+      intervalS = lib.mkOption {
+        type = lib.types.int;
+        default = 60;
+        description = "Seconds between validation rounds.";
+      };
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Extra arguments for `omnirun validate-replay` (e.g. --dry-run).";
+      };
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.omnirun;
@@ -133,6 +157,35 @@ in
         User = cfg.user;
         Group = cfg.group;
         StateDirectory = "omnirun";
+        EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
+      };
+    };
+
+    # The replay validator: a separate unit so a validator crash never touches
+    # the daemon. Same user (store access + `gh` auth from $HOME); needs git+gh
+    # on PATH for issue filing.
+    systemd.services.omnirun-validator = lib.mkIf cfg.validator.enable {
+      description = "omnirun replay validator (formal-model conformance)";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "omnirun.service" ];
+      path = [ cfg.package pkgs.git pkgs.gh ];
+      environment = {
+        OMNIRUN_CONFIG = toString cfg.configFile;
+        OMNIRUN_STATE_DIR = cfg.stateDir;
+        OMNIRUN_LOG_LEVEL = cfg.logLevel;
+        OMNIRUN_TRACE_CHECK = "${cfg.validator.traceCheck}/bin/trace-check";
+      };
+      serviceConfig = {
+        ExecStart = lib.concatStringsSep " " ([
+          "${cfg.package}/bin/omnirun"
+          "validate-replay"
+          "--interval"
+          (toString cfg.validator.intervalS)
+        ] ++ cfg.validator.extraArgs);
+        Restart = "on-failure";
+        RestartSec = "30";
+        User = cfg.user;
+        Group = cfg.group;
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
       };
     };

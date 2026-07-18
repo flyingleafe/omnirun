@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -726,3 +727,23 @@ def test_load_ledger_week_window(store: Store) -> None:
     )
     led = store.load_ledger("week", cap=None, now=now)
     assert [e.job_id for e in led.entries] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# Event-log narration: every appended job event emits one INFO line on the
+# ``omnirun.events`` logger — the resident daemon's journald narration (a full
+# job lifecycle must never be invisible in the daemon log; chaos-run finding).
+# ---------------------------------------------------------------------------
+
+
+def test_append_event_narrates_at_info(
+    store: Store, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="omnirun.events"):
+        store.append_event(
+            "job-narrate", actor="engine", action="reserve", data={"provider": "p"}
+        )
+    records = [r for r in caplog.records if r.name == "omnirun.events"]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "reserve" in msg and "job-narrate" in msg and "engine" in msg

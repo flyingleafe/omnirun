@@ -149,12 +149,31 @@ def _check_assoc(
         return None
 
 
-def _parse_sinfo_gres(text: str) -> list[str]:
+def _gres_inverse(gpu_map: dict[str, str]) -> dict[str, str]:
+    """Site gres type (lowercased) → normalized config key, inverted from the
+    backend's own ``gpu_map`` — the operator's authoritative site mapping."""
+    inv: dict[str, str] = {}
+    for key, entry in gpu_map.items():
+        if entry.startswith("gres:"):
+            site = entry[len("gres:") :].rsplit(":", 1)[0]
+            inv[site.lower()] = normalize_gpu_type(key)
+    return inv
+
+
+def _parse_sinfo_gres(text: str, gpu_map: dict[str, str] | None = None) -> list[str]:
     """Parse sinfo GRES output into a deduplicated list of normalised GPU types.
 
     Each line may contain comma-separated fields like 'gpu:a100:4(S:0-1)'.
     The string '(null)' means no GRES — returns [].
+
+    Site gres names rarely match the normalized alphabet on their own
+    ("tesla_v100-pcie-32gb"), so each discovered type is first translated
+    through the backend's ``gpu_map`` inverse — otherwise discovery would
+    publish raw site names in ``Capabilities.gpu_types`` and admission would
+    reject a normalized ask ("V100") for a GPU the config explicitly maps
+    (live chaos finding: a V100 job HELD on a partition full of V100s).
     """
+    inv = _gres_inverse(gpu_map or {})
     types: list[str] = []
     for line in text.strip().splitlines():
         for field in line.split(","):
@@ -163,7 +182,7 @@ def _parse_sinfo_gres(text: str) -> list[str]:
                 continue
             segs = field.split(":")
             if len(segs) >= 3:  # gpu:<type>:<count>[(S:...)]
-                t = normalize_gpu_type(segs[1])
+                t = inv.get(segs[1].lower()) or normalize_gpu_type(segs[1])
                 if t not in types:
                     types.append(t)
     return types
@@ -340,7 +359,7 @@ class SlurmBackend(Backend):
                     timeout=15,
                 )
                 if g.ok:
-                    caps.gpu_types = _parse_sinfo_gres(g.stdout)
+                    caps.gpu_types = _parse_sinfo_gres(g.stdout, self.config.gpu_map)
             qos = self.config.qos
             if qos:
                 q = self._cached_run(
