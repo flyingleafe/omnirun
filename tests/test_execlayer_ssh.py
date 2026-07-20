@@ -1,6 +1,10 @@
+import threading
+import time
+
 from omnirun.backends.jobdir import _ssh_command
 from omnirun.config import BackendConfig
-from omnirun.execlayer.ssh import SSHExec
+from omnirun.execlayer import ssh as sshmod
+from omnirun.execlayer.ssh import SSHExec, _op_semaphore
 
 
 def _wrapper_detected_host(argv: list[str]) -> str:
@@ -79,3 +83,90 @@ def test_ssh_command_from_config_string_splits():
 def test_ssh_command_defaults_to_ssh():
     cfg = BackendConfig(type="ssh", host="h")
     assert _ssh_command(cfg) == ["ssh"]
+
+
+class _FakeProc:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _peak_concurrency(
+    execs: list[SSHExec], n_threads: int, expected_peak: int, monkeypatch
+) -> int:
+    """Drive ``run`` from *n_threads* callers (round-robin over *execs*) whose
+    fake subprocess blocks on a shared gate, and return the peak simultaneous
+    in-flight count — i.e. how many channels the cap let open at once. Waits for
+    *expected_peak* callers to pile up (bounded) before sampling, so a slow host
+    never under-counts."""
+    live = 0
+    peak = 0
+    guard = threading.Lock()
+    gate = threading.Event()
+
+    def fake_run(argv, **kwargs):
+        nonlocal live, peak
+        with guard:
+            live += 1
+            peak = max(peak, live)
+        gate.wait(5.0)
+        with guard:
+            live -= 1
+        return _FakeProc()
+
+    monkeypatch.setattr(sshmod.subprocess, "run", fake_run)
+    threads = [
+        threading.Thread(target=execs[i % len(execs)].run, args=("true",))
+        for i in range(n_threads)
+    ]
+    for t in threads:
+        t.start()
+    # Wait for the expected number of callers to be simultaneously in-flight,
+    # then settle briefly to catch any (unwanted) extra that slips past the cap.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        with guard:
+            if live >= expected_peak:
+                break
+        time.sleep(0.01)
+    time.sleep(0.1)
+    with guard:
+        observed = peak
+    gate.set()
+    for t in threads:
+        t.join(5.0)
+    return observed
+
+
+def test_run_caps_concurrent_channels(tmp_path, monkeypatch):
+    ex = SSHExec("cap-host", control_dir=tmp_path, max_concurrency=2)
+    peak = _peak_concurrency(
+        [ex], n_threads=6, expected_peak=2, monkeypatch=monkeypatch
+    )
+    assert peak == 2, f"cap of 2 not enforced (peak={peak})"
+
+
+def test_uncapped_run_does_not_gate(tmp_path, monkeypatch):
+    ex = SSHExec("uncapped-host", control_dir=tmp_path, max_concurrency=None)
+    peak = _peak_concurrency(
+        [ex], n_threads=5, expected_peak=5, monkeypatch=monkeypatch
+    )
+    assert peak == 5, f"unexpected gating when uncapped (peak={peak})"
+
+
+def test_cap_is_shared_across_execs_to_the_same_master(tmp_path, monkeypatch):
+    # Three partition backends → three SSHExec instances → ONE master budget.
+    execs = [
+        SSHExec("shared-master", control_dir=tmp_path, max_concurrency=3)
+        for _ in range(3)
+    ]
+    peak = _peak_concurrency(
+        execs, n_threads=9, expected_peak=3, monkeypatch=monkeypatch
+    )
+    assert peak == 3, f"per-master budget not shared across instances (peak={peak})"
+
+
+def test_op_semaphore_first_limit_wins_per_key():
+    a = _op_semaphore("k-unique-xyz", 4)
+    b = _op_semaphore("k-unique-xyz", 9)
+    assert a is b

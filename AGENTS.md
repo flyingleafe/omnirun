@@ -98,6 +98,17 @@ GPU — picking the cheapest/fastest option that fits.
 9. **No `# type: ignore` / `# noqa`.** Restructure until ruff + basedpyright
    (standard mode) pass clean. A pre-commit hook enforces this on every commit.
 
+## Deployment (live daemon)
+
+- The live omnirun **daemon runs on Hetzner**, reachable with `ssh hetzner`.
+- That host is **NixOS**; its config (daemon service, SSH/known_hosts, backend
+  config, secrets) lives in **`/etc/nixos`** on the box. Inspect/change daemon
+  behavior there, not in this repo's `chaos/config.toml`.
+- Apocrita (QMUL Slurm) is reached from the daemon over SSH; interactive
+  `ssh apocrita` from the Hetzner shell can succeed while the daemon fails —
+  environment/known_hosts/rate-limit differences between the login shell and
+  the systemd service unit are the usual culprits.
+
 ## Workflow
 
 - `nix develop` gives the hooked dev shell (ruff, ruff-format, basedpyright;

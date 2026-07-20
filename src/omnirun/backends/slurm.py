@@ -61,6 +61,12 @@ LIVE_STATES = {"RUNNING", "COMPLETING", "STAGE_OUT"}
 
 WAIT_UNKNOWN_NOTE = "queue busy — estimate unknown (backfill estimates are unreliable)"
 
+# Default cap on concurrent ssh channels to a login node's shared ControlMaster.
+# Kept below the OpenSSH default sshd `MaxSessions` (10) so a burst of concurrent
+# queries never overflows the one authenticated connection into fresh dials that
+# cannot re-auth on a password/2FA host. Override with [backends.x] ssh_max_concurrency.
+DEFAULT_SLURM_SSH_MAX_CONCURRENCY = 6
+
 
 # --- partition / QOS parsing helpers -----------------------------------------
 
@@ -297,6 +303,13 @@ class SlurmBackend(Backend):
                 # expensive (password/2FA) and some sites throttle repeated auth.
                 # Regular polling refreshes it, so it effectively never idle-closes.
                 control_persist=str(self.config.extra("ssh_control_persist", "8h")),
+                # Cap concurrent channels on that one master below the login node's
+                # sshd `MaxSessions` (OpenSSH default 10): a burst across partitions +
+                # per-job log reads must not overflow to fresh, un-authable dials on a
+                # password/2FA host. Override per site: [backends.x] ssh_max_concurrency.
+                max_concurrency=self.config.extra(
+                    "ssh_max_concurrency", DEFAULT_SLURM_SSH_MAX_CONCURRENCY
+                ),
             )
         return self._exec
 

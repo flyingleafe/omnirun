@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from omnirun.execlayer.base import (
@@ -49,6 +50,31 @@ def _master_lock(key: str) -> threading.Lock:
             lock = threading.Lock()
             _MASTER_LOCKS[key] = lock
         return lock
+
+
+# One bounded semaphore per (host, control-socket) that caps how many commands
+# may open a channel on the shared ControlMaster AT ONCE. A single multiplexed
+# master is one TCP connection, so its concurrent channels are bounded by the
+# server's per-connection `MaxSessions` (OpenSSH default 10). When a daemon's
+# burst — several slurm partitions' scontrol/sinfo/sbatch + squeue + per-job log
+# reads, all in the same instant — exceeds that, OpenSSH stops multiplexing the
+# overflow and dials FRESH connections instead; on a password/2FA host those
+# fresh dials carry `BatchMode=yes`, cannot re-auth, and fail with "Permission
+# denied (password)". Capping concurrent channels below MaxSessions keeps every
+# op on the one authenticated master. Module-level so all SSHExec instances to
+# the same master (e.g. three apocrita partitions) share ONE budget; the first
+# creator's limit wins for a given key.
+_OP_SEMAPHORES: dict[str, threading.BoundedSemaphore] = {}
+_OP_SEMAPHORES_GUARD = threading.Lock()
+
+
+def _op_semaphore(key: str, limit: int) -> threading.BoundedSemaphore:
+    with _OP_SEMAPHORES_GUARD:
+        sem = _OP_SEMAPHORES.get(key)
+        if sem is None:
+            sem = threading.BoundedSemaphore(limit)
+            _OP_SEMAPHORES[key] = sem
+        return sem
 
 
 # stderr fragments (lowercased) that mean the transport itself failed —
@@ -95,6 +121,7 @@ class SSHExec(Exec):
         control_master: bool = True,
         batch_mode: bool = True,
         control_persist: str = "10m",
+        max_concurrency: int | None = None,
     ) -> None:
         self.target = target
         self.port = port
@@ -115,9 +142,32 @@ class SSHExec(Exec):
         # ONE authenticated session up so subsequent commands multiplex over it
         # instead of re-authenticating — the single-persistent-session model.
         self.control_persist = control_persist
+        # Cap on commands opening a channel on the shared master AT ONCE (None =
+        # unbounded). Keep it below the server's `MaxSessions` so a burst stays on
+        # the one authenticated connection instead of overflowing to fresh dials
+        # that cannot re-auth on a password/2FA host. See _OP_SEMAPHORES.
+        self.max_concurrency = max_concurrency
         # Wall-clock budget for a daemon's non-interactive auto-reconnect (a stuck
         # auth prompt can never exceed this; the backend degrades to unfit instead).
         self._auto_reconnect_timeout_s = 45.0
+
+    @contextmanager
+    def _op_slot(self) -> Iterator[None]:
+        """Hold one channel slot on the shared master for the duration of a
+        command (no-op when uncapped). Gates the short, bursty ops (``run`` and
+        transfers) that otherwise stampede past ``MaxSessions``; NOT the master
+        (re)establishment itself — that is serialized by ``_master_lock`` and
+        must never wait behind ops — nor long-lived ``stream`` follows, which
+        would starve the scheduler if they held slots for their whole lifetime."""
+        if self.max_concurrency is None or self.max_concurrency <= 0:
+            yield
+            return
+        sem = _op_semaphore(self._master_key(), self.max_concurrency)
+        sem.acquire()
+        try:
+            yield
+        finally:
+            sem.release()
 
     def _master_key(self) -> str:
         """Identity of the shared ControlMaster socket (host+port+socket dir) — the
@@ -264,9 +314,14 @@ class SSHExec(Exec):
         healed = False
         while True:
             try:
-                proc = subprocess.run(
-                    argv, input=stdin, capture_output=True, text=True, timeout=timeout
-                )
+                with self._op_slot():
+                    proc = subprocess.run(
+                        argv,
+                        input=stdin,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
             except subprocess.TimeoutExpired as e:
                 _log.debug(
                     "ssh %s: run %r TIMED OUT after %ss",
@@ -415,7 +470,8 @@ class SSHExec(Exec):
 
     def _transfer(self, argv: list[str], what: str) -> None:
         self._ensure_control_dir()
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        with self._op_slot():
+            proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
             msg = f"transfer failed ({what}): {stderr[-500:]}"

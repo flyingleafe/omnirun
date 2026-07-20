@@ -76,6 +76,9 @@ class SshBackend(Backend):
                 ssh_command=_ssh_command(self.config),
                 control_master=self.config.extra("control_master", True),
                 batch_mode=self.config.extra("batch_mode", True),
+                # Unbounded by default; a password/2FA box behind a low sshd
+                # MaxSessions can cap concurrent channels: [backends.x] ssh_max_concurrency.
+                max_concurrency=self.config.extra("ssh_max_concurrency", None),
             )
         return self._exec
 
