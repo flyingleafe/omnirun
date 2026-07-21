@@ -94,6 +94,19 @@ in
       '';
     };
 
+    tmpDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/omnirun/tmp";
+      description = ''
+        TMPDIR for the daemon — where pull staging (`omnirun-pull-*`), snapshot
+        bundles, and other tempfile work land. The default keeps them on real
+        disk under the state dir instead of the host's /tmp, which on typical
+        VPS hosts is a small tmpfs that large job outputs fill (ENOSPC on
+        pull/submit staging). Created by tmpfiles; entries older than 3 days
+        are cleaned.
+      '';
+    };
+
     environmentFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -129,6 +142,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Daemon TMPDIR on real disk (see tmpDir option); age out stale staging.
+    systemd.tmpfiles.rules = [
+      "d ${cfg.tmpDir} 0750 ${cfg.user} ${cfg.group} 3d"
+    ];
+
     users.users = lib.mkIf cfg.createUser {
       ${cfg.user} = {
         isSystemUser = true;
@@ -159,6 +177,7 @@ in
         OMNIRUN_CONFIG = toString cfg.configFile;
         OMNIRUN_STATE_DIR = cfg.stateDir;
         OMNIRUN_LOG_LEVEL = cfg.logLevel;
+        TMPDIR = cfg.tmpDir;
       };
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/omnirun serve";
