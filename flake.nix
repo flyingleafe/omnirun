@@ -33,21 +33,20 @@
         '';
       };
 
-      # kaggle 2.2.x (nixpkgs ships an ancient 1.7.4.5 lacking OAuth support),
-      # built for omnirun's python since omnirun imports it.
-      mkKaggle = pkgs: pkgs.callPackage ./nix/kaggle.nix {
-        python3Packages = pkgs.python312Packages;
-      };
+      # kaggle 2.2.x (nixpkgs ships an ancient 1.7.4.5 lacking OAuth support).
+      # Built against nixpkgs' default python3, same as omnirun itself, so the
+      # two share one interpreter — callPackage supplies python3Packages.
+      mkKaggle = pkgs: pkgs.callPackage ./nix/kaggle.nix { };
 
-      mkOmnirun = pkgs: pkgs.python312Packages.buildPythonApplication {
+      mkOmnirun = pkgs: pkgs.python3Packages.buildPythonApplication {
         pname = "omnirun";
         # Single source of truth: read the version from pyproject.toml so the
         # nix label never drifts from __version__ on a release bump.
         version = (builtins.fromTOML (builtins.readFile ./pyproject.toml)).project.version;
         pyproject = true;
         src = self;
-        build-system = [ pkgs.python312Packages.hatchling ];
-        dependencies = (with pkgs.python312Packages; [
+        build-system = [ pkgs.python3Packages.hatchling ];
+        dependencies = (with pkgs.python3Packages; [
           typer
           rich
           httpx
@@ -84,7 +83,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        python = pkgs.python312;
+        python = pkgs.python3;
 
         # Hooks that need no project dependencies, so they also work inside
         # the hermetic `nix flake check` sandbox (no venv, no network).
