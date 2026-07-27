@@ -5,6 +5,14 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.omnirun;
+
+  # systemd's StateDirectory= creates, owns and chmods a directory under
+  # /var/lib — but only there. A stateDir pointing anywhere else (typically a
+  # large persistent disk mounted elsewhere, when the root filesystem is too
+  # small for job artifacts) has to be provisioned by tmpfiles instead, and
+  # StateDirectory= must be left unset so systemd doesn't also mint an unused
+  # /var/lib/omnirun on the very disk we're moving off.
+  underVarLib = lib.hasPrefix "/var/lib/" cfg.stateDir;
 in
 {
   options.services.omnirun = {
@@ -81,7 +89,11 @@ in
       description = ''
         OMNIRUN_STATE_DIR — where the daemon keeps job state, durable logs, and
         cached outputs (SQLite lives here unless the config points [state] at a
-        Postgres URL). Created as a systemd StateDirectory.
+        Postgres URL). A path under /var/lib is created as a systemd
+        StateDirectory; anywhere else it is created by tmpfiles, so the state
+        dir can be put on a roomier filesystem than the root one — collected
+        job artifacts accumulate here and are easily the largest thing the
+        daemon writes.
       '';
     };
 
@@ -96,7 +108,8 @@ in
 
     tmpDir = lib.mkOption {
       type = lib.types.str;
-      default = "/var/lib/omnirun/tmp";
+      default = "${cfg.stateDir}/tmp";
+      defaultText = lib.literalExpression ''"''${config.services.omnirun.stateDir}/tmp"'';
       description = ''
         TMPDIR for the daemon — where pull staging (`omnirun-pull-*`), snapshot
         bundles, and other tempfile work land. The default keeps them on real
@@ -143,9 +156,12 @@ in
 
   config = lib.mkIf cfg.enable {
     # Daemon TMPDIR on real disk (see tmpDir option); age out stale staging.
-    systemd.tmpfiles.rules = [
-      "d ${cfg.tmpDir} 0750 ${cfg.user} ${cfg.group} 3d"
-    ];
+    # The state dir itself only needs a rule when systemd's StateDirectory=
+    # isn't creating it (see `underVarLib`) — and it must come first, since a
+    # default tmpDir sits inside it.
+    systemd.tmpfiles.rules =
+      lib.optional (!underVarLib) "d ${cfg.stateDir} 0755 ${cfg.user} ${cfg.group} -"
+      ++ [ "d ${cfg.tmpDir} 0750 ${cfg.user} ${cfg.group} 3d" ];
 
     users.users = lib.mkIf cfg.createUser {
       ${cfg.user} = {
@@ -185,7 +201,7 @@ in
         RestartSec = "5";
         User = cfg.user;
         Group = cfg.group;
-        StateDirectory = "omnirun";
+        StateDirectory = lib.mkIf underVarLib (lib.removePrefix "/var/lib/" cfg.stateDir);
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
       };
     };
@@ -203,6 +219,9 @@ in
         OMNIRUN_STATE_DIR = cfg.stateDir;
         OMNIRUN_LOG_LEVEL = cfg.logLevel;
         OMNIRUN_TRACE_CHECK = "${cfg.validator.traceCheck}/bin/trace-check";
+        # Trace exports are staged as tempfiles; keep them off the host /tmp
+        # for the same reason the daemon does (see the tmpDir option).
+        TMPDIR = cfg.tmpDir;
       } // lib.optionalAttrs (cfg.validator.ghRepo != null) {
         GH_REPO = cfg.validator.ghRepo;
       };
