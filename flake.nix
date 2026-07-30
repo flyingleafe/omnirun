@@ -55,7 +55,7 @@
           bottle
           psycopg
         ]) ++ [ (mkKaggle pkgs) ];
-        nativeBuildInputs = [ pkgs.makeWrapper ];
+        nativeBuildInputs = [ pkgs.makeWrapper pkgs.installShellFiles ];
         # Tests are live-gated + run in CI; skip them in the build sandbox.
         doCheck = false;
         # Runtime helper binaries the daemon/CLI shells out to (the Colab backend
@@ -71,6 +71,14 @@
               pkgs.uv
               (mkColabCli pkgs)
             ]}
+
+          # Ship TAB completion (commands, flags, live job ids) so a nix-installed
+          # omnirun completes with no `--install-completion` step. Typer emits the
+          # script when the CLI is run with the completion env var set.
+          installShellCompletion --cmd omnirun \
+            --bash <(_OMNIRUN_COMPLETE=source_bash $out/bin/omnirun) \
+            --zsh <(_OMNIRUN_COMPLETE=source_zsh $out/bin/omnirun) \
+            --fish <(_OMNIRUN_COMPLETE=source_fish $out/bin/omnirun)
         '';
         meta = with pkgs.lib; {
           description = "Run jobs from your repo anywhere: Slurm/SSH/Kaggle/Colab/marketplace GPUs";

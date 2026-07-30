@@ -288,6 +288,11 @@ Global: `omnirun --config PATH <command>` (default config: `$OMNIRUN_CONFIG` or
 `~/.config/omnirun/config.toml`). Every command that takes a job accepts a
 unique id prefix.
 
+Tab completion (commands, flags, and **live job ids** — `omnirun logs <TAB>`
+offers your actual jobs, in-flight first): `omnirun --install-completion` once,
+then restart the shell (`--show-completion` prints the script instead, for
+bash/zsh/fish/powershell). The nix package ships the completions already.
+
 **`omnirun submit [OPTIONS] -- COMMAND...`** — let the scheduler pick and place.
 
 | option | meaning |
@@ -325,8 +330,11 @@ job is terminal then summarizes; `--cancel` cancels one job (id prefix) or `all`
 (project-scoped unless `-A`; an explicit id prefix is never scoped). `--wait` and
 `enqueue` need a running daemon; `--cancel` works with or without one.
 
-**`omnirun ps [-A|--all-projects]`** — known jobs with refreshed statuses (scoped
-to the current repo unless `-A`, which adds a `PROJECT` column for the fleet).
+**`omnirun ps [-A|--all-projects] [-a|--all] [-n|--limit N]`** — what is happening
+now: every in-flight job plus the `N` most recently submitted finished ones
+(default 5; the rest are folded behind a `… older finished job(s) hidden` count).
+`--all` shows the whole history, `-n 0` only the live jobs. Scoped to the current
+repo unless `-A`, which adds a `PROJECT` column for the fleet.
 
 **`omnirun status <job>`** — one job's details (backend, offer, repo sha, exit
 code, timestamps).

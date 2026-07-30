@@ -52,7 +52,9 @@ from omnirun.sentinels import strip_sentinels
 app = typer.Typer(
     name="omnirun",
     no_args_is_help=True,
-    add_completion=False,
+    # `omnirun --install-completion` wires TAB completion for commands, flags
+    # and (via the JOB arguments' `autocompletion`) live job ids.
+    add_completion=True,
     help="Run jobs from your repo anywhere: Slurm over SSH, any SSH box, "
     "Kaggle, Colab, or marketplace GPUs.",
 )
@@ -352,6 +354,68 @@ def _ago(dt: datetime | None, now: datetime) -> str:
 
 def _truncate(s: str, n: int = 40) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ------------------------------------------------------------- shell completion
+
+# How many job ids one TAB press may offer (a long-lived store holds thousands).
+_COMPLETION_LIMIT = 40
+
+
+def _adopt_root_options(ctx: typer.Context) -> None:
+    """Mirror the root ``--config``/``--daemon``/``--local`` flags into ``_state``.
+
+    Completion resolves the command chain without ever invoking the app
+    callback, so ``_state`` still holds its defaults; reading the parsed root
+    params directly makes ``omnirun --daemon host:port status <TAB>`` complete
+    against the same daemon the command itself would talk to."""
+    root = ctx.find_root().params
+    _state["config_path"] = root.get("config")
+    _state["daemon_address"] = root.get("daemon")
+    _state["force_local"] = bool(root.get("local"))
+
+
+def _job_candidates(
+    client: Client, incomplete: str, *, project: str | None
+) -> list[JobRecord]:
+    """Jobs whose id starts with *incomplete*, in-flight ones first then the
+    most recently submitted. (``list_jobs`` is oldest-first by ``submitted_at``.)"""
+    records = [
+        r
+        for r in client.list_jobs(project=project)
+        if r.spec.job_id.startswith(incomplete)
+    ]
+    live = [r for r in records if not r.state.terminal]
+    done = [r for r in records if r.state.terminal]
+    return live + done[::-1]
+
+
+def _complete_job(ctx: typer.Context, incomplete: str) -> list[tuple[str, str]]:
+    """Shell completion for a JOB argument: real job ids from the store/daemon.
+
+    This runs on every TAB press, so it stays a plain read — no catch-up drive
+    — and ANY failure (no config, unreadable store, daemon down) completes to
+    nothing rather than spilling an error into the user's prompt."""
+    try:
+        _adopt_root_options(ctx)
+        client = make_client(_load_cfg(), config_path=_state["config_path"])
+        try:
+            # Scope like `ps` does; a ref matching nothing here may still name a
+            # job from another project (job refs resolve globally), so widen once.
+            records = _job_candidates(client, incomplete, project=_current_project())
+            if not records:
+                records = _job_candidates(client, incomplete, project=None)
+        finally:
+            client.close()
+    except Exception:
+        return []
+    return [
+        (
+            rec.spec.job_id,
+            f"{_display_status(rec)[0]} · {_truncate(rec.spec.command, 30)}",
+        )
+        for rec in records[:_COMPLETION_LIMIT]
+    ]
 
 
 def _build_job_spec(
@@ -701,7 +765,9 @@ def _group_jobs(client: Client, group: str) -> list[JobRecord]:
 @friendly_errors
 def wait(
     job: str | None = typer.Argument(
-        None, help="Job id or unique prefix (omit with --group)."
+        None,
+        help="Job id or unique prefix (omit with --group).",
+        autocompletion=_complete_job,
     ),
     group: str | None = typer.Option(
         None, "--group", help="Wait for every job in this group."
@@ -767,7 +833,11 @@ def wait(
 
 @app.command(help="Explain the scheduler's verdict for a job (why is it where it is).")
 @friendly_errors
-def explain(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+def explain(
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
+) -> None:
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     try:
@@ -1118,15 +1188,36 @@ def _queue_wait(client: Client) -> None:
 
 # --------------------------------------------------------------------------- ps & co
 
+# `ps` answers "what is happening now": job history grows without bound, so only
+# this many finished jobs ride along with the in-flight ones by default.
+_PS_TERMINAL_DEFAULT = 5
+
+
+def _ps_window(
+    records: list[JobRecord], *, limit: int | None
+) -> tuple[list[JobRecord], int]:
+    """Every non-terminal job, plus the *limit* most recent terminal ones
+    (``None`` keeps all), in the input's order; also how many were dropped.
+
+    *records* arrives oldest-first (``list_jobs`` sorts by ``submitted_at``), so
+    the tail of the terminal jobs is the latest batch."""
+    if limit is None:
+        return records, 0
+    terminal = [r for r in records if r.state.terminal]
+    keep = {r.spec.job_id for r in (terminal[-limit:] if limit else [])}
+    kept = [r for r in records if not r.state.terminal or r.spec.job_id in keep]
+    return kept, len(records) - len(kept)
+
 
 @app.command(
-    help="List all known jobs, advancing each by one scheduler tick.",
+    help="List in-flight jobs plus the latest few finished ones, advancing each "
+    "by one scheduler tick.",
     name="ps",
 )
 @app.command(
     name="list",
     hidden=True,
-    help="Alias for `ps` (list all known jobs).",
+    help="Alias for `ps` (list in-flight jobs + the latest finished ones).",
 )
 @friendly_errors
 def ps(
@@ -1138,6 +1229,18 @@ def ps(
     ),
     group: str | None = typer.Option(
         None, "--group", help="List only this group's jobs (across projects)."
+    ),
+    all_jobs: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+        help="Show the whole history, not just the latest finished jobs.",
+    ),
+    limit: int = typer.Option(
+        _PS_TERMINAL_DEFAULT,
+        "--limit",
+        "-n",
+        help="How many of the latest finished jobs to show (0 = none).",
     ),
 ) -> None:
     cfg = _load_cfg()
@@ -1159,6 +1262,7 @@ def ps(
             return
         console.print("no jobs yet — try: omnirun submit -- <command>")
         return
+    records, hidden = _ps_window(records, limit=None if all_jobs else max(0, limit))
     now = datetime.now(timezone.utc)
     show_project = scope is None
     table = Table()
@@ -1187,13 +1291,21 @@ def ps(
         cells += [_ago(rec.submitted_at, now), _truncate(rec.spec.command)]
         table.add_row(*cells)
     console.print(table)
+    if hidden:
+        console.print(
+            f"[dim]{hidden} older finished job(s) hidden (use --all, or -n N)[/dim]"
+        )
     if scope is not None:
         console.print(f"[dim]project: {scope} (use -A for all)[/dim]")
 
 
 @app.command(help="Advance and show one job's details (accepts a unique id prefix).")
 @friendly_errors
-def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> None:
+def status(
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
+) -> None:
     cfg = _load_cfg()
     client = make_client(cfg, config_path=_state["config_path"])
     # One tick reconciles this job's live state (daemonless catch-up; a no-op
@@ -1242,7 +1354,9 @@ def status(job: str = typer.Argument(..., help="Job id or unique prefix.")) -> N
 @app.command(help="Stream a job's logs (stdout+stderr merged).")
 @friendly_errors
 def logs(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
     follow: bool = typer.Option(
         False, "--follow", "-f", help="Tail until the job finishes."
     ),
@@ -1266,7 +1380,9 @@ def logs(
 @friendly_errors
 def cancel(
     job: str | None = typer.Argument(
-        None, help="Job id or unique prefix (omit with --group)."
+        None,
+        help="Job id or unique prefix (omit with --group).",
+        autocompletion=_complete_job,
     ),
     group: str | None = typer.Option(
         None, "--group", help="Cancel every non-terminal job in this group."
@@ -1327,7 +1443,9 @@ def cancel(
 @friendly_errors
 def repin(
     job: str | None = typer.Argument(
-        None, help="Job id/prefix. Omit and use --from to move a whole backend's jobs."
+        None,
+        help="Job id/prefix. Omit and use --from to move a whole backend's jobs.",
+        autocompletion=_complete_job,
     ),
     to: str | None = typer.Option(
         None, "--to", help="Repin to this backend (its provider name)."
@@ -1388,7 +1506,9 @@ def repin(
 )
 @friendly_errors
 def edit(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
     to: str | None = typer.Option(None, "--to", help="Pin to this backend."),
     any_backend: bool = typer.Option(False, "--any", help="Unpin (any backend)."),
     priority: int | None = typer.Option(None, "--priority", help="Higher = sooner."),
@@ -1500,7 +1620,9 @@ def edit(
 @friendly_errors
 def retry(
     job: str | None = typer.Argument(
-        None, help="Job id/prefix. Omit and use --failed/--group for a set."
+        None,
+        help="Job id/prefix. Omit and use --failed/--group for a set.",
+        autocompletion=_complete_job,
     ),
     failed: bool = typer.Option(
         False, "--failed", "--all-failed", help="Retry ALL failed jobs."
@@ -1562,7 +1684,9 @@ def retry(
 @app.command(help="Change a queued/running job's scheduling policy.")
 @friendly_errors
 def reprioritize(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
     priority: int | None = typer.Option(
         None, "--priority", help="New priority (higher = scheduled sooner)."
     ),
@@ -1657,7 +1781,9 @@ def budget(
 @friendly_errors
 def pull(
     job: str | None = typer.Argument(
-        None, help="Job id or unique prefix (omit with --group)."
+        None,
+        help="Job id or unique prefix (omit with --group).",
+        autocompletion=_complete_job,
     ),
     dest: Path | None = typer.Argument(
         None, help="Destination dir (default: ./omnirun-outputs/<job_id>)."
@@ -1887,7 +2013,9 @@ def deploy_key_rm(
 )
 @friendly_errors
 def ssh(
-    job: str = typer.Argument(..., help="Job id or unique prefix."),
+    job: str = typer.Argument(
+        ..., help="Job id or unique prefix.", autocompletion=_complete_job
+    ),
     cmd: list[str] = typer.Argument(
         default=None,
         help="Optional remote command to run (instead of an interactive shell).",

@@ -1562,3 +1562,121 @@ def test_explain_command_renders_verdict(env):
     assert result.exit_code == 0, result.output
     assert "verdict:" in result.output
     assert job_id in result.output
+
+
+# ------------------------------------------------- ps window / shell completion
+
+
+def _seed_finished_job(job_id: str, *, minutes_ago: int) -> JobRecord:
+    """Persist a SUCCEEDED job of the CURRENT project (slug ``proj``), submitted
+    *minutes_ago* — history for the `ps` window to fold away."""
+    rec = JobRecord(
+        spec=JobSpec(
+            job_id=job_id,
+            name="old",
+            command="python old.py",
+            resources=ResourceSpec(),
+            repo=RepoRef(
+                remote_url="git@example.com:me/proj.git",
+                sha="a" * 40,
+                branch="main",
+                slug="proj",
+            ),
+        ),
+        state=JobState.SUCCEEDED,
+        submitted_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+        placement=Placement(
+            provider_name="stub",
+            job_id=job_id,
+            handle={"token": f"t-{job_id}"},
+            state=JobStatus.SUCCEEDED,
+        ),
+        # Fully settled history: nothing left for the catch-up drive to capture
+        # or release, so `ps` narrates nothing and prints just the table.
+        reaped=True,
+    )
+    _store().save_job(rec)
+    return rec
+
+
+def test_ps_shows_every_live_job_but_only_the_latest_finished(env):
+    """The default `ps` is a "what is happening now" view: all in-flight jobs plus
+    the 5 most recent finished ones, with the rest folded behind a count."""
+    live = submit_one()  # RUNNING
+    for i in range(7):
+        _seed_finished_job(f"done-{i:02d}", minutes_ago=100 - i)
+
+    result = runner.invoke(app, ["ps"])
+    assert result.exit_code == 0, result.output
+    assert live in result.output
+    for i in range(2, 7):  # the 5 latest by submitted_at
+        assert f"done-{i:02d}" in result.output
+    assert "done-00" not in result.output
+    assert "done-01" not in result.output
+    assert "2 older finished job(s) hidden" in result.output
+
+
+def test_ps_all_and_limit_widen_or_narrow_the_history(env):
+    live = submit_one()
+    for i in range(7):
+        _seed_finished_job(f"done-{i:02d}", minutes_ago=100 - i)
+
+    everything = runner.invoke(app, ["ps", "--all"])
+    assert everything.exit_code == 0, everything.output
+    assert all(f"done-{i:02d}" in everything.output for i in range(7))
+    assert "hidden" not in everything.output
+
+    one = runner.invoke(app, ["ps", "-n", "1"])
+    assert one.exit_code == 0, one.output
+    assert live in one.output  # live jobs are never capped
+    assert "done-06" in one.output
+    assert "done-05" not in one.output
+    assert "6 older finished job(s) hidden" in one.output
+
+    none = runner.invoke(app, ["ps", "-n", "0"])
+    assert none.exit_code == 0, none.output
+    assert live in none.output
+    assert "done-06" not in none.output
+    assert "7 older finished job(s) hidden" in none.output
+
+
+def _complete(args: list[str], incomplete: str) -> list[str]:
+    """Drive the SAME path a shell does on TAB (what `_OMNIRUN_COMPLETE=…` runs)."""
+    from typer._click.shell_completion import get_completion_class
+    from typer._completion_classes import completion_init
+    from typer.main import get_command
+
+    completion_init()
+    cls = get_completion_class("bash")
+    assert cls is not None
+    comp = cls(get_command(app), {}, "omnirun", "_OMNIRUN_COMPLETE")
+    return [item.value for item in comp.get_completions(args, incomplete)]
+
+
+def test_command_and_option_names_complete(env):
+    assert "ps" in _complete([], "p")
+    assert "submit" in _complete([], "sub")
+    assert "--group" in _complete(["ps"], "--gr")
+    # The installer that wires all of the above into the user's shell.
+    assert "--install-completion" in runner.invoke(app, ["--help"]).output
+
+
+def test_job_arguments_complete_from_live_jobs(env):
+    job_id = submit_one()
+    _seed_finished_job("done-00", minutes_ago=5)
+    for command in ("status", "logs", "cancel", "pull", "retry", "explain"):
+        assert job_id in _complete([command], ""), command
+    assert _complete(["logs"], job_id[:6]) == [job_id]
+    assert _complete(["logs"], "done") == ["done-00"]
+    assert _complete(["logs"], "nosuchjob") == []
+
+
+def test_job_completion_stays_silent_when_the_store_is_unreachable(env, monkeypatch):
+    """TAB must never spill an error into the prompt: a broken config/store/daemon
+    completes to nothing."""
+    submit_one()
+    monkeypatch.setattr(
+        "omnirun.cli.make_client",
+        lambda cfg, config_path=None: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert _complete(["status"], "") == []
