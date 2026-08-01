@@ -116,12 +116,13 @@ def test_resolve_code_plan_attaches_bundle_for_public_unpushed(
 
 
 def test_resolve_code_plan_attaches_bundle_for_known_private_unpushed(
-    sample_repo: Path, origin: Path
+    sample_repo: Path, origin: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _commit(sample_repo, "delta.txt")
     ref = capture_repo_state(sample_repo).model_copy(
         update={"remote_url": "git@github.com:me/p.git"}
     )
+    monkeypatch.setattr(repo_mod, "remote_is_public", lambda url: False)
     dk = DeployKey(origin="git@github.com:me/p.git", private_key="K", public_key="P")
     plan = resolve_code_plan(
         ref, get_key=lambda origin: dk, register_key=lambda dk: None

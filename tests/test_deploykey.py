@@ -38,22 +38,43 @@ class _Keys:
         self.registered.append(dk)
 
 
-def test_known_private_origin_uses_ssh_clone(monkeypatch):
-    """An origin we already hold a key for → private ssh clone, no gh/public probe."""
-    monkeypatch.setattr(repo, "remote_is_public", lambda url: pytest.fail("probed"))
-    keys = _Keys(
+def _seeded_keys() -> _Keys:
+    return _Keys(
         {
             "git@github.com:me/proj.git": DeployKey(
                 origin="git@github.com:me/proj.git", private_key="k", public_key="p"
             )
         }
     )
+
+
+def test_known_private_origin_uses_ssh_clone(monkeypatch):
+    """An origin we hold a key for, and that is still private → private ssh clone."""
+    monkeypatch.setattr(repo, "remote_is_public", lambda url: False)
+    keys = _seeded_keys()
     plan = deploykey.resolve_code_plan(
         _ref(), get_key=keys.get, register_key=keys.register
     )
     assert plan.kind == "private"
     assert plan.clone_url == "git@github.com:me/proj.git"
     assert plan.deploy_key_material is None  # material is injected later, never here
+
+
+def test_origin_made_public_after_key_provisioning_clones_anonymously(monkeypatch):
+    """A stored key proves the origin WAS private, not that it still is. Once the
+    repo is public the worker must clone anonymously — a worker with no outbound
+    ssh to the forge otherwise fails a private fetch it never needed."""
+    monkeypatch.setattr(
+        repo, "worker_clone_url", lambda url: "https://github.com/me/proj.git"
+    )
+    monkeypatch.setattr(repo, "remote_is_public", lambda url: True)
+    keys = _seeded_keys()
+    plan = deploykey.resolve_code_plan(
+        _ref(), get_key=keys.get, register_key=keys.register
+    )
+    assert plan.kind == "remote"
+    assert plan.clone_url == "https://github.com/me/proj.git"
+    assert plan.deploy_key_material is None
 
 
 def test_public_origin_clones_anonymously(monkeypatch):
@@ -67,6 +88,25 @@ def test_public_origin_clones_anonymously(monkeypatch):
     )
     assert plan.kind == "remote"
     assert plan.clone_url == "https://github.com/me/proj.git"
+    assert not keys.registered
+
+
+def test_public_origin_never_provisions_a_key_when_no_public_plan(monkeypatch):
+    """A public origin must never reach the provisioning branch, whatever else
+    went wrong. Before, any reason we could not BUILD a public plan (an unpushed
+    or unprovable sha, a failed probe) fell through to `gh` and minted a deploy
+    key on a repo that was never private — which then poisoned every later submit
+    for that origin, because a stored key short-circuits the public path."""
+    monkeypatch.setattr(repo, "remote_is_public", lambda url: True)
+    monkeypatch.setattr(repo, "worker_clone_url", lambda url: None)  # no public plan
+    monkeypatch.setattr(
+        repo, "gh_can_admin", lambda slug: pytest.fail("probed gh for a public repo")
+    )
+    keys = _Keys()
+    with pytest.raises(RepoError, match="is public"):
+        deploykey.resolve_code_plan(
+            _ref(), get_key=keys.get, register_key=keys.register
+        )
     assert not keys.registered
 
 

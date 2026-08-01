@@ -32,15 +32,11 @@ def _key_title() -> str:
     return f"omnirun-{socket.gethostname()}"
 
 
-def _public_clone_url(ref: RepoRef, root: Path | None) -> str | None:
-    """The anonymous https url the worker can clone, or None when not public.
-
-    With a local checkout we use ``remote_clone_plan`` (proves the sha is
-    reachable on the remote branch); without one we can only check public-ness."""
+def _anon_clone_url(ref: RepoRef) -> str | None:
+    """The anonymous https url a credential-less worker can clone, or None when
+    the origin is not public (or is not a cloneable url at all)."""
     if not ref.remote_url or ref.branch == "detached":
         return None
-    if root is not None:
-        return repo.remote_clone_plan(ref, root)
     url = repo.worker_clone_url(ref.remote_url)
     return url if (url and repo.remote_is_public(ref.remote_url)) else None
 
@@ -54,11 +50,15 @@ def resolve_code_plan(
 ) -> CodePlan:
     """Decide how the worker gets the code for *ref*.
 
-    Order: a known-private origin (we already hold a deploy key) → ssh clone; a
-    public + reachable origin → anonymous https clone; a private origin we can
+    Order: a public + reachable origin → anonymous https clone; a known-private
+    origin (we already hold a deploy key) → ssh clone; a private origin we can
     provision for (github + `gh` admin) → auto-create a read-only deploy key →
     ssh clone; otherwise fall back to the placer's local objects (``local``), or
     raise with actionable guidance when there is nothing to fall back to.
+
+    Public-ness is asked BEFORE the key cache, and a public origin always wins:
+    a repo can become public after we provisioned a key for it, and the cheapest
+    correct clone must not depend on when the key was minted.
 
     A committed-but-UNPUSHED sha with a cloneable origin gets the origin plan
     PLUS a thin delta bundle (CODE-2c): the worker clones origin for the base
@@ -83,25 +83,30 @@ def resolve_code_plan(
             )
         return plan
 
+    # Public origin: anonymous clone, no key, always. This is asked FIRST, and
+    # it is the ONLY question that decides between public and private delivery.
+    # A stored key proves the origin WAS private when we minted it, never that
+    # it still is; and an unpushed or unprovable SHA is a property of the commit,
+    # not of the origin — a deploy key cannot conjure an object the forge does
+    # not have. Either mistake sends a worker with no outbound ssh to the forge
+    # into a private fetch it never needed.
+    origin_public = bool(origin) and repo.remote_is_public(origin)
+    anon = repo.worker_clone_url(origin) if origin and origin_public else None
+    if anon is not None:
+        return _bundle(CodePlan(kind="remote", clone_url=anon, origin=origin))
+
     # Known-private: we already hold a key for this origin — clone via ssh.
     if origin and get_key(origin) is not None:
         ssh_url = repo.ssh_clone_url(origin)
         if ssh_url:
             return _bundle(CodePlan(kind="private", clone_url=ssh_url, origin=origin))
 
-    # Public + reachable: anonymous clone, no key. An unpushed sha only needs
-    # the origin to be public (the reachability proof is what the bundle waives).
-    if unpushed:
-        url = repo.worker_clone_url(origin)
-        if url is not None and repo.remote_is_public(origin):
-            return _bundle(CodePlan(kind="remote", clone_url=url, origin=origin))
-    else:
-        public = _public_clone_url(ref, root)
-        if public is not None:
-            return CodePlan(kind="remote", clone_url=public, origin=origin)
-
-    # Private origin: provision a read-only deploy key if `gh` lets us.
-    if origin:
+    # Private origin: provision a read-only deploy key if `gh` lets us. Guarded
+    # on origin_public: we mint a key ONLY for an origin we positively know is
+    # private. Every other reason to be here (an undecipherable url, a sha we
+    # cannot place on the remote, a probe that failed) must not put a key on a
+    # public repo — that key then poisons every later submit for that origin.
+    if origin and not origin_public:
         ssh_url = repo.ssh_clone_url(origin)
         slug = repo.github_slug(origin)
         if ssh_url and slug and repo.gh_can_admin(slug):
@@ -130,6 +135,12 @@ def resolve_code_plan(
             is not None  # we HAVE a checkout, but the remote placer can't use it
             else ", and this process has no local checkout to fall back to"
         )
+        if origin_public:
+            raise RepoError(
+                f"{origin} is public, but omnirun cannot derive an anonymous "
+                f"clone url from it{remote_note}. Give the repo an http(s) or "
+                "scp-style origin a credential-less worker can clone."
+            )
         raise RepoError(
             f"{origin} is private, no deploy key is registered{remote_note}. "
             "Authenticate `gh` as a repo admin and retry, or register a key "
