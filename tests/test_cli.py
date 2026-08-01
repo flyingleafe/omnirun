@@ -1657,8 +1657,14 @@ def test_command_and_option_names_complete(env):
     assert "ps" in _complete([], "p")
     assert "submit" in _complete([], "sub")
     assert "--group" in _complete(["ps"], "--gr")
-    # The installer that wires all of the above into the user's shell.
-    assert "--install-completion" in runner.invoke(app, ["--help"]).output
+    # The installer that wires all of the above into the user's shell. Asked of
+    # the command's parameters, NOT of `--help`: the rendered help wraps on the
+    # runner's terminal width, so a narrow-enough CI terminal splits the flag
+    # across two lines and the substring vanishes.
+    from typer.main import get_command
+
+    top_level = {opt for p in get_command(app).params for opt in p.opts}
+    assert "--install-completion" in top_level
 
 
 def test_job_arguments_complete_from_live_jobs(env):
