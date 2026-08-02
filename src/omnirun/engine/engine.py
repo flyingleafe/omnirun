@@ -69,6 +69,16 @@ _SHUTDOWN_BUDGET_S = 4.0  # task-group cancellation budget (< 5 s exit, ROBUST-3
 _SETTLE_YIELDS = 25  # event-loop turns granted to stream tasks at quiescence
 _REQUEUE_BACKOFF_S = 30.0  # retry pacing after a dead placement's requeue
 
+#: Bootstrap phase sentinel → the DISPLAY status it implies. The worker sets up
+#: the code and the environment before it runs the job's command, so only
+#: ``run`` reads as RUNNING. Phases outside this map leave the status alone.
+_PHASE_STATUS = {
+    "starting": JobStatus.STARTING,
+    "checkout": JobStatus.STARTING,
+    "env": JobStatus.STARTING,
+    "run": JobStatus.RUNNING,
+}
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -137,6 +147,7 @@ class Engine:
             typed,
             artifacts,
             on_exit=self._on_stream_exit,
+            on_phase=self._on_stream_phase,
             now=self._now,
             restart_backoff_s=stream_backoff_s,
             follow_queue=follow_queue,
@@ -162,6 +173,29 @@ class Engine:
         """Exit sentinel on a job's stream: the ``finish`` transition."""
         finish_job(self._store, job_id, code == 0, self._now())
         self.wake()
+
+    def _on_stream_phase(self, job_id: str, phase: str) -> None:
+        """Phase sentinel on a job's stream: refresh the DISPLAY status.
+
+        The worker announces ``checkout`` → ``env`` → ``run``; only ``run``
+        means the job's own command started. Display data only (no lifecycle
+        event, no CAS), so a stream-primary job reads honestly in ``ps``
+        instead of sitting at the optimistic ``starting`` written at launch.
+        A terminal ``last_status`` is never overwritten: the exit sentinel and
+        this callback race on a fast job, and settled beats in-flight."""
+        status = _PHASE_STATUS.get(phase)
+        if status is None:
+            return
+        rec = self._store.load_job(job_id)
+        if rec is None:
+            return
+        current = rec.last_status.status if rec.last_status is not None else None
+        if current is status or (current is not None and current.terminal):
+            return
+        try:
+            self._store.update_job_status(job_id, StatusReport(status=status))
+        except KeyError:
+            pass
 
     # ------------------------------------------------------------------
     # Client-facing writes (both wake the loop)

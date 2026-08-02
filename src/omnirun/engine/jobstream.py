@@ -112,6 +112,7 @@ class JobStreams:
         *,
         on_exit: Callable[[str, int], None],
         now: Callable[[], datetime],
+        on_phase: Callable[[str, str], None] | None = None,
         restart_backoff_s: float = 1.0,
         max_backoff_s: float = 30.0,
         follow_queue: int = 64,
@@ -119,6 +120,7 @@ class JobStreams:
         self._providers = dict(providers)
         self._dir = artifacts_dir
         self._on_exit = on_exit
+        self._on_phase = on_phase
         self._now = now
         self._restart_backoff_s = restart_backoff_s
         self._max_backoff_s = max_backoff_s
@@ -353,8 +355,25 @@ class JobStreams:
                     _log.exception("exit notification for %s failed", st.job_id)
             elif isinstance(ev, PhaseEv):
                 st.substate = ev.phase
+                self._notify_phase(st.job_id, ev.phase)
             elif isinstance(ev, StartEv):
                 st.substate = "starting"
+                self._notify_phase(st.job_id, "starting")
+
+    def _notify_phase(self, job_id: str, phase: str) -> None:
+        """Publish the execution substate the stream just observed.
+
+        Display data only, exactly like the poll ladder's substate note — no
+        lifecycle event, so the event-logged model is untouched. Without this
+        the substate stayed purely in memory and a stream-primary job (the
+        normal case, where the silence ladder never fires) read ``starting``
+        in ``ps`` for its whole run."""
+        if self._on_phase is None:
+            return
+        try:
+            self._on_phase(job_id, phase)
+        except Exception:  # a display write must never break ingestion
+            _log.exception("phase notification for %s failed", job_id)
 
     # ------------------------------------------------------------------
     # Fan-out

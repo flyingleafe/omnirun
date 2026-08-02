@@ -21,7 +21,7 @@ from omnirun.engine.engine import Engine
 from omnirun.engine.jobstream import DROPPED_MARKER, attempt_header
 from omnirun.engine.outcomes import Unreachable
 from omnirun.engine.providertypes import BatchObservation
-from omnirun.models import JobState, Slot
+from omnirun.models import JobState, JobStatus, Slot
 from omnirun.state.store import Store
 from tests.enginefakes import (
     Eof,
@@ -158,6 +158,90 @@ def test_stream_death_restarts_from_persisted_offset(
 
 
 # ---------------------------------------------------------------------------
+# Display status: the phase sentinels drive what `ps` shows
+# ---------------------------------------------------------------------------
+
+
+def test_run_phase_sentinel_advances_the_display_status(
+    gated_store: Store, tmp_path: Path
+) -> None:
+    """A live, stream-primary job reads ``running`` once the worker announces
+    the run phase.
+
+    Regression: the substate fed by the sentinels lived ONLY in stream memory
+    and nothing persisted it. The silence ladder's substate note was the sole
+    writer of ``last_status`` during a run, and it fires only when the stream
+    goes quiet — so a healthy job kept the optimistic ``starting`` stamped at
+    launch for its entire run, which is what ``ps`` renders."""
+    quiet = asyncio.Event()  # never set: the job stays live
+    fake = FakeAsyncProvider()
+    fake.streams["j1"] = [
+        ScriptedStream(
+            start_line(1), phase_line("checkout"), phase_line("run"), Stall(quiet)
+        )
+    ]
+    fake.batch["j1"] = BatchObservation("j1", heartbeat_age_s=1.0)
+    engine = make_engine(gated_store, fake, [make_slot()], tmp_path)
+
+    async def main() -> None:
+        engine.submit(make_spec("j1"))
+        await engine.run_until_quiescent()
+
+    asyncio.run(main())
+    rec = gated_store.load_job("j1")
+    assert rec is not None and rec.state is JobState.RUNNING
+    assert rec.last_status is not None
+    assert rec.last_status.status is JobStatus.RUNNING
+
+
+def test_setup_phases_read_as_starting(gated_store: Store, tmp_path: Path) -> None:
+    """Checkout and env are setup, not the job's command: the display status
+    stays ``starting`` until the run phase arrives."""
+    quiet = asyncio.Event()
+    fake = FakeAsyncProvider()
+    fake.streams["j1"] = [
+        ScriptedStream(
+            start_line(1), phase_line("checkout"), phase_line("env"), Stall(quiet)
+        )
+    ]
+    fake.batch["j1"] = BatchObservation("j1", heartbeat_age_s=1.0)
+    engine = make_engine(gated_store, fake, [make_slot()], tmp_path)
+
+    async def main() -> None:
+        engine.submit(make_spec("j1"))
+        await engine.run_until_quiescent()
+
+    asyncio.run(main())
+    rec = gated_store.load_job("j1")
+    assert rec is not None and rec.state is JobState.RUNNING
+    assert rec.last_status is not None
+    assert rec.last_status.status is JobStatus.STARTING
+
+
+def test_exit_sentinel_beats_a_late_phase_note(
+    gated_store: Store, tmp_path: Path
+) -> None:
+    """A settled job is never dragged back to a live display status — a phase
+    line trailing the exit sentinel on the same stream changes nothing."""
+    fake = FakeAsyncProvider()
+    fake.streams["j1"] = [
+        ScriptedStream(
+            start_line(1), phase_line("run"), exit_line(0), phase_line("run"), Eof()
+        )
+    ]
+    engine = make_engine(gated_store, fake, [make_slot()], tmp_path)
+
+    async def main() -> None:
+        engine.submit(make_spec("j1"))
+        await engine.run_until_quiescent()
+
+    asyncio.run(main())
+    rec = gated_store.load_job("j1")
+    assert rec is not None and rec.state is JobState.SUCCEEDED
+    assert rec.last_status is None or rec.last_status.status is not JobStatus.RUNNING
+
+
+# ---------------------------------------------------------------------------
 # The silence ladder
 # ---------------------------------------------------------------------------
 
@@ -193,7 +277,12 @@ def test_quiet_but_alive_keeps_waiting(gated_store: Store, tmp_path: Path) -> No
     assert actions(gated_store, "j1") == ["submit", "reserve", "provision", "activate"]
     rec = gated_store.load_job("j1")
     assert rec is not None
-    assert rec.state is JobState.RUNNING and rec.last_status is None
+    # No LIFECYCLE change (the event list above is unchanged). The display
+    # status does read running — the stream announced the run phase before it
+    # went quiet, and that note is display data, not a transition.
+    assert rec.state is JobState.RUNNING
+    assert rec.last_status is not None
+    assert rec.last_status.status is JobStatus.RUNNING
 
 
 def test_dead_worker_requeues_with_two_attempt_segments(

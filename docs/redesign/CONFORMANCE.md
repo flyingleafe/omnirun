@@ -41,7 +41,15 @@ priced from that arc's own first reserve.
 
 **Scale-downs (deliberate, documented):** log growth (`log-append`) is NOT
 event-logged — I12 is enforced by the accumulating-log test suite, not the
-trace. `unreachable-poll` is emitted only when an unreachable outcome was
+trace. The execution substate (checkout / env / run, fed by the bootstrap
+phase sentinels) is NOT event-logged either — DESIGN-V2 §2.3 makes it
+observation data on the placement, never a scheduler state, so it is outside
+this alphabet by construction and the checker cannot see it. JOB-2's display
+half is therefore enforced by `tests/test_substate_invariants.py`, not the
+trace: a job whose stream announced `run` must display `running` and never
+regress within an attempt, and a settled job must never display a live
+substate. That suite exists because the property was, for a time, silently
+false in exactly the way the trace gate could not notice. `unreachable-poll` is emitted only when an unreachable outcome was
 *handled* (diagnostic; it is a model no-op). Multi-attempt provisioning
 inside one place work item collapses to the final `provision` (failed
 rents mint nothing durable; DOA instances destroyed within the work item
