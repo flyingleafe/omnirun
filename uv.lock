@@ -55,6 +55,34 @@ wheels = [
 ]
 
 [[package]]
+name = "boto3"
+version = "1.43.70"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "botocore" },
+    { name = "jmespath" },
+    { name = "s3transfer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/20/68434d996c767e860329d78f2aaf1d7456173ba45f8d6fb8f4a394b85667/boto3-1.43.70.tar.gz", hash = "sha256:4f1e16b9eebbad3f312bb6fbf7685d40abdd52a691485cb9f09e7df60d912b41", size = 112688, upload-time = "2026-08-12T19:23:35.485Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/d1/c95cae121ef5b77ecec08cb8e045eeb2a2c8ec605a5734b6f24bfb3a6326/boto3-1.43.70-py3-none-any.whl", hash = "sha256:b9399cce51bec9552e61a6b85015c42dea68752e79c00a7005d84eaf7ee15fef", size = 140028, upload-time = "2026-08-12T19:23:33.804Z" },
+]
+
+[[package]]
+name = "botocore"
+version = "1.43.70"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jmespath" },
+    { name = "python-dateutil" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2f/1a/ad4ff28cd0caa8ff4f39f18491169dc9ff4b2e359589be1f7108048e1915/botocore-1.43.70.tar.gz", hash = "sha256:a7bebdd0b1c8265e72759a4f7f61e9e43d57968b2c2a5e1e7b350d0a1e3ce81c", size = 15936837, upload-time = "2026-08-12T19:23:30.58Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/b2/c16b4e2e7ccab1f0887c22fbe2d9859ceb4d35fb637cce8a380d51b52b06/botocore-1.43.70-py3-none-any.whl", hash = "sha256:95bc23a6472f8876349ae334b526e66006f6cf3c87bf39d3e9f057dc8c2eb85f", size = 15628519, upload-time = "2026-08-12T19:23:27.38Z" },
+]
+
+[[package]]
 name = "bottle"
 version = "0.13.4"
 source = { registry = "https://pypi.org/simple" }
@@ -513,6 +541,15 @@ wheels = [
 ]
 
 [[package]]
+name = "jmespath"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/59/322338183ecda247fb5d1763a6cbe46eff7222eaeebafd9fa65d4bf5cb11/jmespath-1.1.0.tar.gz", hash = "sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d", size = 27377, upload-time = "2026-01-22T16:35:26.279Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64", size = 20419, upload-time = "2026-01-22T16:35:24.919Z" },
+]
+
+[[package]]
 name = "jsonschema"
 version = "4.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -720,6 +757,7 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "boto3" },
     { name = "bottle" },
     { name = "google-colab-cli" },
     { name = "kaggle" },
@@ -737,9 +775,13 @@ kaggle = [
 postgres = [
     { name = "psycopg", extra = ["binary"] },
 ]
+s3 = [
+    { name = "boto3" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "boto3" },
     { name = "bottle" },
     { name = "hypothesis" },
     { name = "kaggle" },
@@ -750,21 +792,23 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
     { name = "bottle", marker = "extra == 'daemon'", specifier = ">=0.13" },
     { name = "google-colab-cli", marker = "extra == 'colab'", specifier = ">=0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "kaggle", marker = "extra == 'kaggle'", specifier = ">=2.2" },
-    { name = "omnirun", extras = ["kaggle", "colab", "postgres", "daemon"], marker = "extra == 'all'" },
+    { name = "omnirun", extras = ["kaggle", "colab", "postgres", "daemon", "s3"], marker = "extra == 'all'" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "rich", specifier = ">=13.7" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["kaggle", "colab", "postgres", "daemon", "all"]
+provides-extras = ["kaggle", "colab", "postgres", "daemon", "s3", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "boto3", specifier = ">=1.34" },
     { name = "bottle", specifier = ">=0.13" },
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "kaggle", specifier = ">=2.2" },
@@ -1368,6 +1412,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/71/14edf065f04630b1a8472f7653cad03f6c478bcf95ea0e6aed55451e33ea/rpds_py-2026.6.3-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:23a439f31ccbeff1574e24889128821d1f7917470e830cf6544dced1c662262a", size = 576533, upload-time = "2026-06-30T07:17:28.546Z" },
     { url = "https://files.pythonhosted.org/packages/ba/76/65002b08596c389105720a8c0d22298b8dc25a4baf89b2ce431343c8b1de/rpds_py-2026.6.3-cp315-cp315t-win32.whl", hash = "sha256:913ca42ccad3f8cc6e292b587ae8ae49c8c823e5dce51a736252fc7c7cdfa577", size = 201204, upload-time = "2026-06-30T07:17:30.193Z" },
     { url = "https://files.pythonhosted.org/packages/8c/97/d855d6b3c322d1f27e26f5241c42016b56cf01377ea8ed348285f54652f0/rpds_py-2026.6.3-cp315-cp315t-win_amd64.whl", hash = "sha256:ae3d4fe8c0b9213624fdce7279d70e3b148b682ca20719ebd193a23ebfa47324", size = 220719, upload-time = "2026-06-30T07:17:31.788Z" },
+]
+
+[[package]]
+name = "s3transfer"
+version = "0.19.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "botocore" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/76/43/35e4d8aa320bffe8287fe8f65f578fa2d2db0a64212f0e710dce58267854/s3transfer-0.19.2.tar.gz", hash = "sha256:ba0309fd86be3c27dbf78cdd813c13c5e1df16e5874b99d2535ebbdfb9892993", size = 165592, upload-time = "2026-07-22T19:30:44.432Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/e7/5c595c75e9f41a44f30e526eda465ea0b4eec93470e074e4a111b253f13a/s3transfer-0.19.2-py3-none-any.whl", hash = "sha256:d8168eccca828cbb2cd573675333f3bddd254313a9c42494b84c76b539e8ba25", size = 90216, upload-time = "2026-07-22T19:30:43.251Z" },
 ]
 
 [[package]]

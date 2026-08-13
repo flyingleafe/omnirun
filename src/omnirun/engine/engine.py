@@ -30,6 +30,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from omnirun.artifacts import ArtifactStore
 from omnirun.budget import BudgetLedger
 from omnirun.engine import billing
 from omnirun.engine import workitems as wi
@@ -101,6 +102,7 @@ class Engine:
         policy: SchedPolicy | None = None,
         ledger: Callable[[datetime], BudgetLedger] | None = None,
         artifacts_dir: Path | None = None,
+        artifact_store: ArtifactStore | None = None,
         poll_interval: float = 2.0,
         now: Callable[[], datetime] | None = None,
         place_limit: int = 4,
@@ -142,6 +144,7 @@ class Engine:
             cancels=self._cancels,
             place_limit=place_limit,
             cancel_grace_s=cancel_grace_s,
+            artifact_store=artifact_store,
         )
         self._streams = JobStreams(
             typed,

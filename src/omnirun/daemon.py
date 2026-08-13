@@ -44,6 +44,7 @@ from typing import Any
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from omnirun.backends.base import Backend, BackendError, make_backend
+from omnirun.artifacts import make_artifact_store
 from omnirun.config import Config, ConfigError
 from omnirun.endpoints.manager import EndpointManager
 from omnirun.engine.engine import Engine
@@ -199,6 +200,8 @@ class Daemon:
         self._backend_factory: BackendFactory = _cached_factory
         self._endpoints = EndpointManager()
         self._artifacts_dir = self.state_root / "artifacts"
+        # The durable home of captured outputs (local sink, or a bucket).
+        self._artifact_store = make_artifact_store(cfg)
 
         # The resident engine's providers: fakes when injected (tests), else
         # every enabled backend behind the async adapter seam.
@@ -233,6 +236,7 @@ class Daemon:
             slots=self._supply_slots,
             ledger=self._ledger_fn,
             artifacts_dir=self._artifacts_dir,
+            artifact_store=self._artifact_store,
             poll_interval=self.poll_interval,
         )
 
@@ -1118,6 +1122,7 @@ class Daemon:
                 rec,
                 tmp,
                 settle=lambda: d._settle_capture(rec.spec.job_id),
+                artifacts=d._artifact_store,
             )
             bottle.response.content_type = "application/x-tar"
 

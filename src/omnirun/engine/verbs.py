@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from omnirun import chooser
+from omnirun.artifacts import ArtifactStore, LocalArtifactStore
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.budget import BudgetLedger, DualWindowLedger
 from omnirun.config import Config, ConfigError, default_config_path
@@ -966,6 +966,7 @@ def pull_to_dir(
     dest: Path,
     *,
     settle: Callable[[], None],
+    artifacts: ArtifactStore | None = None,
 ) -> tuple[list[Path], Path]:
     """The ``pull`` verb: serve the durable outputs capture when one exists
     (the session may already be reaped), else a direct backend pull of the
@@ -980,16 +981,8 @@ def pull_to_dir(
         settle()
         fresh = store.load_job(rec.spec.job_id) or fresh
     if fresh.outputs_cached_to:
-        cache = Path(fresh.outputs_cached_to)
-        src = cache / "outputs" if (cache / "outputs").is_dir() else cache
-        if not src.is_dir():
-            raise BackendError(
-                f"cached outputs for {fresh.spec.job_id} are missing at {cache} "
-                "(session already reaped, nothing to re-fetch)"
-            )
-        dest.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dest, dirs_exist_ok=True)
-        paths = sorted(p for p in dest.rglob("*") if p.is_file())
+        store_ = artifacts or LocalArtifactStore()
+        paths = store_.fetch(fresh.outputs_cached_to, dest)
     else:
         assert handle is not None
         paths = backend_for(handle.backend).pull_outputs(handle, dest)

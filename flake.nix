@@ -54,6 +54,9 @@
           sqlalchemy
           bottle
           psycopg
+          # [artifacts] store = "s3": captured outputs go to a bucket instead
+          # of growing without bound on the daemon's disk.
+          boto3
         ]) ++ [ (mkKaggle pkgs) ];
         nativeBuildInputs = [ pkgs.makeWrapper pkgs.installShellFiles ];
         # Tests are live-gated + run in CI; skip them in the build sandbox.

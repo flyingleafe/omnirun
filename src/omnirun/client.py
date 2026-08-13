@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
 from omnirun import chooser
+from omnirun.artifacts import make_artifact_store
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.config import Config, ConfigError
 from omnirun.deploykey import resolve_code_plan
@@ -262,6 +263,7 @@ class _Session:
             slots=self._supply_slots,
             ledger=make_ledger(self.store, client.cfg),
             artifacts_dir=client._artifacts_dir,
+            artifact_store=client._artifact_store,
             observe_streams=tuning.streams,
             silence_threshold_s=tuning.silence_threshold_s,
             ladder_cooldown_s=tuning.ladder_cooldown_s,
@@ -347,6 +349,9 @@ class LocalClient:
         # Durable engine artifacts (per-job capture sinks + stream logs) live
         # next to the v1 outputs cache, under the same state root.
         self._artifacts_dir = self._outputs_dir.parent / "artifacts"
+        # The durable home of captured outputs: the sink on this disk by
+        # default, an object bucket when [artifacts] says so.
+        self._artifact_store = make_artifact_store(cfg)
         self._store_obj: Store | None = None
         # ONE EndpointManager per client (per process, in the daemon): every
         # backend this client builds shares its ssh sessions, provider-API
@@ -820,6 +825,7 @@ class LocalClient:
             rec,
             dest,
             settle=self._settle_drive,
+            artifacts=self._artifact_store,
         )
 
 

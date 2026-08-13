@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from omnirun.artifacts import ArtifactStore, LocalArtifactStore
 from omnirun.engine import billing
 from omnirun.engine import workitems as wi
 from omnirun.engine.outcomes import (
@@ -164,11 +165,13 @@ class Supervisor:
         cancels: MutableMapping[str, bool],
         place_limit: int = 4,
         cancel_grace_s: float = 30.0,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._store = store
         self._providers = dict(providers)
         self._wake = wake
         self._artifacts = artifacts_dir
+        self._artifact_store = artifact_store or LocalArtifactStore()
         self._slots = slots
         self._now = now
         self._cancels = cancels
@@ -853,6 +856,12 @@ class Supervisor:
                 raise InfraFailure(f"no provider for capture of {job_id}")
             sink.mkdir(parents=True, exist_ok=True)
             await provider.capture(rec, sink)
+            # The durable home of the outputs. A store that moves them off
+            # this disk does its upload here, so an upload failure retries as
+            # part of the capture it belongs to.
+            pointer = await asyncio.to_thread(
+                self._artifact_store.publish, job_id, sink
+            )
         except asyncio.CancelledError:
             raise
         except Unreachable:
@@ -881,18 +890,28 @@ class Supervisor:
                 cause=f"{type(e).__name__}: {e}",
                 data={"provider": provider_name},
             )
-            self._finish_capture(job_id, provider_name, sink, sacrificed=True)
+            self._finish_capture(
+                job_id, provider_name, sink, str(sink), sacrificed=True
+            )
             return
-        self._finish_capture(job_id, provider_name, sink, sacrificed=False)
+        self._finish_capture(job_id, provider_name, sink, pointer, sacrificed=False)
 
     def _finish_capture(
-        self, job_id: str, provider_name: str | None, sink: Path, *, sacrificed: bool
+        self,
+        job_id: str,
+        provider_name: str | None,
+        sink: Path,
+        pointer: str,
+        *,
+        sacrificed: bool,
     ) -> None:
         def _mut(rec: JobRecord) -> JobRecord | None:
             if not (rec.state.terminal or rec.state is JobState.RUNNING):
                 return None
+            # The log snapshot always stays in the sink on local disk; only
+            # the outputs follow the artifact store's pointer.
             rec.logs_cached_to = str(sink)
-            rec.outputs_cached_to = str(sink)
+            rec.outputs_cached_to = pointer
             return rec
 
         done = cas_step(

@@ -28,6 +28,7 @@ GPU — picking the cheapest/fastest option that fits.
 | `engine/verbs.py` | verb logic SHARED by LocalClient and daemon: backends/slots/ledger construction, submit/edit/retry/reprioritize/cancel-intent/gc/pull, result dataclasses, event narration |
 | `engine/{workitems,outcomes,billing,providertypes}.py` | intent payload/stage records; typed outcomes (`CapacityContention`…`Unreachable`); ledger write-through; `AsyncProvider` protocol |
 | `providers/` | `BackendProvider` (staged seam over a `Backend`) + `AsyncBackendProvider` (to_thread + typed-outcome mapping — the engine's only provider edge) |
+| `artifacts.py` | `ArtifactStore` seam — where captured OUTPUTS come to rest: the local capture sink (default) or an S3-compatible bucket (`[artifacts] store = "s3"`, credentials from the environment). Returns the pointer stamped into `outputs_cached_to`, and reads pointers written under an earlier setting. Logs always stay local |
 | `endpoints/manager.py` | shared per-physical-target sessions/throttles/discovery cache, injected into every backend |
 | `backends/` | `base.py` protocol + registry; `{local,ssh,slurm}.py`, `marketplace.py` + `{runpod,vast,thunder}.py`, `{kaggle,colab}.py`; `jobdir.py` worker-side helpers |
 | `execlayer/` | `Exec` protocol; `SSHExec` (openssh binary, ControlMaster, `login_shell`) |

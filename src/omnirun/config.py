@@ -245,12 +245,28 @@ class StateConfig(BaseModel):
         return default_db_url()
 
 
+class ArtifactsConfig(BaseModel):
+    """Where captured outputs come to rest (DESIGN §9).
+
+    The default keeps every output in the capture sink on local disk. With
+    ``store = "s3"`` the outputs go to an S3-compatible bucket instead and the
+    local copy is dropped; credentials are read from the environment, never
+    from this file. Logs stay local either way.
+    """
+
+    store: Literal["local", "s3"] = "local"
+    bucket: str | None = None
+    endpoint_url: str | None = None
+    prefix: str = ""
+
+
 class Config(BaseModel):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
     bore: BoreConfig = Field(default_factory=BoreConfig)
     state: StateConfig = Field(default_factory=StateConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     backends: dict[str, BackendConfig] = Field(default_factory=dict)
 
 
