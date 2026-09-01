@@ -23,9 +23,11 @@ this also removes the Phase-2 per-probe-engine construction blip.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +71,37 @@ _log = logging.getLogger("omnirun.providers.adapter")
 _LINK_KEY_HINTS = ("url",)
 
 
+def ask_digest(req: ResourceSpec) -> str:
+    """A short, stable fingerprint of ONE resource request.
+
+    Offer keys must identify a concrete offer uniquely across a whole pass, and
+    the slot gather calls ``offer`` once per DISTINCT request. A key numbered
+    only by position inside one ``offer`` call therefore collides across
+    requests — every request's first slot got ``<provider>:0`` — and the pure
+    pass, which treats the key as the distinct-offer identity and CONSUMES it,
+    could then reserve at most one slot per provider per pass however much room
+    the provider had. Scoping the key by the request removes the collision and
+    keeps it re-derivable: the placement stage re-offers the SAME request, so
+    the same digest (and the same key) comes back.
+    """
+    return hashlib.sha256(req.model_dump_json().encode()).hexdigest()[:8]
+
+
+@dataclass(frozen=True)
+class OfferRound:
+    """One ``offer_round`` result: the usable slots, and why the rest were not.
+
+    ``declined`` carries the probe's own unfit reasons verbatim. A plain slot
+    list cannot express "nothing, and here is why", so a provider that declined
+    every request looked exactly like a provider nobody asked — which is how a
+    request the provider had already refused could sit queued indefinitely with
+    the refusal never reaching the operator.
+    """
+
+    slots: list[Slot]
+    declined: list[str]
+
+
 class BackendProvider:
     """Adapt one ``Backend`` + one shared ``Store`` to the ``Provider`` seam."""
 
@@ -108,7 +141,12 @@ class BackendProvider:
         return self._backend.discover()
 
     def offer(self, req: ResourceSpec) -> list[Slot]:
-        """Probe the backend and fold results into ``Slot``s.
+        """The ``Provider`` seam's offer: just the usable slots."""
+        return self.offer_round(req).slots
+
+    def offer_round(self, req: ResourceSpec) -> OfferRound:
+        """Probe the backend and fold results into ``Slot``s, KEEPING the
+        reasons the rest were declined.
 
         MUST NOT raise: ``Backend.probe`` never raises, and any unfit/error
         offer simply does not become a slot. Capabilities come from cached
@@ -116,7 +154,9 @@ class BackendProvider:
         derived from the offer's ``gpu_type``. Capacity is the backend's
         ``max_parallel`` less its currently-active reserved/running jobs.
         """
+        ask = ask_digest(req)
         offers = self._backend.probe(req)
+        declined: list[str] = []
         facts = self._store.load_facts(self.name)
         # Capacity is the MIN of two independent caps: (1) the backend's own free
         # capacity — a discovered ``available`` (self-GC'd count of free slots) — and
@@ -133,6 +173,7 @@ class BackendProvider:
         slots: list[Slot] = []
         for offer in offers:
             if not offer.fits:
+                declined.extend(offer.unfit_reasons)
                 continue
             if facts is not None:
                 caps = facts.capabilities
@@ -165,11 +206,11 @@ class BackendProvider:
                         # assigns THIS key to a Reserve, and the async
                         # adapter's rent stage re-derives the same key from a
                         # fresh offer() call to find the concrete offer again.
-                        "offer_key": f"{self.name}:{len(slots)}",
+                        "offer_key": f"{self.name}:{ask}:{len(slots)}",
                     },
                 )
             )
-        return slots
+        return OfferRound(slots=slots, declined=declined)
 
     def _persist_partial(self, rec: JobRecord) -> ProvisioningSink:
         """A sink that records a partial (provisioning) handle onto *rec*'s live

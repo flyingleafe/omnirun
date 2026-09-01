@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,7 +50,7 @@ from omnirun.models import (
     ResourceSpec,
     Slot,
 )
-from omnirun.providers import BackendProvider
+from omnirun.providers import BackendProvider, OfferRound
 from omnirun.scheduler import JobExplanation, Snapshot
 from omnirun.scheduler import explain as sched_explain
 from omnirun.state import Store
@@ -173,11 +173,22 @@ def explain_job(
     job_id: str,
     *,
     now: datetime | None = None,
+    provider_notes: Mapping[str, list[str]] | None = None,
 ) -> JobExplanation:
     """The ``explain`` verb: the pure pass's per-job verdict over the live
-    snapshot (SCHED-7) — the same function the engine schedules with."""
+    snapshot (SCHED-7) — the same function the engine schedules with.
+
+    *provider_notes* is :attr:`SlotGather.notes` from the gather that produced
+    *slots*: why a provider contributed nothing. It is display-only."""
     at = now or datetime.now(timezone.utc)
-    return sched_explain(build_snapshot(store), slots, ledger(at), at, job_id)
+    return sched_explain(
+        build_snapshot(store),
+        slots,
+        ledger(at),
+        at,
+        job_id,
+        provider_notes=provider_notes,
+    )
 
 
 def handle_of(rec: JobRecord) -> JobHandle | None:
@@ -493,15 +504,27 @@ class SlotGather:
     reports true free capacity). Slot capacity is restored to the provider's
     GROSS room — the v2 pass subtracts the store's active jobs itself, so the
     adapter's already-net capacity would be double-counted.
+
+    Every provider a pending job could use is probed: the union of all
+    providers (for the unpinned reqs) and each pinned req's own provider. A
+    provider that contributes NO slot is not silently dropped — ``notes``
+    records why (it declined the request, it raised, it was too slow this
+    round, or the pin names a provider that is not configured/enabled), so
+    ``explain`` can answer "why is nothing being offered for my job" instead of
+    narrating some other provider's slots.
     """
 
     def __init__(self, store: Store, inners: dict[str, BackendProvider]) -> None:
         self._store = store
         self._inners = inners
+        #: provider name → why it contributed no slot on the last refresh.
+        self.notes: dict[str, list[str]] = {}
 
     def refresh(self) -> list[Slot]:
         jobs = self._store.list_jobs()
         pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
+        notes: dict[str, list[str]] = {}
+        self.notes = notes
         if not pending:
             return []
         self._refresh_facts()
@@ -513,6 +536,12 @@ class SlotGather:
 
         def _add(name: str, req: ResourceSpec) -> None:
             if name not in reqs_by_provider:
+                # A pin that names a provider which is not configured or
+                # enabled was dropped here silently, so its jobs stayed queued
+                # against an empty offer set with the cause recorded nowhere.
+                note = f"no provider named {name!r} is configured and enabled"
+                if note not in notes.setdefault(name, []):
+                    notes[name].append(note)
                 return
             key = req.model_dump_json()
             if key not in seen[name]:
@@ -533,24 +562,40 @@ class SlotGather:
             if reqs_by_provider[name]
         ]
 
-        def _offer_all(item: tuple[str, BackendProvider]) -> list[Slot]:
+        def _offer_all(item: tuple[str, BackendProvider]) -> OfferRound:
             name, inner = item
             out: list[Slot] = []
+            declined: list[str] = []
             for req in reqs_by_provider[name]:
-                out.extend(inner.offer(req))
-            return out
+                round_ = inner.offer_round(req)
+                out.extend(round_.slots)
+                declined.extend(round_.declined)
+            return OfferRound(slots=out, declined=declined)
 
         outcomes = parallel_io(targeted, _offer_all, lambda item: f"offer of {item[0]}")
         by_name: dict[str, list[Slot]] = {}
+        answered: set[str] = set()
         for (name, _inner), outcome in outcomes:
+            answered.add(name)
             if isinstance(outcome, Exception):
                 _log.warning(
                     "offer raised for provider %r; skipping this round: %s",
                     name,
                     outcome,
                 )
+                notes.setdefault(name, []).append(f"offer raised: {outcome}")
                 continue
-            by_name[name] = outcome
+            by_name[name] = outcome.slots
+            if not outcome.slots:
+                # It declined every request it was asked. Keep the provider's
+                # own words, deduplicated: an empty slot list says nothing.
+                reasons = list(dict.fromkeys(outcome.declined))
+                notes.setdefault(name, []).extend(reasons or ["offered no slot"])
+        for name, _inner in targeted:
+            if name not in answered:
+                notes.setdefault(name, []).append(
+                    f"probe did not finish within {POLL_TIMEOUT_S:.0f}s"
+                )
         slots: list[Slot] = []
         for name, _inner in targeted:  # config order: deterministic ranking
             for slot in by_name.get(name, []):

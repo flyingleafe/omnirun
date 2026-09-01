@@ -213,3 +213,32 @@ def test_cancel_force_signals_kill(
         CancelMode.FORCE,
     )
     assert sigs == ["KILL"]
+
+
+# ---------------------------------------------------------------------------
+# Shell resolution (live daemon finding): the local probe reported
+# "probe error: [Errno 2] No such file or directory: 'bash'" on a host that
+# has bash — the process was started by a service manager whose PATH carried
+# no shell, and ["bash", "-c", ...] resolves on PATH only.
+# ---------------------------------------------------------------------------
+
+
+def test_local_exec_finds_a_shell_with_no_shell_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnirun.execlayer import local as local_exec
+
+    monkeypatch.setattr(local_exec.shutil, "which", lambda _name: None)
+    local_exec.shell_path.cache_clear()
+    try:
+        resolved = local_exec.shell_path()
+        assert Path(resolved).exists(), resolved
+        assert local_exec.LocalExec().run("echo hi").stdout.strip() == "hi"
+    finally:
+        local_exec.shell_path.cache_clear()
+
+
+def test_local_probe_reports_no_shell_error(backend: LocalBackend) -> None:
+    """The symptom itself: probing must not fail for want of a shell."""
+    offers = backend.probe(ResourceSpec(cpus=1))
+    assert offers[0].fits, offers[0].unfit_reasons

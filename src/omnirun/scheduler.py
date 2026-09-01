@@ -403,7 +403,7 @@ def schedule(
     pass; a Reserve consumes one unit of its provider's remaining capacity
     across ALL of that provider's slots).
     """
-    decisions, _ = _pass(snapshot, slots, ledger, now, policy, None)
+    decisions, _ = _pass(snapshot, slots, ledger, now, policy, None, {})
     return decisions
 
 
@@ -415,6 +415,7 @@ def explain(
     job_id: str,
     *,
     policy: SchedPolicy | None = None,
+    provider_notes: Mapping[str, list[str]] | None = None,
 ) -> JobExplanation:
     """The pass's per-job reasoning, verbatim (SCHED-7 explainability).
 
@@ -424,10 +425,17 @@ def explain(
     verdict for *job_id*: why it is held/queued/failing, which slot it would
     reserve, and every runner-up with its rejection reason. Raises
     ``KeyError`` for a job absent from the snapshot.
+
+    *provider_notes* maps a provider name to the reasons it offered no slot
+    this round. It is display-only (it changes no decision) and it is plain
+    data, so the pass stays slot-blind: without it an absent provider and a
+    provider that refused the request read identically — as silence.
     """
     if not any(rec.spec.job_id == job_id for rec in snapshot.jobs):
         raise KeyError(f"no job {job_id!r} in the snapshot")
-    _, explanation = _pass(snapshot, slots, ledger, now, policy, job_id)
+    _, explanation = _pass(
+        snapshot, slots, ledger, now, policy, job_id, provider_notes or {}
+    )
     assert explanation is not None  # the job is in the snapshot
     return explanation
 
@@ -439,6 +447,7 @@ def _pass(
     now: datetime,
     policy: SchedPolicy | None,
     explain_for: str | None,
+    provider_notes: Mapping[str, list[str]],
 ) -> tuple[list[SchedDecision], JobExplanation | None]:
     """The one pass body behind :func:`schedule` and :func:`explain` — one
     policy, no drift (DESIGN-V2 §12.6)."""
@@ -639,6 +648,7 @@ def _pass(
                 working,
                 now,
                 policy,
+                provider_notes,
             )
 
         if chosen is not None:
@@ -695,18 +705,40 @@ def _explain_match(
     ledger: BudgetLedger,
     now: datetime,
     policy: SchedPolicy,
+    provider_notes: Mapping[str, list[str]],
 ) -> None:
     """Narrate the matching step for one job: the chosen slot plus every
-    runner-up with the SAME predicates the chooser used (no second policy)."""
+    runner-up with the SAME predicates the chooser used (no second policy).
+
+    A pin is a FILTER, never a per-slot test: a slot of another provider is
+    reported as excluded by the pin and nothing else is evaluated against it.
+    Mixing the two (a foreign slot carrying both "pinned elsewhere" and that
+    OTHER provider's capacity verdict) reads as one reason and hides which
+    provider the second half is about.
+    """
     verdicts: list[SlotVerdict] = []
     candidate_idx = {idx for idx, _ in candidates}
     chosen_idx = chosen[0] if chosen is not None else None
     req = rec.spec.resources
     pin = rec.spec.only_backend
+    excluded: list[str] = []  # providers the pin ruled out
     for idx, slot in enumerate(slots):
-        reasons: list[str] = []
+        est = slot.cost.total(req.time)
         if pin is not None and slot.provider_name != pin:
-            reasons.append(f"job is pinned to {pin}")
+            if slot.provider_name not in excluded:
+                excluded.append(slot.provider_name)
+            verdicts.append(
+                SlotVerdict(
+                    provider=slot.provider_name,
+                    offer_key=offer_key(slot, idx),
+                    free=_is_free(slot),
+                    est_cost=est,
+                    wait_s=slot.availability.wait_s,
+                    reasons=[f"not considered: job is pinned to {pin}"],
+                )
+            )
+            continue
+        reasons: list[str] = []
         unfit = slot.capabilities.satisfies(req)
         if unfit:
             reasons.extend(unfit)
@@ -720,7 +752,6 @@ def _explain_match(
             reasons.extend(_runner_up_reasons(slot, rec, ledger, now, policy, chosen))
         if not reasons and idx not in candidate_idx and idx != chosen_idx:
             reasons.append("provider in this job's avoid window")
-        est = slot.cost.total(req.time)
         verdicts.append(
             SlotVerdict(
                 provider=slot.provider_name,
@@ -732,6 +763,8 @@ def _explain_match(
                 reasons=reasons,
             )
         )
+    considered = [v for v in verdicts if pin is None or v.provider == pin]
+    detail = _supply_detail(pin, excluded, provider_notes)
     if chosen is not None:
         idx, slot = chosen
         est = slot.cost.total(req.time)
@@ -744,12 +777,44 @@ def _explain_match(
             rec,
             f"placing on {slot.provider_name} "
             f"(offer {offer_key(slot, idx)}, {cost_note})",
+            *detail,
+            candidates=verdicts,
+        )
+    elif pin is not None and not considered:
+        record(
+            rec,
+            f"queued: pinned to {pin}, which offered no slot this pass",
+            *detail,
             candidates=verdicts,
         )
     elif not slots:
-        record(rec, "queued: no slots offered right now", candidates=verdicts)
+        record(rec, "queued: no slots offered right now", *detail, candidates=verdicts)
     else:
-        record(rec, "queued: no fitting slot free this pass", candidates=verdicts)
+        record(
+            rec,
+            "queued: no fitting slot free this pass",
+            *detail,
+            candidates=verdicts,
+        )
+
+
+def _supply_detail(
+    pin: str | None,
+    excluded: list[str],
+    provider_notes: Mapping[str, list[str]],
+) -> list[str]:
+    """The supply-side notes for one job's verdict: what the pin ruled out, and
+    what each relevant provider said when it offered nothing."""
+    detail: list[str] = []
+    if pin is not None and excluded:
+        detail.append(
+            f"pinned to {pin}: slots from {', '.join(excluded)} are not candidates"
+        )
+    wanted = [pin] if pin is not None else sorted(provider_notes)
+    for name in wanted:
+        for line in provider_notes.get(name, []):
+            detail.append(f"{name} offered no slot: {line}")
+    return detail
 
 
 def _runner_up_reasons(

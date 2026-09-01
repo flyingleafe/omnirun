@@ -95,7 +95,12 @@ GPU — picking the cheapest/fastest option that fits.
 8. **`probe`/`offers` are fast, speculative, and never crash the chooser.** On
    error or timeout a backend yields a not-fit `Offer` carrying the reason;
    probes and slot gathers run in parallel with a wall budget (a straggler is
-   skipped, never awaited into a hang).
+   skipped, never awaited into a hang). A provider that contributes NO slot
+   still records why (`SlotGather.notes` → `explain`'s detail lines): an empty
+   slot list on its own cannot tell "it refused the request" from "nobody
+   asked it", and a pinned job then waits with its reason nowhere. Offer keys
+   are scoped by the request, because the gather offers once per DISTINCT
+   pending request and the pure pass consumes a key when it reserves.
 9. **No `# type: ignore` / `# noqa`.** Restructure until ruff + basedpyright
    (standard mode) pass clean. A pre-commit hook enforces this on every commit.
 

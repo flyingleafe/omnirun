@@ -1092,6 +1092,7 @@ class Daemon:
                 d._supply_slots(),
                 d._ledger_fn,
                 rec.spec.job_id,
+                provider_notes=d._gather.notes,
             )
             return _json({"explanation": explanation.model_dump(mode="json")})
 

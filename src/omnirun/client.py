@@ -530,6 +530,7 @@ class LocalClient:
         store = self._store()
         rec = store.resolve_job(ref)
         slots: list[Slot] = []
+        notes: dict[str, list[str]] = {}
         try:
             backends, _broken = make_backends(
                 self.cfg,
@@ -540,10 +541,18 @@ class LocalClient:
                 self._endpoints,
             )
             inners = {name: BackendProvider(be, store) for name, be in backends.items()}
-            slots = SlotGather(store, inners).refresh()
+            gather = SlotGather(store, inners)
+            slots = gather.refresh()
+            notes = gather.notes
         except ConfigError:
             pass  # no backends configured: explain over an empty offer set
-        return explain_job(store, slots, make_ledger(store, self.cfg), rec.spec.job_id)
+        return explain_job(
+            store,
+            slots,
+            make_ledger(store, self.cfg),
+            rec.spec.job_id,
+            provider_notes=notes,
+        )
 
     def tick(self) -> list[str]:
         """One catch-up round: what a daemon would have done since last time."""

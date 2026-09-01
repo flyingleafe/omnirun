@@ -30,10 +30,9 @@ from omnirun.models import (
     ProviderFacts,
     RepoRef,
     ResourceSpec,
-    Slot,
     StatusReport,
 )
-from omnirun.providers import BackendProvider, CancelMode
+from omnirun.providers import BackendProvider, CancelMode, OfferRound
 from omnirun.state import open_store
 from omnirun.state.store import Store
 
@@ -680,11 +679,11 @@ def test_slotgather_gross_capacity_immune_to_reserve_race(store: Store) -> None:
         """Two jobs go active AFTER the net capacity was computed but BEFORE
         the gather's add-back — the historical over-count window."""
 
-        def offer(self, req: ResourceSpec) -> list[Slot]:
-            slots = super().offer(req)
+        def offer_round(self, req: ResourceSpec) -> OfferRound:
+            round_ = super().offer_round(req)
             self._store.save_job(_running_on("racer-1", "stub"))
             self._store.save_job(_running_on("racer-2", "stub"))
-            return slots
+            return round_
 
     backend = StubBackend(
         name="stub", config=BackendConfig(type="local", max_parallel=2)
@@ -698,3 +697,124 @@ def test_slotgather_gross_capacity_immune_to_reserve_race(store: Store) -> None:
     # Gross room must equal max_parallel (net 2 + active-at-offer 0), NOT
     # net 2 + racy re-read 2 = 4.
     assert all(s.capacity == 2 for s in slots)
+
+
+# ---------------------------------------------------------------------------
+# Offer-key identity (live daemon finding): the gather calls offer() once per
+# DISTINCT pending request, and a key numbered only by position inside one call
+# gave EVERY request's first slot the same key. The pure pass consumes an
+# offer_key when it reserves, so a provider with four slots could back exactly
+# one reservation per pass — observed live as four "prov:0" rows in `explain`.
+# ---------------------------------------------------------------------------
+
+
+def test_offer_key_is_stable_for_the_same_request(store: Store) -> None:
+    provider, _backend = _provider(store)
+    req = ResourceSpec(gpus=1, gpu_type="T4")
+
+    first = provider.offer(req)[0].provider_ref["offer_key"]
+    second = provider.offer(req)[0].provider_ref["offer_key"]
+
+    # The placement stage re-offers the SAME request to find its offer again.
+    assert first == second
+
+
+def test_offer_keys_differ_across_requests(store: Store) -> None:
+    provider, _backend = _provider(store)
+
+    a = provider.offer(ResourceSpec(gpus=1, gpu_type="T4"))[0]
+    b = provider.offer(ResourceSpec(gpus=2, gpu_type="T4"))[0]
+
+    assert a.provider_ref["offer_key"] != b.provider_ref["offer_key"]
+
+
+def test_gathered_slots_never_share_an_offer_key(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    provider, _backend = _provider(store, max_parallel=4)
+    store.save_job(_record("pending-1", ResourceSpec(gpus=1)))
+    store.save_job(_record("pending-2", ResourceSpec(gpus=2)))
+
+    slots = SlotGather(store, {"stub": provider}).refresh()
+
+    keys = [s.provider_ref["offer_key"] for s in slots]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Slot supply per backend: every provider a pending job could use is probed,
+# and a provider that contributes nothing says why (it used to go silent, so a
+# pinned job waited against an empty offer set with no reason anywhere).
+# ---------------------------------------------------------------------------
+
+
+def _pinned(job_id: str, backend: str) -> JobRecord:
+    rec = _record(job_id)
+    rec.spec = rec.spec.model_copy(update={"only_backend": backend})
+    return rec
+
+
+def _two_providers(store: Store) -> dict[str, BackendProvider]:
+    return {
+        name: BackendProvider(
+            StubBackend(name=name, config=BackendConfig(type="local", max_parallel=2)),
+            store,
+        )
+        for name in ("alpha", "beta")
+    }
+
+
+def test_gather_serves_a_pin_to_a_non_default_provider(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    inners = _two_providers(store)
+    store.save_job(_pinned("pinned-1", "beta"))
+
+    slots = SlotGather(store, inners).refresh()
+
+    assert {s.provider_name for s in slots} == {"beta"}
+
+
+def test_gather_offers_every_provider_for_an_unpinned_job(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    inners = _two_providers(store)
+    store.save_job(_record("free-1"))
+
+    slots = SlotGather(store, inners).refresh()
+
+    assert {s.provider_name for s in slots} == {"alpha", "beta"}
+
+
+def test_gather_notes_why_a_provider_declined(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    inners = _two_providers(store)
+    beta = inners["beta"].backend
+    assert isinstance(beta, StubBackend)
+    beta.offer = Offer(
+        backend="beta",
+        label="beta",
+        fits=False,
+        unfit_reasons=["session cap"],
+    )
+    store.save_job(_pinned("pinned-1", "beta"))
+
+    gather = SlotGather(store, inners)
+    slots = gather.refresh()
+
+    assert slots == []
+    assert gather.notes["beta"] == ["session cap"]
+
+
+def test_gather_notes_a_pin_to_an_unconfigured_provider(store: Store) -> None:
+    from omnirun.engine.verbs import SlotGather
+
+    inners = _two_providers(store)
+    store.save_job(_pinned("pinned-1", "gamma"))
+
+    gather = SlotGather(store, inners)
+    slots = gather.refresh()
+
+    assert slots == []
+    assert any("gamma" in line for line in gather.notes["gamma"])

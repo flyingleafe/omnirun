@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from omnirun.budget import BudgetLedger
-from omnirun.models import JobRecord, JobState
+from omnirun.models import JobRecord, JobState, JobStatus, Placement
 from omnirun.scheduler import (
     Fail,
     Hold,
@@ -218,3 +218,136 @@ def test_explain_pinned_elsewhere() -> None:
     snap = Snapshot(jobs=[rec])
     exp = explain(snap, [make_slot("prov", "k1")], BudgetLedger(), NOW, "pin")
     assert any("pinned to other" in r for c in exp.candidates for r in c.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Pin handling (live daemon finding): a pinned job's table listed only OTHER
+# providers' slots, each carrying "job is pinned to <x>" AND that other
+# provider's capacity verdict as one reason string — two statements about two
+# different providers, printed as one.
+# ---------------------------------------------------------------------------
+
+
+def _pinned(job_id: str, backend: str) -> JobRecord:
+    spec = make_spec(job_id).model_copy(update={"only_backend": backend})
+    return JobRecord(spec=spec, state=JobState.QUEUED, submitted_at=NOW)
+
+
+def _running_on(job_id: str, provider: str) -> JobRecord:
+    rec = JobRecord(spec=make_spec(job_id), state=JobState.RUNNING, submitted_at=NOW)
+    rec.placement = Placement(
+        provider_name=provider, job_id=job_id, state=JobStatus.RUNNING
+    )
+    return rec
+
+
+def test_explain_pin_never_conflates_with_another_providers_capacity() -> None:
+    """A full provider the job is not pinned to gets ONE reason: the pin."""
+    snap = Snapshot(
+        jobs=[
+            _pinned("pin", "other"),
+            _running_on("busy-1", "prov"),
+            _running_on("busy-2", "prov"),
+        ]
+    )
+    slots = [make_slot("prov", "k1", capacity=2)]  # gross 2, both taken
+
+    exp = explain(snap, slots, BudgetLedger(), NOW, "pin")
+
+    row = next(c for c in exp.candidates if c.provider == "prov")
+    assert row.reasons == ["not considered: job is pinned to other"]
+    assert not any("capacity" in r for r in row.reasons)
+
+
+def test_explain_pin_to_a_provider_with_no_slots_says_which_pin() -> None:
+    snap = Snapshot(jobs=[_pinned("pin", "other")])
+    slots = [make_slot("prov", "k1")]
+
+    exp = explain(snap, slots, BudgetLedger(), NOW, "pin")
+
+    assert exp.verdict == "queued: pinned to other, which offered no slot this pass"
+    assert any("slots from prov are not candidates" in line for line in exp.detail)
+
+
+def test_explain_surfaces_why_the_pinned_provider_offered_nothing() -> None:
+    snap = Snapshot(jobs=[_pinned("pin", "other")])
+
+    exp = explain(
+        snap,
+        [make_slot("prov", "k1")],
+        BudgetLedger(),
+        NOW,
+        "pin",
+        provider_notes={"other": ["request exceeds the session cap"]},
+    )
+
+    assert any(
+        "other offered no slot: request exceeds the session cap" in line
+        for line in exp.detail
+    )
+    # A note about a provider this job cannot use is not this job's business.
+    assert not any("prov offered no slot" in line for line in exp.detail)
+
+
+def test_explain_pinned_job_is_matched_against_its_own_providers_slots() -> None:
+    snap = Snapshot(jobs=[_pinned("pin", "other")])
+    slots = [make_slot("prov", "k1"), make_slot("other", "k2")]
+
+    exp = explain(snap, slots, BudgetLedger(), NOW, "pin")
+    decisions = schedule(snap, slots, BudgetLedger(), NOW)
+
+    assert exp.verdict.startswith("placing on other")
+    reserve = next(d for d in decisions if isinstance(d, Reserve))
+    assert reserve.provider == "other" and reserve.offer_key == "k2"
+
+
+def test_explain_full_provider_still_reports_capacity() -> None:
+    """The capacity verdict survives — it just belongs to the job's OWN slot."""
+    snap = Snapshot(
+        jobs=[_rec("a"), _running_on("busy-1", "prov"), _running_on("busy-2", "prov")]
+    )
+    slots = [make_slot("prov", "k1", capacity=2)]
+
+    exp = explain(snap, slots, BudgetLedger(), NOW, "a")
+
+    row = next(c for c in exp.candidates if c.provider == "prov")
+    assert row.reasons == ["provider at capacity (active jobs fill it)"]
+
+
+def test_explain_unpinned_job_sees_every_fitting_providers_slots() -> None:
+    snap = Snapshot(jobs=[_rec("a")])
+    slots = [make_slot("p1", "k1"), make_slot("p2", "k2"), make_slot("p3", "k3")]
+
+    exp = explain(snap, slots, BudgetLedger(), NOW, "a")
+
+    assert {c.provider for c in exp.candidates} == {"p1", "p2", "p3"}
+    assert sum(1 for c in exp.candidates if c.chosen) == 1
+
+
+def test_distinct_offer_keys_let_one_provider_back_several_reserves() -> None:
+    """Two slots of one provider with DISTINCT keys back two reservations."""
+    snap = Snapshot(jobs=[_rec("a"), _rec("b")])
+    slots = [make_slot("prov", "k1", capacity=2), make_slot("prov", "k2", capacity=2)]
+
+    reserves = [
+        d for d in schedule(snap, slots, BudgetLedger(), NOW) if isinstance(d, Reserve)
+    ]
+
+    assert {d.job_id for d in reserves} == {"a", "b"}
+    assert {d.offer_key for d in reserves} == {"k1", "k2"}
+
+
+def test_colliding_offer_keys_cap_a_provider_at_one_reserve_per_pass() -> None:
+    """The defect the adapter's request-scoped key removes, pinned as a fact:
+    two slots that SHARE a key can only ever back one reservation."""
+    snap = Snapshot(jobs=[_rec("a"), _rec("b")])
+    slots = [
+        make_slot("prov", "same", capacity=2),
+        make_slot("prov", "same", capacity=2),
+    ]
+
+    reserves = [
+        d for d in schedule(snap, slots, BudgetLedger(), NOW) if isinstance(d, Reserve)
+    ]
+
+    assert len(reserves) == 1
