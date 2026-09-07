@@ -91,6 +91,10 @@ class VastBackend(MarketplaceBackend):
             "reliability": {"gte": MIN_RELIABILITY},
             "order": [["dph_total", "asc"]],
         }
+        if res.cpus is not None:
+            # A fractional GPU offer receives only part of the host's CPUs.
+            # Filter before the cheapest-first limit, not on host cpu_cores.
+            filt["cpu_cores_effective"] = {"gte": res.cpus}
         if res.gpu_type is not None:
             filt["gpu_name"] = {"in": vast_gpu_names(res.gpu_type)}
             if res.gpu_type == "A100-80":
@@ -103,6 +107,11 @@ class VastBackend(MarketplaceBackend):
         data = self._request("POST", f"{BASE}/bundles/", json_body=filt).json()
         offers: list[Offer] = []
         for raw in data.get("offers", []):
+            cpus = raw.get("cpu_cores_effective")
+            if res.cpus is not None and (
+                not isinstance(cpus, (int, float)) or not cpus >= res.cpus
+            ):
+                continue
             host_cuda = raw.get("cuda_max_good")
             if not cuda_at_least(host_cuda, res.min_cuda):
                 continue
@@ -113,6 +122,9 @@ class VastBackend(MarketplaceBackend):
             rel_note = (
                 f"reliability {rel:.3f}, " if isinstance(rel, (int, float)) else ""
             )
+            cpu_note = (
+                f"{cpus:g} effective vCPUs, " if isinstance(cpus, (int, float)) else ""
+            )
             offers.append(
                 Offer(
                     backend=self.name,
@@ -121,11 +133,12 @@ class VastBackend(MarketplaceBackend):
                     gpu_type=norm,
                     gpus=n,
                     cost_per_hour=dph,  # dph_total is already the whole-machine rate
-                    notes=f"{rel_note}{geo}; offers churn — may be taken by submit time",
+                    notes=f"{rel_note}{cpu_note}{geo}; offers churn — may be taken by submit time",
                     details={
                         "ask_id": raw["id"],
                         "gpu_name": raw.get("gpu_name"),
                         "cuda_max_good": host_cuda,
+                        "cpu_cores_effective": cpus,
                     },
                 )
             )

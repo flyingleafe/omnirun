@@ -422,6 +422,11 @@ CUDA APIs unimplemented, no graphics), possible slowdown vs bare metal, North
 America only — but very cheap and billed per-minute only while running. Vast
 offers churn: the one you picked can be taken between probe and submit —
 re-probe and pick again.
+For Vast, `--cpus N` filters by the offer's **effective vCPU allocation**,
+not the whole host's CPU count. Offers with missing or insufficient effective
+capacity are excluded; the advertised allocation is shown in offer notes.
+Host/container overhead can reduce the observed cgroup quota slightly below
+that advertised count.
 
 **local** — runs jobs on your own machine through the exact same pipeline
 (bare repo, worktree, bootstrap, detached process). Exists so you can test the
