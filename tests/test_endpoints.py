@@ -194,6 +194,36 @@ def test_marketplace_throttle_shared_across_sections(
     assert sleeps == [pytest.approx(1.0)]
 
 
+# --- shared offer cooloff ----------------------------------------------------
+
+
+def test_cooloff_blocks_until_ttl_expires() -> None:
+    """A marked offer is cooling off until the ttl elapses; an expired entry
+    reads as never-marked AND is pruned (the registry does not grow)."""
+    now = [100.0]
+    mgr = EndpointManager(clock=lambda: now[0])
+    mgr.mark_cooloff("vast", "ask-111", 15.0, "sshd never came up")
+    assert mgr.cooloff_reason("vast", "ask-111") == "sshd never came up"
+    now[0] += 15.0
+    assert mgr.cooloff_reason("vast", "ask-111") is None
+    now[0] -= 30.0  # pruning means expiry is sticky, not a clock rewind away
+    assert mgr.cooloff_reason("vast", "ask-111") is None
+
+
+def test_cooloff_keyed_per_provider() -> None:
+    """The registry is shared per provider like the throttle, but one
+    provider's mark never reaches another provider's market."""
+    mgr = EndpointManager()
+    mgr.mark_cooloff("vast", "ask-111", 900.0, "dead rental")
+    assert mgr.cooloff_reason("vast", "ask-111") == "dead rental"
+    assert mgr.cooloff_reason("runpod", "ask-111") is None
+    assert mgr.cooloff_reason("vast", "ask-222") is None
+
+
+def test_cooloff_unknown_key_is_none() -> None:
+    assert EndpointManager().cooloff_reason("vast", "never-marked") is None
+
+
 # --- run_batch --------------------------------------------------------------
 
 

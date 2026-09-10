@@ -93,9 +93,13 @@ class EngineFakeBackend(Backend):
         # "placed but not started" state edit/repin may still move).
         self.queued_at_backend: set[str] = set()
         self.submit_error: Exception | None = None
-        self.submit_errors_left = 0
+        self.probe_calls = 0
+        # job_id → remaining polls reported as LOST (a dead worker the
+        # engine requeues) before normal status resumes
+        self.lost_polls: dict[str, int] = {}
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
+        self.probe_calls += 1
         return [Offer(backend=self.name, label=f"{self.name}: box", fits=True)]
 
     def submit(
@@ -113,6 +117,10 @@ class EngineFakeBackend(Backend):
         )
 
     def status(self, handle: JobHandle) -> StatusReport:
+        lost = self.lost_polls.get(handle.job_id)
+        if lost and lost > 0:
+            self.lost_polls[handle.job_id] = lost - 1
+            return StatusReport(status=JobStatus.LOST, detail="worker gone")
         if handle.job_id in self.queued_at_backend:
             return StatusReport(status=JobStatus.QUEUED, detail="Priority")
         left = self.runs_left.get(handle.job_id)
@@ -255,12 +263,42 @@ def test_submit_failure_fails_over_to_other_backend(harness2: Harness) -> None:
     harness2.backends["a"].submit_error = RuntimeError("a: ssh auth down")
     harness2.backends["a"].submit_errors_left = -1  # always
     out = harness2.client.submit(_spec("fo-1"))
+
     assert out.placed and out.provider_name == "b"
     rec = harness2.store.load_job("fo-1")
     assert rec is not None
     assert rec.state is JobState.RUNNING
     assert rec.attempts >= 1  # the failed attempt was counted
     assert harness2.backends["b"].submitted == ["fo-1"]
+
+
+def test_requeue_mid_drive_regathers_and_replaces(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead placement (LOST) unwinds to requeue and is RE-placed within the
+    SAME drive: the slot supplier notices the pending set changed and
+    re-gathers, so the re-place works from the CURRENT market instead of the
+    cached gather the job was first reserved from (2026-09-10: a requeue
+    re-reserved the same broken vast ask out of a stale cache, burning
+    every placement attempt on one machine)."""
+    from omnirun.engine import engine as engine_mod
+
+    # Zero the dead-placement requeue's retry pacing so the re-place happens
+    # within THIS drive (production paces it 30s wall-clock).
+    monkeypatch.setattr(engine_mod, "_REQUEUE_BACKOFF_S", 0.0)
+
+    backend = harness.backends["a"]
+    backend.lost_polls["rq-1"] = 1  # the first status poll after placement: LOST
+    backend.runs_left["rq-1"] = 0  # the re-placement settles immediately
+
+    harness.client.submit(_spec("rq-1"))
+
+    rec = harness.store.load_job("rq-1")
+    assert rec is not None and rec.state is JobState.SUCCEEDED
+    assert backend.submitted == ["rq-1", "rq-1"]  # two placements, one drive
+    # The mid-drive requeue RE-GATHERED: the supplier did not serve the
+    # cached gather the first reserve came from.
+    assert backend.probe_calls >= 2
 
 
 def test_attempts_cap_fails_job_with_reason(harness: Harness) -> None:

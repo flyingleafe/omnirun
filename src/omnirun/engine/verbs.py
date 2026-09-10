@@ -519,10 +519,29 @@ class SlotGather:
         self._inners = inners
         #: provider name → why it contributed no slot on the last refresh.
         self.notes: dict[str, list[str]] = {}
+        # Job ids of the pending reqs the LAST refresh() offered for. The
+        # daemonless drive's slot supplier diffs this against the store's
+        # current pending set: a NEW pending req (a submit, a requeue) means
+        # the cached gather predates the change and must be re-gathered —
+        # otherwise the re-place re-picks offers from a stale market: one
+        # requeue re-reserved the same broken machine ask because the cache
+        # predated the requeue (seen live 2026-09-10).
+        self.pending_ids: frozenset[str] = frozenset()
+
+    def current_pending_ids(self) -> frozenset[str]:
+        """The store's CURRENT pending reqs (a cheap read), for slot
+        suppliers that cache the gather and must re-gather when the pending
+        set changes."""
+        return frozenset(
+            r.spec.job_id
+            for r in self._store.list_jobs()
+            if r.state in (JobState.QUEUED, JobState.HELD)
+        )
 
     def refresh(self) -> list[Slot]:
         jobs = self._store.list_jobs()
         pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
+        self.pending_ids = frozenset(r.spec.job_id for r in pending)
         notes: dict[str, list[str]] = {}
         self.notes = notes
         if not pending:

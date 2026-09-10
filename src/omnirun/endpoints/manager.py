@@ -89,6 +89,10 @@ class EndpointManager:
         # concurrent identical producers coalesce (single flight) without one
         # slow endpoint blocking cache hits for another.
         self._cache: dict[CacheKey, tuple[float, object]] = {}
+        # (provider, offer-identity) -> (expires_at, reason). An offer whose
+        # rental died before it could take work cools off here so the next
+        # probe stops offering it; entries self-heal on expiry.
+        self._cooloff: dict[CacheKey, tuple[float, str]] = {}
         self._cache_locks: dict[CacheKey, threading.Lock] = {}
 
     # --- shared ssh sessions -------------------------------------------------
@@ -160,6 +164,34 @@ class EndpointManager:
                 th = Throttle(clock=self._clock)
                 self._throttles[provider] = th
             return th
+
+    # --- shared offer cooloff --------------------------------------------------
+
+    def mark_cooloff(self, provider: str, key: str, ttl_s: float, reason: str) -> None:
+        """Mark one offered resource (a machine/ask) unusable until
+        ``clock() + ttl_s``.
+
+        Shared per provider like the throttle: EVERY backend section probing
+        this provider's market stops offering *key* while it cools off, so a
+        dead-on-arrival rental (an ask whose sshd never came up) is not
+        re-picked by the very next placement attempt. In-memory and
+        temporary by design — it expires, self-heals, and restarts clean;
+        it is never a permanent blacklist."""
+        with self._lock:
+            self._cooloff[(provider, key)] = (self._clock() + ttl_s, reason)
+
+    def cooloff_reason(self, provider: str, key: str) -> str | None:
+        """Why *key* is still cooling off for *provider*, or ``None`` — an
+        expired entry is pruned here."""
+        with self._lock:
+            hit = self._cooloff.get((provider, key))
+            if hit is None:
+                return None
+            expires_at, reason = hit
+            if self._clock() < expires_at:
+                return reason
+            del self._cooloff[(provider, key)]
+            return None
 
     # --- shared discovery cache ----------------------------------------------
 

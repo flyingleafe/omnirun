@@ -26,6 +26,7 @@ from omnirun.backends.thunder import ThunderBackend
 from omnirun.backends.vast import BASE as VAST_BASE
 from omnirun.backends.vast import VastBackend, normalize_vast_gpu
 from omnirun.config import BackendConfig
+from omnirun.endpoints.manager import EndpointManager
 from omnirun.execlayer.base import Exec, ExecResult
 from omnirun.models import (
     CancelMode,
@@ -786,6 +787,77 @@ def vast_offer() -> Offer:
 
 
 @respx.mock
+def test_resource_ready_unreachable_cools_the_offer(spec, fake_ssh, fake_stage, caplog):
+    """A staged rental whose sshd never comes up is InstanceUnreachable; the
+    boot stage cools its offer off BEFORE re-raising, so the very next probe —
+    of this backend OR another section on the same provider — skips the dead
+    machine instead of re-renting it (2026-09-10: one broken vast ask was
+    re-rented into all three placement attempts and failed the job)."""
+    respx.post(f"{VAST_BASE}/bundles/").mock(
+        return_value=httpx.Response(200, json=VAST_OFFERS_RESPONSE)
+    )
+    respx.put(f"{VAST_BASE}/asks/111/").mock(
+        return_value=httpx.Response(200, json={"success": True, "new_contract": 4242})
+    )
+    # The instance never becomes visible -> the provisioning wait gives up.
+    respx.get(f"{VAST_BASE}/instances/").mock(
+        return_value=httpx.Response(200, json={"instances": []})
+    )
+    delete = respx.delete(f"{VAST_BASE}/instances/4242/").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    shared = EndpointManager()
+    backend = vast_backend(provision_timeout_s=0)
+    backend.endpoints = shared
+    sibling = vast_backend()  # another section, same provider market
+    sibling.endpoints = shared
+
+    dead = next(o for o in backend.probe(H100_RES) if o.details["ask_id"] == 111)
+    handle = backend.rent_resource(spec, dead)
+    with pytest.raises(BackendError, match="not ready"), caplog.at_level("WARNING"):
+        backend.resource_ready(handle)
+
+    assert delete.called  # the dead rental was destroyed before the raise
+    assert any("cooling off" in r.message for r in caplog.records)
+    for probed in (backend.probe(H100_RES), sibling.probe(H100_RES)):
+        ask111 = next(o for o in probed if o.details["ask_id"] == 111)
+        ask222 = next(o for o in probed if o.details["ask_id"] == 222)
+        assert not ask111.fits
+        assert any("cooling off" in r for r in ask111.unfit_reasons)
+        assert ask222.fits  # the OTHER machine is untouched
+
+
+@respx.mock
+def test_submit_unreachable_cools_its_offer_for_the_next_probe(
+    spec, fake_ssh, fake_stage
+):
+    """The legacy submit path marks the offer too: the single attempt fails on
+    a dead rental, and a following probe skips that ask."""
+    respx.post(f"{VAST_BASE}/bundles/").mock(
+        return_value=httpx.Response(200, json=VAST_OFFERS_RESPONSE)
+    )
+    respx.put(f"{VAST_BASE}/asks/111/").mock(
+        return_value=httpx.Response(200, json={"success": True, "new_contract": 4242})
+    )
+    respx.get(f"{VAST_BASE}/instances/").mock(
+        return_value=httpx.Response(200, json={"instances": []})
+    )
+    respx.delete(f"{VAST_BASE}/instances/4242/").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    backend = vast_backend(provision_timeout_s=0, provision_attempts=1)
+    dead = next(o for o in backend.probe(H100_RES) if o.details["ask_id"] == 111)
+    with pytest.raises(BackendError, match="after 1 attempts"):
+        backend.submit(spec, dead)
+
+    ask111 = next(o for o in backend.probe(H100_RES) if o.details["ask_id"] == 111)
+    assert not ask111.fits
+    assert any("cooling off" in r for r in ask111.unfit_reasons)
+
+
+@respx.mock
 def test_vast_offer_taken_gives_reprobe_advice(spec):
     respx.put(f"{VAST_BASE}/asks/111/").mock(
         return_value=httpx.Response(410, json={"success": False, "msg": "no_such_ask"})
@@ -1120,12 +1192,19 @@ def test_marketplace_observe_batch_lists_once(fake_ssh):
 
 def test_rent_resource_returns_provisioning_stub(fake_ssh, spec):
     """The staged rent creates the instance ONLY: the handle is a provisioning
-    stub (no ssh yet) and the on_provisioning sink saw it before return."""
+    stub (no ssh yet) carrying the offer's cooloff identity (so a dead rental
+    can cool its offer off at the boot stage) and the on_provisioning sink
+    saw it before return."""
     with respx.mock:
         respx.put(f"{VAST_BASE}/asks/111/").mock(
             return_value=httpx.Response(200, json={"success": True, "new_contract": 7})
         )
         seen: list = []
-        handle = vast_backend().rent_resource(spec, vast_offer(), seen.append)
-    assert handle.data == {"instance_id": "7", "provisioning": True}
+        backend = vast_backend()
+        handle = backend.rent_resource(spec, vast_offer(), seen.append)
+    assert handle.data == {
+        "instance_id": "7",
+        "provisioning": True,
+        "cooloff_key": backend._offer_cooloff_key(vast_offer()),
+    }
     assert seen and seen[0].data["instance_id"] == "7"

@@ -43,11 +43,15 @@ path minus ``.pub``) is passed to ssh as the identity when it exists.
 Backend config knobs (``[backends.<name>]`` extras): ``image``,
 ``provision_timeout_s`` (600), ``ssh_wait_timeout_s`` (120), ``auto_terminate``
 (true), ``idle_failsafe`` (true), ``failsafe_grace_s`` (86400),
+``unreachable_cooloff_s`` (900; an offer whose rental never became usable is
+skipped by every probe of that provider for this long — 0 disables),
 ``ssh_public_key``, plus provider-specific ones documented per module.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -103,6 +107,11 @@ DEFAULT_FAILSAFE_GRACE_S = 24 * 3600
 # never boot ssh; a bad rental is the instance's fault, not the job's, so the
 # backend re-provisions rather than failing the whole placement.
 DEFAULT_PROVISION_ATTEMPTS = 3
+# How long an offer is skipped after a rental on it never became usable. The
+# next placement attempt re-probes the market, and without this the same
+# machine — still advertising, still cheapest — is re-rented until the
+# placement's attempts cap burns the job. In-memory and self-healing.
+DEFAULT_UNREACHABLE_COOLOFF_S = 900.0
 # How many times a rate-limited (HTTP 429) provider API call is retried, honoring
 # the server's Retry-After, before giving up. Parallel provisioning bursts calls;
 # a generous retry count keeps a placement from failing on a transient 429.
@@ -399,6 +408,16 @@ class MarketplaceBackend(Backend, ABC):
             offers = self._query_offers(res)
         except Exception as e:  # probe must never raise
             return [self._unfit_offer(f"probe failed: {e}")]
+        for o in offers:
+            if not o.fits:
+                continue
+            reason = self._cooloff_reason(o)
+            if reason is None:
+                continue
+            o.fits = False
+            o.unfit_reasons.append(
+                f"cooling off after an unreachable rental ({reason})"
+            )
         cutoff = self.config.max_hourly
         for o in offers:
             if o.wait_estimate_s is None:
@@ -516,7 +535,13 @@ class MarketplaceBackend(Backend, ABC):
         handle = JobHandle(
             backend=self.name,
             job_id=spec.job_id,
-            data={"instance_id": inst.instance_id, "provisioning": True},
+            data={
+                "instance_id": inst.instance_id,
+                "provisioning": True,
+                # The offer's cooloff identity (see _offer_cooloff_key): the
+                # boot stage reads it back when the rental proves unreachable.
+                "cooloff_key": self._offer_cooloff_key(offer),
+            },
         )
         if on_provisioning is not None:
             on_provisioning(handle)
@@ -540,7 +565,11 @@ class MarketplaceBackend(Backend, ABC):
             )
             ex = self._make_exec(target, inst.ssh_port)
             self._wait_ssh(ex)
-        except InstanceUnreachable:
+        except InstanceUnreachable as e:
+            # The offer that produced a dead rental cools off BEFORE the raise:
+            # the unwinding (requeue) re-probes the market, and without this the
+            # same machine is re-rented into the next attempt.
+            self._mark_unreachable_offer(handle.data.get("cooloff_key"), e)
             try:  # destroy FIRST — a dead rental must not bill (COST-4)
                 self._terminate(instance_id)
             except Exception:
@@ -553,6 +582,7 @@ class MarketplaceBackend(Backend, ABC):
             raise
         data = dict(handle.data)
         data.pop("provisioning", None)
+        data.pop("cooloff_key", None)
         data.update({"ssh_target": target, "ssh_port": inst.ssh_port})
         return JobHandle(backend=self.name, job_id=handle.job_id, data=data)
 
@@ -703,6 +733,46 @@ class MarketplaceBackend(Backend, ABC):
         d = offer.details or {}
         return str(d.get("ask_id") or d.get("gpu_type_id") or offer.label)
 
+    def _offer_cooloff_key(self, offer: Offer) -> str:
+        """The stable identity this backend stamps into rental handles and
+        filters on at probe time. The offer's own details digest: one ask per
+        machine for a provider that shops concrete asks (vast), the whole
+        capability tuple otherwise (runpod/thunder) — stable across probes
+        while the same offer is still on the market."""
+        details = offer.details or {}
+        digest = hashlib.sha256(
+            json.dumps(details, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        return f"{self.provider or self.type_name}:{digest}"
+
+    def _cooloff_reason(self, offer: Offer) -> str | None:
+        """Why this offer should not be picked right now (a prior rental on it
+        never became usable and it is cooling off), or None."""
+        return self.endpoint_manager().cooloff_reason(
+            self.provider or self.type_name, self._offer_cooloff_key(offer)
+        )
+
+    def _mark_unreachable_offer(self, cooloff_key: str | None, e: Exception) -> None:
+        """Cool off the offer whose rental never became usable, so the next
+        probe (same or another backend section on this provider) skips it."""
+        if not cooloff_key:
+            return  # an adopted handle carries no offer identity
+        ttl = float(
+            self.config.extra("unreachable_cooloff_s", DEFAULT_UNREACHABLE_COOLOFF_S)
+        )
+        if ttl <= 0:
+            return  # feature disabled
+        self.endpoint_manager().mark_cooloff(
+            self.provider or self.type_name, cooloff_key, ttl, str(e)
+        )
+        _log.warning(
+            "%s: cooling off offer %s for %.0fs after an unreachable rental: %s",
+            self.name,
+            cooloff_key,
+            ttl,
+            e,
+        )
+
     def _reprobe_offer(self, spec: JobSpec, exclude: set[str]) -> Offer | None:
         """Re-probe the market and return the cheapest fitting offer, preferring one
         not already tried (probe returns cheapest-first). If every fitting offer has
@@ -767,6 +837,10 @@ class MarketplaceBackend(Backend, ABC):
                 self._terminate(instance_id)
             except Exception:
                 pass
+            if isinstance(e, InstanceUnreachable):
+                # Same rule as the staged seam: the offer that produced a dead
+                # rental cools off before submit re-provisions (or requeues).
+                self._mark_unreachable_offer(self._offer_cooloff_key(offer), e)
             # A dead rental (unreachable) propagates so submit re-provisions a fresh
             # instance; a BackendError or interrupt propagates as-is; anything else
             # is the job's/config's fault and is wrapped (not retried).

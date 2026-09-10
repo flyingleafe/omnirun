@@ -257,6 +257,7 @@ class _Session:
         }
         self._gather = SlotGather(self.store, self.inners)
         self._slots: list[Slot] = []
+        self._gathered_pending: frozenset[str] = frozenset()
         self.engine = Engine(
             self.store,
             dict(self.providers),
@@ -273,20 +274,21 @@ class _Session:
     # -- slot gathering (the impure half the pure pass reads) ------------
 
     def _supply_slots(self) -> list[Slot]:
-        """The engine's slot supplier. Normally serves the drive's cached
-        gather; when a job BECOMES pending mid-drive (a rollback, a requeue)
-        with nothing cached, it gathers right then so the same drive can
-        re-place it — bounded, because a pass over an empty offer set takes
-        no action and the drive quiesces."""
-        if not self._slots and any(
-            r.state in (JobState.QUEUED, JobState.HELD) for r in self.store.list_jobs()
-        ):
+        """The engine's slot supplier. Serves the drive's cached gather while
+        the store's pending set is UNCHANGED; a new pending req (a submit, a
+        requeue) re-gathers right then, so the same drive re-places against
+        the CURRENT market. Serving a stale cache across a requeue would
+        re-reserve the very offer that just failed (one broken marketplace
+        ask absorbed every requeue attempt in a single drive, 2026-09-10)."""
+        current = self._gather.current_pending_ids()
+        if current and current != self._gathered_pending:
             self.refresh_slots()
         return list(self._slots)
 
     def refresh_slots(self) -> None:
         """Gather the currently-offered slots for the pending reqs."""
         self._slots = self._gather.refresh()
+        self._gathered_pending = self._gather.pending_ids
 
     # -- drives -----------------------------------------------------------
 
