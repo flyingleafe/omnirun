@@ -107,9 +107,16 @@ GPU — picking the cheapest/fastest option that fits.
 ## Deployment (live daemon)
 
 - The live omnirun **daemon runs on Hetzner**, reachable with `ssh hetzner`.
-- That host is **NixOS**; its config (daemon service, SSH/known_hosts, backend
-  config, secrets) lives in **`/etc/nixos`** on the box. Inspect/change daemon
-  behavior there, not in this repo's `chaos/config.toml`.
+- That host is **NixOS**. The authoritative configuration monorepo is
+  **`/etc/nixos` on the workstation** and **`/home/nixos-config` on Hetzner**;
+  the server's `/etc/nixos` is empty. Its `hosts/hetzner/ci.nix` owns deployment.
+- A push to `master`/`main` triggers the signed GitHub webhook at
+  `https://webhook.flyingleafe.com/github`, then `nixos-self-rebuild.service`
+  updates the `omnirun` flake input and switches the host. GitHub Actions
+  checks/publishing are separate; a green Actions run is not deployment proof.
+- Inspect `journalctl -u nixos-self-rebuild.service` on Hetzner when deployment
+  stalls; `/etc/flake-inputs.json` there records the running input revisions.
+  Do not bypass the deployment path with an ad hoc daemon service override.
 - Apocrita (QMUL Slurm) is reached from the daemon over SSH; interactive
   `ssh apocrita` from the Hetzner shell can succeed while the daemon fails —
   environment/known_hosts/rate-limit differences between the login shell and
