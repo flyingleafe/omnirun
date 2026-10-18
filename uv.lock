@@ -347,7 +347,7 @@ wheels = [
 
 [[package]]
 name = "google-colab-cli"
-version = "0.6.0"
+version = "0.7.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -367,9 +367,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/c2/3bcd37fa78a7d6770fad038ef3de0a761785ca63a738c208a20d7e639f49/google_colab_cli-0.6.0.tar.gz", hash = "sha256:98adc2e200df421a0cdbb4d85bc705ed4e5d8c16892b584992ddfeac74625aca", size = 1159687, upload-time = "2026-06-16T18:54:50.386Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9f/5f/821b28ef717eaa9d857863a8bfc1103e9a8fb9be54e1061a7e8d1d13ec5a/google_colab_cli-0.7.4.tar.gz", hash = "sha256:484c759f1e690a5f455dcaf031ef2170fd4177378889e12164f6e8098f0af586", size = 1193182, upload-time = "2026-09-26T00:20:40.44Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/c1/86a6ecbce96a1889bd7743664095a7af8e67b6a095596b5f4fdba8c41a4b/google_colab_cli-0.6.0-py3-none-any.whl", hash = "sha256:46d1aa45811d1ceea82e009e4c7bcd2bdf8dd2ab5c4238c7ccb83e6a52e1f75b", size = 74614, upload-time = "2026-06-16T18:54:48.939Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/b8/2621fba8c60c1c1c4cb8a13ad172e254d22bf3e8ceb80396668438e1d5ec/google_colab_cli-0.7.4-py3-none-any.whl", hash = "sha256:1435f3533a7064f27b8b81252da85370427d6cf93b94e6c34737bd1cc68ec292", size = 82610, upload-time = "2026-09-26T00:20:39.051Z" },
 ]
 
 [[package]]
@@ -745,7 +745,7 @@ wheels = [
 
 [[package]]
 name = "omnirun"
-version = "0.6.3"
+version = "0.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -794,7 +794,7 @@ dev = [
 requires-dist = [
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
     { name = "bottle", marker = "extra == 'daemon'", specifier = ">=0.13" },
-    { name = "google-colab-cli", marker = "extra == 'colab'", specifier = ">=0.6" },
+    { name = "google-colab-cli", marker = "extra == 'colab'", specifier = ">=0.7.2" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "kaggle", marker = "extra == 'kaggle'", specifier = ">=2.2" },
     { name = "omnirun", extras = ["kaggle", "colab", "postgres", "daemon", "s3"], marker = "extra == 'all'" },

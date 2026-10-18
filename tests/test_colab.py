@@ -211,10 +211,6 @@ def fake_bundle(monkeypatch):
     monkeypatch.setattr(colab_mod, "_remote_clone_plan", lambda spec: None)
     # No .env by default: make_spec leaves spec.env_dotenv None, and the backend
     # reads only that (never the developer's filesystem).
-    # default: bore disabled — keeps submit byte-identical to non-bore baseline.
-    from omnirun.config import BoreConfig
-
-    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())
 
 
 # ---- probe -----------------------------------------------------------------
@@ -528,7 +524,7 @@ def test_logs_nonfollow_reads_the_complete_log_each_time(cli, backend):
 
 
 def test_logs_over_ssh_uses_shared_exec_and_streams(backend, monkeypatch):
-    """With a reachable bore endpoint, colab logs stream over the shared tunnel
+    """With a reachable ssh bridge, colab logs stream over the shared tunnel
     path (sshconn.tunnel_logs → tail_logs_over) — identical to the ssh family, and
     never touching the session-exec fallback."""
     from omnirun import sshconn
@@ -657,71 +653,104 @@ def test_count_sessions_helper():
     assert _count_sessions(two) == 2
 
 
-# ---- bore env injection (ssh-everywhere T2) ------------------------------------
+# ---- ssh bridge: `colab ssh --proxy-mode` as the OpenSSH ProxyCommand ----------
 
 
-def _make_bore_cfg(host: str = "bore.example.com", secret: str = "s3cr3t"):
-    from omnirun.config import BoreConfig
-
-    return BoreConfig(public_host=host, secret=secret, control_port=7835)
+SESSIONS_LISTING = f"[✓] {SESSION} | Hardware: L4 | Variant: GPU\n"
+NO_SESSIONS = "[colab] No active sessions found on server.\n"
 
 
-def test_submit_with_bore_injects_env_vars_into_launcher(cli, backend, monkeypatch):
-    """When bore is enabled, the bore env vars (including OMNIRUN_BORE_PORT and
-    OMNIRUN_SSH_PUBKEY) must appear in the launcher snippet's env dict (sent
-    via `colab exec`)."""
-    from pathlib import Path
-
-    bore = _make_bore_cfg()
-    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
+@pytest.fixture
+def managed_key(monkeypatch, tmp_path) -> Path:
+    key = tmp_path / "id_ed25519"
+    key.write_text("FAKE")
     monkeypatch.setattr(
-        colab_mod,
-        "_managed_keypair",
-        lambda: (Path("/fake/id_ed25519"), "ssh-ed25519 AAAA test-pubkey"),
+        colab_mod, "_managed_keypair", lambda: (key, "ssh-ed25519 AAAA omnirun")
     )
-    monkeypatch.setattr(colab_mod, "_allocate_port", lambda job_id, bore: 20042)
-    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
+    return key
 
+
+def test_ssh_endpoint_bridges_live_session_with_managed_key(cli, backend, managed_key):
+    """A live session is reached through `colab ssh --proxy-mode` carrying the
+    managed identity, as a ProxyCommand on the shared endpoint — no port, root
+    login, and the session name as the host label (per-worker ControlMaster)."""
+    cli.handlers["sessions"] = lambda argv, stdin: (0, SESSIONS_LISTING, "")
+    ep = backend.ssh_endpoint(make_handle())
+    assert ep is not None
+    assert (ep.host, ep.port, ep.user, ep.key_path) == (
+        SESSION,
+        None,
+        "root",
+        managed_key,
+    )
+    assert ep.proxy_command == (
+        f"colab ssh --proxy-mode -s {SESSION} --identity {managed_key}"
+    )
+
+
+def test_ssh_endpoint_none_when_session_not_listed(cli, backend, managed_key):
+    """`colab ssh --proxy-mode -s NAME` would CREATE a runtime for an unknown
+    NAME, so a session Colab no longer lists must never be bridged."""
+    cli.handlers["sessions"] = lambda argv, stdin: (0, NO_SESSIONS, "")
+    assert backend.ssh_endpoint(make_handle()) is None
+    cli.handlers["sessions"] = lambda argv, stdin: (1, "", "auth expired")
+    assert backend.ssh_endpoint(make_handle()) is None
+    assert "ssh" not in cli.subcommands()
+
+
+def test_ssh_endpoint_none_for_terminal_job(cli, backend, managed_key):
+    cli.handlers["sessions"] = lambda argv, stdin: (0, SESSIONS_LISTING, "")
+    backend._terminal[JOB_ID] = StatusReport(status=JobStatus.SUCCEEDED)
+    assert backend.ssh_endpoint(make_handle()) is None
+    assert cli.subcommands() == []  # settled before asking Colab anything
+
+
+def test_session_liveness_is_cached_until_stop(cli, backend, managed_key, monkeypatch):
+    """A positive listing vouches for the session for a while (a followed log's
+    reconnect polls must not hit the API every few seconds); cancel/gc forget it
+    immediately, and a negative answer is re-asked on the next call."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(colab_mod.time, "monotonic", lambda: clock["t"])
+    cli.handlers["sessions"] = lambda argv, stdin: (0, SESSIONS_LISTING, "")
+    assert backend.ssh_endpoint(make_handle()) is not None
+    assert backend.ssh_endpoint(make_handle()) is not None
+    assert cli.subcommands().count("sessions") == 1
+
+    clock["t"] += colab_mod.SESSION_LIVE_TTL_S + 1
+    assert backend.ssh_endpoint(make_handle()) is not None
+    assert cli.subcommands().count("sessions") == 2
+
+    backend.gc(make_handle())
+    backend._terminal.clear()
+    cli.handlers["sessions"] = lambda argv, stdin: (0, NO_SESSIONS, "")
+    assert backend.ssh_endpoint(make_handle()) is None
+    assert backend.ssh_endpoint(make_handle()) is None
+    assert cli.subcommands().count("sessions") == 4
+
+
+def test_submit_vouches_for_the_fresh_session(cli, backend, managed_key):
+    """The session `colab new` just assigned is live by construction: the first
+    `logs -f` bridges it without a `colab sessions` round-trip."""
+    cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
     spec = make_spec(gpu_type="T4")
     offer = backend.probe(spec.resources)[0]
+    handle = backend.submit(spec, offer)
     cli.calls.clear()
-    backend.submit(spec, offer)
-
-    # Find the launcher exec call (last exec)
-    exec_calls = [c for c in cli.calls if c["argv"][1] == "exec"]
-    launcher = exec_calls[-1]["stdin"]
-
-    assert "OMNIRUN_BORE_PUBLIC_HOST" in launcher
-    assert "bore.example.com" in launcher
-    assert "OMNIRUN_BORE_SECRET" in launcher
-    assert "s3cr3t" in launcher
-    assert "OMNIRUN_BORE_CONTROL_PORT" in launcher
-    assert "7835" in launcher
-    assert "OMNIRUN_SSH_PUBKEY" in launcher
-    assert "test-pubkey" in launcher
-    assert "OMNIRUN_BORE_PORT" in launcher
-    assert "20042" in launcher
+    ep = backend.ssh_endpoint(handle)
+    assert ep is not None and ep.host == handle.data["session"]
+    assert cli.subcommands() == []
 
 
-def test_submit_without_bore_launcher_is_byte_unchanged(cli, backend, monkeypatch):
-    """When bore is disabled, the launcher snippet must be byte-identical to the
-    pre-bore baseline — no bore vars, no extra lines."""
-    from omnirun.config import BoreConfig
-
-    monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())  # no public_host
-
+def test_launcher_env_carries_only_the_root(cli, backend):
+    """The launcher cell injects OMNIRUN_ROOT and nothing else — no tunnel
+    credentials ride the kernel channel any more."""
     cli.handlers["exec"] = lambda argv, stdin: (0, "LAUNCHED 4242\n", "")
     spec = make_spec(gpu_type="T4")
     offer = backend.probe(spec.resources)[0]
-    cli.calls.clear()
     backend.submit(spec, offer)
-
-    exec_calls = [c for c in cli.calls if c["argv"][1] == "exec"]
-    launcher = exec_calls[-1]["stdin"]
-
-    assert "OMNIRUN_BORE_PUBLIC_HOST" not in launcher
-    assert "OMNIRUN_BORE_SECRET" not in launcher
-    assert "OMNIRUN_SSH_PUBKEY" not in launcher
+    launcher = [c for c in cli.calls if c["argv"][1] == "exec"][-1]["stdin"]
+    assert "{'OMNIRUN_ROOT': '/content/omnirun'}" in launcher
+    assert "OMNIRUN_BORE" not in launcher and "OMNIRUN_SSH_PUBKEY" not in launcher
 
 
 # ---- typed outcomes + structural capacity + adoption (P5) --------------------

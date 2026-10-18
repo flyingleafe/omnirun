@@ -65,14 +65,14 @@ let
 in
 pp.buildPythonApplication rec {
   pname = "google-colab-cli";
-  version = "0.6.0";
+  version = "0.7.4";
   format = "wheel";
   src = fetchPypi {
     pname = "google_colab_cli";
     inherit version format;
     dist = "py3";
     python = "py3";
-    sha256 = "46d1aa45811d1ceea82e009e4c7bcd2bdf8dd2ab5c4238c7ccb83e6a52e1f75b";
+    sha256 = "1435f3533a7064f27b8b81252da85370427d6cf93b94e6c34737bd1cc68ec292";
   };
   propagatedBuildInputs = [
     pp.click

@@ -1,8 +1,9 @@
 """Colab backend — automated via the official ``google-colab-cli`` (``colab``).
 
 POLICY NOTE: all automation here rides the *official* Google Colab CLI
-(one-time ``colab auth`` OAuth) — no tunnels, no browser scraping, nothing
-that violates the Colab ToS. Reality checks that stay true regardless:
+(one-time ``colab auth`` OAuth) — no browser scraping, nothing that violates
+the Colab ToS; the ssh path below is the CLI's own ``colab ssh`` bridge.
+Reality checks that stay true regardless:
 
   * free-tier GPU availability is a lottery (T4 when Google feels like it);
   * paid tiers burn Colab compute units for every session-hour;
@@ -13,8 +14,11 @@ Mechanics: ``colab new`` provisions a named session ``omnirun-<job_id>``;
 bootstrap.sh + the git bundle are ``colab upload``-ed under
 ``/content/omnirun/jobs/<job_id>/``; a ``colab exec`` launcher cell starts
 bootstrap.sh detached (``start_new_session=True``) so the kernel stays free;
-status/log beacons are tiny ``colab exec`` snippets reading the job-dir files
-(same derivation semantics as the ssh family); outputs come back with
+status beacons are tiny ``colab exec`` snippets reading the job-dir files
+(same derivation semantics as the ssh family); logs stream over OpenSSH with
+``colab ssh --proxy-mode`` as the ``ProxyCommand`` (see ``ssh_endpoint``), the
+same `SSHExec`/`jobdir.tail_logs` path every ssh-family backend uses, with the
+kernel-exec reader as the final-only fallback; outputs come back with
 ``colab download``; ``colab stop`` releases the VM. The CLI's local keep-alive
 daemon holds the VM — a sleeping laptop may lose idle sessions.
 """
@@ -22,6 +26,7 @@ daemon holds the VM — a sleeping laptop may lose idle sessions.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -50,7 +55,6 @@ from omnirun.bootstrap import (
     generate_bootstrap,
     notebook_env_spec,
 )
-from omnirun.config import BoreConfig
 from omnirun.progress import report
 from omnirun.models import (
     CancelMode,
@@ -93,6 +97,10 @@ def _is_accel_rejected(message: str) -> bool:
 
 
 SESSION_CAP_H = 11.5  # headroom under the ~12h session reclaim
+# How long a positive `colab sessions` answer vouches for a session before the
+# ssh bridge re-asks. Short enough that a reclaimed VM stops being offered
+# well inside the status poll's own LOST verdict.
+SESSION_LIVE_TTL_S = 60.0
 COLAB_ROOT = "/content/omnirun"
 COST_NOTE = "consumes Colab compute units on paid tiers; free tier = T4 lottery"
 LOST_DETAIL = "session terminated (12h cap or idle reclaim)"
@@ -142,17 +150,6 @@ def _remote_clone_plan(spec: JobSpec) -> str | None:
     return repo.remote_clone_plan(spec.repo, _local_root(spec))
 
 
-def _bore_cfg() -> BoreConfig:
-    """Load the global bore config (lazy, monkeypatched in tests).
-
-    Kept as a module-level function so tests can replace it with a fake that
-    returns a specific BoreConfig without touching the filesystem.
-    """
-    from omnirun.config import load_config
-
-    return load_config().bore
-
-
 def _managed_keypair() -> tuple[Path, str]:
     """Return (private_key_path, pubkey_str) for the omnirun-managed keypair
     (monkeypatched in tests)."""
@@ -161,26 +158,17 @@ def _managed_keypair() -> tuple[Path, str]:
     return managed_keypair()
 
 
-def _allocate_port(job_id: str, bore: BoreConfig) -> int:
-    """Allocate a deterministic bore tunnel port for ``job_id`` (monkeypatched
-    in tests)."""
-    from omnirun.transport import allocate
+def _ssh_proxy_command(session: str, key_path: Path) -> str:
+    """The OpenSSH ``ProxyCommand`` that bridges stdio to *session*'s sshd.
 
-    return allocate(None, job_id, bore.port_min, bore.port_max)
-
-
-def _port_for(job_id: str) -> int | None:
-    """Return the port currently allocated to ``job_id``, or None."""
-    from omnirun.transport import port_for
-
-    return port_for(None, job_id)
-
-
-def _release_port(job_id: str) -> None:
-    """Release the bore tunnel port allocated to ``job_id``."""
-    from omnirun.transport import release
-
-    release(None, job_id)
+    ``colab ssh --proxy-mode`` (google-colab-cli >= 0.7.2) opens the session's
+    ``/colab/ssh`` WebSocket and pumps bytes; the public half of ``key_path``
+    is derived (``ssh-keygen -y``) and sent in the handshake, so the same
+    managed key authenticates the ssh connection it carries.
+    """
+    return shlex.join(
+        ["colab", "ssh", "--proxy-mode", "-s", session, "--identity", str(key_path)]
+    )
 
 
 def _ts(s: str | None) -> datetime | None:
@@ -195,18 +183,9 @@ def _ts(s: str | None) -> datetime | None:
 # ---- exec snippets (python sent to the session kernel over `colab exec`) -------
 
 
-def _launcher_snippet(
-    root: str, job_dir: str, extra_env: dict[str, str] | None = None
-) -> str:
-    """Python cell that starts bootstrap.sh detached.
-
-    ``extra_env`` is injected into the subprocess environment at launch time
-    (infra vars like bore credentials and the SSH pubkey).  These never touch
-    git — they ride the ``colab exec`` channel directly.
-    """
-    extra = dict(extra_env or {})
-    extra["OMNIRUN_ROOT"] = root
-    env_repr = repr(extra)
+def _launcher_snippet(root: str, job_dir: str) -> str:
+    """Python cell that starts bootstrap.sh detached."""
+    env_repr = repr({"OMNIRUN_ROOT": root})
     return f"""\
 import os, subprocess
 job_dir = {job_dir!r}
@@ -296,6 +275,13 @@ def _count_sessions(output: str) -> int:
     return sum(1 for ln in output.splitlines() if "Hardware:" in ln)
 
 
+def _session_listed(output: str, session: str) -> bool:
+    """True when ``colab sessions`` output has a row for *session* — the row
+    format `_count_sessions` keys on, so a bare mention in a notice line never
+    counts."""
+    return any(session in ln and "Hardware:" in ln for ln in output.splitlines())
+
+
 @register("colab")
 class ColabBackend(Backend):
     # A Colab LOST is a confirmed gone/idle session (3 status-exec retries, then
@@ -313,6 +299,8 @@ class ColabBackend(Backend):
         super().__init__(name, config)
         self._terminal: dict[str, StatusReport] = {}
         self._log_offsets: dict[str, dict[str, int]] = {}
+        # session name -> monotonic time `colab sessions` last listed it live
+        self._session_live_at: dict[str, float] = {}
 
     # ---- CLI plumbing ---------------------------------------------------------
 
@@ -587,6 +575,9 @@ class ColabBackend(Backend):
                 self._colab(*new_args, timeout=PROVISION_TIMEOUT_S)
                 gpu_flag = flag
                 placed = True
+                # Freshly assigned: vouch for it so the first `logs -f` does
+                # not spend a `colab sessions` round-trip re-learning this.
+                self._session_live_at[session] = time.monotonic()
                 break
             except BackendError as e:
                 # An un-entitled accelerator: remember it, tear down any half-made
@@ -618,21 +609,6 @@ class ColabBackend(Backend):
                 resource_class=tried,
                 ttl_s=self._blocked_ttl_s(),
             )
-
-        # bore env — generated at submit time; empty when bore is disabled so
-        # the launcher never touches it and the script is byte-unchanged.
-        bore = _bore_cfg()
-        bore_env: dict[str, str] = {}
-        if bore.enabled:
-            _key_path, pubkey = _managed_keypair()
-            bore_port = _allocate_port(spec.job_id, bore)
-            bore_env = {
-                "OMNIRUN_BORE_PUBLIC_HOST": bore.public_host or "",
-                "OMNIRUN_BORE_SECRET": bore.secret or "",
-                "OMNIRUN_BORE_CONTROL_PORT": str(bore.control_port),
-                "OMNIRUN_SSH_PUBKEY": pubkey,
-                "OMNIRUN_BORE_PORT": str(bore_port),
-            }
 
         # a public repo is cloned by the worker directly (bootstrap does the git
         # clone over the VM's internet); only a private/unpushed sha is uploaded
@@ -750,9 +726,7 @@ class ColabBackend(Backend):
                 "exec",
                 "-s",
                 session,
-                stdin=_launcher_snippet(
-                    COLAB_ROOT, job_dir, extra_env=bore_env or None
-                ),
+                stdin=_launcher_snippet(COLAB_ROOT, job_dir),
                 timeout=EXEC_TIMEOUT_S,
             )
             pid_str = _marker_line(out, "LAUNCHED ")
@@ -888,10 +862,10 @@ class ColabBackend(Backend):
 
     def logs(self, handle: JobHandle, follow: bool = False) -> Iterator[str]:
         # One path for every notebook backend (see sshconn.tunnel_logs): stream
-        # live over the bore tunnel, waiting for a slow-to-provision VM's tunnel to
-        # come up before falling back — so `logs -f` is a live tail here just like
-        # on ssh/slurm. The session-exec reader is used only when not following, or
-        # if the job finishes before its tunnel came up.
+        # live over the `colab ssh` bridge, waiting for a slow-to-provision VM's
+        # sshd to answer before falling back — so `logs -f` is a live tail here
+        # just like on ssh/slurm. The session-exec reader is used only when not
+        # following, or if the job finishes before the bridge ever answered.
         yield from tunnel_logs(
             lambda: self.ssh_endpoint(handle),
             lambda: self.status(handle).status.settled,
@@ -902,7 +876,7 @@ class ColabBackend(Backend):
 
     def _session_exec_logs(self, handle: JobHandle, follow: bool) -> Iterator[str]:
         """Fallback log reader over the Colab session kernel (`colab exec`), used
-        when the bore tunnel never came up. Reads only bootstrap.log — the
+        when the ssh bridge never answered. Reads only bootstrap.log — the
         canonical merged log (diagnostics + the command's stdout+stderr, which the
         run step tees back through fd 1/2); also reading stdout/stderr.log would
         double every command line (those stay on disk for `pull`)."""
@@ -999,45 +973,71 @@ class ColabBackend(Backend):
                 )
             except BackendError:
                 pass
+        self._session_live_at.pop(session, None)
         try:
             self._colab("stop", "-s", session)
         except BackendError:
             pass  # session already reclaimed == effectively cancelled
-        _release_port(handle.job_id)
         self._terminal[handle.job_id] = StatusReport(
             status=JobStatus.CANCELLED, detail="killed process group + stopped session"
         )
 
     def gc(self, handle: JobHandle) -> None:
+        self._session_live_at.pop(handle.data["session"], None)
         try:
             self._colab("stop", "-s", handle.data["session"])
         except Exception:
             pass  # already gone
-        _release_port(handle.job_id)
 
     def ssh_endpoint(self, handle: JobHandle) -> SSHEndpoint | None:
-        """Return SSH endpoint via the bore tunnel, or None.
+        """Return the SSH endpoint bridged by ``colab ssh --proxy-mode``, or None.
 
         Returns None when:
-        - bore is not configured;
-        - no port has been allocated for this job (job was not submitted with bore);
-        - the job is in a terminal state (tunnel is gone).
+        - the job is in a terminal state (the VM is stopped or about to be);
+        - the session is not live on Colab's side.
+
+        The liveness check matters beyond saving a doomed dial: ``colab ssh
+        --proxy-mode -s NAME`` *creates* a runtime when NAME is unknown to the
+        CLI's session store, so proxying a reclaimed session would silently
+        rent a fresh VM for nothing.  The session name doubles as the ssh host
+        label so each worker gets its own ControlMaster socket.
         """
-        bore = _bore_cfg()
-        if not bore.enabled:
-            return None
-        # Terminal jobs no longer have a live tunnel.
         st = self._terminal.get(handle.job_id)
         if st is not None and st.status.terminal:
             return None
-        port = _port_for(handle.job_id)
-        if port is None:
-            return None
-        host = bore.public_host
-        if host is None:
+        session = handle.data["session"]
+        if not self._session_live(session):
             return None
         key_path, _pub = _managed_keypair()
-        return SSHEndpoint(host=host, port=port, user="root", key_path=key_path)
+        return SSHEndpoint(
+            host=session,
+            port=None,
+            user="root",
+            key_path=key_path,
+            proxy_command=_ssh_proxy_command(session, key_path),
+        )
+
+    def _session_live(self, session: str) -> bool:
+        """True when ``colab sessions`` currently lists *session* as assigned.
+
+        A positive answer is remembered for ``SESSION_LIVE_TTL_S`` so a followed
+        log's reconnect polls do not hit the Colab API every few seconds; a
+        negative one is never cached, so the bridge is offered the moment the
+        session appears.
+        """
+        now = time.monotonic()
+        seen = self._session_live_at.get(session)
+        if seen is not None and now - seen < SESSION_LIVE_TTL_S:
+            return True
+        try:
+            out = self._colab("sessions", timeout=30)
+        except BackendError:
+            return False
+        if not _session_listed(out, session):
+            self._session_live_at.pop(session, None)
+            return False
+        self._session_live_at[session] = now
+        return True
 
     def check(self) -> str:
         version = self._colab("version", timeout=10).strip().splitlines()
@@ -1080,15 +1080,15 @@ class ColabBackend(Backend):
             out = self._colab("sessions", timeout=30)
         except BackendError:
             return None  # listing unavailable — best-effort, rent decides
-        for line in out.splitlines():
-            if session in line and "Hardware:" in line:
-                return JobHandle(
-                    backend=self.name,
-                    job_id=spec.job_id,
-                    data={
-                        "session": session,
-                        "job_dir": f"{COLAB_ROOT}/jobs/{spec.job_id}",
-                        "root": COLAB_ROOT,
-                    },
-                )
-        return None
+        if not _session_listed(out, session):
+            return None
+        self._session_live_at[session] = time.monotonic()
+        return JobHandle(
+            backend=self.name,
+            job_id=spec.job_id,
+            data={
+                "session": session,
+                "job_dir": f"{COLAB_ROOT}/jobs/{spec.job_id}",
+                "root": COLAB_ROOT,
+            },
+        )

@@ -103,7 +103,7 @@ Concrete backends:
 | `slurm` (uni) | ssh | slurm | — | no |
 | `runpod` / `vast` / `thunder` | ssh | detached | REST API create→ssh→terminate | no |
 | `kaggle` | kernels API | kernel wraps bootstrap | — | no |
-| `colab` | `google-colab-cli` | exec cell wraps bootstrap | — | no (one-time OAuth) |
+| `colab` | `google-colab-cli` + ssh via `colab ssh --proxy-mode` | exec cell wraps bootstrap | — | no (one-time OAuth) |
 
 ## 3. The bootstrap payload
 
@@ -363,14 +363,21 @@ is already in the revision and is left alone. (`repo.env_file` / `jobdir.stage_e
   (same source as `discover()`) → GPU offers are unfit only when the real remaining allowance
   is exhausted (0h). Poll ≥30s. `gc()` is a no-op (nothing
   worker-side: the bundle rode inside the kernel).
-- **Colab**: fully automated via the official `google-colab-cli` (v0.6+, June 2026;
+- **Colab**: fully automated via the official `google-colab-cli` (v0.7.2+;
   one-time OAuth). Submit = `colab new --gpu <T4|L4|G4|A100|H100>` → `colab upload`
   the bootstrap (plus the git bundle for a private/unpushed repo; a public repo ships no
   bundle and the worker clones it directly, see §6) and, if present, the gitignored
   `.env` → `colab exec` a launcher cell that starts `bootstrap.sh`
   detached under the kernel and returns → CLI keep-alive daemon holds the VM.
-  Status = short `colab exec` beacon reads (or heartbeat-file check); logs via
-  incremental file reads; `colab download` outputs; `colab stop` to release. Env handling
+  Status = short `colab exec` beacon reads (or heartbeat-file check). Logs stream
+  over plain OpenSSH to the VM's sshd with `colab ssh --proxy-mode -s <session>`
+  as the `ProxyCommand` (the CLI bridges its `/colab/ssh` WebSocket to stdio and
+  registers the managed key's public half): `ssh_endpoint()` hands `sshconn` an
+  `SSHEndpoint(proxy_command=…)`, so `logs -f` is the same `SSHExec` +
+  `jobdir.tail_logs` live tail every ssh-family backend uses; the kernel-exec
+  file reader remains the final-only fallback. The endpoint exists only while
+  `colab sessions` lists the session — `--proxy-mode -s NAME` would otherwise
+  *create* a runtime for a reclaimed name. `colab download` outputs; `colab stop` to release. Env handling
   is forced to `system` (§ below) to keep the VM's preinstalled torch.
   Probe honesty: free tier = T4 lottery + ~12h cap; paid = compute-unit burn
   surfaced as a note. An unpinned GPU request offers only the `default_gpu` tier (default

@@ -4,9 +4,10 @@ and ``omnirun ssh`` CLI command.
 Coverage:
 - transport.managed_keypair: single keypair, idempotent, correct location + mode.
 - transport.allocate/release/port_for: allocator semantics, lease expiry, atomicity.
-- injection (colab + kaggle): payload carries managed pubkey + OMNIRUN_BORE_PORT;
+- injection (kaggle): payload carries managed pubkey + OMNIRUN_BORE_PORT;
   snippet uses ``--port``; byte-unchanged when bore disabled.
-- ssh_endpoint: notebook returns public_host:port when not terminal, None otherwise;
+- ssh_endpoint: kaggle returns public_host:port when not terminal, None otherwise;
+  colab returns a `colab ssh --proxy-mode` bridged endpoint for a live session;
   ssh/local return their direct target; slurm/marketplace return None.
 - omnirun ssh: resolves endpoint and builds the correct ssh argv (mock os.execvp);
   clear error when not reachable.
@@ -271,28 +272,20 @@ def _make_colab_handle() -> JobHandle:
 
 
 class TestColabSSHEndpoint:
-    def test_returns_none_when_bore_disabled(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: BoreConfig())
-        be = _make_colab_backend()
-        assert be.ssh_endpoint(_make_colab_handle()) is None
+    """Colab is bridged by `colab ssh --proxy-mode`, never by bore: the endpoint
+    carries a ProxyCommand and no port, and only exists for a session Colab lists."""
 
-    def test_returns_none_when_no_port_allocated(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        bore = _make_bore_cfg()
-        monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
-        monkeypatch.setattr(colab_mod, "_port_for", lambda job_id: None)
-        be = _make_colab_backend()
-        assert be.ssh_endpoint(_make_colab_handle()) is None
+    def _live(self, monkeypatch: pytest.MonkeyPatch, listed: bool) -> None:
+        monkeypatch.setattr(
+            colab_mod.ColabBackend,
+            "_session_live",
+            lambda self, session: listed,
+        )
 
-    def test_returns_endpoint_with_public_host_and_allocated_port(
+    def test_returns_proxied_endpoint_for_live_session(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        bore = _make_bore_cfg()
-        monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
-        monkeypatch.setattr(colab_mod, "_port_for", lambda job_id: 20042)
+        self._live(monkeypatch, True)
         fake_key = tmp_path / "id_ed25519"
         fake_key.write_text("FAKE")
         monkeypatch.setattr(
@@ -303,24 +296,25 @@ class TestColabSSHEndpoint:
         be = _make_colab_backend()
         ep = be.ssh_endpoint(_make_colab_handle())
         assert ep is not None
-        assert ep.host == "bore.example.com"
-        assert ep.port == 20042
+        assert ep.host == f"omnirun-{JOB_ID}"
+        assert ep.port is None
         assert ep.user == "root"
         assert ep.key_path == fake_key
+        assert ep.proxy_command == (
+            f"colab ssh --proxy-mode -s omnirun-{JOB_ID} --identity {fake_key}"
+        )
+
+    def test_returns_none_when_session_not_live(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._live(monkeypatch, False)
+        be = _make_colab_backend()
+        assert be.ssh_endpoint(_make_colab_handle()) is None
 
     def test_returns_none_for_terminal_job(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        bore = _make_bore_cfg()
-        monkeypatch.setattr(colab_mod, "_bore_cfg", lambda: bore)
-        monkeypatch.setattr(colab_mod, "_port_for", lambda job_id: 20042)
-        fake_key = tmp_path / "id_ed25519"
-        fake_key.write_text("FAKE")
-        monkeypatch.setattr(
-            colab_mod,
-            "_managed_keypair",
-            lambda: (fake_key, "ssh-ed25519 AAAA omnirun"),
-        )
+        self._live(monkeypatch, True)
         be = _make_colab_backend()
         handle = _make_colab_handle()
         # Seed the terminal cache.

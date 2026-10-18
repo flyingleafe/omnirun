@@ -1,16 +1,18 @@
 """Shared ssh-connection helpers for the ssh-everywhere transport.
 
-`omnirun ssh` and the notebook backends both reach a worker through the same
-bore tunnel with the same omnirun-managed key.  This module is the single place
-that turns an endpoint into either a one-shot ``ssh`` argv (interactive shell,
-reachability probe) or the shared `SSHExec` transport, so notebook and ssh-family
-backends can never drift apart.
+`omnirun ssh` and the notebook backends reach a worker through the same
+`SSHEndpoint` with the same omnirun-managed key — Kaggle over a bore tunnel
+(host:port), Colab through the ``colab ssh --proxy-mode`` bridge carried as an
+OpenSSH ``ProxyCommand``.  This module is the single place that turns an
+endpoint into either a one-shot ``ssh`` argv (interactive shell, reachability
+probe) or the shared `SSHExec` transport, so notebook and ssh-family backends
+can never drift apart.
 
 Design notes:
 - We shell out to the user's own ``ssh`` binary (invariant: never bypass it),
-  reusing the flags `omnirun ssh` established: managed identity, tunnel port,
-  and ``accept-new`` host-key policy against a throwaway known-hosts file
-  (worker host keys are ephemeral).
+  reusing the flags `omnirun ssh` established: managed identity, tunnel port or
+  proxy command, and ``accept-new`` host-key policy against a throwaway
+  known-hosts file (worker host keys are ephemeral).
 - `exec_for_endpoint` wraps a tunnelled worker in the SAME `SSHExec` transport
   the ssh-family backends use, so a notebook worker is driven byte-for-byte
   identically to a plain-ssh box: `logs` (and any other job-dir operation) goes
@@ -33,6 +35,23 @@ from omnirun.execlayer.ssh import SSHExec
 TUNNEL_WAIT_POLL_S = 3.0
 
 
+def _endpoint_opts(ep: SSHEndpoint) -> list[str]:
+    """The ``-o`` flags an endpoint needs beyond identity and port: offer ONLY
+    the managed key (an ssh-agent holding other keys otherwise exhausts the
+    worker sshd's auth attempts before ours is tried), the ephemeral-host-key
+    policy every worker gets, plus the ``ProxyCommand`` when the endpoint is
+    bridged rather than dialled. Attached ``-oKey=value`` form so an ssh
+    wrapper scanning argv sees whole options."""
+    opts = [
+        "-oIdentitiesOnly=yes",
+        "-oStrictHostKeyChecking=accept-new",
+        "-oUserKnownHostsFile=/dev/null",
+    ]
+    if ep.proxy_command:
+        opts.append(f"-oProxyCommand={ep.proxy_command}")
+    return opts
+
+
 def ssh_argv(
     ep: SSHEndpoint,
     *,
@@ -43,7 +62,7 @@ def ssh_argv(
     """Build the ``ssh`` argv to reach a worker endpoint.
 
     Args:
-        ep:          The SSH endpoint (host, port, user, managed key).
+        ep:          The SSH endpoint (host, port or proxy, user, managed key).
         remote_cmd:  Words appended after the target; ssh runs them on the
             worker.  None/empty means "no command" (interactive shell).
         interactive: Allocate a PTY (``-tt``) for an interactive session.
@@ -57,14 +76,10 @@ def ssh_argv(
     argv = ["ssh"]
     if batch:
         argv.append("-oBatchMode=yes")
-    argv += [
-        "-i",
-        str(ep.key_path),
-        "-p",
-        str(ep.port),
-        "-oStrictHostKeyChecking=accept-new",
-        "-oUserKnownHostsFile=/dev/null",
-    ]
+    argv += ["-i", str(ep.key_path)]
+    if ep.port is not None:
+        argv += ["-p", str(ep.port)]
+    argv += _endpoint_opts(ep)
     if interactive:
         argv.append("-tt")
     argv += ["--", target]
@@ -90,7 +105,7 @@ def endpoint_reachable(ep: SSHEndpoint, timeout: float = 8.0) -> bool:
 
 def exec_for_endpoint(ep: SSHEndpoint) -> SSHExec:
     """Build the SAME `SSHExec` transport the ssh-family backends use, pointed at
-    a worker reached through the bore tunnel.
+    a worker reached through its tunnel or proxy.
 
     Routing a notebook worker's job-dir operations through this — rather than a
     notebook-specific ssh path — means they run identically to a plain-ssh
@@ -105,8 +120,7 @@ def exec_for_endpoint(ep: SSHEndpoint) -> SSHExec:
         port=ep.port,
         identity=str(ep.key_path),
         extra_opts=[
-            "-oStrictHostKeyChecking=accept-new",
-            "-oUserKnownHostsFile=/dev/null",
+            *_endpoint_opts(ep),
             # `logs -f` polls over this connection; suppress the client-side
             # GSSAPI negotiation that otherwise adds seconds to each new session.
             "-oGSSAPIAuthentication=no",
@@ -128,8 +142,9 @@ def tunnel_logs(
     """The one `logs` path every notebook backend uses, so a Colab/Kaggle job's
     logs behave exactly like an ssh-family job's whenever the worker is reachable.
 
-    When the bore tunnel is up, stream the merged log live over it (identical to
-    ssh/slurm). The catch a notebook adds: the worker takes ~30s to boot, so its
+    When the worker's ssh path (bore tunnel or proxy bridge) is up, stream the
+    merged log live over it (identical to ssh/slurm). The catch a notebook adds:
+    the worker takes ~30s to boot, so its
     tunnel is not up the instant `logs -f` is called. So a followed log WAITS for
     the tunnel to come up (surfacing one 'connecting' line) and upgrades to the
     live stream as soon as it does. `fallback` fetches whatever final logs exist
@@ -144,7 +159,7 @@ def tunnel_logs(
         return
     # Wait for the tunnel only when an endpoint EXISTS but is not up yet — a
     # slow-to-start worker whose tunnel is still coming online. If there is no
-    # endpoint at all (bore disabled, or the job already terminal), there is
+    # endpoint at all (no transport configured, or the job already terminal), there is
     # nothing to wait for; go straight to the final-log reader.
     if follow and ep is not None:
         noted = False

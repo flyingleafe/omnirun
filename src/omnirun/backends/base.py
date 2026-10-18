@@ -99,17 +99,24 @@ class SSHEndpoint:
     provisioned, already torn down, or the backend does not support it).
 
     Attributes:
-        host:     Hostname or IP to connect to.
-        port:     SSH (or bore tunnel) port number.
+        host:     Hostname or IP to connect to. With ``proxy_command`` set it is
+                  only a label the proxy ignores (OpenSSH still keys its
+                  ControlMaster socket on it, so keep it unique per worker).
+        port:     SSH (or bore tunnel) port number; None when the proxy
+                  decides where the bytes go.
         user:     Remote login user (typically ``root`` for notebook workers).
         key_path: Path to the private key to use for authentication; the
                   omnirun-managed key at ``<state_dir>/ssh/id_ed25519``.
+        proxy_command: An OpenSSH ``ProxyCommand`` that bridges the connection
+                  to the worker (e.g. ``colab ssh --proxy-mode``), or None for
+                  a directly dialled host:port.
     """
 
     host: str
-    port: int
+    port: int | None
     user: str
     key_path: Path
+    proxy_command: str | None = None
 
 
 #: Optional hook submit() calls the instant it creates a *billable* resource,
@@ -313,10 +320,11 @@ class Backend(ABC):
         - the job is not yet provisioned or has been torn down;
         - the backend does not support direct SSH access (e.g. Slurm, marketplace).
 
-        The default implementation returns None.  Notebook backends (colab,
-        kaggle) return an ``SSHEndpoint`` pointing at the bore tunnel port
-        assigned at submit time when bore is configured.  SSH/local backends
-        return the direct target they already use.
+        The default implementation returns None.  Colab returns an
+        ``SSHEndpoint`` bridged by ``colab ssh --proxy-mode``; Kaggle returns
+        one pointing at the bore tunnel port assigned at submit time when bore
+        is configured.  SSH/local backends return the direct target they
+        already use.
         """
         return None
 

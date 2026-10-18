@@ -69,6 +69,46 @@ def test_exec_for_endpoint_no_user_target() -> None:
     assert sshconn.exec_for_endpoint(ep).target == "h"
 
 
+def _proxied_ep() -> SSHEndpoint:
+    return SSHEndpoint(
+        host="omnirun-job1",
+        port=None,
+        user="root",
+        key_path=Path("/k/id_ed25519"),
+        proxy_command="colab ssh --proxy-mode -s omnirun-job1 --identity /k/id_ed25519",
+    )
+
+
+def test_ssh_argv_proxied_endpoint_carries_proxycommand_and_no_port() -> None:
+    """A bridged worker (Colab) is reached through its ProxyCommand: the option
+    rides in attached form (ssh wrappers scan argv), no `-p` is emitted, and the
+    identity + ephemeral host-key policy stay exactly as for a dialled host."""
+    argv = sshconn.ssh_argv(_proxied_ep(), remote_cmd=["true"], batch=True)
+    assert (
+        "-oProxyCommand=colab ssh --proxy-mode -s omnirun-job1 --identity /k/id_ed25519"
+        in argv
+    )
+    assert "-p" not in argv
+    assert argv[argv.index("-i") + 1] == "/k/id_ed25519"
+    assert "-oIdentitiesOnly=yes" in argv  # an agent's other keys must not be offered
+    assert "-oStrictHostKeyChecking=accept-new" in argv
+    assert argv[argv.index("--") + 1 :] == ["root@omnirun-job1", "true"]
+
+
+def test_exec_for_endpoint_proxied_uses_same_transport() -> None:
+    """The proxied worker gets the SAME SSHExec as a dialled one, differing only
+    by the ProxyCommand option — so tail_logs/derive_status run unchanged."""
+    ex = sshconn.exec_for_endpoint(_proxied_ep())
+    assert ex.target == "root@omnirun-job1"
+    assert ex.port is None
+    assert (
+        "-oProxyCommand=colab ssh --proxy-mode -s omnirun-job1 --identity /k/id_ed25519"
+        in ex.extra_opts
+    )
+    assert "-oStrictHostKeyChecking=accept-new" in ex.extra_opts
+    assert "-oProxyCommand" not in " ".join(sshconn.exec_for_endpoint(_ep()).extra_opts)
+
+
 def test_endpoint_reachable_true_on_zero_exit(monkeypatch) -> None:
     calls: list[list[str]] = []
 

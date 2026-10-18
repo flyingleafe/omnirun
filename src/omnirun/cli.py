@@ -2027,8 +2027,10 @@ def ssh(
     its exit code.  Uses the omnirun-managed keypair so no key management is
     needed.
 
-    Works for notebook jobs via their bore tunnel (``--port`` assigned at
-    submit time) and for ssh/local jobs via their direct host.
+    Works for Colab jobs through ``colab ssh --proxy-mode`` (needs the
+    ``colab`` CLI and its session store on this machine), for Kaggle jobs via
+    their bore tunnel (``--port`` assigned at submit time) and for ssh/local
+    jobs via their direct host.
 
     Example::
 
@@ -2063,7 +2065,7 @@ def ssh(
             reason = (
                 f"job {rec.spec.job_id!r} is not ssh-reachable — "
                 "is it provisioned and still running? "
-                "(bore may not be configured, or the job has finished)"
+                "(the worker transport may not be configured, or the job has finished)"
             )
         _die(reason)
     assert ep is not None
