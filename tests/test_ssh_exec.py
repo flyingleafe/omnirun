@@ -246,6 +246,207 @@ def test_ensure_master_interactive_failure_raises(ex, recorder):
         ex.ensure_master(interactive=True)
 
 
+# --- configured reconnect hint + opt-in reconnect cooldown -------------------------
+
+SITE_HINT = "run `site-login` to renew your 12h ssh certificate"
+
+
+def _auth_rejected(argv, kw):
+    """Every ssh invocation fails the way an expired certificate does: the
+    `-O check` finds no master, and every dial is refused at auth."""
+    return subprocess.CompletedProcess(
+        argv, 255, stdout="", stderr="user@box: Permission denied (publickey)."
+    )
+
+
+def _dials(recorder) -> list[list[str]]:
+    """The ssh invocations that reach the REMOTE (everything but the local
+    `-O check` control-socket probe)."""
+    return [argv for argv, _ in recorder.calls if "-O" not in argv]
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_configured_hint_replaces_generic_hint(recorder, cm_dir):
+    ex = SSHExec("user@box", control_dir=cm_dir, reconnect_hint=SITE_HINT)
+    recorder.behavior = _auth_rejected
+    with pytest.raises(ExecError) as reconnect:
+        ex.ensure_master(interactive=False)
+    assert SITE_HINT in str(reconnect.value)
+    assert "Permission denied" in str(reconnect.value)
+    assert "omnirun backends check" not in str(reconnect.value)
+    # run(): the transport failure after the failed self-heal names it too.
+    with pytest.raises(ExecError) as down:
+        ex.run("squeue")
+    assert "is down" in str(down.value) and SITE_HINT in str(down.value)
+    assert "omnirun backends check" not in str(down.value)
+
+
+def test_configured_hint_on_reconnect_timeout(recorder, cm_dir):
+    ex = SSHExec("user@box", control_dir=cm_dir, reconnect_hint=SITE_HINT)
+
+    def behavior(argv, kwargs):
+        if "-O" in argv:
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(argv, 45)
+
+    recorder.behavior = behavior
+    with pytest.raises(ExecError, match="timed out") as e:
+        ex.ensure_master(interactive=False)
+    assert SITE_HINT in str(e.value)
+    assert "omnirun backends check" not in str(e.value)
+
+
+def test_no_cooldown_by_default_every_operation_dials(recorder, cm_dir):
+    """Default (cooldown 0): today's behavior — each failed operation dials."""
+    ex = SSHExec("user@box", control_dir=cm_dir)
+    recorder.behavior = _auth_rejected
+    for _ in range(2):
+        with pytest.raises(ExecError):
+            ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 2  # one reconnect attempt each
+    recorder.calls.clear()
+    with pytest.raises(ExecError):
+        ex.run("squeue")
+    assert len(_dials(recorder)) == 2  # the command + its one self-heal attempt
+
+
+def test_cooldown_fails_fast_without_dialing_then_dials_after_window(
+    recorder, cm_dir, monkeypatch, tmp_path
+):
+    clock = FakeClock()
+    ex = SSHExec(
+        "user@box",
+        control_dir=cm_dir,
+        reconnect_hint=SITE_HINT,
+        reconnect_cooldown_s=300.0,
+        clock=clock,
+    )
+    recorder.behavior = _auth_rejected
+    with pytest.raises(ExecError) as first:
+        ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 1
+
+    def _no_popen(*args, **kwargs):
+        raise AssertionError("stream dialed the remote during the cooldown")
+
+    monkeypatch.setattr(subprocess, "Popen", _no_popen)
+    monkeypatch.setattr(
+        "omnirun.execlayer.ssh.shutil.which", lambda name: "/usr/bin/rsync"
+    )
+    recorder.calls.clear()
+    clock.now += 299.0
+    for attempt in (
+        lambda: ex.ensure_master(interactive=False),
+        lambda: ex.run("squeue"),
+        lambda: list(ex.stream("tail -F log")),
+        lambda: ex.get("/j/f.txt", tmp_path / "f.txt"),
+    ):
+        with pytest.raises(ExecError) as again:
+            attempt()
+        assert str(again.value) == str(first.value)  # same message, hint included
+    # Another exec on the SAME master shares the cooldown.
+    sibling = SSHExec(
+        "user@box", control_dir=cm_dir, reconnect_cooldown_s=300.0, clock=clock
+    )
+    with pytest.raises(ExecError) as shared:
+        sibling.run("sinfo")
+    assert str(shared.value) == str(first.value)
+    assert _dials(recorder) == []  # nothing but local `-O check`s
+    assert recorder.calls
+
+    clock.now += 2.0  # the window is over: the next operation really tries again
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 1
+
+
+def test_cooldown_cleared_by_interactive_connect(recorder, cm_dir):
+    """`backends check` connects interactively: it ignores the cooldown and,
+    once connected, ends it."""
+    clock = FakeClock()
+    ex = SSHExec(
+        "user@box", control_dir=cm_dir, reconnect_cooldown_s=300.0, clock=clock
+    )
+    recorder.behavior = _auth_rejected
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+
+    def interactive_ok(argv, kwargs):
+        if "-tt" in argv:
+            return subprocess.CompletedProcess(argv, 0)
+        return _auth_rejected(argv, kwargs)
+
+    recorder.behavior = interactive_ok
+    recorder.calls.clear()
+    ex.ensure_master(interactive=True)  # dials despite the cooldown
+    assert any("-tt" in argv for argv in _dials(recorder))
+
+    # The cooldown is gone: the next non-interactive failure dials again.
+    recorder.behavior = _auth_rejected
+    recorder.calls.clear()
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 1
+
+
+def test_cooldown_bypassed_and_cleared_by_live_master(recorder, cm_dir):
+    clock = FakeClock()
+    ex = SSHExec(
+        "user@box", control_dir=cm_dir, reconnect_cooldown_s=300.0, clock=clock
+    )
+    recorder.behavior = _auth_rejected
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+
+    recorder.behavior = None  # the master is back (e.g. re-established elsewhere)
+    recorder.calls.clear()
+    assert ex.run("squeue").ok
+    assert len(_dials(recorder)) == 1  # the command itself ran
+
+    # And the cooldown ended with it: a new failure dials again.
+    recorder.behavior = _auth_rejected
+    recorder.calls.clear()
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 1
+
+
+def test_successful_reconnect_clears_shared_cooldown(recorder, cm_dir):
+    """A successful non-interactive reconnect on the shared master — here by a
+    sibling exec without a cooldown of its own, which always dials — ends the
+    cooldown for every exec on that master."""
+    clock = FakeClock()
+    ex = SSHExec(
+        "user@box", control_dir=cm_dir, reconnect_cooldown_s=300.0, clock=clock
+    )
+    plain = SSHExec("user@box", control_dir=cm_dir, clock=clock)
+    recorder.behavior = _auth_rejected
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+
+    def reconnect_ok(argv, kwargs):
+        if "-O" in argv:
+            return subprocess.CompletedProcess(argv, 255, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0)
+
+    recorder.behavior = reconnect_ok
+    clock.now += 1.0
+    plain.ensure_master(interactive=False)  # the credential was renewed
+
+    recorder.behavior = _auth_rejected
+    recorder.calls.clear()
+    with pytest.raises(ExecError):
+        ex.ensure_master(interactive=False)
+    assert len(_dials(recorder)) == 1  # not suppressed: the success cleared it
+
+
 # --- put / get --------------------------------------------------------------------
 
 

@@ -818,3 +818,38 @@ def test_gather_notes_a_pin_to_an_unconfigured_provider(store: Store) -> None:
 
     assert slots == []
     assert any("gamma" in line for line in gather.notes["gamma"])
+
+
+def test_gather_notes_are_published_whole_when_a_refresh_completes(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reader on another thread (the daemon's explain / submit-settle
+    handlers) never sees a half-built round: while a refresh is probing,
+    ``notes`` still holds the previous COMPLETE round's reasons."""
+    from omnirun.engine.verbs import SlotGather
+
+    inners = _two_providers(store)
+    beta = inners["beta"].backend
+    assert isinstance(beta, StubBackend)
+    beta.offer = Offer(
+        backend="beta", label="beta", fits=False, unfit_reasons=["session cap"]
+    )
+    store.save_job(_pinned("pinned-1", "beta"))
+    gather = SlotGather(store, inners)
+    gather.refresh()
+
+    seen_mid_refresh: list[dict[str, list[str]]] = []
+    real_probe = beta.probe
+
+    def _probe(res: ResourceSpec) -> list[Offer]:
+        seen_mid_refresh.append({k: list(v) for k, v in gather.notes.items()})
+        return real_probe(res)
+
+    monkeypatch.setattr(beta, "probe", _probe)
+    beta.offer = Offer(
+        backend="beta", label="beta", fits=False, unfit_reasons=["auth expired"]
+    )
+    gather.refresh()
+
+    assert seen_mid_refresh == [{"beta": ["session cap"]}]
+    assert gather.notes == {"beta": ["auth expired"]}

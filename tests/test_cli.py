@@ -137,7 +137,9 @@ class UnreachableBackend(Backend):
                 backend=self.name,
                 label=f"{self.name}: offline",
                 fits=False,
-                unfit_reasons=["cannot connect (offline in tests)"],
+                unfit_reasons=[
+                    self.config.extra("reason", "cannot connect (offline in tests)")
+                ],
             )
         ]
 
@@ -311,13 +313,20 @@ def test_submit_failed_placement_leaves_retryable_queued_job(env):
 
 def test_daemonless_submit_no_fitting_offer_exits_0_queued(env):
     """Daemonless submit that can't place right now exits 0 and leaves QUEUED.
-    The job persists so a later `omnirun serve` (or manual submit) can place it."""
+    The job persists so a later `omnirun serve` (or manual submit) can place it,
+    and the output says WHY: the pinned backend's own reason."""
     result = runner.invoke(
         app, ["submit", "--backend", "offline", "--", "python", "train.py"]
     )
     assert result.exit_code == 0, result.output
     assert "queued" in result.output
-    assert "later tick" in result.output or "omnirun serve" in result.output
+    assert "not placed" in result.output
+    assert "offline offered no slot: cannot connect (offline in tests)" in (
+        result.output
+    )
+    assert "stays queued" in result.output
+    assert "automatically once a slot is offered" in result.output
+    assert "omnirun serve" in result.output
 
     ids = _store().list_job_ids()
     assert len(ids) == 1
@@ -325,6 +334,48 @@ def test_daemonless_submit_no_fitting_offer_exits_0_queued(env):
     assert rec is not None
     assert rec.state is JobState.QUEUED
     assert rec.placement is None
+
+
+def test_submit_reason_text_is_not_rich_markup(env):
+    """A reason is printed verbatim — bracketed text in it (an ssh error, a
+    configured hint) must neither vanish as markup nor break the styling."""
+    reason = "auth failed [/yellow][bold]x[/bold] — run `site-login [--renew]`"
+    section = f'[backends.isambard]\ntype = "unreachable"\nreason = "{reason}"\n'
+    env.config_file.write_text(BASE_CONFIG + "\n" + section)
+    result = runner.invoke(
+        app, ["submit", "--backend", "isambard", "--", "python", "train.py"]
+    )
+    assert result.exit_code == 0, result.output
+    assert f"isambard offered no slot: {reason}" in result.output
+
+
+def test_report_submit_daemon_and_stalled_placement_wording(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")  # keep each sentence on one line
+    from omnirun.cli import _report_submit
+    from omnirun.client import SubmitOutcome
+
+    _report_submit(
+        SubmitOutcome(
+            job_id="j-1",
+            state=JobState.QUEUED,
+            provider_name=None,
+            placed=False,
+            queued_reasons=["hpc offered no slot: auth expired"],
+        ),
+        daemon=True,
+    )
+    out = capsys.readouterr().out
+    assert "hpc offered no slot: auth expired" in out
+    assert "the daemon places it automatically once a slot is offered" in out
+
+    _report_submit(
+        SubmitOutcome(
+            job_id="j-2", state=JobState.PLACING, provider_name="hpc", placed=False
+        )
+    )
+    out = capsys.readouterr().out
+    assert "placing j-2 on hpc: not launched yet" in out
+    assert "no slot free" not in out
 
 
 def test_submit_happy_path(env):

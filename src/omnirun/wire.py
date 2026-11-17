@@ -121,6 +121,7 @@ def submit_outcome_to_json(o: client.SubmitOutcome) -> dict[str, Any]:
         "provider_name": o.provider_name,
         "placed": o.placed,
         "held_reason": o.held_reason,
+        "queued_reasons": list(o.queued_reasons),
     }
 
 
@@ -131,6 +132,8 @@ def submit_outcome_from_json(d: dict[str, Any]) -> client.SubmitOutcome:
         provider_name=d["provider_name"],
         placed=bool(d["placed"]),
         held_reason=d.get("held_reason"),
+        # Absent from a daemon that predates it: no reasons to show.
+        queued_reasons=[str(r) for r in d.get("queued_reasons") or []],
     )
 
 

@@ -615,6 +615,43 @@ def test_probe_unfit_for_gpu_job_when_cpu_only():
     assert offer.fits
 
 
+def test_probe_auth_failure_names_configured_reconnect_hint(monkeypatch, tmp_path):
+    """Through the real SSHExec: an expired credential makes the probe unfit
+    with the SITE's reconnect hint (once, not the generic one), and with a
+    reconnect cooldown the next probe inside the window answers the same
+    reason without dialing the login node again."""
+    import subprocess
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv, 255, stdout="", stderr="u@login: Permission denied (publickey)."
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    hint = "run `site-login` to renew your ssh certificate"
+    b = SlurmBackend(
+        "isambard",
+        make_config(reconnect_hint=hint, ssh_reconnect_cooldown_s=600),
+    )
+    (offer,) = b.probe(ResourceSpec())
+    assert not offer.fits
+    (reason,) = offer.unfit_reasons
+    assert reason.count(hint) == 1
+    assert "Permission denied" in reason
+    assert "omnirun backends check" not in reason
+    assert len([a for a in calls if "-O" not in a]) == 1  # one reconnect attempt
+
+    calls.clear()
+    (again,) = b.probe(ResourceSpec())
+    assert again.unfit_reasons == [reason]
+    assert [a for a in calls if "-O" not in a] == []  # cooldown: no dial
+
+
 def test_probe_wait_uses_slurm_test_only_estimate():
     """The honest primary tier: `sbatch --test-only` gives SLURM's own start
     estimate (accounts for priority/QOS gating), used over the idle-node heuristic
@@ -645,6 +682,35 @@ def test_probe_wait_tier1_idle_nodes():
     assert offer.fits
     assert offer.wait_estimate_s == 0
     assert offer.wait_note == "idle nodes available"
+
+
+def test_probe_wait_test_only_estimate_disabled_skips_dry_run():
+    """`test_only_estimate = false`: a site whose `--test-only` reports a start a
+    day out while real jobs start in seconds. No dry-run is sent at all; the
+    idle-node tier answers instead (the default keeps asking test-only)."""
+    testonly = "OMNIRUN_START=1000086400\nOMNIRUN_NOW=1000000000\n"
+    fake = FakeExec()
+    fake.add(r"sinfo -p gpu -t idle", stdout="node01 gpu:a100:4\n")
+    fake.add(r"sbatch --test-only", stdout=testonly)
+    b = make_backend(
+        fake,
+        partition="gpu",
+        gpu_map={"A100": "gres:a100:{n}"},
+        test_only_estimate=False,
+    )
+    (offer,) = b.probe(ResourceSpec(gpus=1, gpu_type="A100"))
+    assert offer.fits
+    assert not any("--test-only" in c for c in fake.commands)
+    assert offer.wait_estimate_s == 0
+    assert offer.wait_note == "idle nodes available"
+
+    default = FakeExec()
+    default.add(r"sinfo -p gpu -t idle", stdout="node01 gpu:a100:4\n")
+    default.add(r"sbatch --test-only", stdout=testonly)
+    b = make_backend(default, partition="gpu", gpu_map={"A100": "gres:a100:{n}"})
+    (offer,) = b.probe(ResourceSpec(gpus=1, gpu_type="A100"))
+    assert any("--test-only" in c for c in default.commands)
+    assert offer.wait_estimate_s == 86400.0
 
 
 def test_probe_idle_nodes_must_match_gres_type():

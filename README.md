@@ -201,6 +201,8 @@ gpus = [{ type = "4090", count = 1 }]  # static declaration; probe verifies via 
 # env_setup = ["export CUDA_HOME=/usr/local/cuda"]  # lines run before env creation
 # port = 2222                # rarely needed — prefer putting these in ~/.ssh/config
 # identity = "~/.ssh/id_ed25519"
+# reconnect_hint = "run `my-login` first"  # shown when the session needs a human (default: `omnirun backends check`)
+# ssh_reconnect_cooldown_s = 300  # after a failed non-interactive reconnect, stop dialing for 300s (default 0 = off)
 
 # ---- Slurm cluster reached through its login node ----
 [backends.uni]
@@ -217,6 +219,12 @@ env_setup = ["module load cuda/12.4"]
 gpu_map = { "A100-80" = "gres:a100:{n}", "V100" = "gres:v100:{n}" }
 extra_directives = ["--mail-type=FAIL"]  # raw #SBATCH lines
 # time_default = "1:00:00"   # --time when the job doesn't set one
+# test_only_estimate = false # skip the `sbatch --test-only` wait estimate (a site whose
+#                            # dry-run start is far off reality); default true
+# reconnect_hint = "run `site-login` to renew your ssh certificate"  # shown when the
+#                            # session expired and needs a human (probe reasons, `submit`)
+# ssh_reconnect_cooldown_s = 300  # after a failed non-interactive reconnect, fail fast for
+#                            # 300s instead of re-dialing every poll (default 0 = off)
 
 # ---- Kaggle kernels (free GPU quota) ----
 [backends.kaggle]
@@ -294,6 +302,9 @@ then restart the shell (`--show-completion` prints the script instead, for
 bash/zsh/fish/powershell). The nix package ships the completions already.
 
 **`omnirun submit [OPTIONS] -- COMMAND...`** — let the scheduler pick and place.
+A job that cannot be placed right now is still accepted (exit 0) and stays
+queued; `submit` prints each relevant backend's reason (e.g. its ssh session
+expired, with the configured `reconnect_hint`), the same lines `explain` shows.
 
 | option | meaning |
 |---|---|
@@ -373,9 +384,16 @@ locally and piped over a multiplexed SSH connection, status from
 `squeue`/`sacct` merged with the job-dir files, no admin cooperation needed.
 The SSH ControlMaster rides your existing 2FA/Duo/Kerberos session: run
 `omnirun backends check` once to authenticate, then background polls reuse the
-socket (and fail fast with a reconnect hint when it expires). Wait estimates
-are honest but rough — three tiers: idle matching nodes ("likely immediate"),
-your own historical waits for similar jobs, otherwise "unknown". Set
+socket (and fail fast with a reconnect hint when it expires — set
+`reconnect_hint` to your site's own re-login command, e.g. a short-lived ssh
+certificate renewal). With an expired credential every scheduler pass would
+otherwise re-dial the login node; `ssh_reconnect_cooldown_s` makes a failed
+non-interactive reconnect suppress further dials for that long (a live session,
+an interactive `omnirun backends check`, or a successful reconnect ends it).
+Wait estimates are honest but rough — Slurm's own `sbatch --test-only` start
+estimate first (`test_only_estimate = false` skips it on a site whose dry-run is
+far off reality), then idle matching nodes ("likely immediate"), your own
+historical waits for similar jobs, otherwise "unknown". Set
 `root = "$SCRATCH/omnirun"`: venvs and worktrees do not fit in a typical HPC
 home quota.
 

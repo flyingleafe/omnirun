@@ -810,11 +810,22 @@ def _supply_detail(
         detail.append(
             f"pinned to {pin}: slots from {', '.join(excluded)} are not candidates"
         )
-    wanted = [pin] if pin is not None else sorted(provider_notes)
-    for name in wanted:
-        for line in provider_notes.get(name, []):
-            detail.append(f"{name} offered no slot: {line}")
+    detail.extend(provider_note_lines(pin, provider_notes))
     return detail
+
+
+def provider_note_lines(
+    pin: str | None, provider_notes: Mapping[str, list[str]]
+) -> list[str]:
+    """Why the providers relevant to one job offered it nothing: the pinned
+    provider's notes only, else every provider's (sorted by name). Shared by
+    ``explain`` and the ``submit`` outcome so both phrase it identically."""
+    wanted = [pin] if pin is not None else sorted(provider_notes)
+    return [
+        f"{name} offered no slot: {line}"
+        for name in wanted
+        for line in provider_notes.get(name, [])
+    ]
 
 
 def _runner_up_reasons(

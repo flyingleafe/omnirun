@@ -290,6 +290,12 @@ class _Session:
         self._slots = self._gather.refresh()
         self._gathered_pending = self._gather.pending_ids
 
+    @property
+    def provider_notes(self) -> dict[str, list[str]]:
+        """Why each provider offered no slot on this session's latest gather
+        (display-only; see :attr:`SlotGather.notes`)."""
+        return self._gather.notes
+
     # -- drives -----------------------------------------------------------
 
     def drive(
@@ -453,7 +459,7 @@ class LocalClient:
         rec = session.store.load_job(job_id)
         if rec is None:  # pragma: no cover — we just wrote it
             raise BackendError(f"job {job_id} vanished after submit")
-        return classify_submit(rec)
+        return classify_submit(rec, session.provider_notes)
 
     def enqueue(
         self, spec: JobSpec, *, backend: str | None = None, count: int = 1

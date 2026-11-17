@@ -79,6 +79,12 @@ class SshBackend(Backend):
                 # Unbounded by default; a password/2FA box behind a low sshd
                 # MaxSessions can cap concurrent channels: [backends.x] ssh_max_concurrency.
                 max_concurrency=self.config.extra("ssh_max_concurrency", None),
+                reconnect_hint=self.config.reconnect_hint,
+                # Opt-in: after a failed non-interactive reconnect, stop dialing
+                # this host for N seconds (expired-credential auth storms).
+                reconnect_cooldown_s=float(
+                    self.config.extra("ssh_reconnect_cooldown_s", 0.0)
+                ),
             )
         return self._exec
 
@@ -96,8 +102,9 @@ class SshBackend(Backend):
             self.exec_.run("true", timeout=10, check=True)
         except Exception as e:  # probe must never raise
             msg = str(e)
-            if RECONNECT_HINT not in msg:
-                msg = f"{msg} — {RECONNECT_HINT}"
+            hint = self.config.reconnect_hint or RECONNECT_HINT
+            if hint not in msg:
+                msg = f"{msg} — {hint}"
             return [
                 Offer(
                     backend=self.name,

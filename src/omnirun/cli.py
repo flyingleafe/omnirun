@@ -13,12 +13,14 @@ from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from omnirun import chooser
 from omnirun.backends.base import Backend, BackendError, make_backend
 from omnirun.client import (
     Client,
+    RemoteClient,
     SubmitOutcome,
     handle_of as _handle_of,
     make_client,
@@ -697,7 +699,8 @@ def submit(
         def _place() -> None:
             report("resolving repo state…")
             spec = _spec()
-            _report_submit(client.submit(spec, backend=backend, wait=wait))
+            outcome = client.submit(spec, backend=backend, wait=wait)
+            _report_submit(outcome, daemon=isinstance(client, RemoteClient))
 
         # On a terminal, narrate on one live status line (spinner). When output is
         # piped / redirected (CI, `nohup`) a Live spinner renders nothing, so print
@@ -713,8 +716,8 @@ def submit(
         client.close()
 
 
-def _report_submit(outcome: SubmitOutcome) -> None:
-    """Render a submit outcome (placed / held / queued-unplaced)."""
+def _report_submit(outcome: SubmitOutcome, *, daemon: bool = False) -> None:
+    """Render a submit outcome (placed / held / placing-stalled / queued)."""
     if outcome.placed:
         console.print(
             f"[green]submitted[/green] {outcome.job_id} -> {outcome.provider_name}"
@@ -723,6 +726,33 @@ def _report_submit(outcome: SubmitOutcome) -> None:
         return
     if outcome.state is JobState.HELD:
         _die(f"job {outcome.job_id} cannot be placed: {outcome.held_reason}")
+    if outcome.state is JobState.PLACING:
+        # Reserved but not launched when the submit settled: the place item
+        # froze on an unreachable provider and retries on a timer (I10).
+        console.print(
+            f"[yellow]placing {outcome.job_id} on "
+            f"{escape(outcome.provider_name or '?')}: not launched yet — the "
+            "provider is unreachable; the placement is retried automatically "
+            f"(see `omnirun status {outcome.job_id}`)[/yellow]"
+        )
+        return
+    if outcome.queued_reasons:
+        # QUEUED and unplaced, with the providers' own words for why. The job
+        # WAS accepted (exit 0); say who advances it (JOB-5).
+        console.print(f"[yellow]queued {outcome.job_id}, not placed:[/yellow]")
+        for line in outcome.queued_reasons:
+            console.print(f"  [yellow]{escape(line)}[/yellow]")
+        placer = (
+            "the daemon places it"
+            if daemon
+            else "any later omnirun command (ps/status/tick) or `omnirun serve` "
+            "places it"
+        )
+        console.print(
+            f"job {outcome.job_id} stays queued; {placer} automatically once a "
+            "slot is offered"
+        )
+        return
     # QUEUED but unplaced: admissible yet no fitting offer right now. The
     # record persists; state WHO advances it (JOB-5): daemonless, the next
     # omnirun command's catch-up retries placement, or a daemon does so

@@ -310,6 +310,12 @@ class SlurmBackend(Backend):
                 max_concurrency=self.config.extra(
                     "ssh_max_concurrency", DEFAULT_SLURM_SSH_MAX_CONCURRENCY
                 ),
+                reconnect_hint=self.config.reconnect_hint,
+                # Opt-in: after a failed non-interactive reconnect, stop dialing
+                # this login host for N seconds (expired-credential auth storms).
+                reconnect_cooldown_s=float(
+                    self.config.extra("ssh_reconnect_cooldown_s", 0.0)
+                ),
             )
         return self._exec
 
@@ -448,8 +454,9 @@ class SlurmBackend(Backend):
             self._connect(interactive=False)
         except Exception as e:  # probe must never raise
             msg = str(e)
-            if RECONNECT_HINT not in msg:
-                msg = f"{msg} — {RECONNECT_HINT}"
+            hint = self.config.reconnect_hint or RECONNECT_HINT
+            if hint not in msg:
+                msg = f"{msg} — {hint}"
             return [
                 Offer(
                     backend=self.name,
@@ -503,11 +510,18 @@ class SlurmBackend(Backend):
         1. idle matching nodes — a fallback only when test-only gives no estimate.
         2. the median of your recent jobs here.
         3. unknown.
+
+        ``[backends.x] test_only_estimate = false`` skips step 0 entirely (no
+        dry-run is sent) for a site whose ``--test-only`` answer is far off the
+        real start — e.g. one reporting a start a day out while identical jobs
+        are allocated in seconds on idle nodes.
         """
-        try:
-            est = self._slurm_start_estimate(res)
-        except Exception:
-            est = None
+        est: float | None = None
+        if self.config.extra("test_only_estimate", True):
+            try:
+                est = self._slurm_start_estimate(res)
+            except Exception:
+                est = None
         if est is not None:
             return est, ("starts ~now (slurm est.)" if est < 60 else "slurm est. start")
         try:

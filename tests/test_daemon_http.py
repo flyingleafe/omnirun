@@ -867,6 +867,73 @@ def test_blocking_submit_path_kept_for_old_clients(harness: _Harness) -> None:
         assert data["placed"] is True and data["provider_name"] == "fake"
 
 
+def test_remote_submit_carries_queued_reasons(tmp_path: Path) -> None:
+    """A job the pinned provider declines is accepted QUEUED, and the outcome
+    collected over /settle carries that provider's reason (not a bare 'no slot
+    free'); a placed outcome carries none."""
+    h = _sync_harness(tmp_path, lambda n, b: _UnfitBackend(n, b))
+    client = RemoteClient(h.url)
+    try:
+        outcome = client.submit(_spec("why"), backend="fake")
+        assert outcome.state is JobState.QUEUED and not outcome.placed
+        assert outcome.queued_reasons == [
+            "fake offered no slot: no capacity in this test"
+        ]
+    finally:
+        client.close()
+        h.stop()
+
+
+def test_remote_submit_placed_has_no_queued_reasons(harness: _Harness) -> None:
+    client = RemoteClient(harness.url)
+    try:
+        outcome = client.submit(_spec("placed"))
+        assert outcome.placed and outcome.queued_reasons == []
+    finally:
+        client.close()
+
+
+def test_submit_outcome_wire_roundtrip_and_old_daemon_payload() -> None:
+    from omnirun import wire
+    from omnirun.client import SubmitOutcome
+
+    out = SubmitOutcome(
+        job_id="j-1",
+        state=JobState.QUEUED,
+        provider_name=None,
+        placed=False,
+        queued_reasons=["x offered no slot: auth expired — run `site-login`"],
+    )
+    data = json.loads(json.dumps(wire.submit_outcome_to_json(out)))
+    assert wire.submit_outcome_from_json(data) == out
+    # A daemon that predates the field sends no key: no reasons, no error.
+    del data["queued_reasons"]
+    assert wire.submit_outcome_from_json(data).queued_reasons == []
+
+
+def test_remote_submit_reports_a_placement_frozen_on_unreachable(
+    tmp_path: Path,
+) -> None:
+    """A place item that froze on an unreachable provider (it retries on a
+    timer) settles the submit as PLACING-not-launched instead of pinning the
+    client to the /settle long-poll until the provider comes back."""
+    from omnirun.engine.outcomes import Unreachable
+
+    prov = FakeAsyncProvider()
+    prov.fail["rent"] = [Unreachable("ssh session expired")]
+    h = _async_daemon(tmp_path, prov)
+    client = RemoteClient(h.url)
+    try:
+        start = time.monotonic()
+        outcome = client.submit(_spec("frozen"))
+        assert time.monotonic() - start < 20.0
+        assert outcome.state is JobState.PLACING and not outcome.placed
+        assert outcome.provider_name == prov.name
+    finally:
+        client.close()
+        h.stop()
+
+
 def test_version_handshake_headers_and_too_old_client(harness: _Harness) -> None:
     import httpx
 

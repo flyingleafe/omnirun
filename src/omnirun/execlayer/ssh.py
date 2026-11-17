@@ -19,7 +19,8 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -77,6 +78,18 @@ def _op_semaphore(key: str, limit: int) -> threading.BoundedSemaphore:
         return sem
 
 
+# Opt-in reconnect cooldown per (host, control-socket) — the SAME key as the
+# master lock, so every SSHExec riding one ControlMaster shares it. After a
+# non-interactive (re)connect fails, nothing else would stop the next scheduler
+# pass / status poll from dialing again within seconds, for as long as the
+# credential stays expired: several failed logins per poll interval against a
+# bastion that may lock the account. While a cooldown is active, non-interactive
+# dials fail fast with the recorded error and spawn NO remote ssh (only the local
+# `-O check`). key -> (cooldown ends at, per the exec's clock; the error message).
+_RECONNECT_COOLDOWNS: dict[str, tuple[float, str]] = {}
+_RECONNECT_COOLDOWNS_GUARD = threading.Lock()
+
+
 # stderr fragments (lowercased) that mean the transport itself failed —
 # distinguished from a remote command exiting 255.
 DEAD_SOCKET_PATTERNS = (
@@ -122,6 +135,9 @@ class SSHExec(Exec):
         batch_mode: bool = True,
         control_persist: str = "10m",
         max_concurrency: int | None = None,
+        reconnect_hint: str | None = None,
+        reconnect_cooldown_s: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.target = target
         self.port = port
@@ -150,6 +166,62 @@ class SSHExec(Exec):
         # Wall-clock budget for a daemon's non-interactive auto-reconnect (a stuck
         # auth prompt can never exceed this; the backend degrades to unfit instead).
         self._auto_reconnect_timeout_s = 45.0
+        # What a human must do when the session cannot be re-established without
+        # one (e.g. a site whose short-lived ssh certificate is renewed by its own
+        # login command); None = the generic `omnirun backends check` hint.
+        self.reconnect_hint = reconnect_hint
+        # Seconds a failed non-interactive reconnect suppresses further dials to
+        # this master (0 = off: every operation may dial again). See
+        # _RECONNECT_COOLDOWNS.
+        self.reconnect_cooldown_s = reconnect_cooldown_s
+        self._clock = clock
+
+    def _hint(self) -> str:
+        return self.reconnect_hint or RECONNECT_HINT
+
+    # --- reconnect cooldown ------------------------------------------------
+
+    def _cooldown_error(self) -> str | None:
+        """The recorded reconnect failure while this master's cooldown runs;
+        None when the cooldown is disabled, absent, or expired."""
+        if self.reconnect_cooldown_s <= 0:
+            return None
+        key = self._master_key()
+        with _RECONNECT_COOLDOWNS_GUARD:
+            entry = _RECONNECT_COOLDOWNS.get(key)
+            if entry is None:
+                return None
+            until, message = entry
+            if self._clock() >= until:
+                del _RECONNECT_COOLDOWNS[key]
+                return None
+            return message
+
+    def _start_cooldown(self, message: str) -> None:
+        if self.reconnect_cooldown_s <= 0:
+            return
+        with _RECONNECT_COOLDOWNS_GUARD:
+            _RECONNECT_COOLDOWNS[self._master_key()] = (
+                self._clock() + self.reconnect_cooldown_s,
+                message,
+            )
+
+    def _clear_cooldown(self) -> None:
+        with _RECONNECT_COOLDOWNS_GUARD:
+            _RECONNECT_COOLDOWNS.pop(self._master_key(), None)
+
+    def _refuse_dial_while_cooling(self) -> None:
+        """Gate for an operation that would open a FRESH connection when the
+        master is dead: during a cooldown, a live master (a cheap local
+        ``-O check``) still serves it — and ends the cooldown — while a dead
+        one fails fast with the recorded error instead of dialing the remote."""
+        message = self._cooldown_error()
+        if message is None:
+            return
+        if self._master_alive():
+            self._clear_cooldown()
+            return
+        raise ExecError(message)
 
     @contextmanager
     def _op_slot(self) -> Iterator[None]:
@@ -227,9 +299,15 @@ class SSHExec(Exec):
         daemon recovers on its own, no human `backends check` needed. Bounded by a
         connect timeout so a stuck auth prompt can never hang the caller; only when
         even that fails does it raise the reconnect hint.
+
+        With ``reconnect_cooldown_s > 0`` a failed non-interactive reconnect
+        suppresses further non-interactive attempts on this master for that long
+        (they re-raise the same error without dialing). A live master, an
+        interactive connect, or a successful reconnect ends the cooldown.
         """
         self._ensure_control_dir()
         if self._master_alive():
+            self._clear_cooldown()
             return
         # Only ONE concurrent (re)auth per target: hold the shared lock so a burst of
         # callers finding the master dead can't each fire a password auth (an auth
@@ -237,6 +315,7 @@ class SSHExec(Exec):
         # shared session; the rest re-check and find it alive.
         with _master_lock(self._master_key()):
             if self._master_alive():
+                self._clear_cooldown()
                 return
             if interactive:
                 # Inherit the user's terminal so keyboard-interactive auth (Duo,
@@ -249,7 +328,11 @@ class SSHExec(Exec):
                         f"could not establish ssh connection to {self.target} "
                         f"(ssh exited {proc.returncode})"
                     )
+                self._clear_cooldown()
                 return
+            cooling = self._cooldown_error()
+            if cooling is not None:
+                raise ExecError(cooling)
             # Daemon path: (re)establish the master WITHOUT a terminal — relies on a
             # key/agent or the configured ssh wrapper to supply auth silently. A
             # bounded timeout keeps a backend whose auth genuinely needs a human from
@@ -268,16 +351,21 @@ class SSHExec(Exec):
                     timeout=self._auto_reconnect_timeout_s,
                 )
             except subprocess.TimeoutExpired as e:
-                raise ExecError(
+                message = (
                     f"ssh session to {self.target} expired and auto-reconnect timed "
-                    f"out after {self._auto_reconnect_timeout_s:.0f}s — {RECONNECT_HINT}"
-                ) from e
+                    f"out after {self._auto_reconnect_timeout_s:.0f}s — {self._hint()}"
+                )
+                self._start_cooldown(message)
+                raise ExecError(message) from e
             if proc.returncode != 0:
                 last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
-                raise ExecError(
+                message = (
                     f"ssh session to {self.target} expired; auto-reconnect failed "
-                    f"({last.strip()}) — {RECONNECT_HINT}"
+                    f"({last.strip()}) — {self._hint()}"
                 )
+                self._start_cooldown(message)
+                raise ExecError(message)
+            self._clear_cooldown()
 
     def _master_alive(self) -> bool:
         """True if the shared ControlMaster socket answers `-O check` (live)."""
@@ -302,6 +390,7 @@ class SSHExec(Exec):
         reconnect_retry: bool = True,
     ) -> ExecResult:
         self._ensure_control_dir()
+        self._refuse_dial_while_cooling()
         argv = [
             *self._batch_ssh_argv(),
             "--",
@@ -352,7 +441,7 @@ class SSHExec(Exec):
                 last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
                 raise ExecError(
                     f"ssh connection to {self.target} is down ({last.strip()}) — "
-                    f"{RECONNECT_HINT}",
+                    f"{self._hint()}",
                     result,
                 )
             break
@@ -381,6 +470,7 @@ class SSHExec(Exec):
         # pipe preserves log bytes exactly (a tty would map \n→\r\n and could
         # expand tabs). Verified live over the bore tunnel.
         self._ensure_control_dir()
+        self._refuse_dial_while_cooling()
         argv = [
             *self._batch_ssh_argv(),
             "--",
@@ -470,13 +560,14 @@ class SSHExec(Exec):
 
     def _transfer(self, argv: list[str], what: str) -> None:
         self._ensure_control_dir()
+        self._refuse_dial_while_cooling()
         with self._op_slot():
             proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
             msg = f"transfer failed ({what}): {stderr[-500:]}"
             if self._transport_failed(stderr):
-                msg += f" — {RECONNECT_HINT}"
+                msg += f" — {self._hint()}"
             raise ExecError(msg, ExecResult(proc.returncode, proc.stdout, proc.stderr))
 
     # --- git integration -----------------------------------------------------

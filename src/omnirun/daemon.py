@@ -470,9 +470,19 @@ class Daemon:
                 return True
             if rec.placement is not None and bool(rec.placement.handle):
                 return True
+            intent = self._store.get_intent(job_id)
+            if (
+                rec.state is JobState.PLACING
+                and intent is not None
+                and intent.data.get("retry_at")
+            ):
+                # The place item froze on an unreachable provider (I10): it
+                # retries on a timer, possibly for hours — report it now
+                # instead of pinning the submit to the long-poll meanwhile.
+                return True
             return (
                 rec.state is JobState.QUEUED
-                and self._store.get_intent(job_id) is None
+                and intent is None
                 and passes_before is not None
                 and self._engine.pass_count > passes_before
             )
@@ -802,7 +812,9 @@ class Daemon:
             # engine to settle the placement, then report the same outcome the
             # daemonless path would; the engine keeps advancing either way.
             rec = d._submit_and_settle(spec, backend)
-            return _json(wire.submit_outcome_to_json(classify_submit(rec)))
+            return _json(
+                wire.submit_outcome_to_json(classify_submit(rec, d._gather.notes))
+            )
 
         @app.get("/jobs/<jid>/settle")
         def _settle(jid: str) -> str:
@@ -817,11 +829,9 @@ class Daemon:
             settled = d._await_settle(rec.spec.job_id, timeout)
             if settled is None:
                 return _json({"settled": False})
+            outcome = classify_submit(settled, d._gather.notes)
             return _json(
-                {
-                    "settled": True,
-                    "outcome": wire.submit_outcome_to_json(classify_submit(settled)),
-                }
+                {"settled": True, "outcome": wire.submit_outcome_to_json(outcome)}
             )
 
         # Pure reads are LOCK-FREE: they hit the independently-transactional

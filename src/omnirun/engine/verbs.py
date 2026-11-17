@@ -51,7 +51,7 @@ from omnirun.models import (
     Slot,
 )
 from omnirun.providers import BackendProvider, OfferRound
-from omnirun.scheduler import JobExplanation, Snapshot
+from omnirun.scheduler import JobExplanation, Snapshot, provider_note_lines
 from omnirun.scheduler import explain as sched_explain
 from omnirun.state import Store
 from omnirun.state.store import EventRow, StaleTransition
@@ -76,6 +76,9 @@ class SubmitOutcome:
     provider_name: str | None
     placed: bool  # a real placement handle exists (the job launched)
     held_reason: str | None = None  # set when state is HELD
+    # QUEUED and unplaced: why the relevant providers offered no slot, phrased
+    # like ``explain`` ("<provider> offered no slot: <reason>"). Empty otherwise.
+    queued_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -201,20 +204,31 @@ def handle_of(rec: JobRecord) -> JobHandle | None:
     return JobHandle(backend=p.provider_name, job_id=rec.spec.job_id, data=p.handle)
 
 
-def classify_submit(rec: JobRecord) -> SubmitOutcome:
-    """Fold a job record into the client-facing submit outcome."""
+def classify_submit(
+    rec: JobRecord, provider_notes: Mapping[str, list[str]] | None = None
+) -> SubmitOutcome:
+    """Fold a job record into the client-facing submit outcome.
+
+    *provider_notes* is :attr:`SlotGather.notes` from the gather the placement
+    attempt ran over. Display-only: a QUEUED, unplaced job carries the lines
+    relevant to it (its pinned provider's, else every provider's) so ``submit``
+    can say WHY nothing took it instead of a bare "no slot free"."""
     placed = rec.placement is not None and bool(rec.placement.handle)
     held_reason = None
     if not placed and rec.state is JobState.HELD:
         held_reason = (
             rec.last_status.detail if rec.last_status else "no slot can satisfy it"
         )
+    queued_reasons: list[str] = []
+    if not placed and rec.state is JobState.QUEUED and provider_notes:
+        queued_reasons = provider_note_lines(rec.spec.only_backend, provider_notes)
     return SubmitOutcome(
         job_id=rec.spec.job_id,
         state=rec.state,
         provider_name=rec.placement.provider_name if rec.placement else None,
         placed=placed,
         held_reason=held_reason,
+        queued_reasons=queued_reasons,
     )
 
 
@@ -517,7 +531,10 @@ class SlotGather:
     def __init__(self, store: Store, inners: dict[str, BackendProvider]) -> None:
         self._store = store
         self._inners = inners
-        #: provider name → why it contributed no slot on the last refresh.
+        #: provider name → why it contributed no slot on the last COMPLETED
+        #: refresh. Published whole at the end of a refresh (never mutated in
+        #: place), so a reader on another thread — the daemon's ``explain`` and
+        #: submit-settle handlers — never sees a half-built round.
         self.notes: dict[str, list[str]] = {}
         # Job ids of the pending reqs the LAST refresh() offered for. The
         # daemonless drive's slot supplier diffs this against the store's
@@ -543,8 +560,8 @@ class SlotGather:
         pending = [r for r in jobs if r.state in (JobState.QUEUED, JobState.HELD)]
         self.pending_ids = frozenset(r.spec.job_id for r in pending)
         notes: dict[str, list[str]] = {}
-        self.notes = notes
         if not pending:
+            self.notes = notes
             return []
         self._refresh_facts()
 
@@ -630,6 +647,7 @@ class SlotGather:
                 slots.append(
                     slot.model_copy(update={"capacity": slot.capacity + active})
                 )
+        self.notes = notes
         return slots
 
     def _refresh_facts(self) -> None:

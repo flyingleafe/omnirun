@@ -45,6 +45,11 @@ class BackendConfig(BaseModel, extra="allow"):
 
     # ssh family
     host: str | None = None  # ssh alias or host; ~/.ssh/config is honored
+    # What a human must run when the ssh session cannot be (re)established
+    # without one — e.g. a site's own certificate-renewal login command. Shown
+    # wherever the session failure surfaces (probe reasons, `submit`, errors);
+    # unset = the generic "run `omnirun backends check`" hint.
+    reconnect_hint: str | None = None
     root: str = "$HOME/.omnirun"  # OMNIRUN_ROOT on the worker (clusters: $SCRATCH/..)
     env_setup: list[str] = Field(default_factory=list)  # module loads, exports
     # Where a project's shared checkout + .venv live on the worker. Default

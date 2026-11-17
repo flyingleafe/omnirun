@@ -97,9 +97,21 @@ class EngineFakeBackend(Backend):
         # job_id → remaining polls reported as LOST (a dead worker the
         # engine requeues) before normal status resumes
         self.lost_polls: dict[str, int] = {}
+        # When set, every probe declines with this reason (an unreachable /
+        # unfit backend: the probe never raises, it says why).
+        self.unfit_reason: str | None = None
 
     def probe(self, res: ResourceSpec) -> list[Offer]:
         self.probe_calls += 1
+        if self.unfit_reason is not None:
+            return [
+                Offer(
+                    backend=self.name,
+                    label=f"{self.name}: unreachable",
+                    fits=False,
+                    unfit_reasons=[self.unfit_reason],
+                )
+            ]
         return [Offer(backend=self.name, label=f"{self.name}: box", fits=True)]
 
     def submit(
@@ -331,8 +343,58 @@ def test_capacity_defer_waits_without_attempt(harness: Harness) -> None:
 def test_pinned_job_lands_on_its_backend(harness2: Harness) -> None:
     out = harness2.client.submit(_spec("pin-1"), backend="b")
     assert out.placed and out.provider_name == "b"
+    assert out.queued_reasons == []  # placed: nothing to explain
     assert harness2.backends["b"].submitted == ["pin-1"]
     assert "pin-1" not in harness2.backends["a"].submitted
+
+
+_AUTH_EXPIRED = (
+    "ssh session to b expired; auto-reconnect failed (Permission denied "
+    "(publickey).) — run `site-login` to renew your ssh certificate"
+)
+
+
+def test_submit_pinned_to_unreachable_backend_says_why(harness2: Harness) -> None:
+    """The job is accepted (QUEUED) and the outcome carries the pinned
+    provider's own reason — only that provider's, phrased like explain."""
+    harness2.backends["a"].unfit_reason = "a is full"
+    harness2.backends["b"].unfit_reason = _AUTH_EXPIRED
+    out = harness2.client.submit(_spec("why-1"), backend="b")
+    assert out.state is JobState.QUEUED and not out.placed
+    assert out.queued_reasons == [f"b offered no slot: {_AUTH_EXPIRED}"]
+
+
+def test_submit_unpinned_unplaceable_lists_every_provider(harness2: Harness) -> None:
+    harness2.backends["a"].unfit_reason = "a is full"
+    harness2.backends["b"].unfit_reason = _AUTH_EXPIRED
+    out = harness2.client.submit(_spec("why-2"))
+    assert out.state is JobState.QUEUED and not out.placed
+    assert out.queued_reasons == [
+        "a offered no slot: a is full",
+        f"b offered no slot: {_AUTH_EXPIRED}",
+    ]
+
+
+def test_classify_submit_reasons_only_for_queued_unplaced() -> None:
+    from omnirun.engine.verbs import classify_submit
+    from omnirun.models import JobRecord, JobStatus as _JobStatus, Placement
+
+    notes = {"a": ["a is full"], "b": ["auth expired"]}
+    queued = JobRecord(spec=_spec("cls-1", only_backend="a"))
+    assert classify_submit(queued, notes).queued_reasons == [
+        "a offered no slot: a is full"
+    ]
+    assert classify_submit(queued).queued_reasons == []  # no notes: none
+
+    held = JobRecord(spec=_spec("cls-2"), state=JobState.HELD)
+    assert classify_submit(held, notes).queued_reasons == []
+
+    placed = JobRecord(spec=_spec("cls-3"), state=JobState.RUNNING)
+    placed.placement = Placement(
+        provider_name="a", job_id="cls-3", state=_JobStatus.RUNNING, handle={"x": 1}
+    )
+    out = classify_submit(placed, notes)
+    assert out.placed and out.queued_reasons == []
 
 
 # ---------------------------------------------------------------------------

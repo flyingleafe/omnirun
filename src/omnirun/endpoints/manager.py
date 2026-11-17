@@ -111,6 +111,8 @@ class EndpointManager:
         batch_mode: bool = True,
         control_persist: str = "10m",
         max_concurrency: int | None = None,
+        reconnect_hint: str | None = None,
+        reconnect_cooldown_s: float = 0.0,
     ) -> SSHExec:
         """The ONE ``SSHExec`` for this physical ssh target + option set.
 
@@ -134,6 +136,8 @@ class EndpointManager:
             batch_mode,
             control_persist,
             max_concurrency,
+            reconnect_hint,
+            reconnect_cooldown_s,
         )
         with self._lock:
             ex = self._ssh.get(key)
@@ -150,6 +154,9 @@ class EndpointManager:
                     batch_mode=batch_mode,
                     control_persist=control_persist,
                     max_concurrency=max_concurrency,
+                    reconnect_hint=reconnect_hint,
+                    reconnect_cooldown_s=reconnect_cooldown_s,
+                    clock=self._clock,
                 )
                 self._ssh[key] = ex
             return ex
