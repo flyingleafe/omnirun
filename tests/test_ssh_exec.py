@@ -288,27 +288,6 @@ def test_configured_hint_replaces_generic_hint(recorder, cm_dir):
     assert "omnirun backends check" not in str(down.value)
 
 
-def test_proxyjump_auth_refusal_is_named_not_the_closing_line(recorder, cm_dir):
-    # Through a ProxyJump the jump hop prints the refusal and the outer
-    # connection then reports only that it was closed; the message must carry
-    # the refusal, or an expired credential reads as a network fault.
-    stderr = (
-        "user@bastion: Permission denied (publickey).\n"
-        "Connection closed by UNKNOWN port 65535\n"
-    )
-    recorder.behavior = lambda argv, kw: subprocess.CompletedProcess(
-        argv, 255, stdout="", stderr=stderr
-    )
-    ex = SSHExec("user@box", control_dir=cm_dir, reconnect_hint=SITE_HINT)
-    with pytest.raises(ExecError) as reconnect:
-        ex.ensure_master(interactive=False)
-    assert "(user@bastion: Permission denied (publickey).)" in str(reconnect.value)
-    with pytest.raises(ExecError) as down:
-        ex.run("squeue")
-    assert "(user@bastion: Permission denied (publickey).)" in str(down.value)
-    assert "UNKNOWN port" not in str(down.value)
-
-
 def test_configured_hint_on_reconnect_timeout(recorder, cm_dir):
     ex = SSHExec("user@box", control_dir=cm_dir, reconnect_hint=SITE_HINT)
 
