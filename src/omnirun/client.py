@@ -1339,7 +1339,13 @@ class RemoteClient:
 
         from omnirun.backends import tarsafe
 
-        with self._http.stream("GET", f"/jobs/{rec.spec.job_id}/outputs") as resp:
+        # The daemon stages the whole output tree before the first byte (a
+        # capture from the worker, or one object GET per file from the artifact
+        # store), which for a few hundred files outlasts the request timeout —
+        # so, like a followed log, this read must not time out.
+        with self._http.stream(
+            "GET", f"/jobs/{rec.spec.job_id}/outputs", timeout=self._stream_timeout
+        ) as resp:
             if resp.status_code >= 400:
                 resp.read()
                 self._raise_typed(resp)

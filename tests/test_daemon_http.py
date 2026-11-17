@@ -679,6 +679,42 @@ def test_pull_streams_chunked_tar_of_captured_outputs(tmp_path: Path) -> None:
         h.stop()
 
 
+def test_pull_survives_staging_longer_than_the_request_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon stages every output file before it sends the first byte. A
+    run with a few hundred files took 77 s to stage against the client's 60 s
+    request timeout, and `pull` died with ReadTimeout on every attempt."""
+    from typing import Any
+
+    import omnirun.daemon as daemon_mod
+
+    real_pull_to_dir = daemon_mod.pull_to_dir
+
+    def slow_pull_to_dir(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0.8)
+        return real_pull_to_dir(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_mod, "pull_to_dir", slow_pull_to_dir)
+    prov = FakeAsyncProvider()
+    spec = _spec("slowpull")
+    prov.observe[spec.job_id] = True
+    h = _async_daemon(tmp_path, prov)
+    client = RemoteClient(h.url)
+    impatient = RemoteClient(h.url, timeout=0.2)
+    try:
+        client.submit(spec)
+        _await_state(client, spec.job_id, {JobState.SUCCEEDED}, reaped=True)
+        rec = client.resolve_job(spec.job_id)
+        dest = tmp_path / "pulled"
+        impatient.pull(rec, dest)
+        assert (dest / "log.txt").read_text() == f"log of {spec.job_id}\n"
+    finally:
+        impatient.close()
+        client.close()
+        h.stop()
+
+
 def test_shutdown_under_hung_provider_is_fast_and_adoptable(tmp_path: Path) -> None:
     """SIGTERM correctness for the daemon lifecycle (ROBUST-3): with a place
     item hung inside the provider, serve() exits well under 5 s, the intent
