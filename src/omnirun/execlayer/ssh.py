@@ -118,6 +118,23 @@ def _text(v: str | bytes | None) -> str:
     return v
 
 
+def _failure_line(stderr: str) -> str:
+    """The stderr line that names WHY ssh failed, for the error message.
+
+    Usually the last line. Through a ProxyJump it is not: the jump hop prints
+    the cause (``user@bastion: Permission denied (publickey).``) and the outer
+    connection then closes with ``Connection closed by UNKNOWN port 65535`` —
+    reporting that last line hides an auth refusal behind a transport symptom."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return "ssh failed"
+    for line in reversed(lines):
+        low = line.lower()
+        if "permission denied" in low or "host key verification failed" in low:
+            return line
+    return lines[-1]
+
+
 class SSHExec(Exec):
     """Exec transport over the openssh client with a managed ControlMaster."""
 
@@ -358,10 +375,9 @@ class SSHExec(Exec):
                 self._start_cooldown(message)
                 raise ExecError(message) from e
             if proc.returncode != 0:
-                last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
                 message = (
                     f"ssh session to {self.target} expired; auto-reconnect failed "
-                    f"({last.strip()}) — {self._hint()}"
+                    f"({_failure_line(proc.stderr)}) — {self._hint()}"
                 )
                 self._start_cooldown(message)
                 raise ExecError(message)
@@ -438,10 +454,9 @@ class SSHExec(Exec):
                         pass  # cannot re-establish → fall through and surface it
                     else:
                         continue
-                last = (proc.stderr.strip().splitlines() or ["ssh failed"])[-1]
                 raise ExecError(
-                    f"ssh connection to {self.target} is down ({last.strip()}) — "
-                    f"{self._hint()}",
+                    f"ssh connection to {self.target} is down "
+                    f"({_failure_line(proc.stderr)}) — {self._hint()}",
                     result,
                 )
             break
